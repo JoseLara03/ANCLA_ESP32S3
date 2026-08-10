@@ -52,11 +52,15 @@ static int anchor_settings_set(const char *key, size_t len,
 {
 	uwb_config_t *cfg = uwb_config_get();
 
-	ARG_UNUSED(len);
-
 	if (strcmp(key, "mode") == 0) {
 		uint8_t v;
 
+		if (len != sizeof(v)) {
+			LOG_WRN("stored mode size %u invalid — expected %u, keeping %s",
+				(unsigned int)len, (unsigned int)sizeof(v),
+				uwb_config_mode_name(cfg->mode));
+			return -EINVAL;
+		}
 		if (read_val(read_cb, cb_arg, &v, sizeof(v))) {
 			return -EINVAL;
 		}
@@ -70,6 +74,11 @@ static int anchor_settings_set(const char *key, size_t len,
 	if (strcmp(key, "id") == 0) {
 		uint8_t v;
 
+		if (len != sizeof(v)) {
+			LOG_WRN("stored id size %u invalid — expected %u, keeping %u",
+				(unsigned int)len, (unsigned int)sizeof(v), cfg->anchor_id);
+			return -EINVAL;
+		}
 		if (read_val(read_cb, cb_arg, &v, sizeof(v))) {
 			return -EINVAL;
 		}
@@ -80,11 +89,23 @@ static int anchor_settings_set(const char *key, size_t len,
 	}
 
 	if (strcmp(key, "ant_tx") == 0) {
+		if (len != sizeof(cfg->ant_delay_tx)) {
+			LOG_WRN("stored ant_tx size %u invalid — expected %u, keeping %u",
+				(unsigned int)len, (unsigned int)sizeof(cfg->ant_delay_tx),
+				cfg->ant_delay_tx);
+			return -EINVAL;
+		}
 		return read_val(read_cb, cb_arg, &cfg->ant_delay_tx,
 				sizeof(cfg->ant_delay_tx));
 	}
 
 	if (strcmp(key, "ant_rx") == 0) {
+		if (len != sizeof(cfg->ant_delay_rx)) {
+			LOG_WRN("stored ant_rx size %u invalid — expected %u, keeping %u",
+				(unsigned int)len, (unsigned int)sizeof(cfg->ant_delay_rx),
+				cfg->ant_delay_rx);
+			return -EINVAL;
+		}
 		return read_val(read_cb, cb_arg, &cfg->ant_delay_rx,
 				sizeof(cfg->ant_delay_rx));
 	}
@@ -92,6 +113,11 @@ static int anchor_settings_set(const char *key, size_t len,
 	if (strcmp(key, "pos") == 0) {
 		struct stored_pos p;
 
+		if (len != sizeof(p)) {
+			LOG_WRN("stored pos size %u invalid — expected %u, keeping defaults",
+				(unsigned int)len, (unsigned int)sizeof(p));
+			return -EINVAL;
+		}
 		if (read_val(read_cb, cb_arg, &p, sizeof(p))) {
 			return -EINVAL;
 		}
