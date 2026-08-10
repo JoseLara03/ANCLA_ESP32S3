@@ -12,4 +12,6 @@ supported:
   - watchdog
   - entropy
   - netif:wifi
+  - dma
+  - led_strip
 vendor: innovaforce

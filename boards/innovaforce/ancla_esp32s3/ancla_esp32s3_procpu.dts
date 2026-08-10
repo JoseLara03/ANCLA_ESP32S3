@@ -8,6 +8,7 @@
 #include <espressif/esp32s3/esp32s3_wroom_n8r2.dtsi>
 #include <espressif/partitions_0x0_amp.dtsi>
 #include "ancla_esp32s3-pinctrl.dtsi"
+#include <zephyr/dt-bindings/led/led.h>
 
 / {
 	model = "Innovaforce ANCLA ESP32-S3 PROCPU";
@@ -17,6 +18,7 @@
 		i2c-0 = &i2c0;
 		watchdog0 = &wdt0;
 		uart-0 = &uart0;
+		rgb0 = &rgb_led;
 	};
 
 	chosen {
@@ -89,4 +91,24 @@
 		compatible = "maxim,max17048";
 		reg = <0x36>;
 	};
+};
+
+&i2s0 {
+	status = "okay";
+	pinctrl-0 = <&i2s0_default>;
+	pinctrl-names = "default";
+	dmas = <&dma 3>;
+	dma-names = "tx";
+
+	rgb_led: ws2812@0 {
+		compatible = "worldsemi,ws2812-i2s";
+		reg = <0>;
+		chain-length = <1>;
+		color-mapping = <LED_COLOR_ID_GREEN LED_COLOR_ID_RED LED_COLOR_ID_BLUE>;
+		reset-delay = <500>;
+	};
+};
+
+&dma {
+	status = "okay";
 };
