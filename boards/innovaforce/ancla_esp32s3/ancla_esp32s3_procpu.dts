@@ -6,7 +6,7 @@
 /dts-v1/;
 
 #include <espressif/esp32s3/esp32s3_wroom_n8r2.dtsi>
-#include <espressif/partitions_0x0_amp.dtsi>
+#include <espressif/partitions_0x0_amp_8M.dtsi>
 #include "ancla_esp32s3-pinctrl.dtsi"
 #include <zephyr/dt-bindings/led/led.h>
 
@@ -111,4 +111,8 @@
 
 &dma {
 	status = "okay";
+};
+
+&timer3 {
+	status = "disabled";
 };

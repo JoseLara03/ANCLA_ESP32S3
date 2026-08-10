@@ -215,10 +215,13 @@ bootloader with no signature, `wdt0`/`trng0`/`wifi`/`esp32_bt_hci` enabled, and
 `boards/espressif/esp32s3_devkitc/`, since these are SoC-family conventions
 unrelated to this board's specific peripherals. (`esp32s3_devkitc` also
 explicitly disables `timer0`-`timer3`; checked against
-`esp32s3_common.dtsi` and confirmed those four nodes already default to
-`status = "disabled"` at the SoC level, so that's dead boilerplate this board
-doesn't need to repeat.) SPI3, I2S1, I2C1, TWAI, and the touch peripheral are
-omitted entirely — nothing on this board uses them.
+`esp32s3_common.dtsi` and confirmed `timer0`-`timer2` already default to
+`status = "disabled"` at the SoC level, so repeating those three would be dead
+boilerplate this board doesn't need. `timer3`, however, does *not* default to
+disabled at the SoC level — it ships enabled — so this board explicitly
+disables it with its own `&timer3 { status = "disabled"; };` override.)
+SPI3, I2S1, I2C1, TWAI, and the touch peripheral are omitted entirely —
+nothing on this board uses them.
 
 The `appcpu` variant (dts/yaml/defconfig) is created for parity with every
 other ESP32-S3 board in this Zephyr tree (the SoC's AMP architecture expects
