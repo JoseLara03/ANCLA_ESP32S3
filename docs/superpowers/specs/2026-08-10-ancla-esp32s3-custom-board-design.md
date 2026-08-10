@@ -208,8 +208,10 @@ D+/D- routed to the USB-C connector).
 
 ### 9. Everything else — copied from the closest in-tree template
 
-Partition layout (`espressif/partitions_0x0_amp.dtsi`, 8MB flash — same as
-`esp32s3_devkitc`, no size suffix needed), MCUboot as default sysbuild
+Partition layout (`espressif/partitions_0x0_amp_8M.dtsi` — the 8MB-sized
+variant, matching this board's flash; not `esp32s3_devkitc`'s plain
+`partitions_0x0_amp.dtsi`, which resolves to a 4MB layout and would strand
+roughly half the flash on this part), MCUboot as default sysbuild
 bootloader with no signature, `wdt0`/`trng0`/`wifi`/`esp32_bt_hci` enabled, and
 `HEAP_MEM_POOL_ADD_SIZE_BOARD` (4096 procpu / 256 appcpu) are all copied from
 `boards/espressif/esp32s3_devkitc/`, since these are SoC-family conventions
