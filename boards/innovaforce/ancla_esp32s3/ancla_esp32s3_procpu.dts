@@ -26,6 +26,13 @@
 		zephyr,code-partition = &slot0_partition;
 		zephyr,bt-hci = &esp32_bt_hci;
 	};
+
+	zephyr,user {
+		dw3000-reset-gpios    = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+		dw3000-irq-gpios      = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+		dw3000-wakeup-gpios   = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+		max17048-alert-gpios  = <&gpio1 9 GPIO_ACTIVE_LOW>;
+	};
 };
 
 &usb_serial {
@@ -61,4 +68,12 @@
 
 &wifi {
 	status = "okay";
+};
+
+&spi2 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+	pinctrl-0 = <&spim2_default>;
+	pinctrl-names = "default";
 };
