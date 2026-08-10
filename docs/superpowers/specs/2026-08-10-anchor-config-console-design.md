@@ -203,7 +203,15 @@ The last point is a deliberate departure from the nRF5 code, which spins forever
 
 ## Verification
 
-### Host tests — `tests/uwb_config/` (twister, `native_sim`)
+### Host tests — `tests/uwb_config/test_uwb_config.c`
+
+Plain-gcc `main()` with a `CHECK` macro, returning non-zero on failure — the
+pattern both sibling projects already use (`tests/anchor_id/test_anchor_id.c` in
+`ESP32S3UWB`, `tests/uwb_frame/test_uwb_frame.c` in the tag). No twister and no
+`native_sim`: `uwb_config.c` has no Zephyr dependencies, so a single `gcc` command
+compiles and runs it.
+
+Cases:
 
 - defaults are the values this document claims, in particular `id == 0` and
   `mode == SLAVE`
