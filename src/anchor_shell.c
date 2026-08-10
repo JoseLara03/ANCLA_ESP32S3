@@ -19,6 +19,38 @@
 #include <errno.h>
 #include <stdlib.h>
 
+/* strtoul()/strtof() return 0 on non-numeric input without reporting the
+ * failure, and 0 is a legal value for every field this file parses — so a
+ * typo has to be caught here via endptr, not left to the range check below.
+ * Rejects if nothing was consumed or if trailing garbage remains. */
+static bool parse_ul(const char *arg, unsigned long *out)
+{
+	char *endptr;
+	unsigned long v;
+
+	v = strtoul(arg, &endptr, 0);
+	if (endptr == arg || *endptr != '\0') {
+		return false;
+	}
+
+	*out = v;
+	return true;
+}
+
+static bool parse_flt(const char *arg, float *out)
+{
+	char *endptr;
+	float v;
+
+	v = strtof(arg, &endptr);
+	if (endptr == arg || *endptr != '\0') {
+		return false;
+	}
+
+	*out = v;
+	return true;
+}
+
 static void print_config(const struct shell *sh)
 {
 	const uwb_config_t *cfg = uwb_config_get();
@@ -48,8 +80,7 @@ static int cmd_id(const struct shell *sh, size_t argc, char **argv)
 
 	ARG_UNUSED(argc);
 
-	v = strtoul(argv[1], NULL, 0);
-	if (v > UINT8_MAX || !uwb_config_set_id(cfg, (uint8_t)v)) {
+	if (!parse_ul(argv[1], &v) || v > UINT8_MAX || !uwb_config_set_id(cfg, (uint8_t)v)) {
 		shell_error(sh, "error: id must be 0..%u", UWB_MAX_ANCHORS - 1);
 		return -EINVAL;
 	}
@@ -81,11 +112,16 @@ static int cmd_mode(const struct shell *sh, size_t argc, char **argv)
 static int cmd_pos(const struct shell *sh, size_t argc, char **argv)
 {
 	uwb_config_t *cfg = uwb_config_get();
+	float x, y, z;
 
 	ARG_UNUSED(argc);
 
-	uwb_config_set_pos(cfg, strtof(argv[1], NULL), strtof(argv[2], NULL),
-			   strtof(argv[3], NULL));
+	if (!parse_flt(argv[1], &x) || !parse_flt(argv[2], &y) || !parse_flt(argv[3], &z)) {
+		shell_error(sh, "error: pos requires three numbers (x y z)");
+		return -EINVAL;
+	}
+
+	uwb_config_set_pos(cfg, x, y, z);
 	uwb_store_save_pos();
 	shell_print(sh, "ok: pos=(%.2f, %.2f, %.2f) (saved) — reboot to apply",
 		    (double)cfg->x, (double)cfg->y, (double)cfg->z);
@@ -95,11 +131,12 @@ static int cmd_pos(const struct shell *sh, size_t argc, char **argv)
 static int cmd_ant(const struct shell *sh, size_t argc, char **argv)
 {
 	uwb_config_t *cfg = uwb_config_get();
+	unsigned long tx, rx;
 
 	ARG_UNUSED(argc);
 
-	if (!uwb_config_set_ant(cfg, (uint32_t)strtoul(argv[1], NULL, 0),
-				(uint32_t)strtoul(argv[2], NULL, 0))) {
+	if (!parse_ul(argv[1], &tx) || !parse_ul(argv[2], &rx) ||
+	    !uwb_config_set_ant(cfg, (uint32_t)tx, (uint32_t)rx)) {
 		shell_error(sh, "error: antenna delays must be 0..65535");
 		return -EINVAL;
 	}
