@@ -31,9 +31,11 @@
 	};
 
 	zephyr,user {
+		/* RESET routes through an NPN inverter: ACTIVE_HIGH here means HIGH = DW3220 running/released, LOW = held in reset. */
 		dw3000-reset-gpios    = <&gpio0 21 GPIO_ACTIVE_HIGH>;
 		dw3000-irq-gpios      = <&gpio1 10 GPIO_ACTIVE_HIGH>;
 		dw3000-wakeup-gpios   = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+		/* ALERT is open-drain, active-low per the MAX17048 datasheet. */
 		max17048-alert-gpios  = <&gpio1 9 GPIO_ACTIVE_LOW>;
 	};
 };
@@ -73,6 +75,7 @@
 	status = "okay";
 };
 
+/* DW3220 is a DW3000-family part (hence dw3000-* properties above), no Zephyr binding yet, so no SPI child device node exists here on purpose — future driver work. */
 &spi2 {
 	#address-cells = <1>;
 	#size-cells = <0>;

@@ -44,6 +44,7 @@
 
 	i2s0_default: i2s0_default {
 		group1 {
+			/* Only O_SD (GPIO38) drives the LED; MCLK/O_WS/O_BCK/I_WS/I_BCK are spare, unconnected pins the I2S0 peripheral requires to be pinned anyway. */
 			pinmux = <I2S0_MCLK_GPIO33>,
 				 <I2S0_O_WS_GPIO34>,
 				 <I2S0_O_BCK_GPIO35>,
@@ -54,6 +55,7 @@
 		};
 
 		group2 {
+			/* Unconnected; pinned only because the I2S0 peripheral requires it. */
 			pinmux = <I2S0_I_SD_GPIO47>;
 			input-enable;
 		};
