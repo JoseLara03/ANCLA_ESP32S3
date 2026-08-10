@@ -31,10 +31,6 @@
 	};
 
 	zephyr,user {
-		/* RESET routes through an NPN inverter: ACTIVE_HIGH here means HIGH = DW3220 running/released, LOW = held in reset. */
-		dw3000-reset-gpios    = <&gpio0 21 GPIO_ACTIVE_HIGH>;
-		dw3000-irq-gpios      = <&gpio1 10 GPIO_ACTIVE_HIGH>;
-		dw3000-wakeup-gpios   = <&gpio0 14 GPIO_ACTIVE_HIGH>;
 		/* ALERT is open-drain, active-low per the MAX17048 datasheet. */
 		max17048-alert-gpios  = <&gpio1 9 GPIO_ACTIVE_LOW>;
 	};
@@ -75,13 +71,34 @@
 	status = "okay";
 };
 
-/* DW3220 is a DW3000-family part (hence dw3000-* properties above), no Zephyr binding yet, so no SPI child device node exists here on purpose — future driver work. */
 &spi2 {
 	#address-cells = <1>;
 	#size-cells = <0>;
 	status = "okay";
 	pinctrl-0 = <&spim2_default>;
 	pinctrl-names = "default";
+	/* GPIO-driven CS, not the SPI2 hardware CSEL: the decadriver toggles CS by
+	 * hand to wake the DW3220 from DEEPSLEEP, which hardware CS cannot do. GPIO10
+	 * is therefore absent from the spim2_default pinctrl group. */
+	cs-gpios = <&gpio0 10 GPIO_ACTIVE_LOW>;
+
+	/* DW3220 is a DW3000-family part, so it binds to the decawave,dw3000
+	 * compatible from the vendored decadriver module. */
+	dw3000: dw3000@0 {
+		compatible = "decawave,dw3000";
+		reg = <0>;
+		status = "okay";
+		spi-max-frequency = <8000000>;
+		/* ACTIVE_HIGH = "reset asserted when the pin is high", because the NPN
+		 * inverter inverts: GPIO HIGH -> transistor ON -> RSTn pulled LOW.
+		 * Note this is the opposite of the decawave,dw3000 binding's stock
+		 * active-low RESET convention, and of the board design spec's pin
+		 * table. Determined on hardware 2026-08-10: with ACTIVE_LOW,
+		 * dwt_probe() failed because the part was held in reset. */
+		reset-gpios  = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+		irq-gpios    = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+		wakeup-gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+	};
 };
 
 &i2c0 {

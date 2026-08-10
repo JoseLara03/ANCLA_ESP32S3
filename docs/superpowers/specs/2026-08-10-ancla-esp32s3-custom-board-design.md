@@ -16,6 +16,10 @@ assignments correctly described in devicetree/Kconfig. It does **not** include
 writing a DW3220 (Qorvo UWB transceiver) Zephyr driver — Zephyr has no in-tree
 Qorvo DW3000-family driver, and writing one is a separate, larger task.
 
+> **Follow-up:** that driver task was since resolved by vendoring the
+> out-of-tree br101 `zephyr-dw3000-decadriver` module rather than writing one.
+> See `docs/dw3000-zephyr-port.md`.
+
 ## Hardware summary
 
 | Peripheral | Signal | GPIO |
@@ -29,7 +33,7 @@ Qorvo DW3000-family driver, and writing one is a separate, larger task.
 | | CS | 10 |
 | | SCLK | 12 |
 | | WAKE_UP | 14 |
-| | RESET | 21 (via NPN inverter: LOW = reset asserted, HIGH = running) |
+| | RESET | 21 (via NPN inverter: **HIGH = reset asserted, LOW = running** — corrected 2026-08-10 after on-hardware testing; this table originally had it backwards, see `docs/dw3000-zephyr-port.md`) |
 | | IRQ | 42 |
 | USB-C | D-/D+ | 19/20 (fixed silicon pins, native USB-Serial-JTAG) |
 | UART0 (link to external device / RPi4, not console) | TXD0/RXD0 | 43/44 (default pins) |
@@ -63,6 +67,14 @@ GPIO 10/11/12/13 (CS/MOSI/SCLK/MISO) are exactly Zephyr's built-in
 that existing pinctrl group — no new pin macros needed for the bus itself.
 
 ### 4. DW3220 control lines + MAX17048 ALERT — `zephyr,user` GPIOs, no device node
+
+> **Superseded for the DW3220 lines** (see `docs/dw3000-zephyr-port.md`). The
+> br101 `zephyr-dw3000-decadriver` module is now vendored at
+> `modules/dw3000-decadriver/`, which brings a `decawave,dw3000` binding — so
+> RESET/IRQ/WAKE_UP moved onto a real `dw3000@0` device node under `&spi2`, and
+> CS became `cs-gpios` instead of the hardware CSEL. Only
+> `max17048-alert-gpios` still lives on `zephyr,user`. The reasoning below still
+> explains why ALERT stays there.
 
 Since there's no DW3000-family binding/driver in this Zephyr tree, RESET, IRQ,
 and WAKE_UP are exposed as plain named GPIOs under a `zephyr,user` devicetree

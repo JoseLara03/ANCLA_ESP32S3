@@ -21,9 +21,10 @@
 
 	spim2_default: spim2_default {
 		group1 {
+			/* No SPIM2_CSEL_GPIO10 here: CS is a plain GPIO (cs-gpios on &spi2)
+			 * so the decadriver can hold it low to wake the DW3220. */
 			pinmux = <SPIM2_MISO_GPIO13>,
-				 <SPIM2_SCLK_GPIO12>,
-				 <SPIM2_CSEL_GPIO10>;
+				 <SPIM2_SCLK_GPIO12>;
 		};
 
 		group2 {
