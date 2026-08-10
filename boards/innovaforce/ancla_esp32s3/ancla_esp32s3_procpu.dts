@@ -14,6 +14,7 @@
 	compatible = "innovaforce,ancla-esp32s3";
 
 	aliases {
+		i2c-0 = &i2c0;
 		watchdog0 = &wdt0;
 		uart-0 = &uart0;
 	};
@@ -76,4 +77,16 @@
 	status = "okay";
 	pinctrl-0 = <&spim2_default>;
 	pinctrl-names = "default";
+};
+
+&i2c0 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+
+	max17048: max17048@36 {
+		compatible = "maxim,max17048";
+		reg = <0x36>;
+	};
 };
