@@ -1,0 +1,6 @@
+board:
+  name: ancla_esp32s3
+  full_name: Innovaforce ANCLA ESP32-S3
+  vendor: innovaforce
+  socs:
+  - name: esp32s3

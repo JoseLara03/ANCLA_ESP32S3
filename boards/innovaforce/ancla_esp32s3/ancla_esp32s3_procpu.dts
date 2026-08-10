@@ -1,0 +1,64 @@
+/*
+ * Copyright (c) 2026 Innovaforce
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/dts-v1/;
+
+#include <espressif/esp32s3/esp32s3_wroom_n8r2.dtsi>
+#include <espressif/partitions_0x0_amp.dtsi>
+#include "ancla_esp32s3-pinctrl.dtsi"
+
+/ {
+	model = "Innovaforce ANCLA ESP32-S3 PROCPU";
+	compatible = "innovaforce,ancla-esp32s3";
+
+	aliases {
+		watchdog0 = &wdt0;
+		uart-0 = &uart0;
+	};
+
+	chosen {
+		zephyr,sram = &sram1;
+		zephyr,console = &usb_serial;
+		zephyr,shell-uart = &usb_serial;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+		zephyr,bt-hci = &esp32_bt_hci;
+	};
+};
+
+&usb_serial {
+	status = "okay";
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+	pinctrl-0 = <&uart0_default>;
+	pinctrl-names = "default";
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&wdt0 {
+	status = "okay";
+};
+
+&trng0 {
+	status = "okay";
+};
+
+&esp32_bt_hci {
+	status = "okay";
+};
+
+&wifi {
+	status = "okay";
+};
