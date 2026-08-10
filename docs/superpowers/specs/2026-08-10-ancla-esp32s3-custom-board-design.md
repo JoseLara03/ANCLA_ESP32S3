@@ -62,29 +62,41 @@ GPIO 10/11/12/13 (CS/MOSI/SCLK/MISO) are exactly Zephyr's built-in
 `spim2_default` pinmux macros for this SoC. The board just enables `&spi2` with
 that existing pinctrl group — no new pin macros needed for the bus itself.
 
-### 4. DW3220 control lines — `zephyr,user` GPIOs, no device node
+### 4. DW3220 control lines + MAX17048 ALERT — `zephyr,user` GPIOs, no device node
 
 Since there's no DW3000-family binding/driver in this Zephyr tree, RESET, IRQ,
 and WAKE_UP are exposed as plain named GPIOs under a `zephyr,user` devicetree
-node (the standard Zephyr idiom for board-defined signals with no driver yet):
+node (the standard Zephyr idiom for board-defined signals with no driver yet).
+
+The MAX17048's ALERT line joins them here rather than living on the
+`max17048` device node: the in-tree `maxim,max17048` binding
+(`maxim,max17048.yaml` → `fuel-gauge.yaml`/`i2c-device.yaml`) has no
+`alert-gpios` property, and the driver source never reads one — so an
+`alert-gpios` property on that node would have no consumer. Same situation as
+the DW3220 lines, so it goes in the same place:
 
 ```
 zephyr,user {
-    dw3000-reset-gpios  = <&gpio0 21 GPIO_ACTIVE_HIGH>;
-    dw3000-irq-gpios    = <&gpio1 10 GPIO_ACTIVE_HIGH>;
-    dw3000-wakeup-gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+    dw3000-reset-gpios    = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+    dw3000-irq-gpios      = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+    dw3000-wakeup-gpios   = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+    max17048-alert-gpios  = <&gpio1 9 GPIO_ACTIVE_LOW>;
 };
 ```
 
 (GPIO bank math: `gpio0` covers absolute pins 0-31 directly; `gpio1` covers
-32-53 at index `pin - 32`, so IRQ on GPIO42 is `&gpio1 10`.)
+32-53 at index `pin - 32`, so IRQ on GPIO42 is `&gpio1 10` and ALERT on GPIO41
+is `&gpio1 9`.)
 
 App code reads these via `GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), dw3000_reset_gpios)`
-etc. `GPIO_ACTIVE_HIGH` here describes the physical pin Zephyr's GPIO API will
-treat as electrically active — HIGH releases/runs the DW3220 per the NPN
-inverter, matching the hardware note in the request. Whether a future driver
-calls that state "asserted" or "released" is a driver-level naming decision,
-out of scope here.
+etc. `GPIO_ACTIVE_HIGH`/`GPIO_ACTIVE_LOW` here only describe each pin's
+electrically-active level — HIGH releases/runs the DW3220 per the NPN
+inverter, and ALERT is open-drain active-low per the MAX17048 datasheet.
+Devicetree `-gpios` properties never declare pin direction; that's set later
+in software (e.g. `gpio_pin_configure_dt(&spec, GPIO_INPUT)` plus
+`gpio_pin_interrupt_configure_dt(...)` for ALERT and IRQ, which are both
+interrupt lines). None of these four signals are configured as input or
+output until application code does so explicitly.
 
 No SPI child devicetree node is created for the DW3220 itself (no binding
 exists to attach); that's part of the future driver work.
@@ -92,7 +104,7 @@ exists to attach); that's part of the future driver work.
 ### 5. MAX17048 — real devicetree node (in-tree driver exists)
 
 Zephyr ships a `maxim,max17048` fuel-gauge driver and binding, so this one gets
-wired up for real, not just as a placeholder:
+wired up for real (I2C address + bus), not just as a placeholder:
 
 ```
 &i2c0 {
@@ -103,10 +115,11 @@ wired up for real, not just as a placeholder:
     max17048: max17048@36 {
         compatible = "maxim,max17048";
         reg = <0x36>;
-        alert-gpios = <&gpio1 9 GPIO_ACTIVE_LOW>;  /* GPIO41, open-drain active-low */
     };
 };
 ```
+
+ALERT (GPIO41) is intentionally not a property on this node — see decision 4.
 
 I2C0 is chosen (arbitrarily, only one I2C device exists on this board) with a
 custom `i2c0_default` pinctrl group for GPIO39/40 (the chip's pinmux header has
