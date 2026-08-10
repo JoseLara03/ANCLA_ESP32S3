@@ -210,12 +210,15 @@ D+/D- routed to the USB-C connector).
 
 Partition layout (`espressif/partitions_0x0_amp.dtsi`, 8MB flash — same as
 `esp32s3_devkitc`, no size suffix needed), MCUboot as default sysbuild
-bootloader with no signature, `wdt0`/`trng0`/`wifi`/`esp32_bt_hci` enabled,
-`timer0`-`timer3` explicitly disabled, and `HEAP_MEM_POOL_ADD_SIZE_BOARD`
-(4096 procpu / 256 appcpu) are all copied verbatim from
+bootloader with no signature, `wdt0`/`trng0`/`wifi`/`esp32_bt_hci` enabled, and
+`HEAP_MEM_POOL_ADD_SIZE_BOARD` (4096 procpu / 256 appcpu) are all copied from
 `boards/espressif/esp32s3_devkitc/`, since these are SoC-family conventions
-unrelated to this board's specific peripherals. SPI3, I2S1, I2C1, TWAI, and the
-touch peripheral are omitted entirely — nothing on this board uses them.
+unrelated to this board's specific peripherals. (`esp32s3_devkitc` also
+explicitly disables `timer0`-`timer3`; checked against
+`esp32s3_common.dtsi` and confirmed those four nodes already default to
+`status = "disabled"` at the SoC level, so that's dead boilerplate this board
+doesn't need to repeat.) SPI3, I2S1, I2C1, TWAI, and the touch peripheral are
+omitted entirely — nothing on this board uses them.
 
 The `appcpu` variant (dts/yaml/defconfig) is created for parity with every
 other ESP32-S3 board in this Zephyr tree (the SoC's AMP architecture expects
