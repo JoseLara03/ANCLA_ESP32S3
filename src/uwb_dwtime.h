@@ -13,6 +13,7 @@
 #ifndef UWB_DWTIME_H
 #define UWB_DWTIME_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <deca_device_api.h>
 
@@ -44,13 +45,24 @@ uint64_t uwb_get_rx_timestamp_u64(void);
  * significant byte first. */
 void uwb_resp_msg_set_ts(uint8_t *ts_field, uint64_t ts);
 
-/* Spin until every bit in lo_mask is set in the low system status register.
+/* Spin until every bit in lo_mask is set in the low system status register,
+ * or timeout_ms elapses. Returns true if the bits set in time, false on
+ * timeout -- the caller must treat a timeout as a failed operation and
+ * recover (e.g. dwt_forcetrxoff()).
+ *
+ * The timeout is not defensive padding: dwt_starttx()'s own HPDWARN deadline
+ * check can race a borderline-late delayed TX and still report DWT_SUCCESS
+ * for a transmission that never actually completes, leaving TXFRS unset
+ * forever. An earlier unbounded version of this spin hung the whole console
+ * (main thread runs at priority 0) the first time that race actually landed
+ * on real hardware, confirmed at DISC_BASE_UUS=2400 in anchor_respond.c.
  *
  * Only safe for events the ISR does not clear first. Never call this with
  * DWT_INT_CIADONE_BIT_MASK after an RX event: dwt_isr() clears
  * SYS_STATUS_ALL_RX_GOOD -- which includes CIADONE -- before invoking the RX
- * callback, so the bit will not set again until the next frame and this spins
- * forever. The same applies to TXFRS if TX interrupts are ever enabled. */
-void uwb_wait_for_sysstatus_lo(uint32_t lo_mask);
+ * callback, so the bit will not set again until the next frame and this would
+ * spin until timeout every time. The same applies to TXFRS if TX interrupts
+ * are ever enabled. */
+bool uwb_wait_for_sysstatus_lo(uint32_t lo_mask, uint32_t timeout_ms);
 
 #endif /* UWB_DWTIME_H */

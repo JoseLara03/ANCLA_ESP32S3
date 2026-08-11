@@ -141,8 +141,14 @@ static void observe_beacon(const uint8_t *buf, uint16_t len, const uwb_config_t 
 					      uwb_config_short_addr(cfg));
 
 	/* Recorded and logged only. Gating RX windows on beacon timing needs a
-	 * real gateway to develop against — that is spec D. */
-	LOG_INF("BEACON ver=%u counter=%u slots=%u our_slot=%d", proto_ver,
+	 * real gateway to develop against — that is spec D. LOG_DBG, not
+	 * LOG_INF: this fires on every beacon (roughly every 195 ms) regardless
+	 * of ranging activity, and at LOG_LEVEL_INF the call compiles out
+	 * entirely — link-budget timing on the DISCOVERY/WAVE responders (see
+	 * disc_schedule.h, anchor_respond.c) matters more than always-on beacon
+	 * visibility. Bump this module's LOG_MODULE_REGISTER level to
+	 * LOG_LEVEL_DBG to re-enable for debugging. */
+	LOG_DBG("BEACON ver=%u counter=%u slots=%u our_slot=%d", proto_ver,
 		frame_counter, n_slots, slot);
 }
 
@@ -190,13 +196,26 @@ void uwb_slave_run(const uwb_config_t *cfg)
 			continue;
 		}
 
+		/* TEMP PROFILING: cycle-count checkpoints across the three RX-side
+		 * SPI reads, to locate the ~1700 uus of overhead measured between
+		 * RX and dwt_starttx() (anchor_respond.c) at DISC_BASE_UUS=2000/2400
+		 * before it was raised to 6000. Printed only after the whole
+		 * frame's processing -- including any delayed TX attempt -- has
+		 * resolved, so the print itself cannot perturb this frame's
+		 * deadline. Remove once the dominant cost is identified. */
+		uint32_t t0 = k_cycle_get_32();
+
 		int32_t cir_power = 0;
 		uint16_t cir_quality = 0;
 
 		read_cir(status, &cir_power, &cir_quality);
+		uint32_t t1 = k_cycle_get_32();
 
 		dwt_readrxdata(rx_buf, flen, 0);
+		uint32_t t2 = k_cycle_get_32();
+
 		uint64_t rx_ts = uwb_get_rx_timestamp_u64();
+		uint32_t t3 = k_cycle_get_32();
 
 		/* Payload length: every consumer below derives field counts from
 		 * it, and two extra bytes corrupt them silently. */
@@ -207,6 +226,14 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		anchor_respond_discovery(rx_buf, plen, rx_ts, cfg, &frame_seq_nb,
 					 cir_power, cir_quality);
 		observe_beacon(rx_buf, plen, cfg);
+
+		/* TEMP PROFILING: see the checkpoint comment above. */
+		uint32_t hz = sys_clock_hw_cycles_per_sec();
+
+		LOG_INF("prof us: cir=%u readdata=%u readts=%u",
+			(unsigned)((uint64_t)(t1 - t0) * 1000000ULL / hz),
+			(unsigned)((uint64_t)(t2 - t1) * 1000000ULL / hz),
+			(unsigned)((uint64_t)(t3 - t2) * 1000000ULL / hz));
 
 		rx_arm();
 	}

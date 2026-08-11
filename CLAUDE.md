@@ -120,6 +120,85 @@ kernel reboot cold             apply — every setter persists immediately,
   `0x0000` for the gateway, so the console's 0-based id cannot go on the wire
   directly. The tag reports anchors as 1..4 while `anchor show` says 0..3; both
   are printed by `anchor show` and the boot banner.
+- **The nRF5 anchor's 2000 uus delayed-TX turnaround does not survive the port
+  to this Zephyr stack — it fails 100% of the time, not occasionally.**
+  Measured on the bench with a cycle-counter margin diagnostic in
+  `tx_delayed()` (`src/anchor_respond.c`): the round trip from RX
+  (`dwt_readrxdata`/`dwt_readrxtimestamp`/`dwt_readdiagnostics`) through the
+  delayed-TX setup writes consumes **~1700 uus** before `dwt_starttx()` is even
+  called — this port's vendored driver wraps every register access through an
+  `ioctl`-style dispatch plus a bit-banged CS pin (`CS (GPIO10) is a GPIO`
+  fact above), which costs far more per call than the bare-metal SPI path the
+  nRF5/ESP32S3UWB budget was sized for. `DISC_BASE_UUS`
+  (`src/disc_schedule.h`) and `POLL_RX_TO_RESP_TX_DLY_UUS`
+  (`src/anchor_respond.c`) are both **6000** as a result. Tried dropping to
+  2400 after downgrading the per-frame `LOG_INF` calls in this path to
+  `LOG_DBG` (compiled out at this module's `LOG_LEVEL_INF`) — still failed
+  100% of the time. **Logging was never the dominant cost** on this stack;
+  don't re-litigate that guess.
+- **`read_cir()`'s `dwt_readdiagnostics()` call is ~944 uus of the ~1700 uus
+  RX-side overhead above — by far the single largest piece.** Traced to
+  `uwb_radio.c:76`'s `dwt_configciadiag(DW_CIA_DIAG_LOG_ALL)`: in the
+  non-double-buffer path (`dw3000_device.c` `ull_readdiagnostics()`,
+  `default:` case), `DW_CIA_DIAG_LOG_ALL` triggers **two separate ~108-byte
+  SPI burst reads** (216 bytes total), and critically, `ipatovPower` /
+  `ipatovAccumCount` — the only two fields `read_cir()` uses — are populated
+  **only** when `LOG_ALL` is set; any cheaper `cia_diagnostic` level leaves
+  them zero. `dwt_readdiagnostics_acc()` does the identical two-burst read
+  internally regardless of accumulator index, so there is no lighter public
+  API for just these two fields — the vendored driver's public surface
+  (`deca_device_api.h`) exposes no direct/targeted register read. Getting
+  non-zero CIR power/quality through this driver's public API costs ~944 uus,
+  full stop, unless the vendored module itself is changed (out of scope; see
+  `modules/dw3000-decadriver/` above).
+  **Open decision, not yet made:** `cir_power`/`cir_quality` are
+  informational only — the tag ranks anchors by them, it does not accept or
+  reject a range on them (`anchor_respond.h`'s own doc comment). Skipping the
+  CIR read entirely in the DISCOVERY hot path (always report zero) would
+  recover the ~944 uus, at the cost of the tag's anchor-selection signal when
+  several anchors are in range. Not implemented pending a decision — see
+  `read_cir()` in `src/uwb_slave.c` if/when this gets revisited.
+- **An unbounded wait for TXFRS can hang the whole console.**
+  `tx_delayed()`'s post-`dwt_starttx()` completion poll used to spin forever
+  on `DWT_INT_TXFRS_BIT_MASK`. `dwt_starttx()`'s own internal HPDWARN deadline
+  check (`dw3000_device.c` `ull_starttx()`) can race a borderline-late
+  delayed TX and still report `DWT_SUCCESS` for a transmission that never
+  actually completes — hit this for real on the bench while testing a too-
+  tight `DISC_BASE_UUS`. TXFRS then never sets, and the spin freezes the main
+  thread (priority 0) permanently, killing the shell along with it. Fixed:
+  `uwb_wait_for_sysstatus_lo()` (`src/uwb_dwtime.{c,h}`) now takes a
+  `timeout_ms` and returns `bool`; `tx_delayed()` treats a timeout like any
+  other TX failure. **The timeout bound must exceed the worst-case scheduled
+  delay, not just a frame's airtime** — `dwt_starttx()` returns almost
+  immediately after arming a delayed TX, the transmission itself happens only
+  once the full scheduled delay elapses. An earlier attempt at this bound
+  (10 ms) was shorter than `disc_resp_delay_uus(2)` and `(3)` (13 ms / 16.5 ms
+  at `DISC_BASE_UUS=6000`), so it force-cancelled every DISCOVERY response for
+  anchor ids ≥ 2 before they'd had a chance to fire. `TX_COMPLETE_TIMEOUT_MS`
+  (`src/anchor_respond.c`) is now 25 — comfortably past the id-3 worst case
+  plus airtime margin. Revisit this constant if the delay budgets above are
+  ever tuned further.
+- **Ranging confirmed on the bench via an external DWM3001CDK sniffer**, not
+  the tag (its serial output is deliberately silent to keep BLE comms
+  overhead low). With a real gateway + a second fw-cre SLAVE device + the
+  tag, the sniffer showed this anchor (short address `0x0002`) answering both
+  paths correctly: legacy WAVE/VEWA with the configured position encoded
+  (`x=1.0,y=0.0` as IEEE-754 bytes `00 00 80 3F` / `00 00 00 00`), and
+  DISCOVERY/RANGE-RESPONSE (`0xE2`→`0xE4`) with `src=0x0002`. This only
+  confirms the RF exchange is correct, not that the tag actually resolves a
+  distance from it (no visibility into that without the tag's BLE output).
+  Also observed on the same air, unrelated to this anchor: the other fw-cre
+  SLAVE answering DISCOVERY with `src=0x0000` — a real protocol violation
+  (collides with the gateway's reserved address) on that rig, not this one;
+  and a `0xE6`/`0xE7`/`0xE8` JOIN/GRANT handshake between the gateway and
+  another device — spec-D TDMA provisioning traffic this project doesn't
+  implement.
+- **A temporary cycle-counter profiling block is still in `uwb_slave.c`**
+  (`k_cycle_get_32()` checkpoints around `read_cir()`/`dwt_readrxdata()`/
+  `uwb_get_rx_timestamp_u64()`, logged as `"prof us: cir=... readdata=...
+  readts=..."`). It produced the `read_cir()` finding above. Remove once the
+  CIR-read decision above is made and no further RX-side profiling is
+  needed.
 
 ## System context
 
@@ -131,6 +210,10 @@ live in the sibling ESP-IDF anchor project at
 the working reference implementation for ranging; the SLAVE responder here
 (`src/anchor_respond.c`, `src/uwb_slave.c`) has now ported the WAVE and
 DISCOVERY response paths from it, but the gateway/beacon side is still to come.
+Both response paths are bench-confirmed correct over the air (sniffer capture,
+see the "Ranging confirmed on the bench" hard-won fact above) after fixing the
+delayed-TX turnaround budget and an unbounded-wait hang; the tag's actual
+distance computation is not independently observable from this project.
 
 ## Host tests
 

@@ -6,6 +6,8 @@
 
 #include "uwb_dwtime.h"
 
+#include <zephyr/kernel.h>
+
 #include <deca_device_api.h>
 
 uint64_t uwb_get_rx_timestamp_u64(void)
@@ -28,8 +30,14 @@ void uwb_resp_msg_set_ts(uint8_t *ts_field, uint64_t ts)
 	}
 }
 
-void uwb_wait_for_sysstatus_lo(uint32_t lo_mask)
+bool uwb_wait_for_sysstatus_lo(uint32_t lo_mask, uint32_t timeout_ms)
 {
+	int64_t deadline = k_uptime_get() + (int64_t)timeout_ms;
+
 	while (!(dwt_readsysstatuslo() & lo_mask)) {
+		if (k_uptime_get() >= deadline) {
+			return false;
+		}
 	}
+	return true;
 }

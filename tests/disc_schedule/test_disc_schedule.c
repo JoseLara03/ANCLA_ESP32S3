@@ -11,12 +11,12 @@ static void test_base_and_stagger(void)
 {
     /* Anchor 0 responds at the turnaround floor, not one slot in. */
     CHECK(disc_resp_delay_uus(0) == DISC_BASE_UUS);
-    CHECK(disc_resp_delay_uus(0) == 2000u);
+    CHECK(disc_resp_delay_uus(0) == 6000u);
 
     /* Each subsequent anchor is exactly one slot later. */
-    CHECK(disc_resp_delay_uus(1) == 2000u + 3500u);
-    CHECK(disc_resp_delay_uus(2) == 2000u + 2u * 3500u);
-    CHECK(disc_resp_delay_uus(3) == 2000u + 3u * 3500u);
+    CHECK(disc_resp_delay_uus(1) == 6000u + 3500u);
+    CHECK(disc_resp_delay_uus(2) == 6000u + 2u * 3500u);
+    CHECK(disc_resp_delay_uus(3) == 6000u + 3u * 3500u);
 }
 
 static void test_slots_never_overlap(void)

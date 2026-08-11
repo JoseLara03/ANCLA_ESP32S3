@@ -24,9 +24,30 @@
 
 LOG_MODULE_REGISTER(anchor_respond, LOG_LEVEL_INF);
 
-/* Legacy responder turnaround, unchanged from the nRF5 anchor and matching the
- * working ESP32S3UWB responder. */
-#define POLL_RX_TO_RESP_TX_DLY_UUS 2000u
+/* Bound for tx_delayed()'s post-dwt_starttx() TXFRS wait. Must exceed the
+ * WORST-CASE scheduled delay across both responders, not just a frame's
+ * airtime -- dwt_starttx() returns almost immediately after arming a
+ * delayed TX; the transmission itself doesn't happen until the full
+ * scheduled delay has elapsed. Worst case today is DISCOVERY at anchor id 3:
+ * disc_resp_delay_uus(3) = DISC_BASE_UUS + 3*DISC_SLOT_UUS = 6000 + 3*3500 =
+ * 16500 uus (~16.5 ms). An earlier version of this bound (10 ms) was shorter
+ * than that for any anchor id >= 2, so it force-cancelled transmissions that
+ * hadn't had a chance to fire yet, on every single attempt for those ids.
+ * Revisit this constant if DISC_BASE_UUS/DISC_SLOT_UUS/
+ * POLL_RX_TO_RESP_TX_DLY_UUS are ever tuned further. */
+#define TX_COMPLETE_TIMEOUT_MS 25
+
+/* Legacy responder turnaround. Was 2000, carried over unchanged from the
+ * nRF5 anchor and the working (non-Zephyr) ESP32S3UWB responder; measured
+ * ~1700 uus short on this ANCLA_ESP32S3/Zephyr port for the DISCOVERY path
+ * (see DISC_BASE_UUS in disc_schedule.h for the full story, including that
+ * dropping to 2400 after removing the per-frame logging still failed 100%
+ * of the time -- logging was not the dominant overhead). 6000 confirmed
+ * working on hardware for DISCOVERY; not yet independently exercised for
+ * this WAVE path specifically, but both share tx_delayed() and the same
+ * driver overhead, so matching it here rather than leaving this one at a
+ * value already shown to fail. */
+#define POLL_RX_TO_RESP_TX_DLY_UUS 6000u
 
 /* ---- Legacy WAVE/0xE0 -> VEWA/0xE1 ---- */
 static const uint8_t rx_poll_ref[] = {
@@ -64,8 +85,18 @@ static void tx_delayed(const uint8_t *buf, uint16_t payload_len, uint32_t tx_tim
 
 	/* Safe to poll: TXFRS is not in the enabled interrupt mask (uwb_slave.c
 	 * enables DWT_INT_RX only), so dwt_isr() never runs for it and never
-	 * clears the bit ahead of us. */
-	uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK);
+	 * clears the bit ahead of us. Bounded, not a plain spin: dwt_starttx()'s
+	 * own deadline check can race a borderline-late delayed TX and still
+	 * report DWT_SUCCESS for a transmission that never completes -- an
+	 * unbounded wait here hung the whole console (main thread is priority 0)
+	 * the first time that race landed on real hardware. See
+	 * TX_COMPLETE_TIMEOUT_MS for why the bound has to cover the scheduled
+	 * delay itself, not just the frame's airtime. */
+	if (!uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK, TX_COMPLETE_TIMEOUT_MS)) {
+		dwt_forcetrxoff();
+		LOG_WRN("delayed TX started but TXFRS never completed — forced off");
+		return;
+	}
 	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
 }
 
@@ -131,13 +162,19 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 	}
 	uwb_frame_set_seq_num(out, (*seq)++);
 
-	LOG_INF("DISC from 0x%04X -> resp src 0x%04X pwr=%d q=%u", tag_addr,
-		uwb_config_short_addr(cfg), cir_power, cir_quality);
-
 	uint32_t delay_uus = disc_resp_delay_uus(cfg->anchor_id);
 	uint32_t resp_tx_time = (uint32_t)((disc_rx_ts +
 		((uint64_t)delay_uus * UUS_TO_DWT_TIME)) >> 8);
 
-	/* Module frames carry no FCS placeholder: ranging=0 adds FCS_LEN. */
+	/* Module frames carry no FCS placeholder: ranging=0 adds FCS_LEN.
+	 * Logged after, not before: a synchronous log call ahead of the
+	 * delayed-TX setup would eat into DISC_BASE_UUS/DISC_SLOT_UUS's already
+	 * tight budget on this port (see disc_schedule.h). */
 	tx_delayed(out, (uint16_t)n, resp_tx_time, 0);
+
+	/* LOG_DBG, not LOG_INF: compiles out at this module's LOG_LEVEL_INF.
+	 * Link-budget timing matters more than per-DISCOVERY visibility here --
+	 * bump the module's registered level to re-enable for debugging. */
+	LOG_DBG("DISC from 0x%04X -> resp src 0x%04X pwr=%d q=%u", tag_addr,
+		uwb_config_short_addr(cfg), cir_power, cir_quality);
 }
