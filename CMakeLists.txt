@@ -7,4 +7,12 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(ANCLA_ESP32S3)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE
+	src/anchor_shell.c
+	src/main.c
+	src/uwb_config.c
+	src/uwb_gateway.c
+	src/uwb_radio.c
+	src/uwb_slave.c
+	src/uwb_store.c
+)
