@@ -29,13 +29,16 @@ LOG_MODULE_REGISTER(anchor_respond, LOG_LEVEL_INF);
  * airtime -- dwt_starttx() returns almost immediately after arming a
  * delayed TX; the transmission itself doesn't happen until the full
  * scheduled delay has elapsed. Worst case today is DISCOVERY at anchor id 3:
- * disc_resp_delay_uus(3) = DISC_BASE_UUS + 3*DISC_SLOT_UUS = 6000 + 3*3500 =
- * 16500 uus (~16.5 ms). An earlier version of this bound (10 ms) was shorter
- * than that for any anchor id >= 2, so it force-cancelled transmissions that
+ * disc_resp_delay_uus(3) = DISC_BASE_UUS + 3*DISC_SLOT_UUS = 2000 + 3*3500 =
+ * 12500 uus (~12.5 ms). Re-derived after DISC_BASE_UUS dropped from 6000 to
+ * 2000 on the fast (26.67 MHz) SPI bus:
+ *   ceil(12500 * 1.0256 / 1000) + 5 = ceil(12.82) + 5 = 13 + 5 = 18.
+ * An earlier version of this bound (10 ms) was shorter than the scheduled
+ * delay for any anchor id >= 2, so it force-cancelled transmissions that
  * hadn't had a chance to fire yet, on every single attempt for those ids.
  * Revisit this constant if DISC_BASE_UUS/DISC_SLOT_UUS/
  * POLL_RX_TO_RESP_TX_DLY_UUS are ever tuned further. */
-#define TX_COMPLETE_TIMEOUT_MS 25
+#define TX_COMPLETE_TIMEOUT_MS 18
 
 /* Legacy responder turnaround. Was 2000, carried over unchanged from the
  * nRF5 anchor and the working (non-Zephyr) ESP32S3UWB responder; measured
@@ -46,8 +49,15 @@ LOG_MODULE_REGISTER(anchor_respond, LOG_LEVEL_INF);
  * working on hardware for DISCOVERY; not yet independently exercised for
  * this WAVE path specifically, but both share tx_delayed() and the same
  * driver overhead, so matching it here rather than leaving this one at a
- * value already shown to fail. */
-#define POLL_RX_TO_RESP_TX_DLY_UUS 6000u
+ * value already shown to fail.
+ * 2000 confirmed working after the SPI bus was switched to fast rate
+ * (26.67 MHz): the earlier 2000/2400 failures were the 2 MHz bus, not the
+ * driver's per-call overhead -- read_cir()'s 216-byte transfer alone was
+ * 864 uus of pure clock time at 2 MHz. Bench-confirmed for DISCOVERY via an
+ * external sniffer (clean WAVE/DISCOVERY responses, no TX misses); matching
+ * it here for WAVE as before, since both share tx_delayed() and the same
+ * driver overhead. */
+#define POLL_RX_TO_RESP_TX_DLY_UUS 2000u
 
 /* ---- Legacy WAVE/0xE0 -> VEWA/0xE1 ---- */
 static const uint8_t rx_poll_ref[] = {

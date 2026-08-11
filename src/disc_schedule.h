@@ -31,9 +31,16 @@
  *     borderline-late TX -- now fixed with a bounded wait, but the near-miss
  *     margin itself is still not something to run in production.
  *   - 6000 confirmed working reliably (~4300 uus margin observed).
- * Back to 6000 pending a real reduction in the ~1700 uus SPI-side overhead
- * (not logging) if a tighter link budget is still required. */
-#define DISC_BASE_UUS 6000u
+ *   - 2000 confirmed working after the SPI bus was switched to fast
+ *     rate (26.67 MHz). The earlier 2000/2400 failures were the 2 MHz bus,
+ *     not the driver's per-call overhead: read_cir()'s 216-byte transfer
+ *     alone was 864 uus of pure clock time at 2 MHz. Bench-confirmed with an
+ *     external sniffer capturing clean WAVE/DISCOVERY responses and no TX
+ *     misses; RX-side profiling at the fast rate measured cir=133-156 uus,
+ *     readdata=23-33 uus, readts=20 uus (down from ~944/~1700 uus total at
+ *     2 MHz). Not iterated below 2000; the gate only requires holding under
+ *     2500 uus. */
+#define DISC_BASE_UUS 2000u
 
 /* Gap between consecutive anchors' responses.
  * TUNE ON HARDWARE: must exceed one 0xE4 reply's air time. 3500 (3.5 ms >
