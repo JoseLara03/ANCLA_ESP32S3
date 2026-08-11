@@ -184,9 +184,28 @@ kernel reboot cold             apply — every setter persists immediately,
   `disc_resp_delay_uus(3) = 2000 + 3*3500 = 12500` uus (~12.5 ms), and
   `TX_COMPLETE_TIMEOUT_MS` (`src/anchor_respond.c`) is 18 — comfortably past
   that plus airtime margin. The gateway has its own separate constant of the
-  same name in `src/uwb_gateway.c` (currently 5, sized against
-  `BEACON_ARM_MARGIN_UUS` instead) — the two are unrelated and must not be
-  confused. Revisit either if the relevant delay budgets are tuned further.
+  same name in `src/uwb_gateway.c` (currently 11) — the two are unrelated and
+  must not be confused. See the next bullet for why 11 and not 5. Revisit
+  either if the relevant delay budgets are tuned further.
+- **The gateway's `TX_COMPLETE_TIMEOUT_MS` is shared by two delayed-TX call
+  sites with different worst cases — size it against the larger one.**
+  `tx_beacon()`'s delayed beacon and `send_grant()`'s GRANT both wait on the
+  same constant after `dwt_starttx()`. An earlier value (5 ms) was derived
+  only from `send_grant()`'s budget (`RX_TO_TX_DLY_UUS` ≈ 2.05 ms + airtime)
+  and treated `BEACON_ARM_MARGIN_UUS` as an upper ceiling this timeout had to
+  stay under. That is backwards for the beacon: the main loop only breaks out
+  of RX-servicing and calls `tx_beacon()` once `to_beacon <=
+  BEACON_ARM_MARGIN_UUS`, so the delayed beacon can be armed with nearly the
+  full ~5.13 ms margin still to run before it fires —
+  `BEACON_ARM_MARGIN_UUS` is the *lower bound* this constant must clear, not
+  an upper one it must stay under. With 5 ms, every delayed beacon timed out
+  on hardware (`"beacon started but TXFRS never completed"` on every beacon
+  after the first, immediate one) while the CAP JOIN/GRANT path kept working
+  underneath it, since JOIN/GRANT traffic doesn't depend on the beacon
+  actually firing. Now 11 ms
+  (`ceil(BEACON_ARM_MARGIN_UUS * 1.0256/1000) + 5`), confirmed on hardware: no
+  more TXFRS timeouts, and a slave observes the beacon's `counter` field
+  incrementing every superframe on the sniffer.
 - **`dwt_readsystimestamphi32()` wraps every ~17.2 s.** hi32 counts 256 DTU
   ≈ 4.006 ns per tick, so 2³² ticks is 17.2 seconds. Every comparison between
   two hi32 values must be signed-difference arithmetic — `(int32_t)(a - b)` —
@@ -213,8 +232,21 @@ kernel reboot cold             apply — every setter persists immediately,
   SLAVE answering DISCOVERY with `src=0x0000` — a real protocol violation
   (collides with the gateway's reserved address) on that rig, not this one;
   and a `0xE6`/`0xE7`/`0xE8` JOIN/GRANT handshake between the gateway and
-  another device — spec-D TDMA provisioning traffic this project doesn't
-  implement.
+  another device — spec-D TDMA provisioning traffic this project didn't
+  implement at the time (see the next bullet: it does now).
+- **This project's own GATEWAY mode (beacon + CAP seats) confirmed on the
+  bench**, after fixing the `TX_COMPLETE_TIMEOUT_MS` regression above.
+  Sniffer capture with this gateway and a tag showed periodic `0xE5` beacon
+  frames (src `0x0000`) with a monotonically incrementing `counter`, and two
+  tags completing JOIN→GRANT (`0xE6`→`0xE7`): `GRANT addr=0x0100 slot=0
+  tier=2 lease=50` then, after the first seat's 10 s lease (`GW_LEASE_SF`=50
+  superframes) expired with no observed KEEPALIVE, `GRANT addr=0x0101 slot=0
+  tier=1 lease=50` reusing the freed slot. Both tags then ranged against the
+  SLAVE anchors using their newly granted short addresses as source, with no
+  gateway involvement in that traffic — confirming the MAC-only contract
+  holds under real JOIN/GRANT load, not just in isolation. KEEPALIVE and
+  RELEASE are implemented (`src/gw_core.c`) but not yet independently
+  observed on the bench; lease expiry substitutes for RELEASE above.
 
 ## System context
 
@@ -225,11 +257,13 @@ live in the sibling ESP-IDF anchor project at
 `../../../PlatformIO/Projects/ESP32S3UWB` (see its `CLAUDE.md`). That project is
 the working reference implementation for ranging; the SLAVE responder here
 (`src/anchor_respond.c`, `src/uwb_slave.c`) has now ported the WAVE and
-DISCOVERY response paths from it. The gateway/beacon side is now implemented (`src/uwb_gateway.c`,
-`src/gw_core.{c,h}`): a MAC-only gateway emits the 200 ms TDMA beacon and runs
-the CAP seat protocol (JOIN→GRANT, KEEPALIVE, RELEASE), and slaves suppress
-ranging responses that would collide with that beacon
-(`src/beacon_guard.{c,h}`).
+DISCOVERY response paths from it. The gateway/beacon side is now implemented
+(`src/uwb_gateway.c`, `src/gw_core.{c,h}`): a MAC-only gateway emits the
+200 ms TDMA beacon and runs the CAP seat protocol (JOIN→GRANT, KEEPALIVE,
+RELEASE), and slaves suppress ranging responses that would collide with that
+beacon (`src/beacon_guard.{c,h}`). Beacon periodicity and JOIN→GRANT are
+bench-confirmed (see "This project's own GATEWAY mode" above); KEEPALIVE and
+RELEASE are implemented but not yet independently observed on the bench.
 Both response paths are bench-confirmed correct over the air (sniffer capture,
 see the "Ranging confirmed on the bench" hard-won fact above) after fixing the
 delayed-TX turnaround budget and an unbounded-wait hang; the tag's actual
