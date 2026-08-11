@@ -111,7 +111,8 @@ static void tx_delayed(const uint8_t *buf, uint16_t payload_len, uint32_t tx_tim
 }
 
 void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx_ts,
-			      const uwb_config_t *cfg, uint8_t *seq)
+			      const uwb_config_t *cfg, uint8_t *seq,
+			      struct beacon_guard *bg)
 {
 	/* The id byte the tag polls with is the low byte of our short address,
 	 * because that is what it read out of our DISCOVERY response
@@ -139,6 +140,11 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx
 	uint64_t resp_tx_ts =
 		(((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + cfg->ant_delay_tx;
 
+	if (bg && !beacon_guard_tx_allowed(bg, resp_tx_time)) {
+		LOG_DBG("WAVE response suppressed — would land on the beacon");
+		return;
+	}
+
 	tx_resp_msg[2] = (*seq)++;
 	tx_resp_msg[POS_ANCHOR_ID_IDX] = wire_id;
 	uwb_resp_msg_set_ts(&tx_resp_msg[POS_POLL_RX_TS_IDX], poll_rx_ts);
@@ -153,7 +159,8 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx
 
 void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx_ts,
 			      const uwb_config_t *cfg, uint8_t *seq,
-			      int32_t cir_power, uint16_t cir_quality)
+			      int32_t cir_power, uint16_t cir_quality,
+			      struct beacon_guard *bg)
 {
 	if (!uwb_frame_is_discovery(buf, len)) {
 		return;
@@ -175,6 +182,11 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 	uint32_t delay_uus = disc_resp_delay_uus(cfg->anchor_id);
 	uint32_t resp_tx_time = (uint32_t)((disc_rx_ts +
 		((uint64_t)delay_uus * UUS_TO_DWT_TIME)) >> 8);
+
+	if (bg && !beacon_guard_tx_allowed(bg, resp_tx_time)) {
+		LOG_DBG("DISCOVERY response suppressed — would land on the beacon");
+		return;
+	}
 
 	/* Module frames carry no FCS placeholder: ranging=0 adds FCS_LEN.
 	 * Logged after, not before: a synchronous log call ahead of the

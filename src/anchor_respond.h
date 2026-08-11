@@ -17,22 +17,33 @@
 
 #include <stdint.h>
 
+#include "beacon_guard.h"
 #include "uwb_config.h"
 
 /* If buf is a legacy WAVE/0xE0 poll addressed to this anchor, schedule the
  * delayed VEWA/0xE1 response carrying our id, both timestamps and (x, y).
- * Otherwise no-op. */
+ * Otherwise no-op.
+ *
+ * bg may be NULL, which disables suppression. When non-NULL, a response whose
+ * scheduled TX would land inside the beacon window is dropped rather than
+ * transmitted -- one lost range instead of a corrupted broadcast. */
 void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx_ts,
-			      const uwb_config_t *cfg, uint8_t *seq);
+			      const uwb_config_t *cfg, uint8_t *seq,
+			      struct beacon_guard *bg);
 
 /* If buf is a DISCOVERY/0xE2 broadcast, schedule an id-staggered
  * RANGE-RESPONSE/0xE4 carrying our short address and CIR metrics. Otherwise
  * no-op.
  *
  * cir_power / cir_quality are captured by the caller from the RX callback --
- * see uwb_slave.c. They are 0 when CIA had not finished for that frame. */
+ * see uwb_slave.c. They are 0 when CIA had not finished for that frame.
+ *
+ * bg may be NULL, which disables suppression. When non-NULL, a response whose
+ * scheduled TX would land inside the beacon window is dropped rather than
+ * transmitted -- one lost range instead of a corrupted broadcast. */
 void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx_ts,
 			      const uwb_config_t *cfg, uint8_t *seq,
-			      int32_t cir_power, uint16_t cir_quality);
+			      int32_t cir_power, uint16_t cir_quality,
+			      struct beacon_guard *bg);
 
 #endif /* ANCHOR_RESPOND_H */

@@ -16,8 +16,10 @@
 #include "uwb_modes.h"
 
 #include "anchor_respond.h"
+#include "beacon_guard.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
+#include "uwb_mac.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -53,6 +55,8 @@ static volatile bool rx_pending;
 
 static uint8_t rx_buf[RX_BUF_LEN];
 static uint8_t frame_seq_nb;
+
+static struct beacon_guard bguard;
 
 static void cb_rx_ok(const dwt_cb_data_t *cb_data)
 {
@@ -108,7 +112,8 @@ static void read_cir(uint32_t status, int32_t *cir_power, uint16_t *cir_quality)
 	*cir_quality = diag.ipatovAccumCount;
 }
 
-static void observe_beacon(const uint8_t *buf, uint16_t len, const uwb_config_t *cfg)
+static void observe_beacon(const uint8_t *buf, uint16_t len,
+			   const uwb_config_t *cfg, uint64_t rx_ts)
 {
 	if (!uwb_frame_is_beacon(buf, len)) {
 		return;
@@ -139,6 +144,11 @@ static void observe_beacon(const uint8_t *buf, uint16_t len, const uwb_config_t 
 
 	int slot = uwb_frame_beacon_find_addr(slot_map, n_slots,
 					      uwb_config_short_addr(cfg));
+
+	/* Re-anchor on the beacon's own RX timestamp, in the same hi32 units
+	 * every scheduled TX is expressed in -- no clock conversion, so no
+	 * second clock to drift against. */
+	beacon_guard_beacon(&bguard, (uint32_t)(rx_ts >> 8));
 
 	/* Recorded and logged only. Gating RX windows on beacon timing needs a
 	 * real gateway to develop against — that is spec D. LOG_DBG, not
@@ -180,6 +190,10 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		"\"short_addr\":\"0x%04X\"}",
 		cfg->anchor_id, uwb_config_short_addr(cfg));
 
+	beacon_guard_init(&bguard, UUS_TO_HI32(T_SUPERFRAME_UUS),
+			  UUS_TO_HI32(BEACON_GUARD_UUS),
+			  UUS_TO_HI32(BEACON_OCCUPANCY_UUS));
+
 	rx_arm();
 
 	while (1) {
@@ -208,10 +222,11 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		uint16_t plen = (uint16_t)(flen - FCS_LEN);
 
 		/* Offered to each in turn; each ignores what is not its own. */
-		anchor_respond_wave_poll(rx_buf, plen, rx_ts, cfg, &frame_seq_nb);
+		anchor_respond_wave_poll(rx_buf, plen, rx_ts, cfg, &frame_seq_nb,
+					 &bguard);
 		anchor_respond_discovery(rx_buf, plen, rx_ts, cfg, &frame_seq_nb,
-					 cir_power, cir_quality);
-		observe_beacon(rx_buf, plen, cfg);
+					 cir_power, cir_quality, &bguard);
+		observe_beacon(rx_buf, plen, cfg, rx_ts);
 
 		rx_arm();
 	}
