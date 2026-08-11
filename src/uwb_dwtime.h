@@ -14,6 +14,7 @@
 #define UWB_DWTIME_H
 
 #include <stdint.h>
+#include <deca_device_api.h>
 
 /* DWT time units per UWB microsecond.
  *
@@ -26,6 +27,14 @@
 
 /* Width of a timestamp field in the legacy VEWA response. */
 #define RESP_MSG_TS_LEN 4u
+
+/* Frame check sequence appended by the radio. dwt_getframelength() and
+ * cb_data->datalength both report payload + FCS. The vendored driver header
+ * (deca_device_api.h) also defines this constant as 2UL; the #ifndef guard
+ * avoids a redefinition conflict when both headers are included. */
+#ifndef FCS_LEN
+#define FCS_LEN 2u
+#endif
 
 /* The 40-bit RX timestamp of the last received frame, as a 64-bit value.
  * Valid until the next reception. */
