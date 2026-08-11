@@ -153,38 +153,44 @@ int uwb_store_init(void)
 	return 0;
 }
 
-static void save_one(const char *key, const void *val, size_t len)
+static int save_one(const char *key, const void *val, size_t len)
 {
 	int ret = settings_save_one(key, val, len);
 
 	if (ret) {
 		LOG_ERR("failed to persist %s (%d)", key, ret);
 	}
+	return ret;
 }
 
-void uwb_store_save_mode(void)
+int uwb_store_save_mode(void)
 {
 	const uwb_config_t *cfg = uwb_config_get();
 
-	save_one(KEY_MODE, &cfg->mode, sizeof(cfg->mode));
+	return save_one(KEY_MODE, &cfg->mode, sizeof(cfg->mode));
 }
 
-void uwb_store_save_id(void)
+int uwb_store_save_id(void)
 {
 	const uwb_config_t *cfg = uwb_config_get();
 
-	save_one(KEY_ID, &cfg->anchor_id, sizeof(cfg->anchor_id));
+	return save_one(KEY_ID, &cfg->anchor_id, sizeof(cfg->anchor_id));
 }
 
-void uwb_store_save_ant(void)
+int uwb_store_save_ant(void)
 {
 	const uwb_config_t *cfg = uwb_config_get();
+	int ret_tx, ret_rx;
 
-	save_one(KEY_ANT_TX, &cfg->ant_delay_tx, sizeof(cfg->ant_delay_tx));
-	save_one(KEY_ANT_RX, &cfg->ant_delay_rx, sizeof(cfg->ant_delay_rx));
+	/* Both keys are always attempted, even if the first fails, so a bad
+	 * tx write does not skip the rx write. Report the first failure. */
+	ret_tx = save_one(KEY_ANT_TX, &cfg->ant_delay_tx, sizeof(cfg->ant_delay_tx));
+	ret_rx = save_one(KEY_ANT_RX, &cfg->ant_delay_rx, sizeof(cfg->ant_delay_rx));
+
+	return ret_tx ? ret_tx : ret_rx;
 }
 
-void uwb_store_save_pos(void)
+int uwb_store_save_pos(void)
 {
 	const uwb_config_t *cfg = uwb_config_get();
 	struct stored_pos p = {
@@ -194,5 +200,5 @@ void uwb_store_save_pos(void)
 		.valid = cfg->position_valid ? 1u : 0u,
 	};
 
-	save_one(KEY_POS, &p, sizeof(p));
+	return save_one(KEY_POS, &p, sizeof(p));
 }

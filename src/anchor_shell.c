@@ -77,6 +77,7 @@ static int cmd_id(const struct shell *sh, size_t argc, char **argv)
 {
 	uwb_config_t *cfg = uwb_config_get();
 	unsigned long v;
+	int ret;
 
 	ARG_UNUSED(argc);
 
@@ -85,7 +86,15 @@ static int cmd_id(const struct shell *sh, size_t argc, char **argv)
 		return -EINVAL;
 	}
 
-	uwb_store_save_id();
+	ret = uwb_store_save_id();
+	if (ret) {
+		shell_error(sh,
+			    "error: anchor_id=%u applied in RAM but NOT persisted "
+			    "(errno %d) — will be lost on reboot",
+			    cfg->anchor_id, ret);
+		return ret;
+	}
+
 	shell_print(sh, "ok: anchor_id=%u (saved) — reboot to apply", cfg->anchor_id);
 	return 0;
 }
@@ -94,6 +103,7 @@ static int cmd_mode(const struct shell *sh, size_t argc, char **argv)
 {
 	uwb_config_t *cfg = uwb_config_get();
 	uint8_t mode;
+	int ret;
 
 	ARG_UNUSED(argc);
 
@@ -103,7 +113,15 @@ static int cmd_mode(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	uwb_config_set_mode(cfg, mode);
-	uwb_store_save_mode();
+	ret = uwb_store_save_mode();
+	if (ret) {
+		shell_error(sh,
+			    "error: mode=%s applied in RAM but NOT persisted "
+			    "(errno %d) — will be lost on reboot",
+			    uwb_config_mode_name(cfg->mode), ret);
+		return ret;
+	}
+
 	shell_print(sh, "ok: mode=%s (saved) — reboot to apply",
 		    uwb_config_mode_name(cfg->mode));
 	return 0;
@@ -113,6 +131,7 @@ static int cmd_pos(const struct shell *sh, size_t argc, char **argv)
 {
 	uwb_config_t *cfg = uwb_config_get();
 	float x, y, z;
+	int ret;
 
 	ARG_UNUSED(argc);
 
@@ -122,7 +141,15 @@ static int cmd_pos(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	uwb_config_set_pos(cfg, x, y, z);
-	uwb_store_save_pos();
+	ret = uwb_store_save_pos();
+	if (ret) {
+		shell_error(sh,
+			    "error: pos=(%.2f, %.2f, %.2f) applied in RAM but NOT "
+			    "persisted (errno %d) — will be lost on reboot",
+			    (double)cfg->x, (double)cfg->y, (double)cfg->z, ret);
+		return ret;
+	}
+
 	shell_print(sh, "ok: pos=(%.2f, %.2f, %.2f) (saved) — reboot to apply",
 		    (double)cfg->x, (double)cfg->y, (double)cfg->z);
 	return 0;
@@ -132,6 +159,7 @@ static int cmd_ant(const struct shell *sh, size_t argc, char **argv)
 {
 	uwb_config_t *cfg = uwb_config_get();
 	unsigned long tx, rx;
+	int ret;
 
 	ARG_UNUSED(argc);
 
@@ -141,7 +169,15 @@ static int cmd_ant(const struct shell *sh, size_t argc, char **argv)
 		return -EINVAL;
 	}
 
-	uwb_store_save_ant();
+	ret = uwb_store_save_ant();
+	if (ret) {
+		shell_error(sh,
+			    "error: ant_tx=%u ant_rx=%u applied in RAM but NOT "
+			    "persisted (errno %d) — will be lost on reboot",
+			    cfg->ant_delay_tx, cfg->ant_delay_rx, ret);
+		return ret;
+	}
+
 	shell_print(sh, "ok: ant_tx=%u ant_rx=%u (saved) — reboot to apply",
 		    cfg->ant_delay_tx, cfg->ant_delay_rx);
 	return 0;
@@ -150,15 +186,30 @@ static int cmd_ant(const struct shell *sh, size_t argc, char **argv)
 static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 {
 	uwb_config_t *cfg = uwb_config_get();
+	int ret, r;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 
 	uwb_config_set_defaults(cfg);
-	uwb_store_save_mode();
-	uwb_store_save_id();
-	uwb_store_save_ant();
-	uwb_store_save_pos();
+
+	/* All four saves are always attempted, even if an earlier one fails;
+	 * report the first failure. */
+	ret = uwb_store_save_mode();
+	r = uwb_store_save_id();
+	ret = ret ? ret : r;
+	r = uwb_store_save_ant();
+	ret = ret ? ret : r;
+	r = uwb_store_save_pos();
+	ret = ret ? ret : r;
+
+	if (ret) {
+		shell_error(sh,
+			    "error: defaults applied in RAM but NOT fully persisted "
+			    "(errno %d) — some fields will revert on reboot", ret);
+		print_config(sh);
+		return ret;
+	}
 
 	shell_print(sh, "ok: defaults restored (saved) — reboot to apply");
 	print_config(sh);
