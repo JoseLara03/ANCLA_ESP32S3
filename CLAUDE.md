@@ -49,10 +49,19 @@ kernel reboot cold             apply — every setter persists immediately,
 - `src/uwb_store.{c,h}` — the above persisted in NVS on `storage_partition`,
   via Zephyr settings, one key per field under `anchor/`.
 - `src/uwb_radio.{c,h}` — DW3220 bring-up shared by both modes.
+- `src/uwb_frame_802_15_4z.{c,h}` — 802.15.4z frame codec, **copied byte-for-byte**
+  from `tag_testting/src/`. Keep it identical: the tag is the on-air peer, and
+  divergence is a wire-format bug waiting to happen. Host-tested in
+  `tests/uwb_frame/` with the tag's own suite.
+- `src/uwb_dwtime.{c,h}` — the Qorvo `shared_functions` helpers the vendored
+  module does not carry, plus `UUS_TO_DWT_TIME` and `FCS_LEN`.
+- `src/disc_schedule.{c,h}` — per-anchor discovery response stagger. Host-tested
+  in `tests/disc_schedule/`.
+- `src/anchor_respond.{c,h}` — the WAVE/0xE1 and DISCOVERY/0xE4 responders.
 - `src/uwb_phy.h` — the fixed PHY contract. Not runtime-configurable.
 - `src/anchor_shell.c` — the `anchor` console command tree.
-- `src/uwb_slave.c` / `src/uwb_gateway.c` — mode entry points; stubs until
-  specs C and D.
+- `src/uwb_slave.c` — SLAVE mode: interrupt-driven SS-TWR responder plus beacon
+  observe. `src/uwb_gateway.c` is still a stub until spec D.
 - `docs/dw3000-zephyr-port.md` — the port reference: local deltas, the DW3000
   call-order footgun, resolved RESET polarity, verification status.
 - `docs/superpowers/{specs,plans}/` — board design spec and implementation plan.
@@ -84,6 +93,33 @@ kernel reboot cold             apply — every setter persists immediately,
   type a command inside the ~26 ms before `main()` claims the config. Anything
   that adds an earlier automatic caller (a `SYS_INIT` hook, a startup command,
   a second thread) breaks that assumption and must initialise explicitly.
+- **`dwt_getframelength()` and `cb_data->datalength` include the 2-byte FCS.**
+  Confirmed on hardware in the sibling project (`ESP32S3UWB@9e1087b`: flen=13 for
+  an 11-byte payload). Always pass `flen - FCS_LEN` to the frame module. The
+  `is_*` validators tolerate the extra bytes because they test `len >=`, but
+  `uwb_frame_parse_beacon()` derives its slot count from the length — an
+  unsubtracted FCS turns a 12-slot beacon into 13, with the FCS read as the
+  thirteenth slot. It fails silently and the output looks plausible.
+- **Never poll `DWT_INT_CIADONE_BIT_MASK` after an RX event.** `dwt_isr()` clears
+  `SYS_STATUS_ALL_RX_GOOD` — which includes CIADONE — *before* it calls
+  `cbRxOk` (`dw3000_device.c:4764` then `:4791`). Waiting on it hangs until the
+  next frame. Test `cb_data->status` instead: it is the pre-clear snapshot
+  (`:4602`). The nRF5 `anchor_read_cir()` polls it and cannot be transcribed.
+- **Keep `TXFRS` out of the enabled interrupt mask.** `dwt_setinterrupt(DWT_INT_RX,
+  0, DWT_ENABLE_INT)` is deliberate: `anchor_respond.c`'s `tx_delayed()` polls for
+  transmit completion, and enabling the TX interrupt would let the ISR clear
+  TXFRS first and hang that poll — the same failure as CIADONE, on the TX side.
+- **br101 runs `dwt_isr()` from the system workqueue, not the GPIO handler**
+  (`platform/dw3000_hw.c:71-82`). DW3000 callbacks are therefore in thread
+  context and may do SPI. That is what makes reading CIA diagnostics inside
+  `cbRxOk` legal at all.
+- **`UUS_TO_DWT_TIME` is 65536 here.** The nRF5 source says 63898. Both peers on
+  this network — the tag and `ESP32S3UWB` — use 65536, and it scales the
+  delayed-TX turnaround the two ends must agree on.
+- **Anchor short address is `0x0001 + anchor_id`.** The MAC contract reserves
+  `0x0000` for the gateway, so the console's 0-based id cannot go on the wire
+  directly. The tag reports anchors as 1..4 while `anchor show` says 0..3; both
+  are printed by `anchor show` and the boot banner.
 
 ## System context
 
@@ -101,7 +137,13 @@ Plain gcc, no Zephyr, following the sibling projects' pattern:
 
 ```powershell
 gcc -Wall -Wextra -o tests/uwb_config/test_uwb_config.exe tests/uwb_config/test_uwb_config.c src/uwb_config.c
-./tests/uwb_config/test_uwb_config.exe    # prints PASSED, exits 0
+./tests/uwb_config/test_uwb_config.exe          # PASSED, exits 0
+
+gcc -Wall -Wextra -o tests/uwb_frame/test_uwb_frame.exe tests/uwb_frame/test_uwb_frame.c src/uwb_frame_802_15_4z.c
+./tests/uwb_frame/test_uwb_frame.exe            # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/disc_schedule/test_disc_schedule.exe tests/disc_schedule/test_disc_schedule.c src/disc_schedule.c
+./tests/disc_schedule/test_disc_schedule.exe    # PASSED, exits 0
 ```
 
 ## Repo
