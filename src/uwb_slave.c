@@ -33,26 +33,46 @@ LOG_MODULE_REGISTER(uwb_slave, LOG_LEVEL_INF);
 
 static K_SEM_DEFINE(rx_sem, 0, 1);
 
-/* Written by the RX callbacks, read by the main thread. Safe without locking:
- * RX is not re-armed until the main thread has finished with the previous
- * event, so only one writer can be live at a time. */
+/* Written by the RX callbacks, read by the main thread. rx_pending is the
+ * guard that makes this safe: br101's IRQ-drain loop (platform/dw3000_hw.c)
+ * calls dwt_isr() repeatedly while the IRQ line is held, and DWT_INT_RX
+ * includes DWT_INT_CIADONE_BIT_MASK, whose completion can trail the RXFCG
+ * pass -- so a second cb_rx_ok/cb_rx_fail can fire (or a datalength==0 case
+ * can dispatch cb_rx_fail) before the main thread has consumed the previous
+ * event's rx_status/rx_len via k_sem_take. Without the guard that second
+ * write corrupts the still-unread values, and the second k_sem_give is
+ * silently swallowed by the limit-1 semaphore -- a real event lost or
+ * corrupted. rx_pending makes each callback a no-op once an event is already
+ * waiting for the main thread; the main thread clears it right after
+ * k_sem_take, before touching rx_status/rx_len, so the next callback is free
+ * to capture again. A plain flag suffices here: these callbacks run in
+ * cooperative thread context on the system workqueue, not a preempting ISR. */
 static volatile uint32_t rx_status;
 static volatile uint16_t rx_len;
+static volatile bool rx_pending;
 
 static uint8_t rx_buf[RX_BUF_LEN];
 static uint8_t frame_seq_nb;
 
 static void cb_rx_ok(const dwt_cb_data_t *cb_data)
 {
+	if (rx_pending) {
+		return;
+	}
 	rx_status = cb_data->status;
 	rx_len = cb_data->datalength;
+	rx_pending = true;
 	k_sem_give(&rx_sem);
 }
 
 static void cb_rx_fail(const dwt_cb_data_t *cb_data)
 {
+	if (rx_pending) {
+		return;
+	}
 	rx_status = cb_data->status;
 	rx_len = 0;
+	rx_pending = true;
 	k_sem_give(&rx_sem);
 }
 
@@ -128,6 +148,16 @@ static void observe_beacon(const uint8_t *buf, uint16_t len, const uwb_config_t 
 
 void uwb_slave_run(const uwb_config_t *cfg)
 {
+	/* Snapshot at mode-entry: anchor_shell.c's "anchor id/ant/pos" commands
+	 * mutate the live uwb_config_get() singleton that cfg points at, and
+	 * this loop runs indefinitely on the main thread with no synchronisation
+	 * against the shell thread. Operating on a stable copy restores the
+	 * documented "changes take effect only on reboot" contract -- notably
+	 * for ant_delay_tx, which resp_tx_ts arithmetic must keep matching the
+	 * antenna delay actually programmed into the radio at boot. */
+	uwb_config_t cfg_snapshot = *cfg;
+	cfg = &cfg_snapshot;
+
 	static dwt_callbacks_s cbs;
 
 	cbs.cbRxOk = cb_rx_ok;
@@ -151,6 +181,7 @@ void uwb_slave_run(const uwb_config_t *cfg)
 
 		uint32_t status = rx_status;
 		uint16_t flen = rx_len;
+		rx_pending = false;
 
 		/* flen counts the FCS. Anything that cannot hold one is not a
 		 * frame we can reason about. */

@@ -128,8 +128,9 @@ anchor. The PHY contract every node must match — **channel 5, PLEN_1024, PAC32
 code 9, 850 kbps, SFD_IEEE_4Z, STS/PDoA off** — and the 802.15.4z wire format
 live in the sibling ESP-IDF anchor project at
 `../../../PlatformIO/Projects/ESP32S3UWB` (see its `CLAUDE.md`). That project is
-the working reference implementation for ranging; none of it has been ported
-here yet.
+the working reference implementation for ranging; the SLAVE responder here
+(`src/anchor_respond.c`, `src/uwb_slave.c`) has now ported the WAVE and
+DISCOVERY response paths from it, but the gateway/beacon side is still to come.
 
 ## Host tests
 
