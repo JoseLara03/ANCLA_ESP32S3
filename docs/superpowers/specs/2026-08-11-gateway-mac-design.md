@@ -89,25 +89,53 @@ retires the earlier conclusion recorded in `CLAUDE.md` — the cost was never th
 reason logging removal did not help: 1728 bits at 2 MHz is 864 µs no matter what else
 changes.
 
-### Target rate
+### Target rate: the DW3000 maximum, which on this SoC is 26.67 MHz
 
-The ESP32-S3 SPI2 clock is APB/N from 80 MHz, so the reachable rates near the target are
-40 / 26.67 / 20 / 16 MHz. There is no 32 MHz as on the nRF52.
+Take the highest rate the part allows. Two ceilings apply, and they interact.
 
-Two practical points:
+**The DW3000 ceiling is ~38 MHz** (Qorvo DW3000 family datasheet; the figure is not
+reproduced anywhere in the vendored module, so confirm it against the datasheet on hand
+before flashing). What *is* in the module is the lower bound's counterpart — the part
+must be clocked slowly until it leaves INIT_RC:
 
-- **Requesting `26000000` will yield 20 MHz.** The HAL selects the highest achievable
-  rate not exceeding the request, and 80/3 = 26.67 MHz exceeds 26. The DTS value must
-  sit just above the divisor to land on it.
+```
+deca_device_api.h:2381  "Once the device is in IDLE_RC SPI rate can be increased to
+                         more than 7 MHz."
+deca_device_api.h:2601  "SPI rate must be <= 7MHz before a call to this function as the
+                         device will use FOSC/4 as part of internal reset"
+```
+
+**The ESP32-S3 ceiling is the divisor ladder.** SPI2 is clocked at APB/N from 80 MHz, so
+the only reachable rates are 80/N: … 20, **26.67**, 40, 80. Nothing exists between 26.67
+and 40. There is no 32 MHz as on the nRF52 — the module README's
+`spi-max-frequency = <32000000>` is the nRF52840 SPIM3 limit, not a DW3000 figure, and
+does not transfer.
+
+Those two together give the answer: 40 MHz overruns the part, so **26.67 MHz — 80/3 — is
+the maximum allowed rate on this hardware.** The conclusion is insensitive to the exact
+datasheet number: whether the DW3000 ceiling is 36 or 38 MHz, the next step up the
+ESP32-S3 ladder is 40, which exceeds both.
+
+Two practical points on setting it:
+
+- **Requesting `26000000` yields 20 MHz.** The HAL selects the highest achievable rate
+  not exceeding the request, and 80/3 = 26.666… MHz exceeds 26. The DTS value must sit
+  just above the divisor — `spi-max-frequency = <26670000>` — to land on 26.67 rather
+  than silently dropping a rung. Verify against the boot log rather than assuming.
 - **The pins are the IO_MUX set.** GPIO 11/12/13 are exactly ESP32-S3 SPI2's
   FSPID / FSPICLK / FSPIQ, so there is no GPIO-matrix routing penalty or input-delay
-  compensation problem at these rates. CS being a bit-banged GPIO does not constrain the
+  compensation problem at this rate. CS being a bit-banged GPIO does not constrain the
   clock.
 
-The DW3000 requires a slow clock until it leaves INIT_RC, which is what the two configs
-exist for. The fix is therefore a call placed after `dwt_initialise()` and
-`dwt_checkidlerc()` and before `dwt_configure()` — the position
-`owner_ss_twr_responder.c:75` uses — not merely a larger DTS number.
+If 26.67 MHz proves unreliable on the PCB — a signal-integrity question no amount of
+datasheet reading settles — the fallback is one rung down at 20 MHz, which still clears
+the task 1 gate with room. Task 1 therefore validates the rate by reading `DEV_ID` and
+re-confirming ranging, not by the boot log alone.
+
+The staging still matters more than the number. The fix is a `dw3000_spi_speed_fast()`
+call placed after `dwt_initialise()` and `dwt_checkidlerc()` and before
+`dwt_configure()` — the position `owner_ss_twr_responder.c:75` uses — not merely a
+larger DTS value, which on its own would only change a config that is never selected.
 `dw3000_spi.h` is already on the include path `uwb_radio.c` uses for `dw3000_hw.h`, so
 no change to `modules/` is required.
 
@@ -308,7 +336,10 @@ the guard; lock drops after the bounded miss count and suppression stops.
 
 ### On target, in order
 
-1. `west build` clean; boot banner shows the new SPI rate in effect.
+1. `west build` clean; the boot log reports the SPI rate actually selected — 26.67 MHz,
+   not 20, which is what a `26000000` DTS value would silently give. `DEV_ID` still reads
+   `0xDECA0312` at that rate, proving the bus is sound before anything downstream is
+   trusted.
 2. **Task 1 gate:** measured turnaround under 2500 µs with the profiling block, then
    `DISC_BASE_UUS` and `POLL_RX_TO_RESP_TX_DLY_UUS` lowered accordingly and ranging
    re-confirmed against the sniffer. Work stops here if the gate is not met.
