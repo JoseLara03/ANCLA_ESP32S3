@@ -88,7 +88,15 @@
 		compatible = "decawave,dw3000";
 		reg = <0>;
 		status = "okay";
-		spi-max-frequency = <8000000>;
+		/* 80 MHz APB / 3. The ESP32-S3 only produces 80/N, so the ladder
+		 * is 20 / 26.67 / 40 with nothing between; 40 overruns the
+		 * DW3000's ~38 MHz ceiling, making 26.67 the maximum usable rate
+		 * on this hardware. Ask for 26670000, not 26000000: the HAL picks
+		 * the highest rate NOT EXCEEDING the request, and 80/3 =
+		 * 26.666... MHz exceeds 26, so asking for 26 silently gives 20.
+		 * GPIO 11/12/13 are the SPI2 IO_MUX pins (FSPID/FSPICLK/FSPIQ),
+		 * so there is no GPIO-matrix penalty at this rate. */
+		spi-max-frequency = <26670000>;
 		/* ACTIVE_HIGH = "reset asserted when the pin is high", because the NPN
 		 * inverter inverts: GPIO HIGH -> transistor ON -> RSTn pulled LOW.
 		 * Note this is the opposite of the decawave,dw3000 binding's stock

@@ -12,10 +12,12 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/devicetree.h>
 
 #include <deca_device_api.h>
 #include <deca_probe_interface.h>
 #include <dw3000_hw.h>
+#include <dw3000_spi.h>
 
 LOG_MODULE_REGISTER(uwb_radio, LOG_LEVEL_INF);
 
@@ -63,6 +65,22 @@ int uwb_radio_init(const uwb_config_t *cfg)
 		LOG_ERR("device not in IDLE_RC after init");
 		return -EIO;
 	}
+
+	/* Up to fast rate now that the part is out of INIT_RC. Until this
+	 * point the DW3000 requires <= 7 MHz (deca_device_api.h:2381, :2601),
+	 * which is why dw3000_spi_init() starts on spi_cfgs[0] at 2 MHz.
+	 *
+	 * Nothing in the driver does this for us on this build: .setfastrate
+	 * is wired into the vtable (platform/deca_port.c:37) but its only
+	 * call sites are inside a static init() wrapper, and dwt_initialise()
+	 * dispatches to ull_initialise instead (dw3000_device.c:9371). Without
+	 * this call the whole session runs at 2 MHz -- which is what it did
+	 * until now, while the module's own boot log printed "max 8MHz" from
+	 * the never-selected spi_cfgs[1]. */
+	dw3000_spi_speed_fast();
+
+	LOG_INF("SPI at fast rate (%u Hz requested)",
+		(unsigned)DT_PROP(DT_INST(0, decawave_dw3000), spi_max_frequency));
 
 	LOG_INF("DW3220 device ID: 0x%08x", dwt_readdevid());
 
