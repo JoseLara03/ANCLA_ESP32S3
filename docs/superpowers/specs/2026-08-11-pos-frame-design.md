@@ -145,6 +145,24 @@ Record the measured value in this spec before choosing among:
 | Adopt MULTI-POLL `0xE3` | `T_slot` → ~6–7 ms, ample room, ~2× seats | explicitly gated on hardware validation of multi-poll timing; turns E1 into a much larger change |
 | Lower POS rate than ranging | preserves 12 seats and all timing | gateway must schedule who reports when; MQTT updates slower than the ranging rate |
 
+### Decision (2026-08-11)
+
+**`N_CFP` 12 → 11.** No hardware `T_slot` measurement was taken — the project
+owner has hardware for 5 tags at present, so 11 concurrent CFP seats is not a
+practical constraint today, and re-measuring/re-tuning `T_slot` is deferred to
+a future optimization pass (see `CLAUDE.md` Phase 4 — Optimization). This is a
+conservative capacity decision, not a measured one: it trades one simultaneous
+mover for headroom without needing to know the real sweep duration.
+
+Per the table above, this bumps `UWB_PROTO_VER` from `1` to `2` (contract §7)
+and ripples through `UWB_FRAME_LEN_BEACON`, `UWB_FRAME_MAX_LEN`, the beacon
+slot-count identity check in `src/uwb_slave.c`, and the shared codec in both
+repos — all owned by Task 2 of the implementation plan.
+
+Before this system is pushed past 5 concurrent tags, or before `N_CFP` is
+reconsidered, the hardware gate above (measured `T_slot`, min/mean/max over
+≥20 sweeps) still needs to be run for real.
+
 ## 6. Tag-side changes
 
 ### 6.0 Base branch and radio ownership
