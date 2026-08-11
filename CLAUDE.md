@@ -74,6 +74,16 @@ kernel reboot cold             apply — every setter persists immediately,
 - **`dwt_configciadiag()` must be called after `dwt_configure()`**, or every
   diagnostic register reads zero — which breaks the CIR power/quality the
   DISCOVERY response carries.
+- **This board reports DEV_ID `0xDECA0312`, not `0xDECA0302`.** That is the
+  PDoA-capable variant id in the driver's table (`DWT_DW3000_PDOA_DEV_ID`);
+  `0xDECA0302` is the base DW3000. Both probe and configure fine — do not treat
+  `0312` as a wrong part.
+- **The shell thread is already running before `main()`'s first statement** —
+  the `uwb:~$` prompt precedes the boot banner in the log. `uwb_config_get()`'s
+  lazy initialiser is unsynchronised, so it is safe only because a human cannot
+  type a command inside the ~26 ms before `main()` claims the config. Anything
+  that adds an earlier automatic caller (a `SYS_INIT` hook, a startup command,
+  a second thread) breaks that assumption and must initialise explicitly.
 
 ## System context
 
