@@ -9,6 +9,7 @@ project(ANCLA_ESP32S3)
 
 target_sources(app PRIVATE
 	src/anchor_shell.c
+	src/disc_schedule.c
 	src/main.c
 	src/uwb_config.c
 	src/uwb_dwtime.c
