@@ -26,6 +26,15 @@
  * on, so the source's value is not merely a different convention here. */
 #define UUS_TO_DWT_TIME 65536UL
 
+/* Convert a UUS span to DW3000 hi32 system-time units (256 DTU ~= 4.006 ns),
+ * the unit dwt_readsystimestamphi32() and dwt_setdelayedtrxtime() work in.
+ *
+ * hi32 is 32 bits and wraps every ~17.2 s (2^32 * 4.006 ns), so every
+ * comparison between two hi32 values must be signed-difference arithmetic --
+ * (int32_t)(a - b) -- which is correct for intervals well under ~8.6 s. A
+ * plain unsigned compare is wrong across the wrap. */
+#define UUS_TO_HI32(uus) ((uint32_t)(((uint64_t)(uus) * UUS_TO_DWT_TIME) >> 8))
+
 /* Width of a timestamp field in the legacy VEWA response. */
 #define RESP_MSG_TS_LEN 4u
 
@@ -40,6 +49,11 @@
 /* The 40-bit RX timestamp of the last received frame, as a 64-bit value.
  * Valid until the next reception. */
 uint64_t uwb_get_rx_timestamp_u64(void);
+
+/* The 40-bit TX timestamp of the last transmitted frame, as a 64-bit value.
+ * Valid until the next transmission. The gateway uses it to anchor the next
+ * superframe on the beacon it actually sent, rather than on when it meant to. */
+uint64_t uwb_get_tx_timestamp_u64(void);
 
 /* Write the low 4 bytes of ts into a response timestamp field, least
  * significant byte first. */
