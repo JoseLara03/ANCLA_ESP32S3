@@ -168,6 +168,52 @@ Reporting zero is safe: the tag uses `cir_power`/`cir_quality` to rank anchors, 
 accept or reject a range, so a frame with absent metrics costs ranking quality for one
 sweep and nothing else.
 
+The mitigation is only legal because of where the callback runs. br101 does not call
+`dwt_isr()` from the GPIO handler — the handler submits to the system workqueue, and
+`dwt_isr()` runs from that thread (`platform/dw3000_hw.c:71-82`):
+
+```c
+static void dw3000_hw_isr_work_handler(struct k_work* item)
+{
+        while (gpio_pin_get_dt(&conf.gpio_irq)) { dwt_isr(); }
+}
+static void dw3000_hw_isr(...) { k_work_submit(&dw3000_isr_work); }
+```
+
+So callbacks run in thread context and SPI is permitted in them. In true ISR context
+`dwt_readdiagnostics()` would be illegal under Zephyr and this mitigation would not
+exist. The callback still does the minimum — it copies `cb_data->status` and
+`cb_data->datalength` and gives the semaphore — and the main thread does the SPI reads,
+so the shared workqueue is not held for the length of a response turnaround.
+
+### 5. `dwt_getframelength()` includes the FCS, and that breaks `parse_beacon()`
+
+Confirmed on hardware by the sibling project (`ESP32S3UWB@9e1087b`, *"flen=13 for an
+11-byte addressed poll payload"*). The length reported after RX is the payload **plus
+the 2-byte FCS**.
+
+Most validators in the frame module tolerate this, because they test `len >=` a
+minimum. `uwb_frame_parse_beacon()` does not — it derives the slot count from the
+length:
+
+```c
+if (((len - 15) % 2) != 0) return -EINVAL;
+uint8_t ns = (uint8_t)((len - 15) / 2);
+```
+
+A 39-byte beacon arrives reported as 41. `(41 - 15) % 2 == 0`, so the guard passes, and
+`ns` becomes **13** instead of 12 — the parser reports a thirteenth slot whose value is
+the FCS read as a `uint16`. It fails silently, with plausible-looking output.
+
+**Every length handed to the frame module is `flen - FCS_LEN`, never `flen`.** The RX
+buffer is sized for the payload plus FCS, and a frame reporting `flen < FCS_LEN` is
+dropped before the subtraction.
+
+Note the driver API here is `dwt_getframelength(uint8_t *rng)`, taking an argument —
+`fw-cre` calls the older no-argument form, so that call does not transcribe. In the
+callback path the value is already available as `cb_data->datalength` and no call is
+needed.
+
 ## Module structure
 
 | File | Origin | Notes |
@@ -225,7 +271,9 @@ Interrupt-driven, not polled. `uwb_radio_init()` already calls
 `dw3000_hw_init_interrupt()`; this adds `dwt_setinterrupt()` for the RX events and
 `dwt_setcallbacks()`. Each callback gives a semaphore; the main thread blocks on it.
 
-**`dwt_setinterrupt()` must enable the RX events only — not `TXFRS`.** `tx_delayed()`
+**`dwt_setinterrupt()` must enable the RX events only — not `TXFRS`.** The driver
+already defines exactly that mask as `DWT_INT_RX` (`deca_device_api.h:343`), which
+excludes every TX bit. `tx_delayed()`
 polls `waitforsysstatus(..., DWT_INT_TXFRS_BIT_MASK, 0)` after `dwt_starttx()`. With
 TXFRS unmasked the IRQ line never asserts for transmit completion, so `dwt_isr()` never
 runs and never clears the bit, and the poll works as written. Enabling TXFRS would make
@@ -268,7 +316,8 @@ antenna delay or id is recoverable over USB without a reflash.
 - A response TX that misses its delayed slot (`dwt_starttx` returns error) —
   `dwt_forcetrxoff()`, log at warning level, re-arm RX. One lost range, not a stuck
   radio. This is the `TX_DLY LATE` path in the source.
-- A frame longer than the RX buffer, or of length zero — dropped, RX re-armed.
+- A frame longer than the RX buffer, or shorter than `FCS_LEN` — dropped, RX re-armed
+  (per finding 5, a length below `FCS_LEN` would underflow the payload calculation).
 - CIA not finished — CIR reported as zero, per finding 4.
 - The frame matches no responder — ignored silently. Most received frames are other
   anchors' responses and other tags' polls; logging each would flood the console.
