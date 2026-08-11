@@ -25,7 +25,8 @@ Native USB-JTAG (not UART0), prompt `uwb:~$ `.
 ```
 anchor show                    active config as JSON
 anchor id <0..3>               ranging id (default 0)
-anchor mode <slave|gateway>    boot mode (default slave)
+anchor mode <slave|gateway>    boot mode (default slave). GATEWAY refuses to
+                               beacon unless `anchor pos` has been set.
 anchor pos <x> <y> <z>         coordinates in metres; sets pos_valid
 anchor ant <tx> <rx>           antenna delays (default 16385/16385)
 anchor reset                   restore defaults
@@ -57,11 +58,17 @@ kernel reboot cold             apply — every setter persists immediately,
   module does not carry, plus `UUS_TO_DWT_TIME` and `FCS_LEN`.
 - `src/disc_schedule.{c,h}` — per-anchor discovery response stagger. Host-tested
   in `tests/disc_schedule/`.
+- `src/gw_core.{c,h}` — CFP seat table, leases and the tag address pool. Pure
+  C, ported unchanged from the nRF5 gateway, host-tested in `tests/gw_core/`.
+- `src/beacon_guard.{c,h}` — predicts the next beacon and refuses any delayed
+  TX that would land on it. Pure C, host-tested in `tests/beacon_guard/`.
 - `src/anchor_respond.{c,h}` — the WAVE/0xE1 and DISCOVERY/0xE4 responders.
 - `src/uwb_phy.h` — the fixed PHY contract. Not runtime-configurable.
 - `src/anchor_shell.c` — the `anchor` console command tree.
-- `src/uwb_slave.c` — SLAVE mode: interrupt-driven SS-TWR responder plus beacon
-  observe. `src/uwb_gateway.c` is still a stub until spec D.
+- `src/uwb_slave.c` — SLAVE mode: interrupt-driven SS-TWR responder, beacon
+  observe, and beacon-collision TX suppression.
+- `src/uwb_gateway.c` — GATEWAY mode: TDMA beacon plus the CAP seat protocol.
+  MAC-only; it does not answer ranging polls.
 - `docs/dw3000-zephyr-port.md` — the port reference: local deltas, the DW3000
   call-order footgun, resolved RESET polarity, verification status.
 - `docs/superpowers/{specs,plans}/` — board design spec and implementation plan.
@@ -120,44 +127,35 @@ kernel reboot cold             apply — every setter persists immediately,
   `0x0000` for the gateway, so the console's 0-based id cannot go on the wire
   directly. The tag reports anchors as 1..4 while `anchor show` says 0..3; both
   are printed by `anchor show` and the boot banner.
-- **The nRF5 anchor's 2000 uus delayed-TX turnaround does not survive the port
-  to this Zephyr stack — it fails 100% of the time, not occasionally.**
-  Measured on the bench with a cycle-counter margin diagnostic in
-  `tx_delayed()` (`src/anchor_respond.c`): the round trip from RX
-  (`dwt_readrxdata`/`dwt_readrxtimestamp`/`dwt_readdiagnostics`) through the
-  delayed-TX setup writes consumes **~1700 uus** before `dwt_starttx()` is even
-  called — this port's vendored driver wraps every register access through an
-  `ioctl`-style dispatch plus a bit-banged CS pin (`CS (GPIO10) is a GPIO`
-  fact above), which costs far more per call than the bare-metal SPI path the
-  nRF5/ESP32S3UWB budget was sized for. `DISC_BASE_UUS`
-  (`src/disc_schedule.h`) and `POLL_RX_TO_RESP_TX_DLY_UUS`
-  (`src/anchor_respond.c`) are both **6000** as a result. Tried dropping to
-  2400 after downgrading the per-frame `LOG_INF` calls in this path to
-  `LOG_DBG` (compiled out at this module's `LOG_LEVEL_INF`) — still failed
-  100% of the time. **Logging was never the dominant cost** on this stack;
-  don't re-litigate that guess.
-- **`read_cir()`'s `dwt_readdiagnostics()` call is ~944 uus of the ~1700 uus
-  RX-side overhead above — by far the single largest piece.** Traced to
-  `uwb_radio.c:76`'s `dwt_configciadiag(DW_CIA_DIAG_LOG_ALL)`: in the
-  non-double-buffer path (`dw3000_device.c` `ull_readdiagnostics()`,
-  `default:` case), `DW_CIA_DIAG_LOG_ALL` triggers **two separate ~108-byte
-  SPI burst reads** (216 bytes total), and critically, `ipatovPower` /
-  `ipatovAccumCount` — the only two fields `read_cir()` uses — are populated
-  **only** when `LOG_ALL` is set; any cheaper `cia_diagnostic` level leaves
-  them zero. `dwt_readdiagnostics_acc()` does the identical two-burst read
-  internally regardless of accumulator index, so there is no lighter public
-  API for just these two fields — the vendored driver's public surface
-  (`deca_device_api.h`) exposes no direct/targeted register read. Getting
-  non-zero CIR power/quality through this driver's public API costs ~944 uus,
-  full stop, unless the vendored module itself is changed (out of scope; see
-  `modules/dw3000-decadriver/` above).
-  **Open decision, not yet made:** `cir_power`/`cir_quality` are
-  informational only — the tag ranks anchors by them, it does not accept or
-  reject a range on them (`anchor_respond.h`'s own doc comment). Skipping the
-  CIR read entirely in the DISCOVERY hot path (always report zero) would
-  recover the ~944 uus, at the cost of the tag's anchor-selection signal when
-  several anchors are in range. Not implemented pending a decision — see
-  `read_cir()` in `src/uwb_slave.c` if/when this gets revisited.
+- **The SPI bus defaults to 2 MHz and nothing switches it — you must call
+  `dw3000_spi_speed_fast()` yourself.** `dw3000_spi_init()` selects
+  `spi_cfgs[0]` (2 MHz); `spi_cfgs[1]` carries the DTS rate and is never
+  selected unless something calls the switch. `.setfastrate` is wired into the
+  driver vtable (`platform/deca_port.c:37`) but its only call sites are in a
+  `static init()` wrapper that `dwt_initialise()` does not dispatch to — it
+  goes to `ull_initialise` (`dw3000_device.c:9371`). The module's boot log
+  prints `spi_cfgs[1].frequency`, so it reports the DTS rate whether or not
+  that rate is in use: **that log line is not evidence.** `uwb_radio.c` makes
+  the call after `dwt_checkidlerc()`, which is the earliest legal point — the
+  part requires ≤7 MHz until it leaves INIT_RC (`deca_device_api.h:2381`,
+  `:2601`).
+- **The RX-side overhead was the 2 MHz bus, not the driver.** An earlier
+  entry here blamed the vendored driver's ioctl-style dispatch and bit-banged
+  CS for ~1700 uus between RX and `dwt_starttx()`, and concluded a 2000 uus
+  turnaround was unreachable on this stack. It was reachable; the bus was
+  running at a quarter of the configured rate. `read_cir()`'s
+  `DW_CIA_DIAG_LOG_ALL` read is two ~108-byte bursts = 1728 bits, which is
+  864 us of pure clock time at 2 MHz against ~944 us measured — the transfer
+  was essentially all of it. The corollary also stands: logging was never the
+  dominant cost, so do not re-litigate that either.
+- **Maximum usable SPI rate here is 26.67 MHz (80/3).** The ESP32-S3 only
+  produces 80 MHz/N, so the ladder is 20 / 26.67 / 40 with nothing between,
+  and 40 overruns the DW3000's ~38 MHz ceiling. Request `26670000` in the DTS,
+  never `26000000`: the HAL picks the highest rate **not exceeding** the
+  request, so asking for 26 silently yields 20. GPIO 11/12/13 are the SPI2
+  IO_MUX pins (FSPID/FSPICLK/FSPIQ), so there is no GPIO-matrix penalty at
+  this rate. The module README's `spi-max-frequency = <32000000>` is the
+  nRF52840 SPIM3 limit and does not transfer.
 - **An unbounded wait for TXFRS can hang the whole console.**
   `tx_delayed()`'s post-`dwt_starttx()` completion poll used to spin forever
   on `DWT_INT_TXFRS_BIT_MASK`. `dwt_starttx()`'s own internal HPDWARN deadline
@@ -178,6 +176,19 @@ kernel reboot cold             apply — every setter persists immediately,
   (`src/anchor_respond.c`) is now 25 — comfortably past the id-3 worst case
   plus airtime margin. Revisit this constant if the delay budgets above are
   ever tuned further.
+- **`dwt_readsystimestamphi32()` wraps every ~17.2 s.** hi32 counts 256 DTU
+  ≈ 4.006 ns per tick, so 2³² ticks is 17.2 seconds. Every comparison between
+  two hi32 values must be signed-difference arithmetic — `(int32_t)(a - b)` —
+  which is correct for any interval under ~8.6 s. A plain unsigned compare is
+  wrong across the wrap and the failure is rare, timing-dependent and looks
+  like a radio fault. `beacon_guard.c` does this correctly and
+  `tests/beacon_guard/` covers both directions across the boundary.
+- **The gateway is MAC-only and holds two reserved values at once.** It uses
+  short address `0x0000` per the contract and consumes no `anchor_id`, so the
+  four ranging slaves take ids 0..3 (`0x0001`–`0x0004`). The deployment is
+  therefore **five boards**, not four. Three ranging anchors would satisfy the
+  tag's solver (`pos_solver.c:10` accepts n ≥ 3) but only as an exact solve
+  with no averaging; the fourth makes it overdetermined.
 - **Ranging confirmed on the bench via an external DWM3001CDK sniffer**, not
   the tag (its serial output is deliberately silent to keep BLE comms
   overhead low). With a real gateway + a second fw-cre SLAVE device + the
@@ -209,7 +220,11 @@ live in the sibling ESP-IDF anchor project at
 `../../../PlatformIO/Projects/ESP32S3UWB` (see its `CLAUDE.md`). That project is
 the working reference implementation for ranging; the SLAVE responder here
 (`src/anchor_respond.c`, `src/uwb_slave.c`) has now ported the WAVE and
-DISCOVERY response paths from it, but the gateway/beacon side is still to come.
+DISCOVERY response paths from it. The gateway/beacon side is now implemented (`src/uwb_gateway.c`,
+`src/gw_core.{c,h}`): a MAC-only gateway emits the 200 ms TDMA beacon and runs
+the CAP seat protocol (JOIN→GRANT, KEEPALIVE, RELEASE), and slaves suppress
+ranging responses that would collide with that beacon
+(`src/beacon_guard.{c,h}`).
 Both response paths are bench-confirmed correct over the air (sniffer capture,
 see the "Ranging confirmed on the bench" hard-won fact above) after fixing the
 delayed-TX turnaround budget and an unbounded-wait hang; the tag's actual
@@ -228,6 +243,12 @@ gcc -Wall -Wextra -o tests/uwb_frame/test_uwb_frame.exe tests/uwb_frame/test_uwb
 
 gcc -Wall -Wextra -Isrc -o tests/disc_schedule/test_disc_schedule.exe tests/disc_schedule/test_disc_schedule.c src/disc_schedule.c
 ./tests/disc_schedule/test_disc_schedule.exe    # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/gw_core/test_gw_core.exe tests/gw_core/test_gw_core.c src/gw_core.c
+./tests/gw_core/test_gw_core.exe                # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/beacon_guard/test_beacon_guard.exe tests/beacon_guard/test_beacon_guard.c src/beacon_guard.c
+./tests/beacon_guard/test_beacon_guard.exe      # PASSED, exits 0
 ```
 
 ## Repo
