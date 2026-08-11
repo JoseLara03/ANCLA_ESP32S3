@@ -45,19 +45,32 @@ LOG_MODULE_REGISTER(uwb_gateway, LOG_LEVEL_INF);
  * cover a discovery stagger this node no longer performs. */
 #define BEACON_ARM_MARGIN_UUS 5000u
 
-/* Bound for the post-dwt_starttx() TXFRS wait. Covers the scheduled delay
- * itself plus airtime -- dwt_starttx() returns when the TX is armed, not when
- * it fires. The longest scheduled delay here is RX_TO_TX_DLY_UUS (~2.05 ms)
- * plus ~1.5 ms airtime, ~3.6 ms total.
+/* Bound for the post-dwt_starttx() TXFRS wait, shared by both tx_beacon()'s
+ * and send_grant()'s delayed TX. Covers the scheduled delay itself plus
+ * airtime -- dwt_starttx() returns when the TX is armed, not when it fires.
  *
- * Must also stay BELOW BEACON_ARM_MARGIN_UUS converted to ms (5000 uus *
- * 1.0256 ~= 5.13 ms): this wait runs inside that reservation, so a GRANT that
- * arms but never completes must time out before it eats the margin meant to
- * protect the beacon. The two constants are coupled -- re-derive this bound
- * if either RX_TO_TX_DLY_UUS or BEACON_ARM_MARGIN_UUS changes. 5 ms clears
- * the ~3.6 ms worst case with margin and fits comfortably under the 5.13 ms
- * ceiling; the earlier value of 10 ms did not. */
-#define TX_COMPLETE_TIMEOUT_MS 5
+ * The two delayed-TX call sites have different worst-case scheduled delays,
+ * and this bound must cover the LARGER one:
+ *   - send_grant(): RX_TO_TX_DLY_UUS (~2.05 ms).
+ *   - tx_beacon(true, ...): up to BEACON_ARM_MARGIN_UUS (~5.13 ms) -- the
+ *     main loop only breaks out of RX-servicing and calls tx_beacon() once
+ *     `to_beacon <= BEACON_ARM_MARGIN_UUS`, so the delayed beacon can be
+ *     armed with nearly the full margin still to run before it fires. A
+ *     bound sized only from RX_TO_TX_DLY_UUS (an earlier version of this
+ *     comment did exactly that, and set this to 5 ms) times out on almost
+ *     every delayed beacon -- confirmed on hardware: the first, immediate,
+ *     beacon transmits fine, and every subsequent delayed one logs "beacon
+ *     started but TXFRS never completed" and gets forced off.
+ *
+ * BEACON_ARM_MARGIN_UUS (~5.13 ms) + ~1.5 ms beacon airtime is the true
+ * worst case, ~6.6 ms. Same derivation style as the slave's
+ * TX_COMPLETE_TIMEOUT_MS in anchor_respond.c: ceil(worst_uus * 1.0256/1000)
+ * + 5 ms margin = ceil(5.13) + 5 = 11. There is no upper ceiling this needs
+ * to clear -- BEACON_ARM_MARGIN_UUS is the lower bound this must exceed, not
+ * an upper one it must stay under; the two constants aren't otherwise
+ * coupled. Re-derive if RX_TO_TX_DLY_UUS or BEACON_ARM_MARGIN_UUS changes
+ * such that either's worst case grows past what 11 ms covers. */
+#define TX_COMPLETE_TIMEOUT_MS 11
 
 /* Longest frame the contract defines is a 39-byte beacon; +FCS, rounded up. */
 #define RX_BUF_LEN 64
