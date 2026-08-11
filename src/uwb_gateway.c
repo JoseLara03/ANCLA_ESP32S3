@@ -3,27 +3,315 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * GATEWAY mode: TDMA beacon plus CAP seat granting.
- * Stub — the beacon and gw_core land in spec D.
+ * GATEWAY mode: the TDMA beacon and the CAP seat protocol.
+ *
+ * MAC-only -- this node does NOT answer ranging polls, unlike the nRF5
+ * gateway's dispatch() fall-through. That costs a board rather than an anchor
+ * (the deployment is one gateway plus four slaves) and buys a much smaller
+ * beacon arm margin: with no anchor_respond in the loop the worst-case service
+ * latency is one GRANT, not a 16.5 ms discovery stagger.
+ *
+ * Interrupt-driven with the same callback shape as uwb_slave.c. The DW3000
+ * system clock is authoritative over the beacon cadence -- the beacon IS the
+ * network's time base, so it is scheduled against the radio's own clock and
+ * never against the kernel's.
  */
 
 #include "uwb_modes.h"
 
+#include "gw_core.h"
+#include "uwb_dwtime.h"
+#include "uwb_frame_802_15_4z.h"
+#include "uwb_mac.h"
+
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#include <deca_device_api.h>
+
 LOG_MODULE_REGISTER(uwb_gateway, LOG_LEVEL_INF);
+
+/* T_SUPERFRAME_UUS comes from uwb_mac.h — the slaves predict the beacon from
+ * the same definition, and a local copy here would drift against theirs. */
+
+/* Delay from a received CAP frame to our GRANT TX. Same budget class as the
+ * responders' turnaround; see disc_schedule.h for why this port needs more
+ * than the nRF5 anchor's 2000. */
+#define RX_TO_TX_DLY_UUS 2000u
+
+/* Stop servicing and arm the beacon when this close to it. MAC-only keeps this
+ * small: worst-case service latency is one GRANT (RX_TO_TX_DLY_UUS + ~1.3 ms
+ * airtime + the bounded TXFRS wait), not the nRF5 gateway's 8000, which had to
+ * cover a discovery stagger this node no longer performs. */
+#define BEACON_ARM_MARGIN_UUS 5000u
+
+/* Bound for the post-dwt_starttx() TXFRS wait. Covers the scheduled delay
+ * itself plus airtime -- dwt_starttx() returns when the TX is armed, not when
+ * it fires. The longest scheduled delay here is RX_TO_TX_DLY_UUS (~2.05 ms);
+ * 10 ms is comfortable. See uwb_dwtime.h for why this must be bounded at all. */
+#define TX_COMPLETE_TIMEOUT_MS 10
+
+/* Longest frame the contract defines is a 39-byte beacon; +FCS, rounded up. */
+#define RX_BUF_LEN 64
+
+static K_SEM_DEFINE(rx_sem, 0, 1);
+
+/* Same rx_pending guard as uwb_slave.c: br101's IRQ-drain loop can call
+ * dwt_isr() again before the main thread has consumed the previous event, and
+ * the limit-1 semaphore would silently swallow the second give while the
+ * second callback corrupted the still-unread values. */
+static volatile uint32_t rx_status;
+static volatile uint16_t rx_len;
+static volatile bool rx_pending;
+
+static uint8_t rx_buf[RX_BUF_LEN];
+static uint8_t beacon_buf[UWB_FRAME_MAX_LEN];
+static uint8_t gw_seq;
+
+static void cb_rx_ok(const dwt_cb_data_t *cb_data)
+{
+	if (rx_pending) {
+		return;
+	}
+	rx_status = cb_data->status;
+	rx_len = cb_data->datalength;
+	rx_pending = true;
+	k_sem_give(&rx_sem);
+}
+
+static void cb_rx_fail(const dwt_cb_data_t *cb_data)
+{
+	if (rx_pending) {
+		return;
+	}
+	rx_status = cb_data->status;
+	rx_len = 0;
+	rx_pending = true;
+	k_sem_give(&rx_sem);
+}
+
+/* Transmit the beacon. Returns its 40-bit TX timestamp, or 0 if it did not go
+ * out. delayed=0 for the very first beacon, which has no predecessor to
+ * schedule against. */
+static uint64_t tx_beacon(struct gw_core_ctx *ctx, bool delayed, uint32_t tx_at)
+{
+	uint16_t slot_map[GW_N_CFP];
+
+	gw_core_build_slotmap(ctx, slot_map);
+
+	/* GW_N_CFP == UWB_FRAME_N_CFP == 12, so need = 15 + 24 = 39 =
+	 * UWB_FRAME_MAX_LEN and beacon_buf is exactly large enough.
+	 * uwb_frame_beacon_build() does not bound n_slots itself -- a known
+	 * defect in the frame module, left unfixed because that file is kept
+	 * byte-identical to the tag's. It cannot fire here: the argument is a
+	 * compile-time constant equal to the maximum. */
+	int n = uwb_frame_beacon_build(beacon_buf, sizeof(beacon_buf),
+				       ctx->frame_counter, slot_map, GW_N_CFP);
+	if (n < 0) {
+		LOG_ERR("beacon build failed (%d)", n);
+		return 0;
+	}
+	uwb_frame_set_seq_num(beacon_buf, gw_seq++);
+
+	if (delayed) {
+		dwt_setdelayedtrxtime(tx_at);
+	}
+	dwt_writetxdata((uint16_t)n, beacon_buf, 0);
+	dwt_writetxfctrl((uint16_t)(n + FCS_LEN), 0, 0);
+
+	if (dwt_starttx(delayed ? DWT_START_TX_DELAYED : DWT_START_TX_IMMEDIATE)
+	    != DWT_SUCCESS) {
+		dwt_forcetrxoff();
+		LOG_WRN("beacon missed its slot — re-basing cadence");
+		return 0;
+	}
+	if (!uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK,
+				       TX_COMPLETE_TIMEOUT_MS)) {
+		dwt_forcetrxoff();
+		LOG_WRN("beacon started but TXFRS never completed — forced off");
+		return 0;
+	}
+	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+
+	return uwb_get_tx_timestamp_u64();
+}
+
+static void send_grant(const uint8_t eui[UWB_FRAME_EUI_LEN],
+		       const struct gw_grant *g, uint64_t rx_ts)
+{
+	uint8_t buf[UWB_FRAME_LEN_GRANT];
+
+	/* eui is non-NULL by construction: it comes from a successfully parsed
+	 * JOIN. uwb_frame_grant_build() writes its header before checking the
+	 * pointer -- another known frame-module defect left unfixed for
+	 * byte-identity with the tag -- which cannot fire on this path. */
+	int n = uwb_frame_grant_build(buf, sizeof(buf), eui, g->short_addr,
+				      g->slot_index, g->tier, g->lease);
+	if (n < 0) {
+		LOG_WRN("grant build failed (%d)", n);
+		return;
+	}
+	uwb_frame_set_seq_num(buf, gw_seq++);
+
+	uint32_t tx_at = (uint32_t)((rx_ts +
+		((uint64_t)RX_TO_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8);
+
+	dwt_setdelayedtrxtime(tx_at);
+	dwt_writetxdata((uint16_t)n, buf, 0);
+	dwt_writetxfctrl((uint16_t)(n + FCS_LEN), 0, 0);
+
+	if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+		dwt_forcetrxoff();
+		LOG_WRN("grant missed its slot — tag will retry via CAP");
+		return;
+	}
+	if (!uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK,
+				       TX_COMPLETE_TIMEOUT_MS)) {
+		dwt_forcetrxoff();
+		LOG_WRN("grant started but TXFRS never completed — forced off");
+		return;
+	}
+	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+}
+
+static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
+		     uint64_t rx_ts)
+{
+	if (uwb_frame_is_join(buf, len)) {
+		uint8_t eui[UWB_FRAME_EUI_LEN];
+		uint8_t req_tier = 0;
+		struct gw_grant g;
+
+		if (uwb_frame_parse_join(buf, len, eui, &req_tier) != 0) {
+			return;
+		}
+		if (!gw_core_join(ctx, eui, req_tier, &g)) {
+			LOG_WRN("JOIN refused — all %u seats occupied", GW_N_CFP);
+			return;
+		}
+		LOG_INF("GRANT addr=0x%04X slot=%u tier=%u lease=%u",
+			g.short_addr, g.slot_index, g.tier, g.lease);
+		send_grant(eui, &g, rx_ts);
+	} else if (uwb_frame_is_keepalive(buf, len)) {
+		uint16_t sa = 0;
+		uint8_t rt = 0, si = 0;
+
+		if (uwb_frame_parse_keepalive(buf, len, &sa, &rt, &si) == 0) {
+			gw_core_keepalive(ctx, sa, rt);
+		}
+	} else if (uwb_frame_is_release(buf, len)) {
+		uint16_t sa = uwb_frame_get_src_addr(buf);
+
+		LOG_INF("RELEASE addr=0x%04X", sa);
+		gw_core_release(ctx, sa);
+	}
+	/* Anything else is tag<->anchor ranging traffic. MAC-only: not ours,
+	 * and logging every frame on a busy network would flood the console. */
+}
 
 void uwb_gateway_run(const uwb_config_t *cfg)
 {
+	/* Snapshot at entry — see uwb_slave.c for why. It matters more here:
+	 * this loop runs indefinitely and drives every other node's timing. */
+	uwb_config_t cfg_snapshot = *cfg;
+
+	cfg = &cfg_snapshot;
+
 	if (!cfg->position_valid) {
-		LOG_ERR("gateway not positioned — set `anchor pos <x> <y> <z>` first");
+		LOG_ERR("{\"error\":\"gateway not positioned\"} — "
+			"set `anchor pos <x> <y> <z>` and reboot");
+		return;
 	}
 
-	LOG_INF("GATEWAY mode, anchor_id=%u — beacon not implemented yet",
-		cfg->anchor_id);
+	static dwt_callbacks_s cbs;
+
+	cbs.cbRxOk = cb_rx_ok;
+	cbs.cbRxTo = cb_rx_fail;
+	cbs.cbRxErr = cb_rx_fail;
+	dwt_setcallbacks(&cbs);
+
+	/* RX events only. TXFRS must stay masked: tx_beacon() and send_grant()
+	 * poll for it, and an ISR that cleared it first would make both wait
+	 * out their full timeout on every single transmission. */
+	dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
+
+	struct gw_core_ctx ctx;
+
+	gw_core_init(&ctx);
+
+	LOG_INF("{\"status\":\"gateway\",\"x\":%.2f,\"y\":%.2f,"
+		"\"superframe_ms\":200,\"slots\":%u}",
+		(double)cfg->x, (double)cfg->y, GW_N_CFP);
+
+	uint64_t beacon_tx_ts = tx_beacon(&ctx, false, 0);
+
+	if (beacon_tx_ts == 0) {
+		LOG_ERR("first beacon failed to transmit — cannot start");
+		return;
+	}
 
 	while (1) {
-		k_sleep(K_FOREVER);
+		uint32_t next_beacon = (uint32_t)((beacon_tx_ts +
+			((uint64_t)T_SUPERFRAME_UUS * UUS_TO_DWT_TIME)) >> 8);
+
+		for (;;) {
+			uint32_t now = dwt_readsystimestamphi32();
+			int32_t to_beacon = (int32_t)(next_beacon - now);
+
+			if (to_beacon <= (int32_t)UUS_TO_HI32(BEACON_ARM_MARGIN_UUS)) {
+				break;
+			}
+
+			/* Expire the RX window BEACON_ARM_MARGIN_UUS before the
+			 * beacon, so the delayed-TX setup has a guaranteed
+			 * window. Without the subtraction the timeout fires at
+			 * exactly the beacon instant and the delayed TX fails
+			 * every time. */
+			uint32_t span_hi32 =
+				(uint32_t)to_beacon - UUS_TO_HI32(BEACON_ARM_MARGIN_UUS);
+			uint32_t rx_to_uus =
+				(uint32_t)(((uint64_t)span_hi32 << 8) / UUS_TO_DWT_TIME);
+
+			dwt_setpreambledetecttimeout(0);
+			dwt_setrxtimeout(rx_to_uus);
+			dwt_setrxaftertxdelay(0);
+			dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+			/* Bounded, not K_FOREVER. DWT_INT_RX includes RXFTO so a
+			 * timeout normally arrives, but a MAC loop that can wedge
+			 * takes the whole network down, not one range. One
+			 * superframe of slack past the window is ample. */
+			if (k_sem_take(&rx_sem, K_MSEC(400)) != 0) {
+				LOG_WRN("no RX event within the window — re-arming");
+				dwt_forcetrxoff();
+				continue;
+			}
+
+			/* rx_status is captured by the callbacks for symmetry with
+			 * uwb_slave.c but is not read here: the gateway needs no
+			 * CIR, since it does not answer ranging polls. */
+			uint16_t flen = rx_len;
+
+			rx_pending = false;
+
+			if (flen <= FCS_LEN || flen > RX_BUF_LEN) {
+				continue;
+			}
+
+			dwt_readrxdata(rx_buf, flen, 0);
+
+			uint64_t rx_ts = uwb_get_rx_timestamp_u64();
+
+			dispatch(&ctx, rx_buf, (uint16_t)(flen - FCS_LEN), rx_ts);
+		}
+
+		gw_core_superframe_tick(&ctx);
+
+		uint64_t ts = tx_beacon(&ctx, true, next_beacon);
+
+		/* On a miss, re-base on the current time rather than compounding
+		 * the error into every following superframe. */
+		beacon_tx_ts = ts ? ts
+				  : (((uint64_t)dwt_readsystimestamphi32()) << 8);
 	}
 }
