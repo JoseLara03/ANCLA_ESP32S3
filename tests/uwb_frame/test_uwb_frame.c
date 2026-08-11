@@ -191,8 +191,8 @@ static void test_new_constants(void)
     CHECK(UWB_FRAME_TYPE_RELEASE   == 0xE9);
     CHECK(UWB_ADDR_GATEWAY == 0x0000);
     CHECK(UWB_ADDR_UNASSOC == 0xFFFE);
-    CHECK(UWB_FRAME_N_CFP  == 12);
-    CHECK(UWB_FRAME_LEN_BEACON == 15 + 2 * 12);  /* 39 */
+    CHECK(UWB_FRAME_N_CFP  == 11);
+    CHECK(UWB_FRAME_LEN_BEACON == 15 + 2 * 11);  /* 37 */
     CHECK(UWB_FRAME_LEN_JOIN   == 19);
     CHECK(UWB_FRAME_LEN_GRANT  == 24);
     CHECK(UWB_FRAME_LEN_KEEPALIVE == 12);
@@ -268,6 +268,69 @@ static void test_keepalive_release(void)
     CHECK(uwb_frame_is_release(buf, n));
 }
 
+static void test_pos(void)
+{
+    uint8_t buf[UWB_FRAME_MAX_LEN];
+
+    CHECK(UWB_FRAME_TYPE_POS == 0xEA);
+    CHECK(UWB_FRAME_LEN_POS == 24);
+    CHECK(UWB_FRAME_POS_SOC_UNKNOWN == 0xFF);
+
+    /* -3.25, 7.5 and 0.125 are exactly representable in binary32, so these
+     * round-trip comparisons can use == without a tolerance. */
+    int n = uwb_frame_pos_build(buf, sizeof(buf), 0x0102,
+                                -3.25f, 7.5f, 0.125f, 4, 87);
+    CHECK(n == UWB_FRAME_LEN_POS);
+    CHECK(uwb_frame_is_pos(buf, (size_t)n));
+    CHECK(uwb_frame_get_dest_addr(buf) == UWB_ADDR_GATEWAY);
+    CHECK(uwb_frame_get_src_addr(buf) == 0x0102);
+    CHECK(buf[9] == UWB_FRAME_TYPE_POS);
+
+    uint16_t sa = 0;
+    float x = 0.0f, y = 0.0f, res = 0.0f;
+    uint8_t na = 0, soc = 0;
+
+    CHECK(uwb_frame_parse_pos(buf, (size_t)n, &sa, &x, &y, &res, &na, &soc) == 0);
+    CHECK(sa == 0x0102);
+    CHECK(x == -3.25f);
+    CHECK(y == 7.5f);
+    CHECK(res == 0.125f);
+    CHECK(na == 4);
+    CHECK(soc == 87);
+
+    /* Every out-param is optional. */
+    CHECK(uwb_frame_parse_pos(buf, (size_t)n, NULL, NULL, NULL, NULL, NULL, NULL) == 0);
+
+    /* The unknown-battery sentinel survives the round trip unchanged, and is
+     * not confused with a real 0 % reading. */
+    n = uwb_frame_pos_build(buf, sizeof(buf), 0x0103, 0.0f, 0.0f, 0.0f, 3,
+                            UWB_FRAME_POS_SOC_UNKNOWN);
+    CHECK(n == UWB_FRAME_LEN_POS);
+    CHECK(uwb_frame_parse_pos(buf, (size_t)n, NULL, NULL, NULL, NULL, &na, &soc) == 0);
+    CHECK(na == 3);
+    CHECK(soc == UWB_FRAME_POS_SOC_UNKNOWN);
+
+    /* Wrong length is rejected by both the predicate and the parser. */
+    CHECK(!uwb_frame_is_pos(buf, UWB_FRAME_LEN_POS - 1));
+    CHECK(uwb_frame_parse_pos(buf, UWB_FRAME_LEN_POS - 1,
+                              &sa, &x, &y, &res, &na, &soc) == -EINVAL);
+
+    /* GRANT is also 24 bytes, so length alone cannot separate the two — only
+     * the type byte does. This asserts that the predicates stay disjoint on a
+     * frame whose length matches both. */
+    buf[9] = UWB_FRAME_TYPE_GRANT;
+    CHECK(!uwb_frame_is_pos(buf, UWB_FRAME_LEN_POS));
+    CHECK(uwb_frame_is_grant(buf, UWB_FRAME_LEN_GRANT));
+    buf[9] = UWB_FRAME_TYPE_POS;
+    CHECK(uwb_frame_is_pos(buf, UWB_FRAME_LEN_POS));
+    CHECK(!uwb_frame_is_grant(buf, UWB_FRAME_LEN_GRANT));
+
+    /* A short buffer is refused, not overrun. */
+    uint8_t small[UWB_FRAME_LEN_POS - 1];
+    CHECK(uwb_frame_pos_build(small, sizeof(small), 0x0102,
+                              1.0f, 2.0f, 0.1f, 4, 50) == -EMSGSIZE);
+}
+
 int main(void)
 {
     test_scaffold();
@@ -280,6 +343,7 @@ int main(void)
     test_beacon();
     test_join_grant();
     test_keepalive_release();
+    test_pos();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

@@ -30,7 +30,7 @@
 
 LOG_MODULE_REGISTER(uwb_slave, LOG_LEVEL_INF);
 
-/* Longest frame the contract defines is a 39-byte beacon; +FCS, rounded up. */
+/* Longest frame the contract defines is a 37-byte beacon; +FCS, rounded up. */
 #define RX_BUF_LEN 64
 
 static K_SEM_DEFINE(rx_sem, 0, 1);
@@ -132,7 +132,7 @@ static void observe_beacon(const uint8_t *buf, uint16_t len,
 	}
 	/* slot_map cannot have overflowed above: parse_beacon derives n_slots as
 	 * (len - 15) / 2, and uwb_frame_is_valid() already capped len at
-	 * UWB_FRAME_MAX_LEN (39) == 15 + 2 * UWB_FRAME_N_CFP, so n_slots <= 12.
+	 * UWB_FRAME_MAX_LEN (37) == 15 + 2 * UWB_FRAME_N_CFP, so n_slots <= 11.
 	 * This check exists to catch that identity being broken by a future
 	 * change to either constant, not to protect the write. */
 	if (n_slots > UWB_FRAME_N_CFP) {

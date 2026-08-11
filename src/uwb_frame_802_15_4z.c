@@ -21,6 +21,11 @@
 #define OFF_RESP_CIRQ  18  /* bytes 18-19 */
 #define OFF_MPOL_NUM   10
 #define OFF_MPOL_SLOTS 11
+#define OFF_POS_X      10  /* bytes 10-13 */
+#define OFF_POS_Y      14  /* bytes 14-17 */
+#define OFF_POS_RES    18  /* bytes 18-21 */
+#define OFF_POS_NANCH  22
+#define OFF_POS_SOC    23
 
 /* ---- Little-endian field helpers ---- */
 static void put_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
@@ -32,6 +37,17 @@ static uint16_t get_u16(const uint8_t *p) { return (uint16_t)(p[0] | ((uint16_t)
 static uint32_t get_u32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static void put_f32(uint8_t *p, float v) {
+    uint32_t u;
+    memcpy(&u, &v, sizeof(u));
+    put_u32(p, u);
+}
+static float get_f32(const uint8_t *p) {
+    uint32_t u = get_u32(p);
+    float v;
+    memcpy(&v, &u, sizeof(v));
+    return v;
 }
 
 /* Write the common 10-byte header. PANID is written as literal bytes 0xCA,0xDE
@@ -340,4 +356,41 @@ bool uwb_frame_is_release(const uint8_t *buf, size_t len)
 {
     return len == UWB_FRAME_LEN_RELEASE && uwb_frame_is_valid(buf, len) &&
            buf[OFF_TYPE] == UWB_FRAME_TYPE_RELEASE;
+}
+
+/* ---- POS frame support ---- */
+
+int uwb_frame_pos_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                        float x, float y, float residual_m,
+                        uint8_t n_anchors, uint8_t batt_soc)
+{
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_POS, UWB_ADDR_GATEWAY,
+                       src_addr, UWB_FRAME_TYPE_POS);
+    if (rc) return rc;
+    put_f32(&buf[OFF_POS_X],   x);
+    put_f32(&buf[OFF_POS_Y],   y);
+    put_f32(&buf[OFF_POS_RES], residual_m);
+    buf[OFF_POS_NANCH] = n_anchors;
+    buf[OFF_POS_SOC]   = batt_soc;
+    return UWB_FRAME_LEN_POS;
+}
+
+bool uwb_frame_is_pos(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_POS && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_POS;
+}
+
+int uwb_frame_parse_pos(const uint8_t *buf, size_t len, uint16_t *src_addr,
+                        float *x, float *y, float *residual_m,
+                        uint8_t *n_anchors, uint8_t *batt_soc)
+{
+    if (!uwb_frame_is_pos(buf, len)) return -EINVAL;
+    if (src_addr)   *src_addr   = uwb_frame_get_src_addr(buf);
+    if (x)          *x          = get_f32(&buf[OFF_POS_X]);
+    if (y)          *y          = get_f32(&buf[OFF_POS_Y]);
+    if (residual_m) *residual_m = get_f32(&buf[OFF_POS_RES]);
+    if (n_anchors)  *n_anchors  = buf[OFF_POS_NANCH];
+    if (batt_soc)   *batt_soc   = buf[OFF_POS_SOC];
+    return 0;
 }
