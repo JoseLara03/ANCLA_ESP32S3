@@ -47,9 +47,17 @@ LOG_MODULE_REGISTER(uwb_gateway, LOG_LEVEL_INF);
 
 /* Bound for the post-dwt_starttx() TXFRS wait. Covers the scheduled delay
  * itself plus airtime -- dwt_starttx() returns when the TX is armed, not when
- * it fires. The longest scheduled delay here is RX_TO_TX_DLY_UUS (~2.05 ms);
- * 10 ms is comfortable. See uwb_dwtime.h for why this must be bounded at all. */
-#define TX_COMPLETE_TIMEOUT_MS 10
+ * it fires. The longest scheduled delay here is RX_TO_TX_DLY_UUS (~2.05 ms)
+ * plus ~1.5 ms airtime, ~3.6 ms total.
+ *
+ * Must also stay BELOW BEACON_ARM_MARGIN_UUS converted to ms (5000 uus *
+ * 1.0256 ~= 5.13 ms): this wait runs inside that reservation, so a GRANT that
+ * arms but never completes must time out before it eats the margin meant to
+ * protect the beacon. The two constants are coupled -- re-derive this bound
+ * if either RX_TO_TX_DLY_UUS or BEACON_ARM_MARGIN_UUS changes. 5 ms clears
+ * the ~3.6 ms worst case with margin and fits comfortably under the 5.13 ms
+ * ceiling; the earlier value of 10 ms did not. */
+#define TX_COMPLETE_TIMEOUT_MS 5
 
 /* Longest frame the contract defines is a 39-byte beacon; +FCS, rounded up. */
 #define RX_BUF_LEN 64

@@ -158,8 +158,9 @@ static void observe_beacon(const uint8_t *buf, uint16_t len,
 	 * disc_schedule.h, anchor_respond.c) matters more than always-on beacon
 	 * visibility. Bump this module's LOG_MODULE_REGISTER level to
 	 * LOG_LEVEL_DBG to re-enable for debugging. */
-	LOG_DBG("BEACON ver=%u counter=%u slots=%u our_slot=%d", proto_ver,
-		frame_counter, n_slots, slot);
+	LOG_DBG("BEACON ver=%u counter=%u slots=%u our_slot=%d locked=%d",
+		proto_ver, frame_counter, n_slots, slot,
+		beacon_guard_locked(&bguard));
 }
 
 void uwb_slave_run(const uwb_config_t *cfg)

@@ -55,9 +55,15 @@ kernel reboot cold             apply — every setter persists immediately,
   divergence is a wire-format bug waiting to happen. Host-tested in
   `tests/uwb_frame/` with the tag's own suite.
 - `src/uwb_dwtime.{c,h}` — the Qorvo `shared_functions` helpers the vendored
-  module does not carry, plus `UUS_TO_DWT_TIME` and `FCS_LEN`.
+  module does not carry, plus `UUS_TO_DWT_TIME`, `FCS_LEN`, the `UUS_TO_HI32`
+  macro, the TX-timestamp helper (`uwb_get_tx_timestamp_u64()`), and the
+  bounded `uwb_wait_for_sysstatus_lo()` TXFRS wait.
 - `src/disc_schedule.{c,h}` — per-anchor discovery response stagger. Host-tested
   in `tests/disc_schedule/`.
+- `src/uwb_mac.h` — the single source of truth for the superframe constants
+  (`T_SUPERFRAME_UUS`, `BEACON_OCCUPANCY_UUS`, `BEACON_GUARD_UUS`) that the
+  gateway schedules the beacon from and the slaves predict it against; no
+  header, no code file.
 - `src/gw_core.{c,h}` — CFP seat table, leases and the tag address pool. Pure
   C, ported unchanged from the nRF5 gateway, host-tested in `tests/gw_core/`.
 - `src/beacon_guard.{c,h}` — predicts the next beacon and refuses any delayed
@@ -171,11 +177,16 @@ kernel reboot cold             apply — every setter persists immediately,
   immediately after arming a delayed TX, the transmission itself happens only
   once the full scheduled delay elapses. An earlier attempt at this bound
   (10 ms) was shorter than `disc_resp_delay_uus(2)` and `(3)` (13 ms / 16.5 ms
-  at `DISC_BASE_UUS=6000`), so it force-cancelled every DISCOVERY response for
-  anchor ids ≥ 2 before they'd had a chance to fire. `TX_COMPLETE_TIMEOUT_MS`
-  (`src/anchor_respond.c`) is now 25 — comfortably past the id-3 worst case
-  plus airtime margin. Revisit this constant if the delay budgets above are
-  ever tuned further.
+  at the then-current `DISC_BASE_UUS=6000`), so it force-cancelled every
+  DISCOVERY response for anchor ids ≥ 2 before they'd had a chance to fire.
+  At HEAD, `DISC_BASE_UUS` is 2000 (`src/disc_schedule.h`, dropped after the
+  SPI bus moved to fast rate), so the id-3 worst case is
+  `disc_resp_delay_uus(3) = 2000 + 3*3500 = 12500` uus (~12.5 ms), and
+  `TX_COMPLETE_TIMEOUT_MS` (`src/anchor_respond.c`) is 18 — comfortably past
+  that plus airtime margin. The gateway has its own separate constant of the
+  same name in `src/uwb_gateway.c` (currently 5, sized against
+  `BEACON_ARM_MARGIN_UUS` instead) — the two are unrelated and must not be
+  confused. Revisit either if the relevant delay budgets are tuned further.
 - **`dwt_readsystimestamphi32()` wraps every ~17.2 s.** hi32 counts 256 DTU
   ≈ 4.006 ns per tick, so 2³² ticks is 17.2 seconds. Every comparison between
   two hi32 values must be signed-difference arithmetic — `(int32_t)(a - b)` —
@@ -204,12 +215,6 @@ kernel reboot cold             apply — every setter persists immediately,
   and a `0xE6`/`0xE7`/`0xE8` JOIN/GRANT handshake between the gateway and
   another device — spec-D TDMA provisioning traffic this project doesn't
   implement.
-- **A temporary cycle-counter profiling block is still in `uwb_slave.c`**
-  (`k_cycle_get_32()` checkpoints around `read_cir()`/`dwt_readrxdata()`/
-  `uwb_get_rx_timestamp_u64()`, logged as `"prof us: cir=... readdata=...
-  readts=..."`). It produced the `read_cir()` finding above. Remove once the
-  CIR-read decision above is made and no further RX-side profiling is
-  needed.
 
 ## System context
 
