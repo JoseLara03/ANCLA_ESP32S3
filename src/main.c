@@ -23,9 +23,11 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 static void log_config(const uwb_config_t *cfg)
 {
-	LOG_INF("{\"mode\":\"%s\",\"id\":%u,\"ant_tx\":%u,\"ant_rx\":%u,"
+	LOG_INF("{\"mode\":\"%s\",\"id\":%u,\"short_addr\":\"0x%04X\","
+		"\"ant_tx\":%u,\"ant_rx\":%u,"
 		"\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"pos_valid\":%u}",
 		uwb_config_mode_name(cfg->mode), cfg->anchor_id,
+		uwb_config_short_addr(cfg),
 		cfg->ant_delay_tx, cfg->ant_delay_rx,
 		(double)cfg->x, (double)cfg->y, (double)cfg->z,
 		cfg->position_valid ? 1u : 0u);

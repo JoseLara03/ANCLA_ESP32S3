@@ -23,6 +23,15 @@
 /* Factory-reference seed for an uncalibrated unit, in DWT units. */
 #define UWB_ANT_DELAY_DEFAULT 16385u
 
+/* Anchor short addresses start at 1: the MAC contract reserves 0x0000 for the
+ * gateway (spec/2026-06-17-uwb-mac-protocol-contract.md, Topology). The console
+ * id stays 0-based; the wire address is derived. */
+#define UWB_ANCHOR_ADDR_BASE 0x0001u
+
+/* Reserved by the contract; declared here so the host test can assert no valid
+ * id ever collides with it. */
+#define UWB_ADDR_GATEWAY_RESERVED 0x0000u
+
 enum uwb_mode {
 	UWB_MODE_SLAVE   = 0, /* SS-TWR responder; observes the gateway beacon */
 	UWB_MODE_GATEWAY = 1, /* emits the TDMA beacon and grants CFP seats    */
@@ -62,5 +71,10 @@ bool uwb_config_mode_from_name(const char *name, uint8_t *out);
 
 /* "slave", "gateway", or "unknown" for an out-of-range value. Never NULL. */
 const char *uwb_config_mode_name(uint8_t mode);
+
+/* This anchor's 16-bit short address: UWB_ANCHOR_ADDR_BASE + anchor_id.
+ * The single place the console id maps to the on-air address. Its low byte is
+ * also the id the tag echoes in the legacy WAVE poll. */
+uint16_t uwb_config_short_addr(const uwb_config_t *c);
 
 #endif /* UWB_CONFIG_H */

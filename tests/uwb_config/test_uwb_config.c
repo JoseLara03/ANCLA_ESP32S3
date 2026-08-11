@@ -114,10 +114,40 @@ static void test_singleton_starts_at_defaults(void)
     CHECK(uwb_config_get() == c);   /* same instance every call */
 }
 
+static void test_short_addr(void)
+{
+    uwb_config_t c;
+    uwb_config_set_defaults(&c);
+
+    /* Default id 0 must not map to the gateway's reserved 0x0000. */
+    CHECK(c.anchor_id == 0);
+    CHECK(uwb_config_short_addr(&c) == 0x0001);
+
+    /* The mapping is base + id across the whole valid range. */
+    for (uint8_t id = 0; id < UWB_MAX_ANCHORS; id++) {
+        CHECK(uwb_config_set_id(&c, id));
+        CHECK(uwb_config_short_addr(&c) == (uint16_t)(UWB_ANCHOR_ADDR_BASE + id));
+    }
+
+    /* No valid id can produce a reserved address. */
+    for (uint8_t id = 0; id < UWB_MAX_ANCHORS; id++) {
+        CHECK(uwb_config_set_id(&c, id));
+        uint16_t a = uwb_config_short_addr(&c);
+        CHECK(a != UWB_ADDR_GATEWAY_RESERVED);
+        CHECK(a != 0xFFFE);
+        CHECK(a != 0xFFFF);
+    }
+
+    /* The low byte is what the tag echoes in the WAVE poll's byte 10. */
+    CHECK(uwb_config_set_id(&c, 3));
+    CHECK((uint8_t)(uwb_config_short_addr(&c) & 0xFFu) == 4);
+}
+
 int main(void)
 {
     test_defaults();
     test_set_id();
+    test_short_addr();
     test_set_mode();
     test_mode_names();
     test_set_ant();

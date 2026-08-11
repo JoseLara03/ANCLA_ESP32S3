@@ -95,3 +95,8 @@ const char *uwb_config_mode_name(uint8_t mode)
 	}
 	return mode_names[mode];
 }
+
+uint16_t uwb_config_short_addr(const uwb_config_t *c)
+{
+	return (uint16_t)(UWB_ANCHOR_ADDR_BASE + c->anchor_id);
+}
