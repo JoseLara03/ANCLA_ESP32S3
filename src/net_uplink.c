@@ -80,6 +80,20 @@ static uint16_t next_msg_id = 1u;
 static bool    mqtt_connected;
 static bool    connack_seen;
 
+/* ~1.5 superframes at GW_N_CFP (11) seats: enough to absorb a publish stalling
+ * behind one TCP retransmit, small enough that a real outage discards rather
+ * than accumulates. */
+#define FIX_QUEUE_DEPTH 16
+
+K_MSGQ_DEFINE(fix_q, sizeof(struct pos_fix), FIX_QUEUE_DEPTH, 4);
+
+static uint32_t dropped_fixes;
+static int64_t  last_drop_warn_ms;
+
+/* A sustained outage drops ~55 fixes per second. An unthrottled warning would
+ * flood the very console being used to diagnose it. */
+#define DROP_WARN_INTERVAL_MS 10000
+
 static K_SEM_DEFINE(ip_sem, 0, 1);
 static struct net_mgmt_event_callback wifi_cb;
 static struct net_mgmt_event_callback ipv4_cb;
@@ -146,6 +160,35 @@ bool net_uplink_get_ip(char *buf, size_t len)
 const char *net_uplink_state_str(void)
 {
 	return state_names[g_state];
+}
+
+void net_uplink_submit(const struct pos_fix *fix)
+{
+	struct pos_fix discarded;
+
+	/* Called from the gateway's dispatch path: never block, never allocate,
+	 * never touch a socket. */
+	if (k_msgq_put(&fix_q, fix, K_NO_WAIT) == 0) {
+		return;
+	}
+
+	/* Full: drop the OLDEST and take the newest. A stale position is
+	 * worthless in an RTLS, so the newest sample is always the one worth
+	 * keeping. */
+	(void)k_msgq_get(&fix_q, &discarded, K_NO_WAIT);
+	if (k_msgq_put(&fix_q, fix, K_NO_WAIT) != 0) {
+		/* Only reachable if the uplink thread raced us to the slot; the
+		 * fix is dropped either way. */
+	}
+
+	dropped_fixes++;
+
+	int64_t now = k_uptime_get();
+
+	if (now - last_drop_warn_ms >= DROP_WARN_INTERVAL_MS) {
+		last_drop_warn_ms = now;
+		LOG_WRN("uplink queue full — %u fixes dropped so far", dropped_fixes);
+	}
 }
 
 /* Associate and wait for DHCP. Returns true once an IPv4 address is assigned. */
@@ -380,6 +423,34 @@ static void publish_anchor_stub(void)
 	}
 }
 
+/* Publish everything queued. QoS 0 and not retained: the topic is flat, so
+ * retaining would only preserve whichever tag published last, and QoS 0
+ * matches the lossy UWB link underneath -- a fix needing a retransmit is
+ * stale by the time it lands. Returns false if the connection died. */
+static bool drain_fix_queue(void)
+{
+	struct pos_fix fix;
+
+	while (k_msgq_get(&fix_q, &fix, K_NO_WAIT) == 0) {
+		int n = pos_json_fix(payload_buf, sizeof(payload_buf), &fix);
+
+		if (n < 0) {
+			/* A formatting bug, not a network problem. Never publish
+			 * a truncated JSON document. */
+			LOG_ERR("position payload truncated — dropping fix from 0x%04X",
+				fix.src_addr);
+			continue;
+		}
+
+		if (publish(LOCATION_TOPIC, payload_buf,
+			    MQTT_QOS_0_AT_MOST_ONCE, false) != 0) {
+			LOG_WRN("position publish failed — reconnecting");
+			return false;
+		}
+	}
+	return true;
+}
+
 static void uplink_thread(void *a, void *b, void *c)
 {
 	const net_config_t *cfg = net_config_get();
@@ -447,7 +518,9 @@ static void uplink_thread(void *a, void *b, void *c)
 				break;
 			}
 
-			/* Task 6 drains the fix queue here. */
+			if (!drain_fix_queue()) {
+				break;
+			}
 		}
 
 		LOG_WRN("MQTT connection lost — reconnecting");
