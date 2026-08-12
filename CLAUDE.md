@@ -115,8 +115,8 @@ kernel reboot cold             apply — every setter persists immediately,
   an 11-byte payload). Always pass `flen - FCS_LEN` to the frame module. The
   `is_*` validators tolerate the extra bytes because they test `len >=`, but
   `uwb_frame_parse_beacon()` derives its slot count from the length — an
-  unsubtracted FCS turns a 12-slot beacon into 13, with the FCS read as the
-  thirteenth slot. It fails silently and the output looks plausible.
+  unsubtracted FCS turns an 11-slot beacon into 12, with the FCS read as the
+  twelfth slot. It fails silently and the output looks plausible.
 - **Never poll `DWT_INT_CIADONE_BIT_MASK` after an RX event.** `dwt_isr()` clears
   `SYS_STATUS_ALL_RX_GOOD` — which includes CIADONE — *before* it calls
   `cbRxOk` (`dw3000_device.c:4764` then `:4791`). Waiting on it hangs until the

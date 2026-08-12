@@ -260,7 +260,7 @@ undebuggable from the broker's side.
 
 | Condition | Behaviour |
 |---|---|
-| Malformed / short POS frame | drop, `LOG_WRN` — matches the existing beacon path |
+| Malformed / short POS frame | fails `uwb_frame_is_pos()`, falls through `dispatch()`'s `else if` chain, and is dropped silently — same as every other unrecognized frame type in that function |
 | `batt_read_soc()` error or `-EBUSY` | `batt_soc = 0xFF` |
 | `pos_solve()` returns false | no POS frame sent at all |
 | POS from unknown short addr | logged normally (§7) |
