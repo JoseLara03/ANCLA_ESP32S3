@@ -14,6 +14,7 @@ target_sources(app PRIVATE
 	src/disc_schedule.c
 	src/gw_core.c
 	src/main.c
+	src/net_config.c
 	src/pos_json.c
 	src/pos_sink.c
 	src/uwb_config.c
