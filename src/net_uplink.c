@@ -22,6 +22,7 @@
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/net/mqtt.h>
+#include <zephyr/net/net_compat.h>
 #include <zephyr/net/socket.h>
 
 #include <errno.h>
@@ -362,11 +363,25 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 	client.client_id.utf8   = (uint8_t *)client_id;
 	client.client_id.size   = strlen(client_id);
 	client.protocol_version = MQTT_VERSION_3_1_1;
-	client.transport.type   = MQTT_TRANSPORT_NON_SECURE;
 	client.rx_buf           = mqtt_rx_buf;
 	client.rx_buf_size      = sizeof(mqtt_rx_buf);
 	client.tx_buf           = mqtt_tx_buf;
 	client.tx_buf_size      = sizeof(mqtt_tx_buf);
+
+	/* Hosted brokers (CloudAMQP included) only expose MQTT over TLS
+	 * externally -- a plain-TCP CONNECT gets the socket closed by the
+	 * broker's TLS-terminating proxy. No CA certificate is provisioned:
+	 * peer verification is off, matching how this broker is reached from
+	 * MQTTX today (SSL/TLS on, certificate verification off). sec_tag_list
+	 * stays empty since nothing is being verified. hostname is still set
+	 * for SNI, in case the broker's TLS front end routes by server name. */
+	client.transport.type                    = MQTT_TRANSPORT_SECURE;
+	client.transport.tls.config.peer_verify   = TLS_PEER_VERIFY_NONE;
+	client.transport.tls.config.cipher_count  = 0;
+	client.transport.tls.config.cipher_list   = NULL;
+	client.transport.tls.config.sec_tag_count = 0;
+	client.transport.tls.config.sec_tag_list  = NULL;
+	client.transport.tls.config.hostname      = cfg->broker;
 
 	/* Empty credentials mean an anonymous broker: leave the pointers NULL
 	 * rather than sending zero-length fields. */
@@ -396,7 +411,7 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 	deadline = k_uptime_get() + 10000;
 	while (!connack_seen && k_uptime_get() < deadline) {
 		struct zsock_pollfd fds = {
-			.fd = client.transport.tcp.sock,
+			.fd = client.transport.tls.sock,
 			.events = ZSOCK_POLLIN,
 		};
 
@@ -535,7 +550,7 @@ static void uplink_thread(void *a, void *b, void *c)
 
 			while (mqtt_connected && wifi_associated) {
 				struct zsock_pollfd fds = {
-					.fd = client.transport.tcp.sock,
+					.fd = client.transport.tls.sock,
 					.events = ZSOCK_POLLIN,
 				};
 
