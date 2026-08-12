@@ -74,7 +74,11 @@ kernel reboot cold             apply — every setter persists immediately,
 - `src/uwb_slave.c` — SLAVE mode: interrupt-driven SS-TWR responder, beacon
   observe, and beacon-collision TX suppression.
 - `src/uwb_gateway.c` — GATEWAY mode: TDMA beacon plus the CAP seat protocol.
-  MAC-only; it does not answer ranging polls.
+  MAC-only for *ranging*; it does not answer ranging polls. It does decode
+  `0xEA` POS frames and hand them to `pos_sink`.
+- `src/pos_sink.{c,h}` — consumes decoded tag position fixes. In E1 it logs one
+  JSON line per fix; E2 replaces the body of `pos_sink_publish()` with an MQTT
+  publish to `testtopic/1/position` and changes nothing else.
 - `docs/dw3000-zephyr-port.md` — the port reference: local deltas, the DW3000
   call-order footgun, resolved RESET polarity, verification status.
 - `docs/superpowers/{specs,plans}/` — board design spec and implementation plan.
@@ -213,6 +217,9 @@ kernel reboot cold             apply — every setter persists immediately,
   wrong across the wrap and the failure is rare, timing-dependent and looks
   like a radio fault. `beacon_guard.c` does this correctly and
   `tests/beacon_guard/` covers both directions across the boundary.
+- **POS (`0xEA`) is not gated on lease state.** The gateway publishes a fix from
+  any tag, including one whose seat has expired. Telemetry should not depend on
+  MAC bookkeeping, and a silently dropped fix is undebuggable from the broker.
 - **The gateway is MAC-only and holds two reserved values at once.** It uses
   short address `0x0000` per the contract and consumes no `anchor_id`, so the
   four ranging slaves take ids 0..3 (`0x0001`–`0x0004`). The deployment is
