@@ -98,6 +98,14 @@ static K_SEM_DEFINE(ip_sem, 0, 1);
 static struct net_mgmt_event_callback wifi_cb;
 static struct net_mgmt_event_callback ipv4_cb;
 
+/* Ground truth for "is the link actually up", set only from the WiFi
+ * association result/disconnect events and from a successful wifi_connect().
+ * uplink_thread()'s MQTT-level retry loop polls this to decide whether an
+ * MQTT failure should be retried in place (WiFi still up) or whether it must
+ * fall back to the outer loop and re-associate. g_state is a *display*
+ * string and must not be trusted for this decision -- see wifi_evt(). */
+static volatile bool wifi_associated;
+
 static void wifi_evt(struct net_mgmt_event_callback *cb, uint64_t event,
 		     struct net_if *iface)
 {
@@ -116,6 +124,10 @@ static void wifi_evt(struct net_mgmt_event_callback *cb, uint64_t event,
 	}
 	case NET_EVENT_WIFI_DISCONNECT_RESULT:
 		LOG_WRN("WiFi disconnected");
+		/* Cleared here, not just left to be inferred: this is the one
+		 * authoritative signal that the link actually dropped, as
+		 * opposed to an MQTT-only failure while WiFi stays up. */
+		wifi_associated = false;
 		g_state = ST_WIFI_CONNECTING;
 		break;
 	default:
@@ -244,6 +256,7 @@ static bool wifi_connect(const net_config_t *cfg)
 	}
 
 	g_state = ST_WIFI_CONNECTED;
+	wifi_associated = true;
 	return true;
 }
 
@@ -454,7 +467,7 @@ static bool drain_fix_queue(void)
 static void uplink_thread(void *a, void *b, void *c)
 {
 	const net_config_t *cfg = net_config_get();
-	uint32_t backoff_s = BACKOFF_START_S;
+	uint32_t wifi_backoff_s = BACKOFF_START_S;
 	char ip[NET_IPV4_ADDR_LEN];
 
 	ARG_UNUSED(a);
@@ -478,55 +491,96 @@ static void uplink_thread(void *a, void *b, void *c)
 	net_mgmt_init_event_callback(&ipv4_cb, ipv4_evt, NET_EVENT_IPV4_ADDR_ADD);
 	net_mgmt_add_event_callback(&ipv4_cb);
 
+	/* Outer loop: WiFi-level connectivity. Only entered/re-entered when
+	 * the link is believed to be down (cold start, wifi_connect()
+	 * failure, or a genuine NET_EVENT_WIFI_DISCONNECT_RESULT clearing
+	 * wifi_associated). Every iteration re-associates and resets both
+	 * backoff ladders. */
 	while (1) {
 		if (!wifi_connect(cfg)) {
-			LOG_WRN("retrying in %u s", backoff_s);
-			k_sleep(K_SECONDS(backoff_s));
-			backoff_s = MIN(backoff_s * 2u, BACKOFF_MAX_S);
+			LOG_WRN("retrying in %u s", wifi_backoff_s);
+			k_sleep(K_SECONDS(wifi_backoff_s));
+			wifi_backoff_s = MIN(wifi_backoff_s * 2u, BACKOFF_MAX_S);
 			continue;
 		}
 
-		backoff_s = BACKOFF_START_S;
+		wifi_backoff_s = BACKOFF_START_S;
 
 		if (net_uplink_get_ip(ip, sizeof(ip))) {
 			LOG_INF("{\"wifi\":\"connected\",\"ip\":\"%s\"}", ip);
 		}
 
-		if (!mqtt_bring_up(cfg)) {
-			LOG_WRN("MQTT retry in %u s", backoff_s);
-			k_sleep(K_SECONDS(backoff_s));
-			backoff_s = MIN(backoff_s * 2u, BACKOFF_MAX_S);
-			continue;
+		uint32_t mqtt_backoff_s = BACKOFF_START_S;
+
+		/* Inner loop: MQTT-level connectivity, retried in place while
+		 * WiFi is believed to still be associated. This is the fix
+		 * for the coupling bug -- an MQTT-only failure (broker down,
+		 * connection dropped, publish failure) must NOT call
+		 * wifi_connect() again: the ESP32 driver rejects a second
+		 * connect request with -EALREADY while already associated
+		 * and raises a fake CONN_FAIL event for it, which used to
+		 * burn the whole WiFi backoff ladder and then get stuck
+		 * because mqtt_bring_up() was never retried. */
+		while (wifi_associated) {
+			if (!mqtt_bring_up(cfg)) {
+				LOG_WRN("MQTT retry in %u s", mqtt_backoff_s);
+				k_sleep(K_SECONDS(mqtt_backoff_s));
+				mqtt_backoff_s = MIN(mqtt_backoff_s * 2u,
+						      BACKOFF_MAX_S);
+				continue;
+			}
+
+			mqtt_backoff_s = BACKOFF_START_S;
+			publish_anchor_stub();
+
+			while (mqtt_connected && wifi_associated) {
+				struct zsock_pollfd fds = {
+					.fd = client.transport.tcp.sock,
+					.events = ZSOCK_POLLIN,
+				};
+
+				if (zsock_poll(&fds, 1, POLL_TIMEOUT_MS) > 0 &&
+				    mqtt_input(&client) != 0) {
+					break;
+				}
+
+				/* Drives the keepalive PINGREQ. mqtt_live()
+				 * returns -EAGAIN directly as its return value
+				 * on the "not yet time to ping" path -- it
+				 * never touches errno -- so the return value
+				 * itself must be checked, not errno (which
+				 * could hold anything from an unrelated call
+				 * and would make this branch fire almost
+				 * every poll). */
+				int live_ret = mqtt_live(&client);
+
+				if (live_ret != 0 && live_ret != -EAGAIN) {
+					break;
+				}
+
+				if (!drain_fix_queue()) {
+					break;
+				}
+			}
+
+			LOG_WRN("MQTT connection lost — reconnecting");
+			mqtt_abort(&client);
+			mqtt_connected = false;
+
+			/* Only claim wifi-connected if WiFi is actually still
+			 * up. If wifi_associated went false while we were in
+			 * the connected loop above, wifi_evt() already set
+			 * g_state = ST_WIFI_CONNECTING for the real reason --
+			 * don't stomp on that with a stale "connected". */
+			if (wifi_associated) {
+				g_state = ST_WIFI_CONNECTED;
+			}
 		}
 
-		backoff_s = BACKOFF_START_S;
-		publish_anchor_stub();
-
-		while (mqtt_connected) {
-			struct zsock_pollfd fds = {
-				.fd = client.transport.tcp.sock,
-				.events = ZSOCK_POLLIN,
-			};
-
-			if (zsock_poll(&fds, 1, POLL_TIMEOUT_MS) > 0 &&
-			    mqtt_input(&client) != 0) {
-				break;
-			}
-
-			/* Drives the keepalive PINGREQ. */
-			if (mqtt_live(&client) != 0 && errno != EAGAIN) {
-				break;
-			}
-
-			if (!drain_fix_queue()) {
-				break;
-			}
-		}
-
-		LOG_WRN("MQTT connection lost — reconnecting");
-		mqtt_abort(&client);
-		mqtt_connected = false;
-		g_state = ST_WIFI_CONNECTED;
+		/* Reached only once wifi_associated is false: a genuine WiFi
+		 * disconnect. Fall back to the top of the outer loop, which
+		 * re-associates and resets mqtt_backoff_s (re-declared each
+		 * outer iteration) back to BACKOFF_START_S. */
 	}
 }
 

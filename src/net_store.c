@@ -46,8 +46,17 @@ static int load_str(settings_read_cb read_cb, void *cb_arg, size_t len,
 	scratch[len - 1] = '\0'; /* defend against a stored value with no NUL */
 
 	if (!apply(net_config_get(), scratch)) {
-		LOG_WRN("stored %s rejected by validation — keeping the default",
-			name);
+		if (scratch[0] == '\0') {
+			/* `net reset` persists empty strings for fields the user
+			 * cleared, and the setters reject empty values by design
+			 * (a min-length check) -- that is expected, not a
+			 * corrupt store, so stay quiet instead of warning on
+			 * every cold boot after a reset. */
+			LOG_DBG("stored %s is empty — keeping the default", name);
+		} else {
+			LOG_WRN("stored %s rejected by validation — keeping the "
+				"default", name);
+		}
 	}
 	return 0;
 }

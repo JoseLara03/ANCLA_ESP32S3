@@ -79,7 +79,7 @@ static int cmd_ssid(const struct shell *sh, size_t argc, char **argv)
 	ret = net_store_save_ssid();
 	if (ret) {
 		shell_error(sh, "error: ssid applied in RAM but NOT persisted "
-				"(errno %d) — will be lost on reboot", ret);
+				"(errno %d) — will be lost on reboot", -ret);
 		return ret;
 	}
 
@@ -103,7 +103,7 @@ static int cmd_pass(const struct shell *sh, size_t argc, char **argv)
 	ret = net_store_save_psk();
 	if (ret) {
 		shell_error(sh, "error: WiFi passphrase applied in RAM but NOT "
-				"persisted (errno %d) — will be lost on reboot", ret);
+				"persisted (errno %d) — will be lost on reboot", -ret);
 		return ret;
 	}
 
@@ -130,7 +130,7 @@ static int cmd_broker(const struct shell *sh, size_t argc, char **argv)
 	ret = net_store_save_broker();
 	if (ret) {
 		shell_error(sh, "error: broker applied in RAM but NOT persisted "
-				"(errno %d) — will be lost on reboot", ret);
+				"(errno %d) — will be lost on reboot", -ret);
 		return ret;
 	}
 
@@ -154,7 +154,7 @@ static int cmd_user(const struct shell *sh, size_t argc, char **argv)
 	ret = net_store_save_user();
 	if (ret) {
 		shell_error(sh, "error: user applied in RAM but NOT persisted "
-				"(errno %d) — will be lost on reboot", ret);
+				"(errno %d) — will be lost on reboot", -ret);
 		return ret;
 	}
 
@@ -178,7 +178,7 @@ static int cmd_mqttpass(const struct shell *sh, size_t argc, char **argv)
 	ret = net_store_save_mqtt_pass();
 	if (ret) {
 		shell_error(sh, "error: MQTT password applied in RAM but NOT "
-				"persisted (errno %d) — will be lost on reboot", ret);
+				"persisted (errno %d) — will be lost on reboot", -ret);
 		return ret;
 	}
 
@@ -198,7 +198,7 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 	ret = net_store_save_all();
 	if (ret) {
 		shell_error(sh, "error: defaults applied in RAM but NOT fully "
-				"persisted (errno %d)", ret);
+				"persisted (errno %d)", -ret);
 		return ret;
 	}
 
