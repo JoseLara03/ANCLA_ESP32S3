@@ -14,6 +14,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#include "net_config.h"
 #include "uwb_config.h"
 #include "uwb_modes.h"
 #include "uwb_radio.h"
@@ -37,6 +38,11 @@ int main(void)
 {
 	const uwb_config_t *cfg = uwb_config_get();
 	int ret;
+
+	/* Before uwb_store_init(): its settings_load() runs the "net" handler,
+	 * which writes into this singleton. Explicit rather than lazy because
+	 * net_uplink is a second thread (see net_config.h). */
+	net_config_init();
 
 	uwb_store_init();
 	log_config(cfg);

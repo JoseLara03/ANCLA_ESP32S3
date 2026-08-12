@@ -15,6 +15,8 @@ target_sources(app PRIVATE
 	src/gw_core.c
 	src/main.c
 	src/net_config.c
+	src/net_shell.c
+	src/net_store.c
 	src/pos_json.c
 	src/pos_sink.c
 	src/uwb_config.c
