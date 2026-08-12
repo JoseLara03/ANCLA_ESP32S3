@@ -14,6 +14,7 @@ target_sources(app PRIVATE
 	src/disc_schedule.c
 	src/gw_core.c
 	src/main.c
+	src/pos_sink.c
 	src/uwb_config.c
 	src/uwb_dwtime.c
 	src/uwb_frame_802_15_4z.c

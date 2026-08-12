@@ -20,6 +20,7 @@
 #include "uwb_modes.h"
 
 #include "gw_core.h"
+#include "pos_sink.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_mac.h"
@@ -225,6 +226,20 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 
 		LOG_INF("RELEASE addr=0x%04X", sa);
 		gw_core_release(ctx, sa);
+	} else if (uwb_frame_is_pos(buf, len)) {
+		struct pos_fix fix;
+
+		/* Deliberately not gated on gw_core seat state: a fix from a tag
+		 * whose lease just expired is still a real measurement, and
+		 * silently dropping it would be close to undebuggable from the
+		 * broker's side. */
+		if (uwb_frame_parse_pos(buf, len, &fix.src_addr, &fix.x, &fix.y,
+					&fix.residual_m, &fix.n_anchors,
+					&fix.batt_soc) == 0) {
+			pos_sink_publish(&fix);
+		} else {
+			LOG_WRN("malformed POS frame (len=%u)", len);
+		}
 	}
 	/* Anything else is tag<->anchor ranging traffic. MAC-only: not ours,
 	 * and logging every frame on a busy network would flood the console. */
