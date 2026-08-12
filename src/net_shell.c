@@ -13,11 +13,14 @@
 
 #include "net_config.h"
 #include "net_store.h"
+#include "net_uplink.h"
 
+#include <zephyr/net/net_ip.h>
 #include <zephyr/shell/shell.h>
 
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* strtoul() returns 0 on non-numeric input without reporting it, and the range
  * check alone would not catch a typo, so endptr does. Same helper shape as
@@ -42,16 +45,23 @@ static const char *secret_state(const char *s)
 static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 {
 	const net_config_t *c = net_config_get();
+	char ip[NET_IPV4_ADDR_LEN];
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 
+	if (!net_uplink_get_ip(ip, sizeof(ip))) {
+		strcpy(ip, "none");
+	}
+
 	shell_print(sh,
 		    "{\"ssid\":\"%s\",\"psk\":\"%s\",\"broker\":\"%s\",\"port\":%u,"
-		    "\"user\":\"%s\",\"mqttpass\":\"%s\",\"provisioned\":%u}",
+		    "\"user\":\"%s\",\"mqttpass\":\"%s\",\"provisioned\":%u,"
+		    "\"state\":\"%s\",\"ip\":\"%s\"}",
 		    c->ssid, secret_state(c->psk), c->broker, c->port,
 		    c->mqtt_user, secret_state(c->mqtt_pass),
-		    net_config_is_provisioned(c) ? 1u : 0u);
+		    net_config_is_provisioned(c) ? 1u : 0u,
+		    net_uplink_state_str(), ip);
 	return 0;
 }
 

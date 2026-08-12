@@ -17,6 +17,7 @@ target_sources(app PRIVATE
 	src/net_config.c
 	src/net_shell.c
 	src/net_store.c
+	src/net_uplink.c
 	src/pos_json.c
 	src/pos_sink.c
 	src/uwb_config.c

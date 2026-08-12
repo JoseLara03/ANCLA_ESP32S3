@@ -15,6 +15,7 @@
 #include <zephyr/logging/log.h>
 
 #include "net_config.h"
+#include "net_uplink.h"
 #include "uwb_config.h"
 #include "uwb_modes.h"
 #include "uwb_radio.h"
@@ -55,6 +56,20 @@ int main(void)
 	}
 
 	if (cfg->mode == UWB_MODE_GATEWAY) {
+		/* Run the beacon loop cooperatively so no network thread can
+		 * preempt a delayed-TX arm. The loop already yields at its
+		 * k_sem_take(), which is where every other thread gets time.
+		 *
+		 * This makes any unbounded busy-wait on this path fatal: no
+		 * lower-priority thread -- including the shell -- can ever run
+		 * again. Every spin here must be bounded (see
+		 * uwb_wait_for_sysstatus_lo).
+		 *
+		 * SLAVE mode is deliberately left at the default priority: it
+		 * runs no network thread, so the change would buy nothing and
+		 * would perturb a bench-confirmed path. */
+		k_thread_priority_set(k_current_get(), K_PRIO_COOP(0));
+		net_uplink_start();
 		uwb_gateway_run(cfg);
 	} else {
 		uwb_slave_run(cfg);
