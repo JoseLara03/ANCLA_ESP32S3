@@ -7,22 +7,23 @@ static int g_fail = 0;
 
 static void test_fix_exact_contract(void)
 {
-    /* The byte-for-byte contract with the existing Python consumer. */
+    /* The byte-for-byte contract with the downstream consumer. */
     struct pos_fix f = { .src_addr = 0x1234, .x = 1.23f, .y = 4.56f,
                          .residual_m = 0.12f, .n_anchors = 3, .batt_soc = 87 };
     char buf[POS_JSON_MAX_LEN];
     int n = pos_json_fix(buf, sizeof(buf), &f);
 
     CHECK(n > 0);
-    CHECK(strcmp(buf,
-        "{\"tagId\":\"1234\",\"x\":1.23,\"y\":4.56,\"z\":0,\"zoneName\":\"Zona\"}") == 0);
+    CHECK(strcmp(buf, "{\"Tid\":4660,\"x\":1.23,\"y\":4.56,\"z\":0}") == 0);
     CHECK(n == (int)strlen(buf));
 }
 
 static void test_fix_drops_diagnostics(void)
 {
     /* residual, n_anchors and batt_soc must NOT reach the payload -- they stay
-     * on the console log line. Changing this breaks the consumer contract. */
+     * on the console log line. zoneName is also gone: the consumer looks the
+     * zone up via the anchors topic instead. Changing this breaks the
+     * consumer contract. */
     struct pos_fix f = { .src_addr = 0x0001, .x = 0.0f, .y = 0.0f,
                          .residual_m = 9.99f, .n_anchors = 4, .batt_soc = 42 };
     char buf[POS_JSON_MAX_LEN];
@@ -31,22 +32,25 @@ static void test_fix_drops_diagnostics(void)
     CHECK(strstr(buf, "residual") == NULL);
     CHECK(strstr(buf, "anchors")  == NULL);
     CHECK(strstr(buf, "battery")  == NULL);
+    CHECK(strstr(buf, "zoneName") == NULL);
     CHECK(strstr(buf, "42")       == NULL);
 }
 
-static void test_tag_id_is_zero_padded_uppercase_hex(void)
+static void test_tid_is_plain_decimal_not_hex(void)
 {
-    /* 0x00AB must be "00AB", not "AB" and not "171". */
+    /* Tid is fix->src_addr as a bare decimal NUMBER, not a hex string:
+     * 0x00AB must be 171, not "00AB" and not quoted at all. */
     struct pos_fix f = { .src_addr = 0x00AB, .x = 0.0f, .y = 0.0f,
                          .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
     char buf[POS_JSON_MAX_LEN];
 
     CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
-    CHECK(strstr(buf, "\"tagId\":\"00AB\"") != NULL);
+    CHECK(strstr(buf, "\"Tid\":171,") != NULL);
+    CHECK(strstr(buf, "\"Tid\":\"") == NULL);
 
     f.src_addr = 0xBEEF;
     CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
-    CHECK(strstr(buf, "\"tagId\":\"BEEF\"") != NULL);
+    CHECK(strstr(buf, "\"Tid\":48879,") != NULL);
 }
 
 static void test_z_is_an_integer_literal(void)
@@ -57,7 +61,7 @@ static void test_z_is_an_integer_literal(void)
     char buf[POS_JSON_MAX_LEN];
 
     CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
-    CHECK(strstr(buf, "\"z\":0,") != NULL);
+    CHECK(strstr(buf, "\"z\":0}") != NULL);
     CHECK(strstr(buf, "\"z\":0.00") == NULL);
 }
 
@@ -79,7 +83,7 @@ static void test_fix_truncation_is_reported(void)
     /* A partial JSON document must never be published. */
     struct pos_fix f = { .src_addr = 0x1234, .x = 1.23f, .y = 4.56f,
                          .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
-    char small[16];
+    char small[8];
 
     CHECK(pos_json_fix(small, sizeof(small), &f) == -1);
 }
@@ -91,13 +95,27 @@ static void test_anchors_stub(void)
 
     CHECK(n > 0);
     CHECK(n == (int)strlen(buf));
-    /* Same zone identifier as the position payload -- both topics must agree. */
-    CHECK(strstr(buf, "\"name\":\"Zona\"") != NULL);
+    CHECK(strstr(buf, "\"name\":\"852541\"") != NULL);
     CHECK(strstr(buf, "\"anchors\":[") != NULL);
-    CHECK(strstr(buf, "\"isAxis\":true") != NULL);
-    CHECK(strstr(buf, "\"isReferenceAxis\":true") != NULL);
-    CHECK(strstr(buf, "\"latitude\":0.0") != NULL);
-    CHECK(strstr(buf, "\"longitude\":0.0") != NULL);
+
+    /* Exactly one axis/reference anchor, carrying the only real
+     * (building-level) lat/long -- the other three are local-only. */
+    CHECK(strstr(buf, "\"name\":\"ANC-LOBBY-001\",\"isAxis\":true,"
+                      "\"isReferenceAxis\":true,"
+                      "\"latitude\":21.01604164655441,"
+                      "\"longitude\":-89.6521292940793") != NULL);
+    CHECK(strstr(buf, "\"name\":\"ANC-LOBBY-002\",\"isAxis\":false,"
+                      "\"isReferenceAxis\":false,"
+                      "\"latitude\":0,\"longitude\":0") != NULL);
+    CHECK(strstr(buf, "\"name\":\"ANC-LOBBY-003\"") != NULL);
+    CHECK(strstr(buf, "\"name\":\"ANC-LOBBY-004\"") != NULL);
+
+    /* Four anchors at the corners of a 2 m x 2 m square. */
+    CHECK(strstr(buf, "\"x\":0.0,\"y\":0.0,\"z\":0.0") != NULL);
+    CHECK(strstr(buf, "\"x\":2.0,\"y\":0.0,\"z\":0.0") != NULL);
+    CHECK(strstr(buf, "\"x\":2.0,\"y\":2.0,\"z\":0.0") != NULL);
+    CHECK(strstr(buf, "\"x\":0.0,\"y\":2.0,\"z\":0.0") != NULL);
+
     CHECK(buf[n - 1] == '}');
 }
 
@@ -121,7 +139,7 @@ int main(void)
 {
     test_fix_exact_contract();
     test_fix_drops_diagnostics();
-    test_tag_id_is_zero_padded_uppercase_hex();
+    test_tid_is_plain_decimal_not_hex();
     test_z_is_an_integer_literal();
     test_negative_and_large_coordinates();
     test_fix_truncation_is_reported();

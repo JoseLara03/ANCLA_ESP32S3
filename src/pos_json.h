@@ -17,16 +17,22 @@
 
 #include "pos_sink.h"
 
-/* Zone identifier. Published as "zoneName" on the position topic and as "name"
- * on the anchor topic -- one define so the two can never disagree. */
-#define POS_JSON_ZONE_NAME "Zona"
+/* Zone identifier, published as "name" on the anchors topic. The position
+ * topic no longer carries a zone field -- the consumer looks it up via the
+ * anchors topic instead. */
+#define POS_JSON_ZONE_NAME "852541"
 
 /* Buffer size that fits either document plus its NUL. The anchors stub is the
- * larger of the two; tests/pos_json/ asserts it still fits. */
-#define POS_JSON_MAX_LEN 512
+ * larger of the two (four named anchors plus one real lat/long pair);
+ * tests/pos_json/ asserts it still fits. */
+#define POS_JSON_MAX_LEN 640
 
 /* Format one fix as the position payload:
- *   {"tagId":"1234","x":1.23,"y":4.56,"z":0,"zoneName":"Zona"}
+ *   {"Tid":4660,"x":1.23,"y":4.56,"z":0}
+ *
+ * Tid is fix->src_addr as a plain decimal number (NOT hex, NOT a string) --
+ * 0x1234 formats as 4660. z is the integer literal 0: the solver is 2D and
+ * there is no z measurement yet.
  *
  * Returns the number of bytes written excluding the NUL, or -1 if the buffer
  * was too small. On -1 the caller MUST drop the message: publishing a

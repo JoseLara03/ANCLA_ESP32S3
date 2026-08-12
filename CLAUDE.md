@@ -87,9 +87,15 @@ net reset                      restore network defaults
   per fix (the only place `residual`/`batt` stay visible) and hands the fix to
   `net_uplink` through a bounded queue.
 - `src/pos_json.{c,h}` — MQTT payload formatting. Pure C, host-tested in
-  `tests/pos_json/`. The position payload is a **fixed contract** with an
-  existing Python consumer: `tagId` is bare uppercase hex with no `0x` prefix,
-  `z` is the integer `0`, and the diagnostic fields are deliberately absent.
+  `tests/pos_json/`. The position payload is a **fixed contract** with the
+  downstream consumer: `{"Tid":<decimal>,"x":...,"y":...,"z":0}` — `Tid` is
+  `fix->src_addr` as a **plain decimal number** (not hex, not a string; e.g.
+  `0x1234` → `4660`), `z` is the integer `0`, there is no `zoneName` (the
+  consumer gets the zone from the anchors topic), and the diagnostic fields
+  are deliberately absent. The anchors stub publishes zone `"852541"` and
+  four named anchors (`ANC-LOBBY-001..004`) at the corners of a 2 m × 2 m
+  square; only `ANC-LOBBY-001` is the axis/reference anchor and carries a
+  real (building-level) lat/long — the rest are local-only placeholders.
 - `src/net_config.{c,h}` — WiFi and MQTT settings. Pure C, host-tested in
   `tests/net_config/`. Explicitly initialised from `main()`, **not** lazily like
   `uwb_config_get()`, because `net_uplink` is a second thread.
