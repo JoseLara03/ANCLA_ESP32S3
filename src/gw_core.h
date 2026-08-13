@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * CFP seat management for the gateway: a 12-entry table keyed by slot index,
+ * CFP seat management for the gateway: an 11-entry table keyed by slot index,
  * leases aged one superframe at a time, and a monotonic short-address pool for
  * joining tags. Ported unchanged from the nRF5 gateway (fw-cre Src/gw_core.c);
  * it was already pure C with no radio dependency, which is why it carries the
@@ -17,7 +17,7 @@
 #include <stdbool.h>
 #include "uwb_frame_802_15_4z.h"   /* UWB_FRAME_N_CFP / _EUI_LEN / _ADDR_BCAST */
 
-#define GW_N_CFP          UWB_FRAME_N_CFP   /* 12 ranging slots */
+#define GW_N_CFP          UWB_FRAME_N_CFP   /* 11 ranging slots */
 #define GW_LEASE_SF       50u               /* lease length, superframes */
 #define GW_TAG_ADDR_BASE  0x0100u           /* tag short-addr pool base */
 

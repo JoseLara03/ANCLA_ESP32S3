@@ -20,6 +20,7 @@
 #include "uwb_modes.h"
 
 #include "gw_core.h"
+#include "pos_sink.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_mac.h"
@@ -120,7 +121,7 @@ static uint64_t tx_beacon(struct gw_core_ctx *ctx, bool delayed, uint32_t tx_at)
 
 	gw_core_build_slotmap(ctx, slot_map);
 
-	/* GW_N_CFP == UWB_FRAME_N_CFP == 12, so need = 15 + 24 = 39 =
+	/* GW_N_CFP == UWB_FRAME_N_CFP == 11, so need = 15 + 22 = 37 =
 	 * UWB_FRAME_MAX_LEN and beacon_buf is exactly large enough.
 	 * uwb_frame_beacon_build() does not bound n_slots itself -- a known
 	 * defect in the frame module, left unfixed because that file is kept
@@ -225,6 +226,17 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 
 		LOG_INF("RELEASE addr=0x%04X", sa);
 		gw_core_release(ctx, sa);
+	} else if (uwb_frame_is_pos(buf, len)) {
+		struct pos_fix fix;
+
+		/* Deliberately not gated on gw_core seat state: a fix from a tag
+		 * whose lease just expired is still a real measurement, and
+		 * silently dropping it would be close to undebuggable from the
+		 * broker's side. */
+		uwb_frame_parse_pos(buf, len, &fix.src_addr, &fix.x, &fix.y,
+				    &fix.residual_m, &fix.n_anchors,
+				    &fix.batt_soc);
+		pos_sink_publish(&fix);
 	}
 	/* Anything else is tag<->anchor ranging traffic. MAC-only: not ours,
 	 * and logging every frame on a busy network would flood the console. */

@@ -32,6 +32,13 @@ anchor ant <tx> <rx>           antenna delays (default 16385/16385)
 anchor reset                   restore defaults
 kernel reboot cold             apply — every setter persists immediately,
                                but changes take effect only on reboot
+net show                       network config and live state as JSON
+net ssid <ssid>                WiFi SSID
+net pass <psk>                 WiFi passphrase (8..63) — NOT the MQTT password
+net broker <host> [port]       MQTT broker; port defaults to 1883
+net user <username>            MQTT username
+net mqttpass <password>        MQTT password — NOT the WiFi passphrase
+net reset                      restore network defaults
 ```
 
 ## Layout
@@ -74,7 +81,28 @@ kernel reboot cold             apply — every setter persists immediately,
 - `src/uwb_slave.c` — SLAVE mode: interrupt-driven SS-TWR responder, beacon
   observe, and beacon-collision TX suppression.
 - `src/uwb_gateway.c` — GATEWAY mode: TDMA beacon plus the CAP seat protocol.
-  MAC-only; it does not answer ranging polls.
+  MAC-only for *ranging*; it does not answer ranging polls. It does decode
+  `0xEA` POS frames and hand them to `pos_sink`.
+- `src/pos_sink.{c,h}` — consumes decoded tag position fixes. Logs one JSON line
+  per fix (the only place `residual`/`batt` stay visible) and hands the fix to
+  `net_uplink` through a bounded queue.
+- `src/pos_json.{c,h}` — MQTT payload formatting. Pure C, host-tested in
+  `tests/pos_json/`. The position payload is a **fixed contract** with the
+  downstream consumer: `{"Tid":<decimal>,"x":...,"y":...,"z":0}` — `Tid` is
+  `fix->src_addr` as a **plain decimal number** (not hex, not a string; e.g.
+  `0x1234` → `4660`), `z` is the integer `0`, there is no `zoneName` (the
+  consumer gets the zone from the anchors topic), and the diagnostic fields
+  are deliberately absent. The anchors stub publishes zone `"852541"` and
+  four named anchors (`ANC-LOBBY-001..004`) at the corners of a 2 m × 2 m
+  square; only `ANC-LOBBY-001` is the axis/reference anchor and carries a
+  real (building-level) lat/long — the rest are local-only placeholders.
+- `src/net_config.{c,h}` — WiFi and MQTT settings. Pure C, host-tested in
+  `tests/net_config/`. Explicitly initialised from `main()`, **not** lazily like
+  `uwb_config_get()`, because `net_uplink` is a second thread.
+- `src/net_store.{c,h}` — the above persisted under the `net/` settings subtree.
+- `src/net_shell.c` — the `net` console command tree.
+- `src/net_uplink.{c,h}` — the WiFi + MQTT uplink thread and the bounded fix
+  queue. GATEWAY mode only.
 - `docs/dw3000-zephyr-port.md` — the port reference: local deltas, the DW3000
   call-order footgun, resolved RESET polarity, verification status.
 - `docs/superpowers/{specs,plans}/` — board design spec and implementation plan.
@@ -111,8 +139,8 @@ kernel reboot cold             apply — every setter persists immediately,
   an 11-byte payload). Always pass `flen - FCS_LEN` to the frame module. The
   `is_*` validators tolerate the extra bytes because they test `len >=`, but
   `uwb_frame_parse_beacon()` derives its slot count from the length — an
-  unsubtracted FCS turns a 12-slot beacon into 13, with the FCS read as the
-  thirteenth slot. It fails silently and the output looks plausible.
+  unsubtracted FCS turns an 11-slot beacon into 12, with the FCS read as the
+  twelfth slot. It fails silently and the output looks plausible.
 - **Never poll `DWT_INT_CIADONE_BIT_MASK` after an RX event.** `dwt_isr()` clears
   `SYS_STATUS_ALL_RX_GOOD` — which includes CIADONE — *before* it calls
   `cbRxOk` (`dw3000_device.c:4764` then `:4791`). Waiting on it hangs until the
@@ -213,6 +241,9 @@ kernel reboot cold             apply — every setter persists immediately,
   wrong across the wrap and the failure is rare, timing-dependent and looks
   like a radio fault. `beacon_guard.c` does this correctly and
   `tests/beacon_guard/` covers both directions across the boundary.
+- **POS (`0xEA`) is not gated on lease state.** The gateway publishes a fix from
+  any tag, including one whose seat has expired. Telemetry should not depend on
+  MAC bookkeeping, and a silently dropped fix is undebuggable from the broker.
 - **The gateway is MAC-only and holds two reserved values at once.** It uses
   short address `0x0000` per the contract and consumes no `anchor_id`, so the
   four ranging slaves take ids 0..3 (`0x0001`–`0x0004`). The deployment is
@@ -247,6 +278,31 @@ kernel reboot cold             apply — every setter persists immediately,
   holds under real JOIN/GRANT load, not just in isolation. KEEPALIVE and
   RELEASE are implemented (`src/gw_core.c`) but not yet independently
   observed on the bench; lease expiry substitutes for RELEASE above.
+- **`CONFIG_NET_TC_THREAD_PREEMPTIVE=y` is load-bearing, not tuning.** The
+  `NET_TC_THREAD_TYPE` choice has no explicit default, so it resolves to its
+  first entry, `NET_TC_THREAD_COOPERATIVE`, at base priority 0 — i.e.
+  `K_PRIO_COOP(0)`, the *same* priority `main()` is promoted to in GATEWAY mode.
+  A cooperative thread cannot be preempted, so an RX burst runs to completion
+  and can overrun `BEACON_ARM_MARGIN_UUS` (5 ms). Removing this line does not
+  fail to build and does not fail immediately — it makes the beacon
+  intermittently late under network load.
+- **The GATEWAY loop runs at `K_PRIO_COOP(0)`, so every busy-wait on that path
+  must be bounded.** No lower-priority thread — including the shell — can run
+  while it spins. An unbounded TXFRS wait already froze this board once at
+  priority 0; cooperatively it is unrecoverable by construction.
+- **WiFi is not on its own core and cannot be.** `WIFI_ESP32` is
+  `depends on !SMP`, and the AMP alternative cannot host the network stack
+  because the blobs bind to procpu. Isolation is by thread priority: the
+  gateway loop cooperative, the WiFi blob tasks preemptible at ≤7
+  (`ESP32_WIFI_MAX_THREAD_PRIORITY`), and `net_uplink` at 10.
+- **`WIFI_ESP32` selects `MBEDTLS` and `PSA_CRYPTO` regardless of MQTT.** They
+  are needed for WPA2 supplicant crypto, so mbedTLS is linked even with a
+  plain-TCP broker. Adding MQTT TLS later therefore costs the TLS heap arena, a
+  CA certificate and SNTP — not the library itself.
+- **There are two passwords and they are not interchangeable.** `net pass` is
+  the WiFi PSK (NVS `net/psk`, JSON `"psk"`); `net mqttpass` is the MQTT
+  password (NVS `net/mqttpass`, JSON `"mqttpass"`). Command, key and JSON field
+  agree in each case, deliberately.
 
 ## System context
 
@@ -288,6 +344,12 @@ gcc -Wall -Wextra -Isrc -o tests/gw_core/test_gw_core.exe tests/gw_core/test_gw_
 
 gcc -Wall -Wextra -Isrc -o tests/beacon_guard/test_beacon_guard.exe tests/beacon_guard/test_beacon_guard.c src/beacon_guard.c
 ./tests/beacon_guard/test_beacon_guard.exe      # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/pos_json/test_pos_json.exe tests/pos_json/test_pos_json.c src/pos_json.c
+./tests/pos_json/test_pos_json.exe              # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/net_config/test_net_config.exe tests/net_config/test_net_config.c src/net_config.c
+./tests/net_config/test_net_config.exe          # PASSED, exits 0
 ```
 
 ## Repo

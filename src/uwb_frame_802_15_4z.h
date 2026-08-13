@@ -16,12 +16,13 @@
 #define UWB_FRAME_TYPE_GRANT     0xE7
 #define UWB_FRAME_TYPE_KEEPALIVE 0xE8
 #define UWB_FRAME_TYPE_RELEASE   0xE9
+#define UWB_FRAME_TYPE_POS       0xEA
 
 #define UWB_ADDR_GATEWAY  0x0000u
 #define UWB_ADDR_UNASSOC  0xFFFEu   /* tag src before it is granted a short addr */
 
-#define UWB_PROTO_VER     1
-#define UWB_FRAME_N_CFP   12        /* ranging slots per superframe (v1) */
+#define UWB_PROTO_VER     2
+#define UWB_FRAME_N_CFP   11        /* ranging slots per superframe (v2) */
 #define UWB_FRAME_N_CAP   4         /* CAP Aloha mini-slots (v1) */
 
 #define UWB_FRAME_PANID       0xCADE  /* written as literal bytes 0xCA,0xDE */
@@ -31,7 +32,7 @@
 #define UWB_FRAME_HDR_LEN     10  /* bytes 0-9 common header */
 #define UWB_FRAME_LEN_DISC    14
 #define UWB_FRAME_LEN_RESP    20
-#define UWB_FRAME_MAX_LEN     39  /* BEACON with 12 slots, excl. FCS */
+#define UWB_FRAME_MAX_LEN     37  /* BEACON with 11 slots, excl. FCS */
 
 /* Multi-poll is variable length: header(10) + num(1) + n*(addr2+delay2) + ts(4). */
 #define UWB_FRAME_LEN_MPOL(n)  (15 + 4 * (n))
@@ -42,6 +43,12 @@
 #define UWB_FRAME_LEN_KEEPALIVE  12
 #define UWB_FRAME_LEN_RELEASE    10
 #define UWB_FRAME_EUI_LEN        8
+
+/* batt_soc value meaning "no reading" — the charger is connected (terminal
+ * voltage says nothing about charge then) or the gauge failed. Distinct from a
+ * real 0 % reading. */
+#define UWB_FRAME_POS_SOC_UNKNOWN 0xFFu
+#define UWB_FRAME_LEN_POS        24
 
 struct uwb_anchor_slot {
     uint16_t addr;      /* anchor short address */
@@ -98,6 +105,15 @@ int uwb_frame_parse_keepalive(const uint8_t *buf, size_t len, uint16_t *src_addr
 bool uwb_frame_is_keepalive(const uint8_t *buf, size_t len);
 int uwb_frame_release_build(uint8_t *buf, size_t buf_len, uint16_t src_addr);
 bool uwb_frame_is_release(const uint8_t *buf, size_t len);
+
+/* ---- POS (0xEA): tag position report, tag -> gateway ---- */
+int  uwb_frame_pos_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                         float x, float y, float residual_m,
+                         uint8_t n_anchors, uint8_t batt_soc);
+bool uwb_frame_is_pos(const uint8_t *buf, size_t len);
+int  uwb_frame_parse_pos(const uint8_t *buf, size_t len, uint16_t *src_addr,
+                         float *x, float *y, float *residual_m,
+                         uint8_t *n_anchors, uint8_t *batt_soc);
 
 /* ---- Validators ---- */
 bool uwb_frame_is_valid(const uint8_t *buf, size_t len);
