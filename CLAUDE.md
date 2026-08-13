@@ -6,6 +6,63 @@ Qorvo DW3220 (DW3000 family), plus a MAX17048 fuel gauge and a WS2812 RGB LED.
 **Start here:** `docs/handoff-2026-08-10-dw3000-port.md` — current state, build
 and flash commands, and the two traps that have already cost a debug cycle each.
 
+## Status: the chain works end to end (2026-08-13)
+
+Bench-verified with 3 anchors + 1 gateway + 1 tag in a ~1 m layout: a tag joins,
+discovers three anchors, ranges them, solves a 2D fix, reports it as `0xEA`, and
+the gateway republishes it to the customer platform over MQTT. Position fixes
+are visible on the platform.
+
+**The numbers it produces are not yet trustworthy.** Two things below must land
+before any position is worth reading.
+
+## URGENT next work
+
+### 1. Antenna delay calibration
+
+Every unit still runs the factory seed `ant_tx = ant_rx = 16385`
+(`UWB_ANT_DELAY_DEFAULT`), which has never been trimmed on this hardware.
+
+Measured effect: solving over a **1 m** anchor geometry produced residuals of
+**1.9–2.0 m** in one session and **0.48–0.73 m** in another. A residual larger
+than the array itself means the three ranges disagree wildly; the reported
+`(x, y)` wandered ~0.7 m between consecutive fixes with nothing moving.
+
+Until this is done, **no coordinate this system emits means anything**, and no
+amount of solver or geometry work will change that.
+
+- Console hook already exists: `anchor ant <tx> <rx>`, persisted per board.
+- Only **TX** needs trimming: `RX_ANT_DLY` cancels in `RTD_resp`, so it drops
+  out of the SS-TWR result. The sibling ESP-IDF project documents this and
+  carries a working automated procedure — `src/anchor_cal.{c,h}` plus the
+  `cal self <ref_mm>` command in `src/ranging.c`, which takes 1000 samples at a
+  known reference distance, trims outliers and solves for the delay. Port that
+  procedure rather than re-deriving it.
+- With 3 anchors solving in 2D there is one degree of redundancy, so `residual`
+  in the `0xEA` frame is a genuine (if weak) quality signal — it is the metric
+  to watch collapse as the delays are trimmed.
+
+### 2. Anchor auto-positioning
+
+Anchor coordinates are hand-entered with `anchor pos` and are **silently wrong**
+when unset: `position_valid` gates only the GATEWAY's beaconing, so a SLAVE with
+no position happily answers ranging polls reporting **(0, 0)**. Three anchors all
+claiming the origin yields a confidently meaningless fix with no error anywhere.
+This has already cost a bench session — after an `anchor id` swap the
+coordinates did *not* follow the ids, leaving two live anchors on the same
+baseline and the apex coordinate stranded on a third board.
+
+The anchors payload published retained to `uwb/anchor/setup/<zone>` is also
+**still the stub** (`ANC-LOBBY-001..004` at the corners of a 2 m square, only
+`-001` carrying a real lat/long — see `pos_json.c`). The platform therefore draws
+the stub geometry, not the deployment. Auto-positioning should feed this payload
+too, so the map and the solver agree by construction.
+
+Approach to evaluate: **DS-TWR between anchors only.** Anchors are static and can
+afford the extra exchange for precision, then the inter-anchor geometry is
+solved. This is Phase 5 of the sibling project's roadmap and is deliberately
+distinct from the tag-facing SS-TWR path.
+
 ## Build & flash
 
 ```powershell
@@ -303,6 +360,55 @@ net reset                      restore network defaults
   the WiFi PSK (NVS `net/psk`, JSON `"psk"`); `net mqttpass` is the MQTT
   password (NVS `net/mqttpass`, JSON `"mqttpass"`). Command, key and JSON field
   agree in each case, deliberately.
+- **Driving the external PA requires `dwt_setfinegraintxseq(0)` *before*
+  `dwt_setlnapamode()`.** Fine grain TX sequencing is ON by default and the
+  Qorvo API forbids it while an external PA is enabled (note on
+  `dwt_setlnapamode()` in `deca_device_api.h`); left on, EXTTXE does not hold
+  the QM14070 asserted across the frame. `uwb_radio.c` does both, in that order.
+  The board has a PA but **no LNA** — the `DWT_LNA_ENABLE` bit is therefore
+  cosmetic here.
+- **MQTT topics are zone-scoped and composed from `POS_JSON_ZONE_NAME`**, not
+  written as literals: `uwb/anchor/setup/<zone>` (retained, QoS 1, published
+  once per connect) and `uwb/response/position/<zone>` (QoS 0, one per fix).
+  The zone id lives only in `pos_json.h`, so a topic can never disagree with the
+  payload published on it.
+- **A board that transmits exactly one frame per boot and then goes silent is a
+  wedged DW3220, not a firmware bug.** Diagnosed the long way once: it happened
+  identically in SLAVE *and* GATEWAY mode — two entirely different loops — with
+  a **live shell**, so the main thread was not spinning. In GATEWAY mode every
+  beacon carried `seq = 0` and `frame_counter = 0`, proving the loop never
+  reached its second iteration: `uwb_gateway_run()`'s inner loop only exits when
+  `dwt_readsystimestamphi32()` says the next beacon is due, so a frozen chip
+  clock traps it forever. Prime physical suspect is the supply sagging under the
+  PA's draw at the first TX, since everything works right up to that instant.
+  Swapping the board fixed it.
+- **To tell a firmware fault from a board fault, swap `anchor id` between a
+  working unit and a suspect one.** Two console commands, no rebuild. If the
+  symptom follows the *id*, it is timing or configuration; if it follows the
+  *board*, it is hardware. This is what exonerated `DISC_BASE_UUS = 2000` after
+  two captures had implicated it.
+- **The tag needs three anchors and fails silently with two.**
+  `UWB_NET_MIN_ANCHORS = 3` (tag side). Below it the tag oscillates
+  DISCOVER→RANGING→DISCOVER forever and never emits `0xEA` — visible in a
+  sniffer capture as alternating `0xE2`/`0xE4` and `0xE0`/`0xE1` bursts with no
+  POS frame. A gateway does **not** count: it is MAC-only for ranging and never
+  answers a poll.
+- **Reading sniffer captures: `frame_seq_nb` is consumed at *build* time**, in
+  `anchor_respond_discovery()` before both the beacon-guard check and
+  `tx_delayed()`. So a gap in an anchor's sequence numbers means "built but
+  never reached the sniffer" (suppressed, TX-failed, or lost in the air), while
+  1:1 continuity against the tag's DISCOVERY broadcasts proves the responder
+  answered every single one. That distinction is what separates an RF problem
+  from a firmware problem without touching the boards. Note the sniffer's
+  `RX[n]` length **excludes** the FCS, unlike `dwt_getframelength()`.
+- **The ANCLA boards transmit well below free-space expectation, and this is
+  unresolved.** Measured with the sniffer 0.5 m from the gateway: beacons at
+  −84 dBm where ~−57 dBm is predicted, while the tag at ~3 m arrived at
+  −74.5 dBm against ~−72.5 dBm predicted — i.e. the tag matches physics and the
+  ANCLA boards are ~25 dB down. That ceiling is why early range tests died at
+  2–3 m. The fine-grain TX fix above was applied but a controlled before/after
+  (same positions, firmware toggled) was **never run**, so its contribution is
+  unknown. Re-measure before trusting any range budget.
 
 ## System context
 
@@ -322,8 +428,15 @@ bench-confirmed (see "This project's own GATEWAY mode" above); KEEPALIVE and
 RELEASE are implemented but not yet independently observed on the bench.
 Both response paths are bench-confirmed correct over the air (sniffer capture,
 see the "Ranging confirmed on the bench" hard-won fact above) after fixing the
-delayed-TX turnaround budget and an unbounded-wait hang; the tag's actual
-distance computation is not independently observable from this project.
+delayed-TX turnaround budget and an unbounded-wait hang.
+
+The tag's distance computation **is** now observable, end to end: with three
+anchors answering, sniffer captures show the tag's `0xEA` POS frames carrying
+`n_anchors = 3`, the responders' turnaround measured at exactly
+`POLL_RX_TO_RESP_TX_DLY_UUS + ant_delay_tx` (2000 UUS × 65536 + ~16 000 DTU,
+read straight off the wire), the gateway logging each fix through `pos_sink`,
+and the platform receiving them over MQTT. What is **not** yet trustworthy is
+the accuracy of those coordinates — see "URGENT next work" at the top.
 
 ## Host tests
 
