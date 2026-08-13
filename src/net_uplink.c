@@ -68,8 +68,13 @@ static enum uplink_state g_state = ST_UNCONFIGURED;
  * 50 ms against a 200 ms superframe is not a meaningful added latency. */
 #define POLL_TIMEOUT_MS 50
 
-#define LOCATION_TOPIC "testtopic/1/position"
-#define ANCHOR_TOPIC   "testtopic/1/anchors"
+/* Both topics are zone-scoped, and the trailing element is the same zone id the
+ * anchors payload already carries as its "name" field -- so it is composed from
+ * POS_JSON_ZONE_NAME rather than repeated as a literal here. Changing zone is
+ * then one edit in pos_json.h, and the topic can never disagree with the
+ * payload published on it. */
+#define LOCATION_TOPIC "uwb/response/position/" POS_JSON_ZONE_NAME
+#define ANCHOR_TOPIC   "uwb/anchor/setup/" POS_JSON_ZONE_NAME
 
 static struct mqtt_client client;
 static struct sockaddr_storage broker_addr;
