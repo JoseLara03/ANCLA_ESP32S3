@@ -96,6 +96,18 @@ int uwb_radio_init(const uwb_config_t *cfg)
 	dwt_configuretxrf(&tx_cfg);
 	dwt_settxantennadelay(cfg->ant_delay_tx);
 	dwt_setrxantennadelay(cfg->ant_delay_rx);
+	/* Must precede dwt_setlnapamode(): driving the external PA requires fine
+	 * grain TX sequencing to be off (Qorvo API note on dwt_setlnapamode() in
+	 * deca_device_api.h), and it is ON by default. Left on, EXTTXE does not
+	 * hold the PA asserted across the frame and the board transmits far below
+	 * its rated power -- measured on the bench as this board's frames landing
+	 * at -90..-92 dBm where a DWM3001C anchor at comparable range landed at
+	 * -74..-76 dBm, i.e. within 1-3 dB of the DW3000's ~-93 dBm sensitivity
+	 * floor, which cost ~40 % of DISCOVERY responses to packet loss. The
+	 * symptom is TX-only and looks like an RF range problem, not a firmware
+	 * one: RX is unaffected, so the anchor still hears every poll it fails to
+	 * answer audibly. */
+	dwt_setfinegraintxseq(0);
 	dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
 
 	ret = dw3000_hw_init_interrupt();
