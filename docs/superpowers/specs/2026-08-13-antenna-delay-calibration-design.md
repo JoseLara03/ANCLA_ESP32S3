@@ -120,6 +120,14 @@ Qorvo's stock `ss_twr_responder` example, PHY-matched to this project's contract
 (channel 5, PLEN_1024, PAC32, code 9, 850 kbps, SFD_IEEE_4Z, STS/PDoA off), and
 configured to load the OTP delay rather than the example's hardcoded `16385`.
 
+**Its `POLL_RX_TO_RESP_TX_DLY_UUS` must also be raised from the example's 450 to
+2000, matching `anchor_respond.c:60`.** This is not a preference. The example's
+450 µus assumes the example's PLEN_128 preamble (~131 µus); under this project's
+PLEN_1024 the preamble alone is ~1.05 ms, so a 450 µus turnaround is physically
+impossible — the responder would have to begin transmitting before it finished
+receiving the poll. Setting it to 2000 also means one set of initiator RX timings
+(§5.2) covers both peer types, with nothing to get wrong per-peer.
+
 **This is a dependency outside this repository.** If the OTP value turns out not
 to be loaded, or the PHY is not matched, the cross-check in §6.3 is what will
 reveal it — see §7.
@@ -285,6 +293,21 @@ Body: `new_total = cal_solve_step(measured_mm, ref_mm, cur_tx + cur_rx)`, then
 `uwb_config_set_ant()` + `uwb_store` path that `anchor ant` uses, leaving
 `ant_delay_rx` at 16385.
 
+**The new delay is applied hot, not only on the next boot.** `cal_run` calls
+`dwt_settxantennadelay(new_tx)` and updates its own config snapshot in the same
+breath, so a second `cal ref` immediately re-measures the trimmed board with no
+reboot in between. This is what the sibling does (`ranging.c:440-445`, *"aplica en
+caliente"*) and it is safe here in a way it would not be in production: the write
+happens inside `cal_run`'s own loop between batches, and `cal_run` is the sole
+owner of that snapshot.
+
+The snapshot and the radio register must move **together**. `anchor_respond.c:141`
+builds the reported `resp_tx_ts` by adding `cfg->ant_delay_tx` in software, while
+the radio applies the register value to the frame it actually sends; if the two
+disagree, this board silently reports a turnaround it did not perform. This is
+the same hazard `uwb_slave.c:168-176` avoids by snapshotting — production keeps
+the reboot-to-apply rule, and only the cal image is allowed to move both at once.
+
 Applied on the next boot, consistent with the documented "every setter persists
 immediately, but changes take effect only on reboot" contract. `uwb_slave_run()`
 snapshots the config at mode entry precisely so a live edit cannot desynchronise
@@ -331,8 +354,9 @@ Tags powered off, so nothing else polls the air.
 
 ### 6.3 Sequence
 
-1. For each anchor in turn: `cal ref <mm>`, then `cal ref <mm>` again. The second
-   run's reported error is the residual.
+1. For each anchor in turn: `cal ref <mm>`, then `cal ref <mm>` again. No reboot
+   between the two — the first run applies its result hot (§5.5), so the second
+   run's reported error *is* the residual of the trimmed board.
 2. After all three are trimmed, cross-check every anchor pair with
    `cal peer <id> <mm>` at tape-measured distances. These pairs were never used
    to calibrate anything, so their residual is independent evidence.
