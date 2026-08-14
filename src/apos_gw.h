@@ -96,16 +96,30 @@ enum apos_gw_phase {
  * It cannot be split across steps (apos_geom_refine() is one call and keeps its
  * working matrices in function-local static storage), so instead the solve step
  * simply refuses to start unless this much time remains before the beacon must
- * be armed. The gateway loop offers up to ~195000 uus immediately after a
- * beacon, so the solve reliably runs in the first step of a superframe and
- * costs at most one superframe of latency.
+ * be armed.
  *
- * 60000 uus (~61.5 ms) is ~3x a pessimistic 200-iteration estimate and still
- * under a third of the superframe. THIS IS AN ESTIMATE, not a measurement: it
- * has never been timed on hardware. If a bench run ever shows a late beacon at
- * the instant `{"apos_solve":...}` is logged, measure the solve and raise this
- * -- do not lower APOS_LM_MAX_ITER, which would change what is reported. */
-#define APOS_GW_SOLVE_BUDGET_UUS 60000u
+ * 150000 uus (~154 ms) is chosen so that the ONLY moment in a superframe that
+ * can satisfy it is the first step after a beacon. avail_uus peaks at
+ * T_SUPERFRAME_UUS - BEACON_ARM_MARGIN_UUS ~= 195000 and falls monotonically
+ * through the superframe, so a threshold this high cannot be met mid-superframe
+ * -- and mid-superframe is reachable, because a step runs whenever the RX
+ * servicing above it finishes early, not only at the top of the loop. A smaller
+ * threshold would therefore guarantee only ITSELF as headroom, not the ~195000
+ * uus this reasoning wants; sizing it near the superframe is what makes
+ * "the solve gets a whole superframe to run in" true of the code rather than of
+ * the typical case. The cost is nil: the solve happens once per run, and the
+ * loop offers a qualifying step every 200 ms.
+ *
+ * THIS IS AN ESTIMATE, not a measurement -- neither this value nor the solve it
+ * guards has ever been timed on hardware. If a bench run ever shows a late
+ * beacon at the instant `{"apos_solve":...}` is logged, measure the solve
+ * first. Do NOT lower APOS_LM_MAX_ITER, which would change what is reported.
+ * The only genuinely HARD bound is to stop running the solve on this thread at
+ * all -- hand it to a preemptible worker that touches no SPI and let the
+ * gateway loop poll for its completion. That is the real fix if this ever hurts;
+ * it is deliberately out of scope here, because deferring to the top of a
+ * superframe removes the risk for every plausible solve duration. */
+#define APOS_GW_SOLVE_BUDGET_UUS 150000u
 
 /* Exchanges per commanded pair. The gateway owns this tradeoff, which is why it
  * is a RANGE_CMD field and not a constant on the anchor. 40 at ~5 ms is the

@@ -243,6 +243,19 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 		return;
 	}
 
+	/* Phase, not just session: the session is unchanged across a whole run,
+	 * so a straggler ENUM_RSP arriving during RANGE would otherwise be
+	 * accepted. That appends a peer and bumps tbl.n_peers while pair_total
+	 * stays frozen at the old N -- pair_of() then decomposes with the new
+	 * per_row against the old total, revisiting some ordered pairs, never
+	 * commanding others, and dropping the new node into the solve with no
+	 * edges at all. It would also let the -EADDRINUSE branch below abort a
+	 * run in progress with a message about enumeration, which by then is not
+	 * even true. Late enumeration replies belong to ENUM or to nothing. */
+	if (phase != APOS_GW_ENUM) {
+		return;
+	}
+
 	uint16_t addr = apos_frame_src(buf);
 
 	/* apos_table deliberately does not filter this, so it is filtered here,
@@ -305,6 +318,19 @@ void apos_gw_set_zoff(float dz)
 	zoff_m = dz;
 }
 
+/* Returns a pointer into live module storage, unsynchronised, while the gateway
+ * loop may be rewriting it in do_solve(). That is safe TODAY for one reason
+ * only: the gateway loop runs at K_PRIO_COOP(0), so no lower-priority thread
+ * -- the shell included -- can be scheduled at any instant between do_solve()'s
+ * first and last write to `res`. A reader therefore never observes a half-built
+ * result; it sees the previous one or the next one.
+ *
+ * That assumption breaks the moment a caller is NOT strictly lower priority than
+ * the gateway loop: another cooperative thread at priority 0, anything
+ * preemptible above it, or an ISR. Any such reader needs a copy taken under a
+ * lock, or `res` double-buffered with the published pointer swapped at the end
+ * of do_solve(). Task 12's `apos apply` reads this from the gateway loop itself,
+ * which is fine; a future MQTT or web reader would not be. */
 const struct apos_result *apos_gw_result(void)
 {
 	return &res;
@@ -419,19 +445,26 @@ static void judge_result(void)
 	 * on this mesh the number it was computed from could not have come out
 	 * any other way. See apos_geom.h's note on apos_geom_refine(). */
 	if (solve_unverified) {
+		/* Deliberately TWO messages, not one. Deferred logging formats
+		 * into a shared CONFIG_LOG_BUFFER_SIZE pool (1024 B by default,
+		 * and prj.conf does not raise it), and a single ~550-byte
+		 * message is both the most droppable in this file under a burst
+		 * and the one an operator least tolerates losing. Two ~280-byte
+		 * messages fit far more comfortably, and if the second is ever
+		 * dropped the first still carries the finding. */
 		LOG_WRN("{\"apos_warn\":\"rms_mm and worst_mm are NOT a quality "
 			"check on this array: %u usable edge(s) against %d free "
 			"parameters (3N-6) leaves %d spare. With no spare edge "
 			"the fit reproduces ANY set of ranges exactly, so "
-			"rms_mm is ~0 however bad the ranging was. "
-			"\\\"accepted\\\":%u here means only that nothing "
-			"contradicted the ranges — it does NOT mean they are "
-			"correct. Check the solved node-to-node distances "
-			"against a tape measure before `apos apply`, or add a "
-			"fifth anchor so the mesh has a spare edge.\"}",
+			"rms_mm is ~0 however bad the ranging was.\"}",
 			solve_n_edges, 3 * (int)res.n_placed - 6,
-			solve_redundancy,
-			accepted ? 1u : 0u);
+			solve_redundancy);
+		LOG_WRN("{\"apos_warn\":\"\\\"accepted\\\":%u above therefore "
+			"means only that nothing contradicted the ranges — it "
+			"does NOT mean they are correct. Check the solved "
+			"node-to-node distances against a tape measure before "
+			"`apos apply`, or add a fifth anchor so the mesh has a "
+			"spare edge.\"}", accepted ? 1u : 0u);
 	}
 
 	if (planar && res.n_placed >= 4u) {
@@ -490,10 +523,11 @@ static void do_solve(void)
 	 * degrees of freedom, so n_edges must EXCEED 3*n_placed - 6 before
 	 * rms_m can disagree with anything. n_edges is an upper bound on the
 	 * edges the fit actually used (edges touching an unplaced node are
-	 * dropped), which makes this an optimistic estimate of the spare count
-	 * -- and being optimistic about redundancy is the safe direction only
-	 * for the <= 0 test, which is why the flag is set with >=-style
-	 * conservatism below. */
+	 * dropped), so this is an OPTIMISTIC estimate of the spare count: the
+	 * fit may have had fewer spare edges than this says, never more. That is
+	 * why the flag below triggers on <= 0 rather than < 0 -- an optimistic
+	 * count of exactly zero spare edges is already the degenerate case, and
+	 * anything this overestimates only moves further into it. */
 	solve_n_edges = n_edges;
 	solve_redundancy = (int16_t)((int)n_edges -
 				     (3 * (int)res.n_placed - 6));
@@ -578,9 +612,11 @@ static void step_range(uint32_t avail_uus, uint8_t *seq)
 
 	if (pair_idx >= pair_total) {
 		/* The one step that transmits nothing and cannot be bounded in
-		 * microseconds. It runs only with a full solve budget in hand;
-		 * otherwise it waits for the next superframe, which costs
-		 * 200 ms of latency once per run and protects the beacon. */
+		 * microseconds. APOS_GW_SOLVE_BUDGET_UUS is sized so only the
+		 * first step after a beacon can satisfy this test, giving the
+		 * solve most of a superframe to run in. Waiting for that costs
+		 * up to 200 ms of latency once per run, and protects the
+		 * beacon. */
 		if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
 			return;
 		}
