@@ -113,11 +113,35 @@ void apos_geom_zoff(struct apos_result *r, float dz);
  *
  * Returns 0, -EINVAL on a bad argument, or -ENODATA if no usable edge remains.
  * Non-convergence is NOT an error: the caller judges the result on rms_m, which
- * is what acceptance is defined against. */
+ * is what acceptance is defined against.
+ *
+ * IMPORTANT: rms_m and worst_edge_m are only meaningful once the usable edge
+ * count exceeds 3N-6 (N = usable nodes). At N = 4 with a full mesh, 6 edges
+ * exactly match the 6 free parameters -- an isostatic system with no spare
+ * equation for a bad range to disagree with -- so LM finds an exact
+ * re-embedding of whatever distances it is given and rms_m/worst_edge_m come
+ * back identically zero regardless of the input's quality. From N = 5 to 7
+ * there is enough redundancy for rms_m to read nonzero, but not always enough
+ * to keep worst_i/worst_j pointing at the actual bad pair: least-squares
+ * "masking" can let the fit shift two good nodes just enough to spread the
+ * disagreement onto a different, merely-correlated edge instead. Both were
+ * hit and confirmed while writing this module's own tests (see
+ * tests/apos_geom/test_apos_geom.c); only a mesh with real edge redundancy
+ * well past 3N-6 is a trustworthy witness. The real deployment (4 ranging
+ * slaves + 1 gateway) sits right in this under-determined regime, so an
+ * acceptance check against rms_m alone can pass on a badly-ranged pair that a
+ * richer mesh would have caught.
+ *
+ * NOT REENTRANT: the LM working matrices are function-local `static` storage
+ * (too large for a comfortable stack frame), so only one call -- across
+ * apos_geom_refine() and apos_geom_solve() below, which calls it -- may be in
+ * flight at a time. Fine for the single-threaded gateway loop this is written
+ * for; do not call either from more than one thread. */
 int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 		     const struct apos_gauge *g, struct apos_result *io);
 
-/* apos_geom_seed() then apos_geom_refine(). The normal entry point. */
+/* apos_geom_seed() then apos_geom_refine(). The normal entry point. Not
+ * reentrant -- see apos_geom_refine() above. */
 int apos_geom_solve(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 		    const struct apos_gauge *g, struct apos_result *out);
 

@@ -730,9 +730,13 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 		float Jtr[3 * APOS_MAX_NODES] = {0};
 		float bvec[3 * APOS_MAX_NODES];
 
-		/* static, not automatic: two 18x18 float matrices are 2.6 kB
-		 * and CONFIG_MAIN_STACK_SIZE is 4096. This runs only from the
-		 * gateway loop, single-threaded, so there is no reentrancy. */
+		/* static, not automatic: declared [3*APOS_MAX_NODES][3*APOS_MAX_NODES]
+		 * = 24x24 for indexing convenience, so the two of them are
+		 * 2 * 24*24*4 = 4.6 kB of .bss (only the 18x18 corner --
+		 * 3*APOS_MAX_NODES-6 free parameters -- is ever read or
+		 * written), against a CONFIG_MAIN_STACK_SIZE of 4096. This
+		 * runs only from the gateway loop, single-threaded, so there
+		 * is no reentrancy. */
 		memset(JtJ, 0, sizeof(JtJ));
 
 		for (uint16_t k = 0; k < n_edges; k++) {
