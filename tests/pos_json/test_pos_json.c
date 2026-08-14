@@ -91,7 +91,7 @@ static void test_fix_truncation_is_reported(void)
 static void test_anchors_stub(void)
 {
     char buf[POS_JSON_MAX_LEN];
-    int n = pos_json_anchors(buf, sizeof(buf));
+    int n = pos_json_anchors(buf, sizeof(buf), NULL);
 
     CHECK(n > 0);
     CHECK(n == (int)strlen(buf));
@@ -125,14 +125,127 @@ static void test_anchors_fits_in_max_len(void)
      * documents, or the uplink buffer is undersized. */
     char buf[POS_JSON_MAX_LEN];
 
-    CHECK(pos_json_anchors(buf, sizeof(buf)) > 0);
+    CHECK(pos_json_anchors(buf, sizeof(buf), NULL) > 0);
 }
 
 static void test_anchors_truncation_is_reported(void)
 {
     char small[32];
 
-    CHECK(pos_json_anchors(small, sizeof(small)) == -1);
+    CHECK(pos_json_anchors(small, sizeof(small), NULL) == -1);
+}
+
+/* A gateway that was never surveyed must still publish a valid document, so the
+ * stub is a fallback and not dead code. */
+static void test_anchors_falls_back_to_the_stub(void)
+{
+    char buf[POS_JSON_MAX_LEN];
+    struct apos_survey s;
+
+    memset(&s, 0, sizeof(s));
+    s.valid = false;
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), NULL) > 0);
+    CHECK(strstr(buf, "ANC-LOBBY-001") != NULL);
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), &s) > 0);
+    CHECK(strstr(buf, "ANC-LOBBY-001") != NULL);
+}
+
+static void test_anchors_emits_the_surveyed_geometry(void)
+{
+    char buf[POS_JSON_MAX_LEN];
+    struct apos_survey s;
+
+    memset(&s, 0, sizeof(s));
+    s.valid = true;
+    s.n_nodes = 3;
+    s.node[0].short_addr = 0x0001;
+    s.node[0].x = 0.0f;  s.node[0].y = 0.0f;  s.node[0].z = 0.0f;
+    s.node[1].short_addr = 0x0002;
+    s.node[1].x = 3.25f; s.node[1].y = 0.0f;  s.node[1].z = 0.1f;
+    s.node[2].short_addr = 0x0004;
+    s.node[2].x = 1.5f;  s.node[2].y = 4.75f; s.node[2].z = 2.0f;
+    s.ref_lat = 21.016042;
+    s.ref_lon = -89.652129;
+    s.ref_valid = true;
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), &s) > 0);
+
+    /* Named from the short address, so the platform's anchor names track the
+     * boards rather than a hand-kept list. */
+    CHECK(strstr(buf, "ANC-" POS_JSON_ZONE_NAME "-001") != NULL);
+    CHECK(strstr(buf, "ANC-" POS_JSON_ZONE_NAME "-002") != NULL);
+    CHECK(strstr(buf, "ANC-" POS_JSON_ZONE_NAME "-004") != NULL);
+    /* The stub must be entirely gone -- a document with both would draw twice. */
+    CHECK(strstr(buf, "ANC-LOBBY-001") == NULL);
+    /* Surveyed coordinates, including a real z. */
+    CHECK(strstr(buf, "\"x\":3.25") != NULL);
+    CHECK(strstr(buf, "\"y\":4.75") != NULL);
+    CHECK(strstr(buf, "\"z\":2.00") != NULL);
+    /* Exactly one axis/reference anchor, and it is node[0]. */
+    CHECK(strstr(buf, "\"isReferenceAxis\":true") != NULL);
+    CHECK(strstr(buf, "21.016042") != NULL);
+}
+
+/* Without `apos ref` there is no lat/long to publish. The document must still be
+ * valid -- zeroes, exactly as the stub does for its non-reference anchors -- so
+ * the platform draws the geometry even before the site is geo-referenced. */
+static void test_anchors_without_a_geo_reference(void)
+{
+    char buf[POS_JSON_MAX_LEN];
+    struct apos_survey s;
+
+    memset(&s, 0, sizeof(s));
+    s.valid = true;
+    s.n_nodes = 1;
+    s.node[0].short_addr = 0x0001;
+    s.ref_valid = false;
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), &s) > 0);
+    CHECK(strstr(buf, "\"latitude\":0") != NULL);
+    CHECK(strstr(buf, "\"isReferenceAxis\":true") != NULL);
+}
+
+/* POS_JSON_MAX_LEN must still hold the largest real document, which is now a
+ * full APOS_MAX_NODES survey rather than the four-anchor stub. */
+static void test_full_survey_fits_the_buffer(void)
+{
+    char buf[POS_JSON_MAX_LEN];
+    struct apos_survey s;
+
+    memset(&s, 0, sizeof(s));
+    s.valid = true;
+    s.n_nodes = APOS_MAX_NODES;
+    for (uint8_t k = 0; k < APOS_MAX_NODES; k++) {
+        s.node[k].short_addr = (uint16_t)(0x0001 + k);
+        /* Widest plausible values, so the check is on the real worst case. */
+        s.node[k].x = -123.456f;
+        s.node[k].y = -123.456f;
+        s.node[k].z = -123.456f;
+    }
+    s.ref_lat = -89.123456;
+    s.ref_lon = -179.123456;
+    s.ref_valid = true;
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), &s) > 0);
+}
+
+/* A survey too large for the buffer must be REFUSED, not truncated: half a JSON
+ * document published retained would poison the topic until the next connect. */
+static void test_anchors_refuses_a_short_buffer(void)
+{
+    char small[64];
+    struct apos_survey s;
+
+    memset(&s, 0, sizeof(s));
+    s.valid = true;
+    s.n_nodes = APOS_MAX_NODES;
+    for (uint8_t k = 0; k < APOS_MAX_NODES; k++) {
+        s.node[k].short_addr = (uint16_t)(0x0001 + k);
+    }
+
+    CHECK(pos_json_anchors(small, sizeof(small), &s) == -1);
 }
 
 int main(void)
@@ -146,6 +259,11 @@ int main(void)
     test_anchors_stub();
     test_anchors_fits_in_max_len();
     test_anchors_truncation_is_reported();
+    test_anchors_falls_back_to_the_stub();
+    test_anchors_emits_the_surveyed_geometry();
+    test_anchors_without_a_geo_reference();
+    test_full_survey_fits_the_buffer();
+    test_anchors_refuses_a_short_buffer();
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;
 }
