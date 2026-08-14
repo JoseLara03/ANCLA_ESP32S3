@@ -97,11 +97,13 @@ static void window_open(uint16_t session, uint16_t window_s)
 	window_deadline_ms = k_uptime_get() + (int64_t)window_s * 1000;
 }
 
-/* Push the deadline out on a SETPOS matching the current session, so a long
+/* Push the deadline out on an in-session SETPOS or RANGE_CMD, so a long
  * survey does not need the gateway to re-broadcast SURVEY_BEGIN just to keep
- * the window alive. Called only from handle_setpos(), after the session
- * check, so a stale-session SETPOS cannot extend a window it does not belong
- * to. */
+ * the window alive. Called only from handle_setpos() and handle_range_cmd(),
+ * both AFTER their own session check, so a stale-session or malformed frame
+ * of either kind cannot extend a window it does not belong to -- that check
+ * is what keeps the window's self-closing property meaningful under a stream
+ * of garbage RANGE_CMDs. */
 static void window_refresh(void)
 {
 	if (window_session != 0) {
@@ -300,7 +302,11 @@ static uint8_t batch_stats(const int32_t *s, uint8_t n, int32_t *mean_out,
 	memcpy(tmp, s, (size_t)n * sizeof(tmp[0]));
 	for (uint8_t i = 1; i < n; i++) {
 		int32_t v = tmp[i];
-		int8_t j = (int8_t)(i - 1);
+		/* int16_t, not int8_t: an int8_t j silently depends on
+		 * APOS_MAX_EXCHANGES <= 128 (i - 1 would overflow past that).
+		 * int16_t costs nothing here and removes that trap for whoever
+		 * raises the cap. */
+		int16_t j = (int16_t)(i - 1);
 
 		while (j >= 0 && tmp[j] > v) {
 			tmp[j + 1] = tmp[j];
@@ -392,10 +398,22 @@ static void handle_range_cmd(const uint8_t *buf, uint16_t plen,
 		LOG_WRN("RANGE_CMD refused — window closed or session mismatch");
 		return;
 	}
+	/* Only after the session check: a stale-session or otherwise-refused
+	 * RANGE_CMD must not keep the window alive, or a stream of garbage
+	 * from 0x0000 defeats the window's self-closing property. See
+	 * window_refresh()'s own comment. */
+	window_refresh();
+
 	if (peer_addr == UWB_ADDR_GATEWAY_RESERVED ||
-	    peer_addr == uwb_config_short_addr(cfg)) {
-		/* The gateway never answers a poll, and polling ourselves is
-		 * meaningless. Either means the gateway's table is wrong. */
+	    peer_addr == uwb_config_short_addr(cfg) ||
+	    peer_addr < UWB_ANCHOR_ADDR_BASE ||
+	    peer_addr >= UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS) {
+		/* The gateway never answers a poll, polling ourselves is
+		 * meaningless, and anything outside the valid anchor-address
+		 * range would silently alias onto some other anchor's wire id
+		 * once truncated to a byte below (e.g. 0x0102 -> id 1). Either
+		 * means the gateway's table is wrong -- surface it rather than
+		 * producing a plausible-looking wrong measurement. */
 		LOG_WRN("RANGE_CMD refused — peer 0x%04X is not rangeable",
 			peer_addr);
 		return;
@@ -409,8 +427,24 @@ static void handle_range_cmd(const uint8_t *buf, uint16_t plen,
 	 * what the tag polls with too (anchor_respond.c:122). */
 	uint8_t peer_wire_id = (uint8_t)(peer_addr & 0xFFu);
 
+	/* Wall-clock deadline, not just the APOS_MAX_EXCHANGES count cap: a
+	 * batch against an unreachable peer runs ~37 ms/exchange (both
+	 * ss_initiator_range() timeouts plus the inter-exchange sleep), not
+	 * the ~5 ms/exchange the count cap alone was sized against, so the
+	 * count cap alone does not keep this inside beacon_guard's lock
+	 * budget. See APOS_RANGE_BATCH_DEADLINE_MS in apos_node.h. */
+	int64_t deadline = k_uptime_get() + (int64_t)APOS_RANGE_BATCH_DEADLINE_MS;
+
 	ss_initiator_enter();
 	for (uint8_t i = 0; i < want; i++) {
+		if (k_uptime_get() >= deadline) {
+			/* Not a failure: the exchanges gathered so far are
+			 * still good data, and n_ok (kept, below) already
+			 * reports the count honestly. */
+			LOG_WRN("RANGE_CMD batch deadline hit — stopping at "
+				"%u/%u exchanges", i, want);
+			break;
+		}
 		int32_t mm = ss_initiator_range(peer_wire_id);
 
 		if (mm != INT32_MIN) {
@@ -446,8 +480,23 @@ static void handle_range_cmd(const uint8_t *buf, uint16_t plen,
 
 	/* ss_initiator_leave() has already restored the interrupt mask and
 	 * cleared the RX timeouts, so a normal immediate TX is legal again. The
-	 * SLAVE loop re-arms RX when this returns. */
-	tx_now(tx_buf, (uint16_t)n, bg);
+	 * SLAVE loop re-arms RX when this returns.
+	 *
+	 * A completed batch's result must not silently vanish -- a suppressed
+	 * TX (e.g. landing on the beacon right after a long batch, entirely
+	 * plausible here) would otherwise look identical at the gateway to
+	 * "the RANGE_CMD never arrived", which is exactly the conflation
+	 * APOS_MIN_N_OK's comment says must not happen. One retry after a
+	 * short sleep, then give up loudly. */
+	if (!tx_now(tx_buf, (uint16_t)n, bg)) {
+		LOG_WRN("RANGE_RSP TX failed — retrying once");
+		k_sleep(K_MSEC(5));
+		apos_frame_set_seq(tx_buf, (*seq)++);
+		if (!tx_now(tx_buf, (uint16_t)n, bg)) {
+			LOG_ERR("RANGE_RSP TX failed twice — batch result for "
+				"peer 0x%04X lost", peer_addr);
+		}
+	}
 }
 
 bool apos_node_on_rx(const uint8_t *buf, uint16_t plen, uwb_config_t *cfg,
@@ -481,7 +530,10 @@ bool apos_node_on_rx(const uint8_t *buf, uint16_t plen, uwb_config_t *cfg,
 		handle_survey_end(buf, plen);
 		break;
 	case APOS_SUB_RANGE_CMD:
-		window_refresh();
+		/* window_refresh() happens inside handle_range_cmd(), after
+		 * its own session check -- not here -- so a stale-session or
+		 * malformed RANGE_CMD cannot extend a window it does not
+		 * belong to. */
 		handle_range_cmd(buf, plen, cfg, seq, bg);
 		break;
 	default:

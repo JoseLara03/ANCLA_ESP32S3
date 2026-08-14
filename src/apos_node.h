@@ -24,6 +24,7 @@
 
 #include "beacon_guard.h"
 #include "uwb_config.h"
+#include "uwb_mac.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -53,12 +54,37 @@
  * that is the failure mode the survey window exists to prevent, and a count
  * cap is the second half of it.
  *
- * 64 exchanges at ~5 ms is ~320 ms, during which this board is an initiator and
- * therefore blind to the beacon. Its beacon_guard prediction goes stale over
- * that span but stays trustworthy: BEACON_GUARD_MAX_MISSES is 4 superframes
- * (~800 ms). Raising this past ~150 exchanges would cross that line and the
- * guard would drop its lock mid-batch. */
+ * This bound alone is NOT what keeps the batch inside beacon_guard's lock
+ * budget -- APOS_RANGE_BATCH_DEADLINE_MS below is. Sized only on the SUCCESS
+ * case (~5 ms/exchange, ~320 ms for 64), this constant is far too loose for
+ * the FAILURE case: ss_initiator_range()'s own worst case is
+ * TX_DONE_TIMEOUT_MS (10) + RX_DONE_TIMEOUT_MS (25) = 35 ms, plus the 2 ms
+ * inter-exchange sleep = 37 ms/exchange. A batch against an unreachable peer
+ * -- a routine event, since the survey commands every pair including
+ * out-of-range ones -- would run 64 x 37 ms =~ 2.4 s if this count cap were
+ * the only bound, three times beacon_guard's ~800 ms lock budget
+ * (BEACON_GUARD_MAX_MISSES superframes). The wall-clock deadline is what
+ * actually protects the guard; this constant only bounds the DATA a
+ * successful batch collects (Task 11's gateway asks for 40, so the reported
+ * sd stays a useful quality signal). */
 #define APOS_MAX_EXCHANGES 64u
+
+/* Wall-clock deadline for one RANGE_CMD batch, independent of APOS_MAX_EXCHANGES:
+ * the loop breaks out once elapsed time exceeds this, whatever the exchange
+ * count reached. This is what actually bounds the batch against
+ * beacon_guard's lock budget in the failure case above -- the count cap alone
+ * does not, since a batch of all-timeout exchanges is ~37 ms each, not ~5 ms.
+ *
+ * Derived from the same lock budget the guard uses to judge its own
+ * prediction stale: BEACON_GUARD_MAX_MISSES * T_SUPERFRAME_UUS is 4 * 195000
+ * UUS = 780000 UUS =~ 800 ms (T_SUPERFRAME_UUS is exactly 200.0 ms, see
+ * uwb_mac.h). 700 ms leaves an 80 ms margin inside that 800 ms budget for the
+ * RANGE_RSP build/send (and its retry, see apos_node.c) that follows the
+ * batch before the guard's next real read. A deadline break is not a
+ * failure: whatever exchanges completed are still good data, and n_ok already
+ * reports that count honestly. */
+#define APOS_RANGE_BATCH_DEADLINE_MS \
+	((BEACON_GUARD_MAX_MISSES * T_SUPERFRAME_UUS) / 1000u - 80u)
 
 /* Below this many successful exchanges the batch is reported with its real
  * n_ok and the gateway discards it (apos_table_symmetrise's min_n_ok). Reported
