@@ -249,6 +249,118 @@ static int cmd_zoff(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/* The unverified-mesh caveat, repeated at the point of commit.
+ *
+ * apos_gw_start_apply() also logs it, but the log and the console are not the
+ * same audience: an operator typing `apos apply` gets this back synchronously,
+ * under their own command, whereas the LOG_WRN lands in whatever the monitor
+ * happens to be scrolling. Apply is the point of no return, so it is said in
+ * both places -- and it is printed whether or not `force` was given, because
+ * `force` overrides ACCEPTANCE, not physics. */
+static void warn_unverified(const struct shell *sh)
+{
+	if (!apos_gw_result_unverified()) {
+		return;
+	}
+
+	shell_warn(sh, "WARNING: this survey is UNVERIFIED. The mesh has %d "
+		       "spare edge(s) (usable edges minus 3N-6), so the fit "
+		       "reproduced the ranges exactly and rms/worst came back "
+		       "at ~0 however bad the ranging was.",
+		   apos_gw_result_redundancy());
+	shell_warn(sh, "A PASS here means only that nothing contradicted the "
+		       "ranges — NOT that they are correct. These coordinates "
+		       "are being written to every anchor's NVS now. Check the "
+		       "solved node-to-node distances against a tape measure, "
+		       "or add a fifth anchor so the mesh has a spare edge.");
+}
+
+static int cmd_apply(const struct shell *sh, size_t argc, char **argv)
+{
+	bool force = (argc > 1) && (strcmp(argv[1], "force") == 0);
+
+	int rc = require_gateway(sh);
+
+	if (rc) {
+		return rc;
+	}
+	if (argc > 1 && !force) {
+		shell_error(sh, "error: the only argument is `force`");
+		return -EINVAL;
+	}
+
+	rc = apos_gw_start_apply(force);
+	if (rc == -EBUSY) {
+		shell_error(sh, "error: a survey is already running");
+		return rc;
+	}
+	if (rc == -ENODATA) {
+		shell_error(sh, "error: no result to apply — run `apos run` first");
+		return rc;
+	}
+	if (rc == -EPERM) {
+		const struct apos_result *r = apos_gw_result();
+
+		shell_error(sh, "error: the last run FAILED acceptance "
+				"(rms=%d mm, worst=%d mm on pair [%u,%u], "
+				"placed=%u/%u, ambiguous=%u). Fix the geometry "
+				"and re-run, or `apos apply force` to commit it "
+				"anyway.",
+			    (int)(r->rms_m * 1000.0f),
+			    (int)(r->worst_edge_m * 1000.0f),
+			    r->worst_i, r->worst_j, r->n_placed, r->n_nodes,
+			    r->n_ambiguous);
+		return rc;
+	}
+	if (rc) {
+		shell_error(sh, "error: apply refused (errno %d)", rc);
+		return rc;
+	}
+
+	warn_unverified(sh);
+
+	shell_print(sh, "applying — each anchor is pushed its coordinates and "
+			"must acknowledge; watch for apos_apply_done");
+	return 0;
+}
+
+static int cmd_ref(const struct shell *sh, size_t argc, char **argv)
+{
+	char *e1, *e2;
+	double lat, lon;
+
+	ARG_UNUSED(argc);
+
+	int rc = require_gateway(sh);
+
+	if (rc) {
+		return rc;
+	}
+
+	lat = strtod(argv[1], &e1);
+	lon = strtod(argv[2], &e2);
+	if (e1 == argv[1] || *e1 != '\0' || e2 == argv[2] || *e2 != '\0') {
+		shell_error(sh, "error: lat and lon must be decimal degrees");
+		return -EINVAL;
+	}
+	if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0) {
+		shell_error(sh, "error: lat must be -90..90 and lon -180..180");
+		return -EINVAL;
+	}
+
+	rc = apos_store_set_ref(lat, lon);
+	if (rc) {
+		shell_error(sh, "error: reference NOT persisted (errno %d)", rc);
+		return rc;
+	}
+
+	shell_print(sh, "{\"apos_ref\":{\"lat\":%.6f,\"lon\":%.6f}} — this is "
+			"the origin anchor's real-world position; the platform "
+			"places the whole survey against it",
+		    lat, lon);
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_apos,
 	SHELL_CMD_ARG(enum,  NULL,
 		      "enum — discover anchors over the air and print their "
@@ -262,6 +374,14 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_apos,
 		      "run — range every anchor pair, solve, and REPORT ONLY "
 		      "(persists nothing)",
 		      cmd_run, 1, 0),
+	SHELL_CMD_ARG(apply, NULL,
+		      "apply [force] — push the last result to every anchor, "
+		      "persist it, and close the survey",
+		      cmd_apply, 1, 1),
+	SHELL_CMD_ARG(ref,   NULL,
+		      "ref <lat> <lon> — the origin anchor's real-world "
+		      "position, for the platform map",
+		      cmd_ref, 3, 0),
 	SHELL_CMD_ARG(zoff,  NULL,
 		      "zoff <metres> — shift z so z=0 is the floor rather than "
 		      "the plane through the gauge anchors",

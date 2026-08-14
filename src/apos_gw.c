@@ -62,6 +62,14 @@ static bool awaiting_rsp;
 static uint16_t await_from_addr;
 static uint16_t await_peer_addr;
 
+/* APPLY phase cursor. */
+static uint8_t apply_idx;
+static uint8_t apply_retries;
+static uint8_t applied_ok;
+static uint8_t applied_fail;
+static uint8_t applied_skip;
+static bool apply_ending;   /* all nodes done; SURVEY_END still to send */
+
 /* Result judgement, filled by do_solve()/judge_result(). */
 static bool accepted;
 static int16_t solve_redundancy; /* see apos_gw_result_redundancy() */
@@ -89,6 +97,12 @@ void apos_gw_init(void)
 	solve_redundancy = 0;
 	solve_n_edges = 0;
 	solve_unverified = false;
+	apply_idx = 0;
+	apply_retries = 0;
+	applied_ok = 0;
+	applied_fail = 0;
+	applied_skip = 0;
+	apply_ending = false;
 }
 
 bool apos_gw_busy(void)
@@ -119,6 +133,8 @@ void apos_gw_get_status(struct apos_gw_status *out)
 	out->have_result = have_result;
 	out->meas_done = pair_idx;
 	out->meas_total = pair_total;
+	out->applied_ok = applied_ok;
+	out->applied_fail = applied_fail;
 }
 
 int apos_gw_set_gauge(uint16_t origin, uint16_t xaxis, uint16_t plane,
@@ -658,6 +674,288 @@ static void step_range(uint32_t avail_uus, uint8_t *seq)
 	next_action_ms = now + APOS_GW_RANGE_TIMEOUT_MS;
 }
 
+/* ---- APPLY phase ---- */
+
+int apos_gw_start_apply(bool force)
+{
+	if (apos_gw_busy()) {
+		return -EBUSY;
+	}
+	if (!have_result) {
+		return -ENODATA;
+	}
+	if (!accepted && !force) {
+		return -EPERM;
+	}
+
+	apply_idx = 0;
+	apply_retries = 0;
+	applied_ok = 0;
+	applied_fail = 0;
+	applied_skip = 0;
+	apply_ending = false;
+	awaiting_rsp = false;
+	tx_fails = 0;
+	next_action_ms = 0;
+	phase = APOS_GW_APPLY;
+
+	LOG_INF("{\"apos\":\"applying\",\"nodes\":%u,\"forced\":%u}",
+		res.n_nodes, force ? 1u : 0u);
+
+	/* Repeated HERE, not only at solve time. Apply is the point of no
+	 * return -- it rewrites every anchor's NVS and this gateway's survey --
+	 * and the operator typing it may have read `"accepted":1` minutes ago.
+	 * `force` deliberately does not gate this: the condition is a property
+	 * of the mesh, not a decision, and it is loudest precisely when the
+	 * result looks best. */
+	if (solve_unverified) {
+		LOG_WRN("{\"apos_warn\":\"COMMITTING AN UNVERIFIED SURVEY: %u "
+			"usable edge(s) against %d free parameters (3N-6) left "
+			"%d spare, so rms_mm was ~0 however bad the ranging "
+			"was.\"}", solve_n_edges, 3 * (int)res.n_placed - 6,
+			solve_redundancy);
+		LOG_WRN("{\"apos_warn\":\"on this array \\\"accepted\\\" means "
+			"only that nothing contradicted the ranges — it does "
+			"NOT mean they are correct. These coordinates are about "
+			"to be written to every anchor's NVS.\"}");
+	}
+	return 0;
+}
+
+/* Persist the survey locally, with the gauge origin first.
+ *
+ * node[0] must be the origin: apos_store.h documents that the geographic
+ * reference belongs to it, and pos_json.c relies on the ordering. The solver's
+ * node order is the order anchors answered enumeration in, which is arbitrary,
+ * so the origin is moved to the front here rather than being assumed. */
+static void persist_survey(void)
+{
+	struct apos_survey s;
+	struct apos_gauge g;
+
+	memset(&s, 0, sizeof(s));
+
+	if (resolve_gauge(&g) != 0) {
+		LOG_ERR("{\"apos_error\":\"cannot persist — gauge no longer "
+			"resolves\"}");
+		return;
+	}
+
+	/* The ordering contract above is only satisfiable if the origin is in
+	 * the output at all. An unplaced origin should be impossible -- the
+	 * gauge is placed by construction -- but writing node[0] as some other
+	 * anchor while pos_json still reads it as the geographic reference is a
+	 * silent wrong-coordinate failure, which is the exact class of bug this
+	 * feature exists to remove. Refuse instead. */
+	if (res.node[g.origin].state == APOS_NODE_UNPLACED) {
+		LOG_ERR("{\"apos_error\":\"cannot persist — the gauge origin "
+			"0x%04X was not placed by the solve\"}",
+			tbl.peer[g.origin].short_addr);
+		return;
+	}
+
+	uint8_t w = 0;
+
+	/* Origin first, then everything else in solver order. */
+	for (uint8_t pass = 0; pass < 2; pass++) {
+		for (uint8_t k = 0; k < res.n_nodes && w < APOS_MAX_NODES; k++) {
+			bool is_origin = (k == g.origin);
+
+			if ((pass == 0) != is_origin) {
+				continue;
+			}
+			if (res.node[k].state == APOS_NODE_UNPLACED) {
+				continue;
+			}
+			memcpy(s.node[w].eui, tbl.peer[k].eui, APOS_EUI_LEN);
+			s.node[w].short_addr = tbl.peer[k].short_addr;
+			s.node[w].x = res.node[k].x;
+			s.node[w].y = res.node[k].y;
+			s.node[w].z = res.node[k].z;
+			w++;
+		}
+	}
+
+	s.n_nodes = w;
+	s.valid = w > 0u;
+
+	int rc = apos_store_save(&s);
+
+	if (rc) {
+		LOG_ERR("{\"apos_error\":\"survey applied to the anchors but NOT "
+			"persisted on the gateway (errno %d) — the anchors "
+			"topic will fall back to the stub after a reboot\"}",
+			rc);
+	} else {
+		LOG_INF("{\"apos_store\":\"survey saved\",\"nodes\":%u}", w);
+	}
+}
+
+static void on_setpos_ack(const uint8_t *buf, uint16_t plen)
+{
+	uint16_t sess = 0;
+	float x = 0.0f, y = 0.0f, z = 0.0f;
+	bool ok = false;
+
+	if (apos_frame_parse_setpos_ack(buf, plen, &sess, &x, &y, &z, &ok)
+	    != 0) {
+		return;
+	}
+	if (sess != session || !awaiting_rsp) {
+		return;
+	}
+	/* Phase, not just session and awaiting_rsp: the session is unchanged
+	 * across a whole run, and RANGE also sets awaiting_rsp. A SETPOS_ACK
+	 * arriving then -- a duplicate from a previous apply against the same
+	 * session -- would otherwise advance the RANGE cursor past a pair that
+	 * was never measured. Same reasoning as on_enum_rsp(). */
+	if (phase != APOS_GW_APPLY) {
+		return;
+	}
+	if (apos_frame_src(buf) != await_from_addr) {
+		return;
+	}
+
+	if (ok) {
+		applied_ok++;
+		LOG_INF("{\"apos_applied\":{\"addr\":\"0x%04X\",\"x\":%.3f,"
+			"\"y\":%.3f,\"z\":%.3f}}", await_from_addr,
+			(double)x, (double)y, (double)z);
+	} else {
+		/* The anchor applied it but could not persist it. Counted as a
+		 * failure: it will silently revert on its next reboot, which is
+		 * exactly the kind of half-applied state worth being loud
+		 * about. */
+		applied_fail++;
+		LOG_ERR("{\"apos_error\":\"0x%04X applied but could not persist "
+			"— it will revert on reboot\"}", await_from_addr);
+	}
+
+	awaiting_rsp = false;
+	apply_retries = 0;
+	tx_fails = 0;
+	apply_idx++;
+	next_action_ms = 0;
+}
+
+static void step_apply(uint8_t *seq)
+{
+	int64_t now = k_uptime_get();
+
+	if (awaiting_rsp) {
+		if (now < next_action_ms) {
+			return;
+		}
+		if (apply_retries < APOS_GW_APPLY_RETRIES) {
+			apply_retries++;
+			awaiting_rsp = false;
+			LOG_WRN("{\"apos_retry\":{\"setpos\":\"0x%04X\","
+				"\"attempt\":%u}}", await_from_addr,
+				apply_retries);
+		} else {
+			applied_fail++;
+			LOG_ERR("{\"apos_error\":\"0x%04X never acknowledged "
+				"SETPOS after %u attempts — it is still on its "
+				"OLD coordinates\"}", await_from_addr,
+				APOS_GW_APPLY_RETRIES + 1u);
+			awaiting_rsp = false;
+			apply_retries = 0;
+			tx_fails = 0;
+			apply_idx++;
+		}
+		return;
+	}
+
+	if (apply_ending) {
+		int n = apos_frame_survey_end_build(tx_buf, sizeof(tx_buf),
+						  UWB_ADDR_GATEWAY_RESERVED,
+						  session);
+
+		if (n < 0) {
+			LOG_ERR("SURVEY_END build failed (%d)", n);
+		} else if (!tx_now((uint16_t)n, seq)) {
+			/* Not retried: the windows the run opened close on
+			 * their own after APOS_NODE_REFRESH_S with nothing
+			 * refreshing them, so this costs a minute of an open
+			 * window, not a stuck deployment. Retrying instead
+			 * would keep the survey busy on a wedged radio. */
+			LOG_WRN("{\"apos_warn\":\"SURVEY_END did not transmit — "
+				"the anchors' survey windows will lapse on "
+				"their own instead\"}");
+		}
+
+		LOG_INF("{\"apos_apply_done\":{\"ok\":%u,\"failed\":%u,"
+			"\"skipped\":%u,\"nodes\":%u}}",
+			applied_ok, applied_fail, applied_skip, res.n_nodes);
+		if (applied_fail || applied_skip) {
+			LOG_ERR("{\"apos_error\":\"%u anchor(s) did NOT take the "
+				"new coordinates — the deployment is "
+				"inconsistent. Re-run `apos apply`.\"}",
+				(unsigned int)(applied_fail + applied_skip));
+		}
+		apply_ending = false;
+		phase = APOS_GW_IDLE;
+		return;
+	}
+
+	/* Skip unplaced nodes: there is nothing to push, and pushing (0, 0, 0)
+	 * would be exactly the silent-wrong-coordinate failure this whole
+	 * design exists to remove. Counted, so the summary above cannot report
+	 * a clean `failed:0` for an apply that only covered part of the
+	 * array. */
+	while (apply_idx < res.n_nodes &&
+	       res.node[apply_idx].state == APOS_NODE_UNPLACED) {
+		LOG_WRN("{\"apos_skip\":{\"addr\":\"0x%04X\",\"reason\":"
+			"\"unplaced\"}}", tbl.peer[apply_idx].short_addr);
+		applied_skip++;
+		apply_idx++;
+	}
+
+	if (apply_idx >= res.n_nodes) {
+		/* Persist before SURVEY_END, so a gateway that dies between the
+		 * two still has the survey on flash. */
+		persist_survey();
+		apply_ending = true;
+		return;
+	}
+
+	await_from_addr = tbl.peer[apply_idx].short_addr;
+
+	int n = apos_frame_setpos_build(tx_buf, sizeof(tx_buf),
+				       UWB_ADDR_GATEWAY_RESERVED,
+				       await_from_addr, session,
+				       res.node[apply_idx].x,
+				       res.node[apply_idx].y,
+				       res.node[apply_idx].z);
+
+	if (n < 0) {
+		LOG_ERR("SETPOS build failed (%d)", n);
+		phase = APOS_GW_IDLE;
+		return;
+	}
+	if (!tx_now((uint16_t)n, seq)) {
+		/* Bounded exactly as step_range()'s RANGE_CMD is: a TX that
+		 * never starts is not this anchor's fault and does not consume
+		 * its retry budget, but a wedged radio must not park APPLY on
+		 * one anchor forever with apply_idx never advancing and nothing
+		 * on the console saying why. */
+		if (++tx_fails >= APOS_GW_TX_FAIL_LIMIT) {
+			applied_fail++;
+			LOG_ERR("{\"apos_error\":\"SETPOS for 0x%04X would not "
+				"transmit — it is still on its OLD "
+				"coordinates\"}", await_from_addr);
+			tx_fails = 0;
+			apply_retries = 0;
+			apply_idx++;
+		}
+		return;
+	}
+	tx_fails = 0;
+
+	awaiting_rsp = true;
+	next_action_ms = now + APOS_GW_APPLY_TIMEOUT_MS;
+}
+
 void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
 {
 	if (!apos_frame_is_apos(buf, plen)) {
@@ -677,8 +975,12 @@ void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
 	case APOS_SUB_RANGE_RSP:
 		on_range_rsp(buf, plen);
 		break;
+	case APOS_SUB_SETPOS_ACK:
+		on_setpos_ack(buf, plen);
+		break;
 	default:
-		/* SETPOS_ACK arrives in Task 12. */
+		/* The remaining subtypes are gateway-to-anchor commands; a
+		 * board echoing one back is not this module's business. */
 		break;
 	}
 }
@@ -750,10 +1052,15 @@ void apos_gw_step(uint32_t avail_uus, uint8_t *seq)
 	case APOS_GW_RANGE:
 		step_range(avail_uus, seq);
 		break;
+	case APOS_GW_APPLY:
+		step_apply(seq);
+		break;
 	default:
-		/* APOS_GW_APPLY is Task 12's to implement. Unreachable until it
-		 * sets that phase --
-		 * but a phase with no handler means apos_gw_busy() stays true
+		/* Every value of enum apos_gw_phase now has a handler, so this
+		 * is unreachable through the normal paths -- but `phase` is a
+		 * uint8_t, not the enum, so the compiler does not prove that,
+		 * and the arm is kept as the guard it was written to be:
+		 * a phase with no handler means apos_gw_busy() stays true
 		 * forever with nothing advancing it, which from the console is
 		 * indistinguishable from a wedged radio. Say so loudly rather
 		 * than hanging in silence. */

@@ -145,6 +145,16 @@ enum apos_gw_phase {
  * and never reports why. */
 #define APOS_GW_TX_FAIL_LIMIT 10u
 
+/* A SETPOS_ACK comes straight back -- no ranging batch in between -- so this is
+ * tight compared with APOS_GW_RANGE_TIMEOUT_MS. */
+#define APOS_GW_APPLY_TIMEOUT_MS 1500u
+
+/* Three attempts per anchor. Unlike a failed range, a failed SETPOS cannot be
+ * shrugged off as a hole: an anchor left on its old coordinates while its peers
+ * move to new ones is a silently inconsistent deployment, so this retries hard
+ * and then reports the anchor by address. */
+#define APOS_GW_APPLY_RETRIES 3u
+
 /* Acceptance thresholds. Anchored on the antenna-delay cross-check, which
  * accepts |error| < 30 mm per pair: a fit over many such edges should land
  * inside 50 mm RMS, and anything much worse means a bad edge or a wrong gauge
@@ -239,6 +249,19 @@ bool apos_gw_result_unverified(void);
 /* Spare edges in the last solve: usable_edges - (3 * n_placed - 6). <= 0 is the
  * unverified regime above. Meaningful only when have_result. */
 int apos_gw_result_redundancy(void);
+
+/* Push the last solved result to every anchor, persist it locally, and close the
+ * survey window.
+ *
+ * Refuses a result that failed acceptance unless force is true. Returns 0,
+ * -EBUSY if a survey runs, -ENODATA if there is no result to apply, or
+ * -EPERM if the result failed acceptance and force was not given.
+ *
+ * `force` overrides ACCEPTANCE only. It does not, and must not, suppress the
+ * unverified-mesh warning: that condition is a property of the array's edge
+ * count, not an operator decision, and it is loudest exactly where the result
+ * looks best. See apos_gw_result_unverified(). */
+int apos_gw_start_apply(bool force);
 
 /* Shift z on every subsequent solve, moving z = 0 off the plane through the
  * three gauge anchors and onto the floor. Applied at solve time, so changing it
