@@ -13,6 +13,7 @@ target_sources(app PRIVATE
 	src/apos_frame.c
 	src/apos_geom.c
 	src/apos_node.c
+	src/apos_store.c
 	src/apos_table.c
 	src/beacon_guard.c
 	src/disc_schedule.c
