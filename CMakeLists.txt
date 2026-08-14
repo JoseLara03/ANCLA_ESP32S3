@@ -28,3 +28,14 @@ target_sources(app PRIVATE
 	src/uwb_slave.c
 	src/uwb_store.c
 )
+
+# Calibration image only (see cal.conf, docs/superpowers/specs/
+# 2026-08-13-antenna-delay-calibration-design.md). Deliberately excluded from
+# the production build: a deployed anchor must never initiate a poll.
+target_sources_ifdef(CONFIG_ANCLA_CAL_MODE app PRIVATE
+	src/cal_initiator.c
+	src/cal_math.c
+	src/cal_run.c
+	src/cal_shell.c
+	src/cal_solve.c
+)

@@ -6,6 +6,16 @@
 
 #include "net_uplink.h"
 
+#include <zephyr/sys/util.h> /* ARG_UNUSED, used by both branches below */
+
+/* Every symbol below is WiFi/MQTT-stack shaped and has zero fallback of its
+ * own, so this whole file compiles only when the net stack it depends on is
+ * actually present. The calibration image (cal.conf) turns CONFIG_NETWORKING
+ * off on purpose -- it never runs GATEWAY mode and has nothing to publish --
+ * and the stub block below keeps the public API linkable (net_shell.c and
+ * pos_sink.c call it unconditionally) without dragging in net_if.h et al. */
+#ifdef CONFIG_NETWORKING
+
 #include "net_config.h"
 #include "pos_json.h"
 #include "uwb_config.h"
@@ -614,3 +624,28 @@ void net_uplink_start(void)
 			UPLINK_PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&uplink_thread_data, "net_uplink");
 }
+
+#else /* !CONFIG_NETWORKING */
+
+void net_uplink_start(void)
+{
+}
+
+void net_uplink_submit(const struct pos_fix *fix)
+{
+	ARG_UNUSED(fix);
+}
+
+const char *net_uplink_state_str(void)
+{
+	return "networking-disabled";
+}
+
+bool net_uplink_get_ip(char *buf, size_t len)
+{
+	ARG_UNUSED(buf);
+	ARG_UNUSED(len);
+	return false;
+}
+
+#endif /* CONFIG_NETWORKING */

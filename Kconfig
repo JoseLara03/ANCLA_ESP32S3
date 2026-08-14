@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Innovaforce
+# SPDX-License-Identifier: Apache-2.0
+
+menu "ANCLA anchor"
+
+config ANCLA_CAL_MODE
+	bool "Antenna-delay calibration firmware"
+	help
+	  Build the calibration image instead of the production anchor.
+
+	  main() hands the main thread to cal_run() rather than dispatching on
+	  the configured mode, giving the board a `cal` console tree that lets
+	  it act as a temporary SS-TWR initiator. Production images must never
+	  enable this: a deployed anchor transmitting unsolicited polls would
+	  collide with tag ranging traffic.
+
+endmenu
+
+source "Kconfig.zephyr"

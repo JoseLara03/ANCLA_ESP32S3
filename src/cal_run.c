@@ -1,0 +1,194 @@
+/*
+ * Copyright (c) 2026 Innovaforce
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * See cal_run.h. The RX path mirrors uwb_slave.c deliberately -- it is the
+ * production responder, and the whole point of calibrating in this image is
+ * that the exchange being measured is the one the tag actually uses.
+ */
+
+#include "cal_run.h"
+
+#include "anchor_respond.h"
+#include "uwb_dwtime.h"
+
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+
+#include <deca_device_api.h>
+
+#include <errno.h>
+
+LOG_MODULE_REGISTER(cal_run, LOG_LEVEL_INF);
+
+#define RX_BUF_LEN 64
+
+static K_SEM_DEFINE(rx_sem, 0, 1);
+static K_SEM_DEFINE(req_sem, 0, 1);
+static K_SEM_DEFINE(done_sem, 0, 1);
+
+/* Handed between the shell thread and the main loop, one batch at a time. The
+ * semaphore pair is the handshake: the shell writes g_req before giving
+ * req_sem and reads g_res only after taking done_sem, so the two never touch
+ * either struct at once. g_busy rejects a second command while one is running
+ * rather than letting it corrupt the first. */
+static struct cal_request g_req;
+static struct cal_result g_res;
+static bool g_busy;
+
+/* See uwb_slave.c:38-51 for why rx_pending is required. */
+static volatile uint32_t rx_status;
+static volatile uint16_t rx_len;
+static volatile bool rx_pending;
+
+static uint8_t rx_buf[RX_BUF_LEN];
+static uint8_t frame_seq_nb;
+
+static void cb_rx_ok(const dwt_cb_data_t *cb_data)
+{
+	if (rx_pending) {
+		return;
+	}
+	rx_status = cb_data->status;
+	rx_len = cb_data->datalength;
+	rx_pending = true;
+	k_sem_give(&rx_sem);
+}
+
+static void cb_rx_fail(const dwt_cb_data_t *cb_data)
+{
+	if (rx_pending) {
+		return;
+	}
+	rx_status = cb_data->status;
+	rx_len = 0;
+	rx_pending = true;
+	k_sem_give(&rx_sem);
+}
+
+static void rx_arm(void)
+{
+	dwt_setpreambledetecttimeout(0);
+	dwt_setrxtimeout(0);
+	dwt_setrxaftertxdelay(0);
+	dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+int cal_run_execute(const struct cal_request *req, struct cal_result *out)
+{
+	if (g_busy) {
+		return -EBUSY;
+	}
+	g_busy = true;
+	g_req = *req;
+	k_sem_give(&req_sem);
+
+	/* Generous: a fully failing 128-sample batch is 128 * (10 + 25) ms of
+	 * timeouts plus the inter-sample sleep, about 6 s. */
+	if (k_sem_take(&done_sem, K_SECONDS(30)) != 0) {
+		g_busy = false;
+		return -ETIMEDOUT;
+	}
+
+	*out = g_res;
+	g_busy = false;
+	return g_res.status;
+}
+
+/* Filled in by Task 3. */
+static void run_batch(const struct cal_request *req, struct cal_result *res,
+		      uwb_config_t *cfg)
+{
+	ARG_UNUSED(req);
+	ARG_UNUSED(cfg);
+
+	res->status = -ENOSYS;
+}
+
+void cal_run(const uwb_config_t *cfg)
+{
+	/* Mutable, unlike uwb_slave_run()'s const snapshot: a `cal ref` applies
+	 * its solved delay hot, and this copy and the radio's TX antenna delay
+	 * register must move together. anchor_respond.c:141 adds
+	 * cfg->ant_delay_tx in software to build the reported resp_tx_ts while
+	 * the radio applies the register to the frame it actually sends; if the
+	 * two disagree this board silently reports a turnaround it did not
+	 * perform. cal_run owns this copy outright -- the shell thread never
+	 * touches it. */
+	static uwb_config_t cfg_live;
+
+	cfg_live = *cfg;
+
+	static dwt_callbacks_s cbs;
+
+	cbs.cbRxOk = cb_rx_ok;
+	cbs.cbRxTo = cb_rx_fail;
+	cbs.cbRxErr = cb_rx_fail;
+	dwt_setcallbacks(&cbs);
+
+	/* RX only, same as the production responder: TXFRS must stay out of the
+	 * mask or the responder's tx_delayed() completion poll would hang. */
+	dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
+
+	LOG_INF("{\"status\":\"listening\",\"mode\":\"cal\",\"id\":%u,"
+		"\"short_addr\":\"0x%04X\",\"ant_tx\":%u,\"ant_rx\":%u}",
+		cfg_live.anchor_id, uwb_config_short_addr(&cfg_live),
+		cfg_live.ant_delay_tx, cfg_live.ant_delay_rx);
+
+	struct k_poll_event events[2] = {
+		K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,
+						K_POLL_MODE_NOTIFY_ONLY,
+						&rx_sem, 0),
+		K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,
+						K_POLL_MODE_NOTIFY_ONLY,
+						&req_sem, 0),
+	};
+
+	rx_arm();
+
+	while (1) {
+		k_poll(events, 2, K_FOREVER);
+
+		if (events[1].state == K_POLL_STATE_SEM_AVAILABLE) {
+			k_sem_take(&req_sem, K_NO_WAIT);
+
+			struct cal_result res = {0};
+
+			res.ref_mm = g_req.ref_mm;
+			run_batch(&g_req, &res, &cfg_live);
+			g_res = res;
+
+			rx_arm();
+			k_sem_give(&done_sem);
+		}
+
+		if (events[0].state == K_POLL_STATE_SEM_AVAILABLE) {
+			k_sem_take(&rx_sem, K_NO_WAIT);
+
+			uint16_t flen = rx_len;
+
+			rx_pending = false;
+
+			if (flen > FCS_LEN && flen <= RX_BUF_LEN) {
+				dwt_readrxdata(rx_buf, flen, 0);
+
+				uint64_t rx_ts = uwb_get_rx_timestamp_u64();
+				uint16_t plen = (uint16_t)(flen - FCS_LEN);
+
+				/* No beacon guard: there is no gateway on air
+				 * during calibration, and
+				 * beacon_guard_tx_allowed() returns true while
+				 * unlocked in any case (beacon_guard.c:37). */
+				anchor_respond_wave_poll(rx_buf, plen, rx_ts,
+							 &cfg_live,
+							 &frame_seq_nb, NULL);
+			}
+
+			rx_arm();
+		}
+
+		events[0].state = K_POLL_STATE_NOT_READY;
+		events[1].state = K_POLL_STATE_NOT_READY;
+	}
+}

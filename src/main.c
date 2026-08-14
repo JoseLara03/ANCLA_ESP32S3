@@ -21,6 +21,10 @@
 #include "uwb_radio.h"
 #include "uwb_store.h"
 
+#ifdef CONFIG_ANCLA_CAL_MODE
+#include "cal_run.h"
+#endif
+
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 static void log_config(const uwb_config_t *cfg)
@@ -55,6 +59,11 @@ int main(void)
 		return ret;
 	}
 
+#ifdef CONFIG_ANCLA_CAL_MODE
+	/* The calibration image ignores the configured mode entirely: it is
+	 * neither a SLAVE nor a GATEWAY, and it must not beacon. */
+	cal_run(cfg);
+#else
 	if (cfg->mode == UWB_MODE_GATEWAY) {
 		/* Run the beacon loop cooperatively so no network thread can
 		 * preempt a delayed-TX arm. The loop already yields at its
@@ -74,6 +83,7 @@ int main(void)
 	} else {
 		uwb_slave_run(cfg);
 	}
+#endif
 
 	return 0;
 }
