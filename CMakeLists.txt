@@ -12,7 +12,9 @@ target_sources(app PRIVATE
 	src/anchor_shell.c
 	src/apos_frame.c
 	src/apos_geom.c
+	src/apos_gw.c
 	src/apos_node.c
+	src/apos_shell.c
 	src/apos_store.c
 	src/apos_table.c
 	src/beacon_guard.c
