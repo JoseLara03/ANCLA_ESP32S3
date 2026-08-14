@@ -31,13 +31,55 @@ than the array itself means the three ranges disagree wildly; the reported
 Until this is done, **no coordinate this system emits means anything**, and no
 amount of solver or geometry work will change that.
 
+**The calibration procedure itself is now fully implemented, built, and
+code-reviewed** — branch `cal/antenna-delay`, four completed tasks: a pure-C
+solver host-tested against the tag's own vectors (`src/cal_math.{c,h}`,
+`src/cal_solve.{c,h}`), a separate calibration firmware image that is an
+ordinary WAVE responder until told otherwise (`src/cal_run.{c,h}`, `cal.conf`),
+an SS-TWR initiator so an anchor can poll a peer from the console
+(`src/cal_initiator.{c,h}`), and the `cal ref`/`cal peer` shell commands
+(`src/cal_shell.c`) that solve, apply hot, and persist. The full runnable
+procedure — DWM3001CDK prerequisites, physical setup, per-anchor `cal ref`,
+the `cal peer` cross-check and its acceptance threshold, and troubleshooting —
+is written up in `docs/antenna-delay-calibration.md`.
+
+**What has not happened yet: end-to-end hardware verification, on any board.**
+The code was written and builds cleanly, but no board has actually been
+flashed and run through this procedure. The outstanding hardware gates, in the
+order a human would hit them running `docs/antenna-delay-calibration.md`:
+
+- The cal image is a working WAVE responder on real hardware (one board,
+  sniffer-confirmed against `0xE0`/`0xE1`).
+- Two cal-image anchors range each other with a stable (if inaccurate) mean
+  across repeated `cal peer` runs, and responder duty survives a batch.
+- `cal ref` against the prepared DWM3001CDK reference node converges to
+  `|error_mm| < 15` on a second run, survives `kernel reboot cold`, and is
+  then repeated for all three anchors.
+- The `cal peer` cross-check acceptance test: `|error_mm| < 30` on every
+  anchor pair, on pairs never used to calibrate anything.
+- The actual point of the branch: with all three anchors calibrated and
+  reflashed to the **production** image, a tag's `0xEA` `residual` collapses
+  from the 0.48–2.0 m recorded above to under ~0.1 m, with `(x, y)` stable
+  between consecutive fixes.
+
+None of these have been run. `docs/antenna-delay-calibration.md` is the
+document to execute them from; until they are done, the residuals recorded at
+the top of this section are still the current, unresolved measurement.
+
 - Console hook already exists: `anchor ant <tx> <rx>`, persisted per board.
-- Only **TX** needs trimming: `RX_ANT_DLY` cancels in `RTD_resp`, so it drops
-  out of the SS-TWR result. The sibling ESP-IDF project documents this and
-  carries a working automated procedure — `src/anchor_cal.{c,h}` plus the
-  `cal self <ref_mm>` command in `src/ranging.c`, which takes 1000 samples at a
-  known reference distance, trims outliers and solves for the delay. Port that
-  procedure rather than re-deriving it.
+- **Only the sum `ant_tx + ant_rx` is observable — trim TX and pin RX.**
+  `RTD_resp` as a *number* is `D + ant_delay_tx` and independent of
+  `RX_ANT_DLY`, but the delayed TX time is derived *from* `poll_rx_ts`
+  (`anchor_respond.c:138`), which the hardware has already shifted by
+  `RX_ANT_DLY`. Raising `ant_delay_rx` by a tick therefore makes the anchor
+  physically transmit a tick earlier, moving the initiator's result by exactly
+  as much as raising `ant_delay_tx` does by growing the reported turnaround.
+  Both are half a tick of range per unit. So putting the whole correction into
+  TX is *equivalent*, not merely conventional — and `ant_delay_rx` is **not** a
+  free parameter: change it after calibration and you have decalibrated the
+  board. An earlier version of this bullet said RX "drops out of the SS-TWR
+  result", which is the right conclusion by the wrong route. Full derivation in
+  `docs/superpowers/specs/2026-08-13-antenna-delay-calibration-design.md` §3.1.
 - With 3 anchors solving in 2D there is one degree of redundancy, so `residual`
   in the `0xEA` frame is a genuine (if weak) quality signal — it is the metric
   to watch collapse as the delays are trimmed.
@@ -75,6 +117,22 @@ west espressif monitor -p COM5
 `$env:ZEPHYR_BASE` is **required** — this project lives outside the
 `zephyrproject` west workspace. Zephyr 4.4.x, SDK at `~/zephyr-sdk-1.0.1`.
 
+There is also a separate **calibration image**, selected with an
+`EXTRA_CONF_FILE` overlay rather than a runtime mode:
+
+```powershell
+west build -b ancla_esp32s3/esp32s3/procpu --pristine -- -DEXTRA_CONF_FILE=cal.conf
+west flash
+```
+
+`cal.conf` sets `CONFIG_ANCLA_CAL_MODE=y` and turns off WiFi/MQTT/networking
+entirely. The resulting image is an ordinary WAVE responder that can be told,
+from the console, to become a temporary SS-TWR initiator for one batch of
+antenna-delay calibration exchanges — see `docs/antenna-delay-calibration.md`
+for the full procedure. Never flash this image to a deployed anchor: a board
+transmitting unsolicited polls would collide with tag ranging traffic. The
+production build (no `EXTRA_CONF_FILE`) compiles none of the `cal_*.c` files.
+
 ## Console
 
 Native USB-JTAG (not UART0), prompt `uwb:~$ `.
@@ -97,6 +155,20 @@ net user <username>            MQTT username
 net mqttpass <password>        MQTT password — NOT the WiFi passphrase
 net reset                      restore network defaults
 ```
+
+The calibration image (`CONFIG_ANCLA_CAL_MODE`, see "Build & flash") adds a
+`cal` tree that exists **only** in that build, not in production:
+
+```
+cal ref <mm>                   calibrate ant_delay_tx against the reference
+                                node at a known distance; applies hot and
+                                persists to NVS
+cal peer <id> <mm>              range anchor <id> at a known distance;
+                                reports only, never persists — the cross-check
+```
+
+See `docs/antenna-delay-calibration.md` for the full procedure and acceptance
+thresholds.
 
 ## Layout
 
@@ -160,6 +232,28 @@ net reset                      restore network defaults
 - `src/net_shell.c` — the `net` console command tree.
 - `src/net_uplink.{c,h}` — the WiFi + MQTT uplink thread and the bounded fix
   queue. GATEWAY mode only.
+- `src/cal_math.{c,h}` — the pure-C antenna-delay solver, copied verbatim from
+  the tag (`tag_testting/src/`), same rule as `uwb_frame_802_15_4z.c`: keep it
+  byte-identical so this stays a copy the tag and the anchor share rather than
+  a fork that drifts.
+- `src/cal_solve.{c,h}` — the one piece of arithmetic this project adds on top
+  of `cal_math.c`: converts a solved combined antenna delay back into a
+  TX-only value, holding `ant_delay_rx` fixed. Host-tested in
+  `tests/cal_solve/`.
+- `src/cal_initiator.{c,h}` — one SS-TWR exchange with this board as the
+  initiator, the role the tag normally plays. Calibration image only.
+- `src/cal_run.{c,h}` — CAL mode's main loop: an ordinary WAVE responder that
+  can be told, from the console, to become a temporary SS-TWR initiator for
+  one batch of exchanges.
+- `src/cal_shell.c` — the `cal` console command tree (`cal ref`, `cal peer`).
+  Calibration image only.
+- `Kconfig` — the project's own `Kconfig`, sourcing `Kconfig.zephyr` last;
+  defines `CONFIG_ANCLA_CAL_MODE`.
+- `cal.conf` — the `EXTRA_CONF_FILE` overlay that builds the calibration image
+  instead of production (see "Build & flash").
+- `docs/antenna-delay-calibration.md` — the operator procedure for the above:
+  DWM3001CDK prerequisites, physical setup, `cal ref`, the `cal peer`
+  cross-check and its acceptance threshold, troubleshooting.
 - `docs/dw3000-zephyr-port.md` — the port reference: local deltas, the DW3000
   call-order footgun, resolved RESET polarity, verification status.
 - `docs/superpowers/{specs,plans}/` — board design spec and implementation plan.
@@ -409,6 +503,14 @@ net reset                      restore network defaults
   2–3 m. The fine-grain TX fix above was applied but a controlled before/after
   (same positions, firmware toggled) was **never run**, so its contribution is
   unknown. Re-measure before trusting any range budget.
+- **The DWM3001CDK reference node used for antenna-delay calibration must run
+  `POLL_RX_TO_RESP_TX_DLY_UUS = 2000`, not the Qorvo `ss_twr_responder`
+  example's stock 450.** At PLEN_1024 the preamble alone takes ~1.05 ms, so a
+  450 uus turnaround would require the response to leave before the poll's
+  preamble finished decoding — physically impossible. ANCLA's own responder
+  already turns around at 2000 uus; matching it on the reference node is what
+  lets `cal_initiator.c` use a single RX window for both peer types. See
+  `docs/antenna-delay-calibration.md` §1.1.
 
 ## System context
 
@@ -463,6 +565,9 @@ gcc -Wall -Wextra -Isrc -o tests/pos_json/test_pos_json.exe tests/pos_json/test_
 
 gcc -Wall -Wextra -Isrc -o tests/net_config/test_net_config.exe tests/net_config/test_net_config.c src/net_config.c
 ./tests/net_config/test_net_config.exe          # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/cal_solve/test_cal_solve.exe tests/cal_solve/test_cal_solve.c src/cal_solve.c src/cal_math.c
+./tests/cal_solve/test_cal_solve.exe            # PASSED, exits 0
 ```
 
 ## Repo
