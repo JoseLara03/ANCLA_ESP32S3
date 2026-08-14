@@ -96,8 +96,11 @@ static void window_open(uint16_t session, uint16_t window_s)
 	window_deadline_ms = k_uptime_get() + (int64_t)window_s * 1000;
 }
 
-/* Push the deadline out on any in-session APOS frame, so a long survey does not
- * need the gateway to re-broadcast SURVEY_BEGIN just to keep the window alive. */
+/* Push the deadline out on a SETPOS matching the current session, so a long
+ * survey does not need the gateway to re-broadcast SURVEY_BEGIN just to keep
+ * the window alive. Called only from handle_setpos(), after the session
+ * check, so a stale-session SETPOS cannot extend a window it does not belong
+ * to. */
 static void window_refresh(void)
 {
 	if (window_session != 0) {
@@ -123,6 +126,8 @@ static bool tx_now(const uint8_t *buf, uint16_t len, struct beacon_guard *bg)
 
 	dwt_forcetrxoff();
 	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+	/* dwt_writetxdata() only reads from buf; the driver's signature is not
+	 * const-correct, hence the cast rather than a non-const parameter here. */
 	dwt_writetxdata(len, (uint8_t *)(uintptr_t)buf, 0);
 	dwt_writetxfctrl((uint16_t)(len + FCS_LEN), 0, 0);
 
@@ -162,6 +167,9 @@ static void handle_survey_begin(const uint8_t *buf, uint16_t plen,
 	uint16_t session = 0, window_s = 0;
 
 	if (apos_frame_parse_survey_begin(buf, plen, &session, &window_s) != 0) {
+		LOG_WRN("SURVEY_BEGIN parse failed: plen=%u expected=%u — check "
+			"the caller is passing flen - FCS_LEN",
+			plen, APOS_LEN_SURVEY_BEGIN);
 		return;
 	}
 	if (session == 0 || !eui_ready) {
@@ -201,6 +209,9 @@ static void handle_setpos(const uint8_t *buf, uint16_t plen,
 	float x = 0.0f, y = 0.0f, z = 0.0f;
 
 	if (apos_frame_parse_setpos(buf, plen, &session, &x, &y, &z) != 0) {
+		LOG_WRN("SETPOS parse failed: plen=%u expected=%u — check the "
+			"caller is passing flen - FCS_LEN",
+			plen, APOS_LEN_SETPOS);
 		return;
 	}
 	if (session != window_session) {
@@ -208,6 +219,7 @@ static void handle_setpos(const uint8_t *buf, uint16_t plen,
 			session, window_session);
 		return;
 	}
+	window_refresh();
 
 	/* Applied to the loop's snapshot AND to the shared singleton, then
 	 * persisted. The snapshot is what anchor_respond.c reports to the tag,
@@ -249,6 +261,9 @@ static void handle_survey_end(const uint8_t *buf, uint16_t plen)
 	uint16_t session = 0;
 
 	if (apos_frame_parse_survey_end(buf, plen, &session) != 0) {
+		LOG_WRN("SURVEY_END parse failed: plen=%u expected=%u — check "
+			"the caller is passing flen - FCS_LEN",
+			plen, APOS_LEN_SURVEY_END);
 		return;
 	}
 	if (session != window_session) {
@@ -283,7 +298,6 @@ bool apos_node_on_rx(const uint8_t *buf, uint16_t plen, uwb_config_t *cfg,
 		handle_survey_begin(buf, plen, cfg, seq, bg);
 		break;
 	case APOS_SUB_SETPOS:
-		window_refresh();
 		handle_setpos(buf, plen, cfg, seq, bg);
 		break;
 	case APOS_SUB_SURVEY_END:

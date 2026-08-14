@@ -13,9 +13,9 @@
  * harmless.
  *
  * The survey window is the safety boundary. SURVEY_BEGIN opens it for a bounded
- * number of seconds; any later APOS frame refreshes it; SURVEY_END closes it
- * early. Outside the window this module transmits nothing and this board will
- * not act as an initiator, which is what keeps a production anchor from
+ * number of seconds; a later in-session SETPOS refreshes it; SURVEY_END closes
+ * it early. Outside the window this module transmits nothing and this board
+ * will not act as an initiator, which is what keeps a production anchor from
  * colliding with tag ranging traffic.
  */
 
@@ -61,11 +61,23 @@ void apos_node_init(void);
  * no tick or timer. */
 bool apos_node_window_open(void);
 
-/* This board's EUI-64. Never NULL; 8 bytes. */
+/* This board's EUI-64. Never NULL; 8 bytes.
+ *
+ * Before apos_node_init() has run (or if hwinfo failed), this is all zero --
+ * indistinguishable from a genuine all-zero id. Callers that care about the
+ * difference must track readiness themselves; this module does not expose
+ * one. */
 const uint8_t *apos_node_eui(void);
 
 /* Offer one received frame. Returns true if it was an APOS frame handled here,
  * so the caller can skip the remaining responders.
+ *
+ * plen MUST exclude the 2-byte FCS -- callers pass flen - FCS_LEN, exactly as
+ * every other frame consumer in this project does. The apos_frame parsers
+ * require an EXACT length match per subtype, so a caller that forgets this
+ * (the project's classic mistake) gets a board that receives every survey
+ * frame and silently answers none -- watch for the "parse failed" LOG_WRN
+ * lines in apos_node.c, which name the subtype and the plen actually seen.
  *
  * cfg must be the SLAVE loop's own mutable snapshot: a SETPOS is applied to it
  * immediately, not deferred to the next reboot. Unlike ant_delay_tx there is no
