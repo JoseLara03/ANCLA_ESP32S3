@@ -15,6 +15,7 @@
 
 #include <deca_device_api.h>
 
+#include <stdbool.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(cal_initiator, LOG_LEVEL_INF);
@@ -71,8 +72,30 @@ static const uint8_t rx_resp_ref[] = {
 
 static uint8_t poll_seq;
 
+/* Diagnostic only: logs the first exchange of each batch in full, so a
+ * hardware-debugging session can see the actual peer response layout instead
+ * of guessing. Not part of the calibration result. */
+static bool diag_logged;
+
+/* Diagnostic only: which of cal_initiator_range()'s early-return paths fired,
+ * tallied across a batch, so a hardware-debugging session can tell "no
+ * response at all" from "response arrived but was malformed" instead of
+ * both collapsing into the same INT32_MIN. Logged once in
+ * cal_initiator_leave(). Not part of the calibration result. */
+static struct {
+	uint32_t ok;
+	uint32_t tx_start_fail;
+	uint32_t tx_done_timeout;
+	uint32_t rx_timeout_or_err;
+	uint32_t frame_len_bad;
+	uint32_t header_mismatch;
+	uint32_t layout_unknown;
+} diag_counts;
+
 void cal_initiator_enter(void)
 {
+	diag_logged = false;
+	memset(&diag_counts, 0, sizeof(diag_counts));
 	dwt_forcetrxoff();
 	/* ull_forcetrxoff() only issues CMD_TXRXOFF (and skips even that if the
 	 * part is already idle) -- it does not clear SYS_STATUS. Without this, a
@@ -98,6 +121,14 @@ void cal_initiator_leave(void)
 	dwt_setrxtimeout(0);
 	dwt_setpreambledetecttimeout(0);
 	dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
+
+	LOG_INF("cal diag: batch tally ok=%u tx_start_fail=%u tx_done_timeout=%u "
+		"rx_timeout_or_err=%u frame_len_bad=%u header_mismatch=%u "
+		"layout_unknown=%u",
+		diag_counts.ok, diag_counts.tx_start_fail,
+		diag_counts.tx_done_timeout, diag_counts.rx_timeout_or_err,
+		diag_counts.frame_len_bad, diag_counts.header_mismatch,
+		diag_counts.layout_unknown);
 }
 
 /* Bounded wait for ANY bit in mask. uwb_wait_for_sysstatus_lo() waits for ALL
@@ -140,12 +171,14 @@ int32_t cal_initiator_range(uint8_t peer_wire_id)
 
 	if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) !=
 	    DWT_SUCCESS) {
+		diag_counts.tx_start_fail++;
 		return INT32_MIN;
 	}
 
 	if (!uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK,
 				       TX_DONE_TIMEOUT_MS)) {
 		dwt_forcetrxoff();
+		diag_counts.tx_done_timeout++;
 		return INT32_MIN;
 	}
 	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
@@ -157,6 +190,7 @@ int32_t cal_initiator_range(uint8_t peer_wire_id)
 	if (!(got & DWT_INT_RXFCG_BIT_MASK)) {
 		dwt_forcetrxoff();
 		dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+		diag_counts.rx_timeout_or_err++;
 		return INT32_MIN;
 	}
 	dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
@@ -165,6 +199,7 @@ int32_t cal_initiator_range(uint8_t peer_wire_id)
 	uint16_t flen = dwt_getframelength(&rng);
 
 	if (flen <= FCS_LEN || flen > RX_BUF_LEN) {
+		diag_counts.frame_len_bad++;
 		return INT32_MIN;
 	}
 
@@ -178,6 +213,7 @@ int32_t cal_initiator_range(uint8_t peer_wire_id)
 
 	buf[ALL_MSG_SN_IDX] = 0;
 	if (memcmp(buf, rx_resp_ref, ALL_MSG_COMMON_LEN) != 0) {
+		diag_counts.header_mismatch++;
 		return INT32_MIN;
 	}
 
@@ -191,6 +227,7 @@ int32_t cal_initiator_range(uint8_t peer_wire_id)
 		resp_tx_idx = RESP_TS_IDX_STOCK_RESP_TX;
 	} else {
 		LOG_DBG("unknown response layout, plen=%u", plen);
+		diag_counts.layout_unknown++;
 		return INT32_MIN;
 	}
 
@@ -209,6 +246,21 @@ int32_t cal_initiator_range(uint8_t peer_wire_id)
 	int32_t rtd_resp = (int32_t)(resp_tx_ts - poll_rx_ts);
 	double tof = ((rtd_init - rtd_resp * (1.0 - clk_off)) / 2.0) *
 		     DWT_TIME_UNITS_V;
+	int32_t dist_mm = (int32_t)(tof * SPEED_OF_LIGHT * 1000.0);
 
-	return (int32_t)(tof * SPEED_OF_LIGHT * 1000.0);
+	diag_counts.ok++;
+
+	if (!diag_logged) {
+		diag_logged = true;
+		LOG_HEXDUMP_INF(buf, plen, "cal diag: raw response payload");
+		LOG_INF("cal diag: plen=%u layout=%s poll_rx_idx=%u resp_tx_idx=%u",
+			plen, (plen == RESP_LEN_ANCLA) ? "ANCLA" : "STOCK",
+			poll_rx_idx, resp_tx_idx);
+		LOG_INF("cal diag: poll_tx_ts=%u resp_rx_ts=%u poll_rx_ts=%u resp_tx_ts=%u",
+			poll_tx_ts, resp_rx_ts, poll_rx_ts, resp_tx_ts);
+		LOG_INF("cal diag: rtd_init=%d rtd_resp=%d clk_off=%d(x1e6) dist_mm=%d",
+			rtd_init, rtd_resp, (int)(clk_off * 1.0e6), dist_mm);
+	}
+
+	return dist_mm;
 }

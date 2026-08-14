@@ -244,6 +244,23 @@ void cal_run(const uwb_config_t *cfg)
 				uint64_t rx_ts = uwb_get_rx_timestamp_u64();
 				uint16_t plen = (uint16_t)(flen - FCS_LEN);
 
+				/* DIAGNOSTIC: this board's idle responder duty
+				 * had never been exercised against another
+				 * live ANCLA cal image before this debugging
+				 * session (only against the DWM3001CDK
+				 * reference, which does not filter on id).
+				 * Show what actually arrived, and what this
+				 * board expects as its own wire id, so a
+				 * mismatch or a "nothing ever arrives" case
+				 * is visible directly instead of guessed at. */
+				LOG_HEXDUMP_INF(rx_buf, plen,
+						"cal diag: RX frame while idle");
+				LOG_INF("cal diag: plen=%u our_wire_id=0x%02X "
+					"frame_id_byte=0x%02X (idx10)",
+					plen,
+					(unsigned int)(uwb_config_short_addr(&cfg_live) & 0xFFu),
+					(plen > 10U) ? rx_buf[10] : 0xFFU);
+
 				/* No beacon guard: there is no gateway on air
 				 * during calibration, and
 				 * beacon_guard_tx_allowed() returns true while
