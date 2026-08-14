@@ -74,6 +74,15 @@ static uint8_t poll_seq;
 void cal_initiator_enter(void)
 {
 	dwt_forcetrxoff();
+	/* ull_forcetrxoff() only issues CMD_TXRXOFF (and skips even that if the
+	 * part is already idle) -- it does not clear SYS_STATUS. Without this, a
+	 * WAVE-responder RX that completed just as this function runs can leave
+	 * RXFCG latched, and the very first poll's wait_any_sysstatus_lo() would
+	 * "see" that stale bit and pair a fresh poll_tx_ts with a stale
+	 * resp_rx_ts -- a garbage but self-consistent measurement that can
+	 * propagate across the whole batch. */
+	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK | SYS_STATUS_ALL_RX_GOOD |
+			     SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
 	/* Every interrupt off: this path polls SYS_STATUS, and an enabled ISR
 	 * would clear TXFRS/RXFCG before the poll could see them. */
 	dwt_setinterrupt(0xFFFFFFFFU, 0xFFFFFFFFU, DWT_DISABLE_INT);

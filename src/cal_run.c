@@ -85,6 +85,12 @@ int cal_run_execute(const struct cal_request *req, struct cal_result *out)
 	}
 	g_busy = true;
 	g_req = *req;
+
+	/* Clear any stale token left by a prior batch that timed out below but
+	 * is still running in the background: without this, this command's
+	 * k_sem_take() could return instantly on that stale give and hand back
+	 * the PREVIOUS (unrelated) batch's result as if it were this one's. */
+	k_sem_reset(&done_sem);
 	k_sem_give(&req_sem);
 
 	/* Generous: a fully failing 128-sample batch is 128 * (10 + 25) ms of
