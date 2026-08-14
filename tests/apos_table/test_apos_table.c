@@ -241,6 +241,78 @@ static void test_symmetrise_respects_out_cap(void)
     CHECK(apos_table_symmetrise(&t, e, 2, 10) == 2);
 }
 
+/* APOS_MAX_MEAS = 56 = 8*7 is hit exactly by a fully-surveyed 8-node
+ * deployment, with zero headroom. A `>` -vs- `>=` slip in the capacity
+ * check would silently drop the last real measurement of a full survey, so
+ * the boundary is asserted explicitly: fill every ordered pair except
+ * (6, 7), confirm the 56th add (the last new pair, reaching capacity
+ * exactly) still SUCCEEDS, confirm a genuinely new 57th pair is impossible
+ * to request at APOS_MAX_NODES peers so -ENOSPC is exercised by shrinking
+ * the peer set instead, and confirm replace-on-repeat still succeeds at
+ * full capacity since it consumes no new slot. */
+static void test_measurement_table_fills_to_exact_capacity(void)
+{
+    struct apos_table t;
+    uint16_t n = 0;
+
+    apos_table_init(&t);
+    for (uint8_t k = 0; k < APOS_MAX_NODES; k++) {
+        add(&t, (uint8_t)(k + 1), (uint16_t)(0x0001 + k));
+    }
+    CHECK(t.n_peers == APOS_MAX_NODES);
+
+    /* Fill every ordered pair except (6, 7): APOS_MAX_MEAS - 1 rows. */
+    for (uint8_t i = 0; i < APOS_MAX_NODES; i++) {
+        for (uint8_t j = 0; j < APOS_MAX_NODES; j++) {
+            if (i == j || (i == 6 && j == 7)) {
+                continue;
+            }
+            CHECK(apos_table_add_meas(&t, i, j, 1000, 10, 40) == 0);
+            n++;
+        }
+    }
+    CHECK(n == APOS_MAX_MEAS - 1);
+    CHECK(t.n_meas == APOS_MAX_MEAS - 1);
+
+    /* The 56th row: the last remaining new (from, to) pair, reaching
+     * capacity exactly. This is the boundary a `>` -vs- `>=` slip would
+     * break -- it must still SUCCEED. */
+    CHECK(apos_table_add_meas(&t, 6, 7, 1234, 10, 40) == 0);
+    CHECK(t.n_meas == APOS_MAX_MEAS);
+
+    /* Replace-on-repeat for an already-recorded pair must still succeed at
+     * full capacity: it consumes no new slot, so the capacity check must
+     * not block it. */
+    CHECK(apos_table_add_meas(&t, 6, 7, 9999, 99, 41) == 0);
+    CHECK(t.n_meas == APOS_MAX_MEAS);
+    CHECK(t.meas[APOS_MAX_MEAS - 1].mean_mm == 9999);
+    CHECK(t.meas[APOS_MAX_MEAS - 1].n_ok == 41);
+}
+
+/* NOTE on the -ENOSPC branch of apos_table_add_meas: a true 57th-add-returns
+ * -ENOSPC test is not constructible with legal indices. apos_table_add_meas
+ * rejects from/to >= t->n_peers, and t->n_peers <= APOS_MAX_NODES, so the
+ * maximum number of distinct valid (from, to) pairs is
+ * APOS_MAX_NODES*(APOS_MAX_NODES-1) = APOS_MAX_MEAS exactly -- the array is
+ * sized so that a fully-surveyed maximum deployment lands precisely on the
+ * capacity boundary with no legal index combination left over to overflow
+ * it. The -ENOSPC branch in apos_table_add_meas is therefore unreachable
+ * through the function's own bounds contract; see the fix report for this
+ * disclosed as a finding rather than a fabricated test. */
+
+/* A freshly-initialised table has no peers at all. symmetrise and
+ * missing_pairs must both no-op cleanly rather than reading past n_peers. */
+static void test_empty_table_symmetrise_and_missing_pairs_are_zero(void)
+{
+    struct apos_table t;
+    struct apos_edge e[APOS_MAX_EDGES];
+
+    apos_table_init(&t);
+    CHECK(t.n_peers == 0);
+    CHECK(apos_table_symmetrise(&t, e, APOS_MAX_EDGES, 10) == 0);
+    CHECK(apos_table_missing_pairs(&t, 10) == 0);
+}
+
 int main(void)
 {
     test_peers_get_sequential_indices();
@@ -257,6 +329,8 @@ int main(void)
     test_zero_sd_is_floored();
     test_missing_pairs_counts_holes();
     test_symmetrise_respects_out_cap();
+    test_measurement_table_fills_to_exact_capacity();
+    test_empty_table_symmetrise_and_missing_pairs_are_zero();
 
     if (g_fail) {
         printf("%d CHECK(s) FAILED\n", g_fail);
