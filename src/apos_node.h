@@ -47,6 +47,25 @@
  * enough that a gateway which stops talking releases this board promptly. */
 #define APOS_NODE_REFRESH_S 60u
 
+/* Hard cap on one commanded batch, independent of what the RANGE_CMD asks for.
+ * The gateway owns the tradeoff and sends 40, but this board must not be
+ * talkable into an unbounded transmit run by a malformed or hostile command --
+ * that is the failure mode the survey window exists to prevent, and a count
+ * cap is the second half of it.
+ *
+ * 64 exchanges at ~5 ms is ~320 ms, during which this board is an initiator and
+ * therefore blind to the beacon. Its beacon_guard prediction goes stale over
+ * that span but stays trustworthy: BEACON_GUARD_MAX_MISSES is 4 superframes
+ * (~800 ms). Raising this past ~150 exchanges would cross that line and the
+ * guard would drop its lock mid-batch. */
+#define APOS_MAX_EXCHANGES 64u
+
+/* Below this many successful exchanges the batch is reported with its real
+ * n_ok and the gateway discards it (apos_table_symmetrise's min_n_ok). Reported
+ * rather than suppressed: "the pair cannot range" and "the command never
+ * arrived" must not collapse into the same silence at the gateway. */
+#define APOS_MIN_N_OK 10u
+
 /* Clear to the closed-window state. Call once before the SLAVE loop starts. */
 void apos_node_init(void);
 

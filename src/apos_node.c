@@ -9,6 +9,7 @@
 #include "apos_node.h"
 
 #include "apos_frame.h"
+#include "ss_initiator.h"
 #include "uwb_dwtime.h"
 #include "uwb_store.h"
 
@@ -273,6 +274,182 @@ static void handle_survey_end(const uint8_t *buf, uint16_t plen)
 	LOG_INF("{\"apos\":\"window closed\",\"reason\":\"survey end\"}");
 }
 
+/* Static, not on the stack: CONFIG_MAIN_STACK_SIZE is 4096 and this is 256 B. */
+static int32_t batch[APOS_MAX_EXCHANGES];
+
+/* Mean and standard deviation of the batch, in mm. Returns the count kept.
+ *
+ * A median-absolute-deviation filter rather than cal_math.c's cal_filtered_mean:
+ * that one is tuned for a batch measured against a known reference at a known
+ * distance, and here nothing is known in advance. The sd is the whole point --
+ * it becomes the edge weight in the fit and the operator's per-pair quality
+ * signal -- so it must describe the kept samples, not the raw ones. */
+static uint8_t batch_stats(const int32_t *s, uint8_t n, int32_t *mean_out,
+			   uint16_t *sd_out)
+{
+	if (n == 0) {
+		*mean_out = 0;
+		*sd_out = 0;
+		return 0;
+	}
+
+	/* Median via a partial insertion sort into a scratch copy: n <= 64, so
+	 * O(n^2) is irrelevant and a real sort would be more code. */
+	int32_t tmp[APOS_MAX_EXCHANGES];
+
+	memcpy(tmp, s, (size_t)n * sizeof(tmp[0]));
+	for (uint8_t i = 1; i < n; i++) {
+		int32_t v = tmp[i];
+		int8_t j = (int8_t)(i - 1);
+
+		while (j >= 0 && tmp[j] > v) {
+			tmp[j + 1] = tmp[j];
+			j--;
+		}
+		tmp[j + 1] = v;
+	}
+
+	int32_t median = tmp[n / 2];
+
+	/* Reject anything more than 300 mm from the median. A reflection or a
+	 * half-decoded frame lands far outside that; honest ranging noise on
+	 * this hardware is tens of millimetres. */
+	int64_t sum = 0;
+	uint8_t kept = 0;
+
+	for (uint8_t i = 0; i < n; i++) {
+		int32_t dev = s[i] - median;
+
+		if (dev < 0) {
+			dev = -dev;
+		}
+		if (dev <= 300) {
+			sum += s[i];
+			kept++;
+		}
+	}
+	if (kept == 0) {
+		*mean_out = median;
+		*sd_out = 0;
+		return 0;
+	}
+
+	int32_t mean = (int32_t)(sum / kept);
+	int64_t var = 0;
+
+	for (uint8_t i = 0; i < n; i++) {
+		int32_t dev = s[i] - median;
+
+		if (dev < 0) {
+			dev = -dev;
+		}
+		if (dev <= 300) {
+			int64_t d = (int64_t)s[i] - mean;
+
+			var += d * d;
+		}
+	}
+
+	/* Population sd over the kept samples. Divide by kept, not kept-1: with
+	 * 40 samples the difference is under 2 % and this feeds a weight, not a
+	 * hypothesis test. */
+	uint32_t sd = 0;
+
+	if (kept > 1) {
+		int64_t v = var / kept;
+
+		/* Integer sqrt: no float needed and this runs on the SLAVE
+		 * loop's stack. */
+		while ((int64_t)(sd + 1) * (sd + 1) <= v) {
+			sd++;
+		}
+	}
+
+	*mean_out = mean;
+	*sd_out = (sd > UINT16_MAX) ? UINT16_MAX : (uint16_t)sd;
+	return kept;
+}
+
+static void handle_range_cmd(const uint8_t *buf, uint16_t plen,
+			     const uwb_config_t *cfg, uint8_t *seq,
+			     struct beacon_guard *bg)
+{
+	uint16_t session = 0, peer_addr = 0;
+	uint8_t n_exchanges = 0;
+
+	if (apos_frame_parse_range_cmd(buf, plen, &session, &peer_addr,
+				       &n_exchanges) != 0) {
+		LOG_WRN("RANGE_CMD parse failed: plen=%u expected=%u — check "
+			"the caller is passing flen - FCS_LEN",
+			plen, APOS_LEN_RANGE_CMD);
+		return;
+	}
+
+	/* Gate one: the window. Gate two: the session. src == 0x0000 was
+	 * already checked by the caller. All three must hold before this board
+	 * transmits a single unsolicited poll -- see apos_node.h. */
+	if (!apos_node_window_open() || session != window_session) {
+		LOG_WRN("RANGE_CMD refused — window closed or session mismatch");
+		return;
+	}
+	if (peer_addr == UWB_ADDR_GATEWAY_RESERVED ||
+	    peer_addr == uwb_config_short_addr(cfg)) {
+		/* The gateway never answers a poll, and polling ourselves is
+		 * meaningless. Either means the gateway's table is wrong. */
+		LOG_WRN("RANGE_CMD refused — peer 0x%04X is not rangeable",
+			peer_addr);
+		return;
+	}
+
+	uint8_t want = (n_exchanges > APOS_MAX_EXCHANGES)
+		       ? (uint8_t)APOS_MAX_EXCHANGES : n_exchanges;
+	uint8_t valid = 0;
+
+	/* The responder filters on the low byte of its short address, which is
+	 * what the tag polls with too (anchor_respond.c:122). */
+	uint8_t peer_wire_id = (uint8_t)(peer_addr & 0xFFu);
+
+	ss_initiator_enter();
+	for (uint8_t i = 0; i < want; i++) {
+		int32_t mm = ss_initiator_range(peer_wire_id);
+
+		if (mm != INT32_MIN) {
+			batch[valid++] = mm;
+		}
+		/* Yields to the shell so the console survives the batch, and
+		 * decorrelates consecutive exchanges slightly. */
+		k_sleep(K_MSEC(2));
+	}
+	ss_initiator_leave();
+
+	int32_t mean = 0;
+	uint16_t sd = 0;
+	uint8_t kept = batch_stats(batch, valid, &mean, &sd);
+
+	LOG_INF("{\"apos_range\":{\"peer\":\"0x%04X\",\"tried\":%u,\"ok\":%u,"
+		"\"kept\":%u,\"mean_mm\":%d,\"sd_mm\":%u}}",
+		peer_addr, want, valid, kept, mean, sd);
+
+	/* n_ok reports the KEPT count, not the raw count: the gateway's
+	 * min_n_ok threshold is about how many samples the mean rests on, and
+	 * outliers that were filtered out did not contribute to it. */
+	int n = apos_frame_range_rsp_build(tx_buf, sizeof(tx_buf),
+					  uwb_config_short_addr(cfg),
+					  UWB_ADDR_GATEWAY_RESERVED, session,
+					  peer_addr, mean, sd, kept);
+
+	if (n < 0) {
+		LOG_ERR("RANGE_RSP build failed (%d)", n);
+		return;
+	}
+	apos_frame_set_seq(tx_buf, (*seq)++);
+
+	/* ss_initiator_leave() has already restored the interrupt mask and
+	 * cleared the RX timeouts, so a normal immediate TX is legal again. The
+	 * SLAVE loop re-arms RX when this returns. */
+	tx_now(tx_buf, (uint16_t)n, bg);
+}
+
 bool apos_node_on_rx(const uint8_t *buf, uint16_t plen, uwb_config_t *cfg,
 		     uint8_t *seq, struct beacon_guard *bg)
 {
@@ -303,9 +480,13 @@ bool apos_node_on_rx(const uint8_t *buf, uint16_t plen, uwb_config_t *cfg,
 	case APOS_SUB_SURVEY_END:
 		handle_survey_end(buf, plen);
 		break;
+	case APOS_SUB_RANGE_CMD:
+		window_refresh();
+		handle_range_cmd(buf, plen, cfg, seq, bg);
+		break;
 	default:
-		/* RANGE_CMD lands here until Task 7. Every other subtype is
-		 * anchor-to-gateway and should never arrive with src 0x0000. */
+		/* Every remaining subtype is anchor-to-gateway and should
+		 * never arrive with src 0x0000. */
 		break;
 	}
 	return true;
