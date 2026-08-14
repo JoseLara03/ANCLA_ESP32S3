@@ -349,13 +349,18 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 
 	/* Everything else, best-determined first: re-scan after each placement
 	 * so a node that gains a fourth neighbour is placed unambiguously
-	 * rather than being guessed at from three. */
+	 * rather than being guessed at from three. `tried[]` remembers a
+	 * candidate that failed trilateration (collinear or non-intersecting
+	 * neighbours) so it is excluded from the best_cnt competition on later
+	 * scans, without stopping the loop from placing every other node. */
+	bool tried[APOS_MAX_NODES] = {0};
+
 	for (;;) {
 		uint8_t best = APOS_MAX_NODES;
 		uint8_t best_cnt = 0;
 
 		for (uint8_t n = 0; n < n_nodes; n++) {
-			if (out->node[n].state != APOS_NODE_UNPLACED) {
+			if (out->node[n].state != APOS_NODE_UNPLACED || tried[n]) {
 				continue;
 			}
 			uint8_t c = placed_neighbours(e, n_edges, out, n, nb,
@@ -371,9 +376,12 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 		}
 		if (!place_from_neighbours(e, n_edges, out, best)) {
 			/* Geometrically unplaceable despite having the edges;
-			 * leave it unplaced and stop retrying it. */
+			 * leave it unplaced and stop retrying just this
+			 * candidate -- other unplaced nodes may still be
+			 * well-conditioned and must still get their turn. */
 			out->node[best].state = APOS_NODE_UNPLACED;
-			break;
+			tried[best] = true;
+			continue;
 		}
 	}
 

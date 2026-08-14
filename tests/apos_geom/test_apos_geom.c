@@ -199,6 +199,42 @@ static void test_zoff_shifts_only_placed_nodes(void)
     CLOSE(r.node[3].z, 4.5f, 1e-6f);
 }
 
+/* Regression for the fix-round-1 finding: a geometrically unplaceable
+ * candidate must not stop the placement loop from reaching an unrelated,
+ * well-conditioned candidate. Node 4 has 4 edges to placed nodes but three
+ * of them (spheres of radius 0.01 m centred metres apart) cannot mutually
+ * intersect, so trilateration must fail for it. Node 5 also has 4 edges,
+ * to the same four placed nodes, but with the true exact distances, so it
+ * is fully determined. Both have neighbour count 4, so the candidate-
+ * selection loop's first-found-wins tie-break picks node 4 (lower index)
+ * first, exactly the ordering that exposed the bug: the old code's `break`
+ * on node 4's failure left node 5 permanently UNPLACED even though nothing
+ * about its own geometry was wrong. */
+static void test_bad_candidate_does_not_block_good_candidate(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh(e, 4);
+    const float p5[3] = {1.5f, 1.0f, 1.0f};
+
+    e[n].i = 0; e[n].j = 4; e[n].d_m = 0.01f; e[n].sd_m = 0.001f; n++;
+    e[n].i = 1; e[n].j = 4; e[n].d_m = 0.01f; e[n].sd_m = 0.001f; n++;
+    e[n].i = 2; e[n].j = 4; e[n].d_m = 0.01f; e[n].sd_m = 0.001f; n++;
+    e[n].i = 3; e[n].j = 4; e[n].d_m = 5.0f;  e[n].sd_m = 0.001f; n++;
+
+    e[n].i = 0; e[n].j = 5; e[n].d_m = dist3(ref_xyz[0], p5); e[n].sd_m = 0.001f; n++;
+    e[n].i = 1; e[n].j = 5; e[n].d_m = dist3(ref_xyz[1], p5); e[n].sd_m = 0.001f; n++;
+    e[n].i = 2; e[n].j = 5; e[n].d_m = dist3(ref_xyz[2], p5); e[n].sd_m = 0.001f; n++;
+    e[n].i = 3; e[n].j = 5; e[n].d_m = dist3(ref_xyz[3], p5); e[n].sd_m = 0.001f; n++;
+
+    CHECK(apos_geom_seed(e, n, 6, &g_ref, &r) == 0);
+    CHECK(r.node[4].state == APOS_NODE_UNPLACED);
+    CHECK(r.node[5].state == APOS_NODE_PLACED);
+    CLOSE(r.node[5].x, p5[0], 1e-3f);
+    CLOSE(r.node[5].y, p5[1], 1e-3f);
+    CLOSE(r.node[5].z, p5[2], 1e-3f);
+}
+
 static void test_rejects_bad_arguments(void)
 {
     struct apos_edge e[APOS_MAX_EDGES];
@@ -221,6 +257,7 @@ int main(void)
     test_node_with_three_edges_is_flagged_ambiguous();
     test_fourth_edge_resolves_the_mirror();
     test_missing_gauge_edge_is_enodata();
+    test_bad_candidate_does_not_block_good_candidate();
     test_zoff_shifts_only_placed_nodes();
     test_rejects_bad_arguments();
 
