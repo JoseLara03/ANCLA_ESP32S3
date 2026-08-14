@@ -6,6 +6,7 @@
 
 #include "pos_json.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -68,6 +69,25 @@ int pos_json_anchors(char *buf, size_t len, const struct apos_survey *s)
 	}
 	if (!s || !s->valid || s->n_nodes == 0) {
 		return anchors_stub(buf, len);
+	}
+
+	/* A non-finite coordinate would still format under %f (as a bare `nan`
+	 * or `inf` token, which is not valid JSON) and this function would
+	 * still report success -- the retained document would then be rejected
+	 * whole by the platform's parser, which is worse than the stub it
+	 * replaced. Refuse the whole document up front, for the same reason
+	 * truncation below is refused rather than published partially.
+	 * APOS_MIN_NODES (4) is isostatic (6 edges == 3N-6 free parameters), so
+	 * a degenerate/near-collinear solve can be accepted by the solver with
+	 * a non-finite coordinate in it -- this is the last check before MQTT. */
+	if (s->ref_valid && (!isfinite(s->ref_lat) || !isfinite(s->ref_lon))) {
+		return -1;
+	}
+	for (uint8_t k = 0; k < s->n_nodes; k++) {
+		if (!isfinite(s->node[k].x) || !isfinite(s->node[k].y) ||
+		    !isfinite(s->node[k].z)) {
+			return -1;
+		}
 	}
 
 	/* Accumulated with a running offset rather than one giant snprintf: the

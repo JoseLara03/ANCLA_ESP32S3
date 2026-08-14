@@ -1,4 +1,5 @@
 #include "../../src/pos_json.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -170,7 +171,9 @@ static void test_anchors_emits_the_surveyed_geometry(void)
     s.ref_lon = -89.652129;
     s.ref_valid = true;
 
-    CHECK(pos_json_anchors(buf, sizeof(buf), &s) > 0);
+    int n = pos_json_anchors(buf, sizeof(buf), &s);
+
+    CHECK(n > 0);
 
     /* Named from the short address, so the platform's anchor names track the
      * boards rather than a hand-kept list. */
@@ -186,6 +189,117 @@ static void test_anchors_emits_the_surveyed_geometry(void)
     /* Exactly one axis/reference anchor, and it is node[0]. */
     CHECK(strstr(buf, "\"isReferenceAxis\":true") != NULL);
     CHECK(strstr(buf, "21.016042") != NULL);
+
+    /* Same shape of pin the stub test already applies: the return value is
+     * the real strlen (no embedded NUL / no unaccounted bytes), and the
+     * document actually closes. Neither of these is implied by the substring
+     * checks above -- a missing comma or a doubled '}' would still pass all
+     * of them. */
+    CHECK(n == (int)strlen(buf));
+    CHECK(buf[n - 1] == '}');
+
+    /* Full-string comparison, so the exact byte layout (comma placement,
+     * field order, %.8f/%.2f widths) is frozen the same way the stub's is. */
+    CHECK(strcmp(buf,
+        "{\"name\":\"852541\",\"anchors\":["
+        "{\"name\":\"ANC-852541-001\",\"isAxis\":true,\"isReferenceAxis\":true,"
+        "\"latitude\":21.01604200,\"longitude\":-89.65212900,"
+        "\"x\":0.00,\"y\":0.00,\"z\":0.00},"
+        "{\"name\":\"ANC-852541-002\",\"isAxis\":false,\"isReferenceAxis\":false,"
+        "\"latitude\":0.00000000,\"longitude\":0.00000000,"
+        "\"x\":3.25,\"y\":0.00,\"z\":0.10},"
+        "{\"name\":\"ANC-852541-004\",\"isAxis\":false,\"isReferenceAxis\":false,"
+        "\"latitude\":0.00000000,\"longitude\":0.00000000,"
+        "\"x\":1.50,\"y\":4.75,\"z\":2.00}"
+        "]}") == 0);
+}
+
+/* Node counts APOS_MIN_NODES-1 (1, 3, 8) are exercised elsewhere; fill in the
+ * untested middle of the range (4..8) so the comma logic isn't only proven at
+ * the edges. */
+static void test_anchors_well_formed_across_node_counts(void)
+{
+    for (uint8_t count = 4; count <= APOS_MAX_NODES; count++) {
+        char buf[POS_JSON_MAX_LEN];
+        struct apos_survey s;
+
+        memset(&s, 0, sizeof(s));
+        s.valid = true;
+        s.n_nodes = count;
+        for (uint8_t k = 0; k < count; k++) {
+            s.node[k].short_addr = (uint16_t)(0x0001 + k);
+            s.node[k].x = (float)k * 1.5f;
+            s.node[k].y = (float)k * -2.5f;
+            s.node[k].z = 0.0f;
+        }
+        s.ref_lat = 21.0;
+        s.ref_lon = -89.0;
+        s.ref_valid = true;
+
+        int n = pos_json_anchors(buf, sizeof(buf), &s);
+
+        CHECK(n > 0);
+        CHECK(n == (int)strlen(buf));
+        CHECK(buf[n - 1] == '}');
+        CHECK(strstr(buf, "\"anchors\":[") != NULL);
+        /* No malformed comma runs: neither back-to-back commas nor a comma
+         * immediately before the closing bracket. */
+        CHECK(strstr(buf, ",,") == NULL);
+        CHECK(strstr(buf, ",]") == NULL);
+    }
+}
+
+/* A non-finite coordinate must never reach the wire: %f on a NaN/Inf prints a
+ * bare, unquoted token that is not valid JSON, and the platform's parser would
+ * reject the WHOLE retained document -- worse than the stub it replaced. This
+ * is not hypothetical: at APOS_MIN_NODES the accept criterion is isostatic
+ * (6 edges == 3N-6 free parameters), so a degenerate/near-collinear solve can
+ * be accepted with a non-finite coordinate already in it. */
+static void test_anchors_refuses_a_nonfinite_coordinate(void)
+{
+    char buf[POS_JSON_MAX_LEN];
+    struct apos_survey s;
+
+    memset(&s, 0, sizeof(s));
+    s.valid = true;
+    s.n_nodes = 2;
+    s.node[0].short_addr = 0x0001;
+    s.node[1].short_addr = 0x0002;
+    s.node[1].x = (float)NAN;
+    s.ref_valid = false;
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), &s) == -1);
+
+    memset(&s, 0, sizeof(s));
+    s.valid = true;
+    s.n_nodes = 1;
+    s.node[0].short_addr = 0x0001;
+    s.node[0].z = (float)INFINITY;
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), &s) == -1);
+}
+
+/* Same failure mode for the geographic reference: a non-finite ref_lat/lon
+ * must also refuse the whole document, not just the node coordinates. */
+static void test_anchors_refuses_a_nonfinite_reference(void)
+{
+    char buf[POS_JSON_MAX_LEN];
+    struct apos_survey s;
+
+    memset(&s, 0, sizeof(s));
+    s.valid = true;
+    s.n_nodes = 1;
+    s.node[0].short_addr = 0x0001;
+    s.ref_valid = true;
+    s.ref_lat = (double)NAN;
+    s.ref_lon = -89.0;
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), &s) == -1);
+
+    s.ref_lat = 21.0;
+    s.ref_lon = -(double)INFINITY;
+
+    CHECK(pos_json_anchors(buf, sizeof(buf), &s) == -1);
 }
 
 /* Without `apos ref` there is no lat/long to publish. The document must still be
@@ -264,6 +378,9 @@ int main(void)
     test_anchors_without_a_geo_reference();
     test_full_survey_fits_the_buffer();
     test_anchors_refuses_a_short_buffer();
+    test_anchors_well_formed_across_node_counts();
+    test_anchors_refuses_a_nonfinite_coordinate();
+    test_anchors_refuses_a_nonfinite_reference();
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;
 }
