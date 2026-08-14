@@ -46,6 +46,28 @@ static float zoff_m;
 static uint8_t enum_round;
 static int64_t next_action_ms;
 
+/* Set by apos_gw_start_run(), cleared by apos_gw_start_enum(): whether the ENUM
+ * phase now running should fall through into RANGE when it completes. */
+static bool is_run;
+
+/* RANGE phase cursor. `pair_idx` walks every ORDERED pair in a fixed row-major
+ * order: for from = 0..n-1, for to = 0..n-1, skipping from == to. A single
+ * index rather than two counters, so the phase state is one number to reason
+ * about and meas_done/meas_total are trivially derived. */
+static uint16_t pair_idx;
+static uint16_t pair_total;
+static uint8_t pair_retries;
+static uint8_t tx_fails;
+static bool awaiting_rsp;
+static uint16_t await_from_addr;
+static uint16_t await_peer_addr;
+
+/* Result judgement, filled by do_solve()/judge_result(). */
+static bool accepted;
+static int16_t solve_redundancy; /* see apos_gw_result_redundancy() */
+static uint16_t solve_n_edges;
+static bool solve_unverified;
+
 static uint8_t tx_buf[APOS_LEN_MAX];
 
 void apos_gw_init(void)
@@ -57,6 +79,16 @@ void apos_gw_init(void)
 	phase = APOS_GW_IDLE;
 	session = 0;
 	zoff_m = 0.0f;
+	is_run = false;
+	pair_idx = 0;
+	pair_total = 0;
+	pair_retries = 0;
+	tx_fails = 0;
+	awaiting_rsp = false;
+	accepted = false;
+	solve_redundancy = 0;
+	solve_n_edges = 0;
+	solve_unverified = false;
 }
 
 bool apos_gw_busy(void)
@@ -85,6 +117,8 @@ void apos_gw_get_status(struct apos_gw_status *out)
 	out->session = session;
 	out->n_peers = tbl.n_peers;
 	out->have_result = have_result;
+	out->meas_done = pair_idx;
+	out->meas_total = pair_total;
 }
 
 int apos_gw_set_gauge(uint16_t origin, uint16_t xaxis, uint16_t plane,
@@ -172,6 +206,20 @@ int apos_gw_start_enum(void)
 	session = new_session();
 	enum_round = 0;
 	next_action_ms = 0; /* fire on the very next step */
+	is_run = false;
+
+	/* Clear the run cursor too, so a bare `apos enum` after an aborted run
+	 * cannot inherit stale RANGE state. */
+	pair_idx = 0;
+	pair_total = 0;
+	pair_retries = 0;
+	tx_fails = 0;
+	awaiting_rsp = false;
+	accepted = false;
+	solve_unverified = false;
+	solve_redundancy = 0;
+	solve_n_edges = 0;
+
 	phase = APOS_GW_ENUM;
 
 	LOG_INF("{\"apos\":\"enumerating\",\"session\":%u}", session);
@@ -238,6 +286,342 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 		eui[6], eui[7], pv ? 1u : 0u, (double)x, (double)y, (double)z);
 }
 
+/* ---- RANGE phase ---- */
+
+/* Decompose an ordered-pair index into (from, to), skipping the diagonal. */
+static void pair_of(uint16_t idx, uint8_t n, uint8_t *from, uint8_t *to)
+{
+	uint16_t per_row = (uint16_t)(n - 1u);
+
+	*from = (uint8_t)(idx / per_row);
+
+	uint8_t col = (uint8_t)(idx % per_row);
+
+	*to = (col >= *from) ? (uint8_t)(col + 1u) : col;
+}
+
+void apos_gw_set_zoff(float dz)
+{
+	zoff_m = dz;
+}
+
+const struct apos_result *apos_gw_result(void)
+{
+	return &res;
+}
+
+bool apos_gw_accepted(void)
+{
+	return accepted;
+}
+
+bool apos_gw_result_unverified(void)
+{
+	return solve_unverified;
+}
+
+int apos_gw_result_redundancy(void)
+{
+	return solve_redundancy;
+}
+
+int apos_gw_start_run(void)
+{
+	if (apos_gw_busy()) {
+		return -EBUSY;
+	}
+	if (!apos_gw_gauge_set()) {
+		return -EINVAL;
+	}
+
+	apos_table_init(&tbl);
+	memset(&res, 0, sizeof(res));
+	have_result = false;
+	accepted = false;
+	solve_unverified = false;
+	solve_redundancy = 0;
+	solve_n_edges = 0;
+	session = new_session();
+	enum_round = 0;
+	next_action_ms = 0;
+	pair_idx = 0;
+	pair_total = 0;
+	pair_retries = 0;
+	tx_fails = 0;
+	awaiting_rsp = false;
+	is_run = true;
+
+	/* Starts in ENUM: a run always re-enumerates rather than trusting a
+	 * table from an earlier `apos enum`, because a board may have been
+	 * rebooted, re-addressed or swapped in between. The gauge survives that
+	 * because it is stored as addresses, not indices. */
+	phase = APOS_GW_ENUM;
+
+	LOG_INF("{\"apos\":\"run\",\"session\":%u}", session);
+	return 0;
+}
+
+/* Resolve the four gauge addresses to node indices in the freshly enumerated
+ * table. Returns 0, or -ENOENT with the offending address logged. */
+static int resolve_gauge(struct apos_gauge *g)
+{
+	uint8_t *out[4] = {&g->origin, &g->xaxis, &g->plane, &g->up};
+
+	for (int k = 0; k < 4; k++) {
+		int idx = apos_table_find_addr(&tbl, gauge_addr[k]);
+
+		if (idx < 0) {
+			LOG_ERR("{\"apos_error\":\"gauge address 0x%04X did not "
+				"answer enumeration\"}", gauge_addr[k]);
+			return -ENOENT;
+		}
+		*out[k] = (uint8_t)idx;
+	}
+	return 0;
+}
+
+static void judge_result(void)
+{
+	bool planar = res.planarity_m * 1000.0f <
+		      (float)APOS_ACCEPT_PLANARITY_MM;
+
+	accepted = res.n_placed == res.n_nodes &&
+		   res.n_ambiguous == 0u &&
+		   res.rms_m * 1000.0f < (float)APOS_ACCEPT_RMS_MM &&
+		   res.worst_edge_m <= APOS_ACCEPT_WORST_FACTOR * res.rms_m +
+				       (float)APOS_ACCEPT_RMS_MM / 1000.0f;
+
+	LOG_INF("{\"apos_solve\":{\"nodes\":%u,\"placed\":%u,\"ambiguous\":%u,"
+		"\"rms_mm\":%d,\"worst_mm\":%d,\"worst_pair\":[%u,%u],"
+		"\"planarity_mm\":%d,\"iters\":%u,\"spare_edges\":%d,"
+		"\"rms_meaningful\":%u,\"accepted\":%u}}",
+		res.n_nodes, res.n_placed, res.n_ambiguous,
+		(int)(res.rms_m * 1000.0f), (int)(res.worst_edge_m * 1000.0f),
+		res.worst_i, res.worst_j,
+		(int)(res.planarity_m * 1000.0f), res.iterations,
+		solve_redundancy, solve_unverified ? 0u : 1u,
+		accepted ? 1u : 0u);
+
+	for (uint8_t k = 0; k < res.n_nodes; k++) {
+		LOG_INF("{\"apos_node\":{\"idx\":%u,\"addr\":\"0x%04X\","
+			"\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"state\":%u,"
+			"\"resid_mm\":%d}}",
+			k, tbl.peer[k].short_addr, (double)res.node[k].x,
+			(double)res.node[k].y, (double)res.node[k].z,
+			res.node[k].state,
+			(int)(res.node[k].residual_m * 1000.0f));
+	}
+
+	/* The degenerate-redundancy case, said out loud. `accepted` is left
+	 * exactly as the thresholds computed it -- weakening or inverting a
+	 * threshold here would hide the condition rather than show it -- but an
+	 * operator reading `"accepted":1` off the console has to be told that
+	 * on this mesh the number it was computed from could not have come out
+	 * any other way. See apos_geom.h's note on apos_geom_refine(). */
+	if (solve_unverified) {
+		LOG_WRN("{\"apos_warn\":\"rms_mm and worst_mm are NOT a quality "
+			"check on this array: %u usable edge(s) against %d free "
+			"parameters (3N-6) leaves %d spare. With no spare edge "
+			"the fit reproduces ANY set of ranges exactly, so "
+			"rms_mm is ~0 however bad the ranging was. "
+			"\\\"accepted\\\":%u here means only that nothing "
+			"contradicted the ranges — it does NOT mean they are "
+			"correct. Check the solved node-to-node distances "
+			"against a tape measure before `apos apply`, or add a "
+			"fifth anchor so the mesh has a spare edge.\"}",
+			solve_n_edges, 3 * (int)res.n_placed - 6,
+			solve_redundancy,
+			accepted ? 1u : 0u);
+	}
+
+	if (planar && res.n_placed >= 4u) {
+		LOG_WRN("{\"apos_warn\":\"array is near-coplanar (%d mm) — x and "
+			"y are good but the solved z values are not "
+			"survey-quality\"}",
+			(int)(res.planarity_m * 1000.0f));
+	}
+	if (res.n_ambiguous) {
+		LOG_WRN("{\"apos_warn\":\"%u node(s) reflection-ambiguous — each "
+			"needs a fourth measured edge or a repositioned "
+			"anchor\"}", res.n_ambiguous);
+	}
+}
+
+static void do_solve(void)
+{
+	struct apos_gauge g;
+	struct apos_edge edges[APOS_MAX_EDGES];
+
+	if (resolve_gauge(&g) != 0) {
+		phase = APOS_GW_IDLE;
+		return;
+	}
+
+	uint16_t n_edges = apos_table_symmetrise(&tbl, edges, APOS_MAX_EDGES,
+						(uint8_t)APOS_MIN_N_OK);
+	uint16_t missing = apos_table_missing_pairs(&tbl,
+						   (uint8_t)APOS_MIN_N_OK);
+
+	/* Logged, never silent: a hole changes what the fit rests on, and
+	 * "covered everything" is exactly the wrong impression to leave. */
+	LOG_INF("{\"apos_edges\":{\"usable\":%u,\"missing_pairs\":%u}}",
+		n_edges, missing);
+
+	int rc = apos_geom_solve(edges, n_edges, tbl.n_peers, &g, &res);
+
+	if (rc == -ENODATA) {
+		LOG_ERR("{\"apos_error\":\"the gauge anchors are not mutually "
+			"ranged — move them into line of sight of each other "
+			"and re-run\"}");
+		phase = APOS_GW_IDLE;
+		return;
+	}
+	if (rc) {
+		LOG_ERR("{\"apos_error\":\"solve failed (errno %d)\"}", rc);
+		phase = APOS_GW_IDLE;
+		return;
+	}
+
+	if (zoff_m != 0.0f) {
+		apos_geom_zoff(&res, zoff_m);
+	}
+
+	/* Redundancy of the fit that just ran: the gauge fixes 6 of the 3N
+	 * degrees of freedom, so n_edges must EXCEED 3*n_placed - 6 before
+	 * rms_m can disagree with anything. n_edges is an upper bound on the
+	 * edges the fit actually used (edges touching an unplaced node are
+	 * dropped), which makes this an optimistic estimate of the spare count
+	 * -- and being optimistic about redundancy is the safe direction only
+	 * for the <= 0 test, which is why the flag is set with >=-style
+	 * conservatism below. */
+	solve_n_edges = n_edges;
+	solve_redundancy = (int16_t)((int)n_edges -
+				     (3 * (int)res.n_placed - 6));
+	solve_unverified = solve_redundancy <= 0;
+
+	have_result = true;
+	judge_result();
+	phase = APOS_GW_IDLE;
+}
+
+static void on_range_rsp(const uint8_t *buf, uint16_t plen)
+{
+	uint16_t sess = 0, peer = 0, sd = 0;
+	int32_t mean = 0;
+	uint8_t n_ok = 0;
+
+	if (apos_frame_parse_range_rsp(buf, plen, &sess, &peer, &mean, &sd,
+				       &n_ok) != 0) {
+		return;
+	}
+	if (sess != session || !awaiting_rsp) {
+		return;
+	}
+	/* Both endpoints must match what we asked for. Without the peer check a
+	 * late reply from the PREVIOUS pair would be recorded against this one,
+	 * which is a wrong edge rather than a missing one -- far worse. */
+	if (apos_frame_src(buf) != await_from_addr || peer != await_peer_addr) {
+		return;
+	}
+
+	int from = apos_table_find_addr(&tbl, await_from_addr);
+	int to = apos_table_find_addr(&tbl, await_peer_addr);
+
+	if (n_ok < APOS_MIN_N_OK) {
+		LOG_WRN("{\"apos_thin\":{\"from\":\"0x%04X\",\"to\":\"0x%04X\","
+			"\"n_ok\":%u}}", await_from_addr, await_peer_addr, n_ok);
+	} else if (from >= 0 && to >= 0) {
+		apos_table_add_meas(&tbl, (uint8_t)from, (uint8_t)to, mean, sd,
+				    n_ok);
+	}
+
+	awaiting_rsp = false;
+	pair_retries = 0;
+	tx_fails = 0;
+	pair_idx++;
+	next_action_ms = 0; /* next pair on the very next step */
+}
+
+/* Give up on the pair at the cursor and move on. A hole is a reported outcome,
+ * not a failure of the run: the fit works around it and the operator gets to
+ * see exactly which pair could not range. */
+static void retire_pair(const char *why)
+{
+	LOG_WRN("{\"apos_hole\":{\"from\":\"0x%04X\",\"to\":\"0x%04X\","
+		"\"why\":\"%s\"}}", await_from_addr, await_peer_addr, why);
+	awaiting_rsp = false;
+	pair_retries = 0;
+	tx_fails = 0;
+	pair_idx++;
+}
+
+static void step_range(uint32_t avail_uus, uint8_t *seq)
+{
+	int64_t now = k_uptime_get();
+
+	if (awaiting_rsp) {
+		if (now < next_action_ms) {
+			return;
+		}
+		/* Timed out. */
+		if (pair_retries < APOS_GW_RANGE_RETRIES) {
+			pair_retries++;
+			awaiting_rsp = false;
+			LOG_WRN("{\"apos_retry\":{\"from\":\"0x%04X\","
+				"\"to\":\"0x%04X\"}}", await_from_addr,
+				await_peer_addr);
+		} else {
+			retire_pair("no RANGE_RSP");
+		}
+		return;
+	}
+
+	if (pair_idx >= pair_total) {
+		/* The one step that transmits nothing and cannot be bounded in
+		 * microseconds. It runs only with a full solve budget in hand;
+		 * otherwise it waits for the next superframe, which costs
+		 * 200 ms of latency once per run and protects the beacon. */
+		if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
+			return;
+		}
+		do_solve();
+		return;
+	}
+
+	uint8_t from, to;
+
+	pair_of(pair_idx, tbl.n_peers, &from, &to);
+	await_from_addr = tbl.peer[from].short_addr;
+	await_peer_addr = tbl.peer[to].short_addr;
+
+	int n = apos_frame_range_cmd_build(tx_buf, sizeof(tx_buf),
+					  UWB_ADDR_GATEWAY_RESERVED,
+					  await_from_addr, session,
+					  await_peer_addr,
+					  (uint8_t)APOS_GW_N_EXCHANGES);
+
+	if (n < 0) {
+		LOG_ERR("RANGE_CMD build failed (%d)", n);
+		phase = APOS_GW_IDLE;
+		return;
+	}
+	if (!tx_now((uint16_t)n, seq)) {
+		/* The command never left. Retry on the next step rather than
+		 * counting it against this pair's retry budget -- but only up
+		 * to APOS_GW_TX_FAIL_LIMIT times, or a wedged radio would park
+		 * the survey on this pair forever with pair_idx never
+		 * advancing and nothing on the console saying why. */
+		if (++tx_fails >= APOS_GW_TX_FAIL_LIMIT) {
+			retire_pair("RANGE_CMD would not transmit");
+		}
+		return;
+	}
+	tx_fails = 0;
+
+	awaiting_rsp = true;
+	next_action_ms = now + APOS_GW_RANGE_TIMEOUT_MS;
+}
+
 void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
 {
 	if (!apos_frame_is_apos(buf, plen)) {
@@ -254,8 +638,11 @@ void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
 	case APOS_SUB_ENUM_RSP:
 		on_enum_rsp(buf, plen);
 		break;
+	case APOS_SUB_RANGE_RSP:
+		on_range_rsp(buf, plen);
+		break;
 	default:
-		/* RANGE_RSP and SETPOS_ACK arrive in Tasks 11 and 12. */
+		/* SETPOS_ACK arrives in Task 12. */
 		break;
 	}
 }
@@ -272,7 +659,35 @@ static void step_enum(uint8_t *seq)
 
 	if (enum_round >= APOS_GW_ENUM_ROUNDS) {
 		LOG_INF("{\"apos_enum_done\":{\"peers\":%u}}", tbl.n_peers);
-		phase = APOS_GW_IDLE;
+
+		/* An explicit flag, NOT apos_gw_gauge_set(). The gauge is
+		 * sticky module state: an operator who sets the gauge and then
+		 * runs a bare `apos enum` to re-read the addresses would,
+		 * gating on the gauge, silently get a full multi-minute
+		 * ranging run they never asked for. Whether this is a run is a
+		 * property of which command started it. */
+		if (!is_run) {
+			phase = APOS_GW_IDLE;
+			return;
+		}
+		if (tbl.n_peers < APOS_MIN_NODES) {
+			LOG_ERR("{\"apos_error\":\"%u anchor(s) answered; a 3D "
+				"gauge needs at least %u\"}",
+				tbl.n_peers, APOS_MIN_NODES);
+			phase = APOS_GW_IDLE;
+			return;
+		}
+
+		pair_total = (uint16_t)tbl.n_peers *
+			     (uint16_t)(tbl.n_peers - 1u);
+		pair_idx = 0;
+		pair_retries = 0;
+		tx_fails = 0;
+		awaiting_rsp = false;
+		next_action_ms = 0;
+		phase = APOS_GW_RANGE;
+		LOG_INF("{\"apos\":\"ranging\",\"ordered_pairs\":%u}",
+			pair_total);
 		return;
 	}
 
@@ -296,9 +711,12 @@ void apos_gw_step(uint32_t avail_uus, uint8_t *seq)
 	case APOS_GW_ENUM:
 		step_enum(seq);
 		break;
+	case APOS_GW_RANGE:
+		step_range(avail_uus, seq);
+		break;
 	default:
-		/* APOS_GW_RANGE and APOS_GW_APPLY are Tasks 11 and 12's to
-		 * implement. Unreachable until one of them sets those phases --
+		/* APOS_GW_APPLY is Task 12's to implement. Unreachable until it
+		 * sets that phase --
 		 * but a phase with no handler means apos_gw_busy() stays true
 		 * forever with nothing advancing it, which from the console is
 		 * indistinguishable from a wedged radio. Say so loudly rather

@@ -80,6 +80,78 @@ enum apos_gw_phase {
  * TX_COMPLETE_TIMEOUT_MS or the largest APOS frame changes. */
 #define APOS_GW_STEP_BUDGET_UUS 10000u
 
+/* Reserved separately for the ONE step that does not transmit: the solve.
+ *
+ * apos_geom_solve() is a Levenberg-Marquardt fit, up to APOS_LM_MAX_ITER (200)
+ * iterations, each rebuilding an 18x18 normal-equation matrix over every usable
+ * edge and running a dense Gaussian elimination with partial pivoting on it. It
+ * is bounded, but bounded in ITERATIONS, not in microseconds, and its bound is
+ * nowhere near APOS_GW_STEP_BUDGET_UUS: a rough count is ~15k float operations
+ * plus ~5 kB of matrix traffic per iteration, which at 240 MHz through the
+ * instruction cache is tens of microseconds per iteration at best and 200 of
+ * them is comfortably past BEACON_ARM_MARGIN_UUS (5000 uus). Running it in a
+ * step sized for one transmission would mean a beacon armed late -- and the
+ * beacon is the whole network's time base.
+ *
+ * It cannot be split across steps (apos_geom_refine() is one call and keeps its
+ * working matrices in function-local static storage), so instead the solve step
+ * simply refuses to start unless this much time remains before the beacon must
+ * be armed. The gateway loop offers up to ~195000 uus immediately after a
+ * beacon, so the solve reliably runs in the first step of a superframe and
+ * costs at most one superframe of latency.
+ *
+ * 60000 uus (~61.5 ms) is ~3x a pessimistic 200-iteration estimate and still
+ * under a third of the superframe. THIS IS AN ESTIMATE, not a measurement: it
+ * has never been timed on hardware. If a bench run ever shows a late beacon at
+ * the instant `{"apos_solve":...}` is logged, measure the solve and raise this
+ * -- do not lower APOS_LM_MAX_ITER, which would change what is reported. */
+#define APOS_GW_SOLVE_BUDGET_UUS 60000u
+
+/* Exchanges per commanded pair. The gateway owns this tradeoff, which is why it
+ * is a RANGE_CMD field and not a constant on the anchor. 40 at ~5 ms is the
+ * ~200 ms batch apos_node's beacon-staleness budget is sized around, and 40
+ * samples make the reported sd a usable quality signal rather than noise. */
+#define APOS_GW_N_EXCHANGES 40u
+
+/* How long to wait for a RANGE_RSP. The batch itself is ~200 ms plus the
+ * anchor's own beacon-guard suppressions, so this is generous by design: a
+ * spurious timeout costs a retry and a wrong measurement costs the geometry. */
+#define APOS_GW_RANGE_TIMEOUT_MS 3000u
+
+/* One retry per ordered pair. A pair that fails twice is reported as a hole
+ * rather than retried indefinitely -- the fit works around holes, and an
+ * operator needs the run to finish so they can see WHICH pair failed. */
+#define APOS_GW_RANGE_RETRIES 1u
+
+/* Consecutive failures to get a RANGE_CMD off the air before the pair is given
+ * up on. A TX that never starts is not the pair's fault, so it does not consume
+ * the retry budget above -- but it must not be retried forever either: the
+ * radio can wedge, and a step that re-attempts an impossible transmission every
+ * superframe with nothing advancing pair_idx is a survey that never finishes
+ * and never reports why. */
+#define APOS_GW_TX_FAIL_LIMIT 10u
+
+/* Acceptance thresholds. Anchored on the antenna-delay cross-check, which
+ * accepts |error| < 30 mm per pair: a fit over many such edges should land
+ * inside 50 mm RMS, and anything much worse means a bad edge or a wrong gauge
+ * rather than accumulated noise.
+ *
+ * These are the numbers most likely to need adjusting after the first real
+ * bench run. They are thresholds on a REPORTED result, so raising one never
+ * changes what was measured -- only whether `apos apply` will proceed.
+ *
+ * THEY ARE ALSO ONLY MEANINGFUL WHERE THE MESH HAS SPARE EDGES. See
+ * apos_gw_result_unverified() below and the long note in apos_geom.h: with
+ * n_edges <= 3N-6 the fit reproduces any input exactly and rms_m comes back
+ * zero however bad the ranges were, so passing these thresholds proves nothing.
+ * The real deployment (four ranging slaves, full mesh) is exactly that case. */
+#define APOS_ACCEPT_RMS_MM       50u
+#define APOS_ACCEPT_WORST_FACTOR 3.0f
+/* Below this, the array is too close to coplanar for the solved z values to
+ * mean anything. Does NOT block acceptance on its own -- x and y are still
+ * good -- but it is reported, and the operator is told z is not survey-quality. */
+#define APOS_ACCEPT_PLANARITY_MM 100u
+
 struct apos_gw_status {
 	uint8_t  phase;        /* enum apos_gw_phase */
 	uint16_t session;
@@ -125,5 +197,38 @@ int apos_gw_set_gauge(uint16_t origin, uint16_t xaxis, uint16_t plane,
 		      uint16_t up);
 
 bool apos_gw_gauge_set(void);
+
+/* Begin a full run: re-enumerate, range every ordered pair, solve, report.
+ * Persists NOTHING. Returns 0, -EBUSY if a survey runs, or -EINVAL if the gauge
+ * has not been set. */
+int apos_gw_start_run(void);
+
+/* The last solved result. Never NULL; check apos_gw_get_status()->have_result. */
+const struct apos_result *apos_gw_result(void);
+
+/* Whether the last result met every threshold in this header. */
+bool apos_gw_accepted(void);
+
+/* True when the last result's rms_m / worst_edge_m CANNOT be read as a quality
+ * check, because the mesh had no spare edges: usable edges <= 3 * n_placed - 6.
+ * In that regime LM re-embeds whatever distances it was handed exactly and both
+ * numbers come back at (or near) zero regardless of how bad the ranging was, so
+ * apos_gw_accepted() means only "nothing contradicted the ranges", never "the
+ * ranges are good".
+ *
+ * This is not a corner case: the deployment is four ranging slaves, and a
+ * four-node full mesh has exactly 6 edges against exactly 6 free parameters.
+ * Anything that reports acceptance to an operator must report this alongside
+ * it. See the long note on apos_geom_refine(). */
+bool apos_gw_result_unverified(void);
+
+/* Spare edges in the last solve: usable_edges - (3 * n_placed - 6). <= 0 is the
+ * unverified regime above. Meaningful only when have_result. */
+int apos_gw_result_redundancy(void);
+
+/* Shift z on every subsequent solve, moving z = 0 off the plane through the
+ * three gauge anchors and onto the floor. Applied at solve time, so changing it
+ * requires a re-run rather than silently rewriting a reported result. */
+void apos_gw_set_zoff(float dz);
 
 #endif /* APOS_GW_H */

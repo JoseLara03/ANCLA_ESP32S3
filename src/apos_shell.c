@@ -187,6 +187,68 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_run(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	int rc = require_gateway(sh);
+
+	if (rc) {
+		return rc;
+	}
+
+	rc = apos_gw_start_run();
+	if (rc == -EBUSY) {
+		shell_error(sh, "error: a survey is already running");
+		return rc;
+	}
+	if (rc == -EINVAL) {
+		shell_error(sh, "error: set the frame first — `apos gauge "
+				"origin=<addr> xaxis=<addr> plane=<addr> "
+				"up=<addr>` (run `apos enum` to list addresses)");
+		return rc;
+	}
+	if (rc) {
+		shell_error(sh, "error: run refused (errno %d)", rc);
+		return rc;
+	}
+
+	shell_print(sh, "running — this takes a few seconds per anchor pair and "
+			"reports as JSON when it finishes. NOTHING is persisted; "
+			"run `apos apply` afterwards to commit.");
+	return 0;
+}
+
+static int cmd_zoff(const struct shell *sh, size_t argc, char **argv)
+{
+	char *endptr;
+	float v;
+
+	ARG_UNUSED(argc);
+
+	int rc = require_gateway(sh);
+
+	if (rc) {
+		return rc;
+	}
+
+	/* strtof, not strtod: anchor_shell.c's coordinate parser already uses
+	 * it, and everything downstream (apos_gw_set_zoff, apos_geom_zoff) is
+	 * float — parsing to double only to narrow it again buys nothing. */
+	v = strtof(argv[1], &endptr);
+	if (endptr == argv[1] || *endptr != '\0') {
+		shell_error(sh, "error: \"%s\" is not a number of metres",
+			    argv[1]);
+		return -EINVAL;
+	}
+
+	apos_gw_set_zoff(v);
+	shell_print(sh, "{\"apos_zoff_m\":%.3f} — takes effect on the next "
+			"`apos run`", (double)v);
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_apos,
 	SHELL_CMD_ARG(enum,  NULL,
 		      "enum — discover anchors over the air and print their "
@@ -196,6 +258,14 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_apos,
 		      "gauge origin=<addr> xaxis=<addr> plane=<addr> up=<addr> "
 		      "— pin the coordinate frame",
 		      cmd_gauge, 5, 0),
+	SHELL_CMD_ARG(run,   NULL,
+		      "run — range every anchor pair, solve, and REPORT ONLY "
+		      "(persists nothing)",
+		      cmd_run, 1, 0),
+	SHELL_CMD_ARG(zoff,  NULL,
+		      "zoff <metres> — shift z so z=0 is the floor rather than "
+		      "the plane through the gauge anchors",
+		      cmd_zoff, 2, 0),
 	SHELL_CMD_ARG(show,  NULL,
 		      "show — current phase, enumerated anchors and the stored "
 		      "survey, as JSON",
