@@ -3,10 +3,10 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * See cal_initiator.h.
+ * See ss_initiator.h.
  */
 
-#include "cal_initiator.h"
+#include "ss_initiator.h"
 
 #include "uwb_dwtime.h"
 
@@ -18,7 +18,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-LOG_MODULE_REGISTER(cal_initiator, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(ss_initiator, LOG_LEVEL_INF);
 
 /* Speed of light in air as every peer on this network uses it: the tag
  * (uwb_ss_initiator.c) and the sibling ESP-IDF anchor (ranging.c) both use
@@ -77,11 +77,11 @@ static uint8_t poll_seq;
  * of guessing. Not part of the calibration result. */
 static bool diag_logged;
 
-/* Diagnostic only: which of cal_initiator_range()'s early-return paths fired,
+/* Diagnostic only: which of ss_initiator_range()'s early-return paths fired,
  * tallied across a batch, so a hardware-debugging session can tell "no
  * response at all" from "response arrived but was malformed" instead of
  * both collapsing into the same INT32_MIN. Logged once in
- * cal_initiator_leave(). Not part of the calibration result. */
+ * ss_initiator_leave(). Not part of the calibration result. */
 static struct {
 	uint32_t ok;
 	uint32_t tx_start_fail;
@@ -92,7 +92,7 @@ static struct {
 	uint32_t layout_unknown;
 } diag_counts;
 
-void cal_initiator_enter(void)
+void ss_initiator_enter(void)
 {
 	diag_logged = false;
 	memset(&diag_counts, 0, sizeof(diag_counts));
@@ -114,7 +114,7 @@ void cal_initiator_enter(void)
 	dwt_setpreambledetecttimeout(0);
 }
 
-void cal_initiator_leave(void)
+void ss_initiator_leave(void)
 {
 	dwt_forcetrxoff();
 	dwt_setrxaftertxdelay(0);
@@ -122,7 +122,7 @@ void cal_initiator_leave(void)
 	dwt_setpreambledetecttimeout(0);
 	dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
 
-	LOG_INF("cal diag: batch tally ok=%u tx_start_fail=%u tx_done_timeout=%u "
+	LOG_INF("ss diag: batch tally ok=%u tx_start_fail=%u tx_done_timeout=%u "
 		"rx_timeout_or_err=%u frame_len_bad=%u header_mismatch=%u "
 		"layout_unknown=%u",
 		diag_counts.ok, diag_counts.tx_start_fail,
@@ -159,7 +159,7 @@ static uint32_t ts_from(const uint8_t *p)
 	return ts;
 }
 
-int32_t cal_initiator_range(uint8_t peer_wire_id)
+int32_t ss_initiator_range(uint8_t peer_wire_id)
 {
 	tx_poll[ALL_MSG_SN_IDX] = poll_seq++;
 	tx_poll[POLL_PEER_ID_IDX] = peer_wire_id;
@@ -252,13 +252,13 @@ int32_t cal_initiator_range(uint8_t peer_wire_id)
 
 	if (!diag_logged) {
 		diag_logged = true;
-		LOG_HEXDUMP_INF(buf, plen, "cal diag: raw response payload");
-		LOG_INF("cal diag: plen=%u layout=%s poll_rx_idx=%u resp_tx_idx=%u",
+		LOG_HEXDUMP_INF(buf, plen, "ss diag: raw response payload");
+		LOG_INF("ss diag: plen=%u layout=%s poll_rx_idx=%u resp_tx_idx=%u",
 			plen, (plen == RESP_LEN_ANCLA) ? "ANCLA" : "STOCK",
 			poll_rx_idx, resp_tx_idx);
-		LOG_INF("cal diag: poll_tx_ts=%u resp_rx_ts=%u poll_rx_ts=%u resp_tx_ts=%u",
+		LOG_INF("ss diag: poll_tx_ts=%u resp_rx_ts=%u poll_rx_ts=%u resp_tx_ts=%u",
 			poll_tx_ts, resp_rx_ts, poll_rx_ts, resp_tx_ts);
-		LOG_INF("cal diag: rtd_init=%d rtd_resp=%d clk_off=%d(x1e6) dist_mm=%d",
+		LOG_INF("ss diag: rtd_init=%d rtd_resp=%d clk_off=%d(x1e6) dist_mm=%d",
 			rtd_init, rtd_resp, (int)(clk_off * 1.0e6), dist_mm);
 	}
 

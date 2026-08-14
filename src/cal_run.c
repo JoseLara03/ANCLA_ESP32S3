@@ -11,7 +11,7 @@
 #include "cal_run.h"
 
 #include "anchor_respond.h"
-#include "cal_initiator.h"
+#include "ss_initiator.h"
 #include "cal_math.h"
 #include "cal_solve.h"
 #include "uwb_dwtime.h"
@@ -114,10 +114,10 @@ static void run_batch(const struct cal_request *req, struct cal_result *res,
 {
 	uint32_t valid = 0;
 
-	cal_initiator_enter();
+	ss_initiator_enter();
 
 	for (uint32_t i = 0; i < CAL_MAX_SAMPLES; i++) {
-		int32_t mm = cal_initiator_range(req->peer_wire_id);
+		int32_t mm = ss_initiator_range(req->peer_wire_id);
 
 		if (mm != INT32_MIN) {
 			samples[valid++] = mm;
@@ -129,7 +129,7 @@ static void run_batch(const struct cal_request *req, struct cal_result *res,
 		k_sleep(K_MSEC(2));
 	}
 
-	cal_initiator_leave();
+	ss_initiator_leave();
 
 	res->attempted = CAL_MAX_SAMPLES;
 	res->valid = valid;
