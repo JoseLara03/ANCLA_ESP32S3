@@ -1,0 +1,3 @@
+# Preserve CRLF line endings for copied tag_testting sources
+src/cal_math.h binary
+src/cal_math.c binary
