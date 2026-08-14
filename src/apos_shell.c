@@ -337,6 +337,22 @@ static int cmd_ref(const struct shell *sh, size_t argc, char **argv)
 		return rc;
 	}
 
+	/* apos_store_set_ref() writes flash, and this runs on the SHELL thread
+	 * with no way to gate on the gateway loop's avail_uus from outside it.
+	 * On a WROOM-1-N8R2 running XIP, a write or erase stalls ALL execution
+	 * while the instruction cache is disabled, so an NVS sector rotation
+	 * here would arm the beacon late no matter what priority anything runs
+	 * at. Refusing while a survey is in flight is the cheap half of the
+	 * fix and costs nothing -- setting the site's geographic reference
+	 * mid-survey is not a sensible thing to do anyway. It does NOT make
+	 * this safe against a beacon that is merely beaconing; that is the
+	 * same exposure `anchor pos` has always had. */
+	if (apos_gw_busy()) {
+		shell_error(sh, "error: a survey is running — wait for it to "
+				"finish, then set the reference");
+		return -EBUSY;
+	}
+
 	lat = strtod(argv[1], &e1);
 	lon = strtod(argv[2], &e2);
 	if (e1 == argv[1] || *e1 != '\0' || e2 == argv[2] || *e2 != '\0') {

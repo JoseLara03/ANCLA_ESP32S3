@@ -69,6 +69,7 @@ static uint8_t applied_ok;
 static uint8_t applied_fail;
 static uint8_t applied_skip;
 static bool apply_ending;   /* all nodes done; SURVEY_END still to send */
+static bool apply_persisted;
 
 /* Result judgement, filled by do_solve()/judge_result(). */
 static bool accepted;
@@ -103,6 +104,7 @@ void apos_gw_init(void)
 	applied_fail = 0;
 	applied_skip = 0;
 	apply_ending = false;
+	apply_persisted = false;
 }
 
 bool apos_gw_busy(void)
@@ -694,6 +696,7 @@ int apos_gw_start_apply(bool force)
 	applied_fail = 0;
 	applied_skip = 0;
 	apply_ending = false;
+	apply_persisted = false;
 	awaiting_rsp = false;
 	tx_fails = 0;
 	next_action_ms = 0;
@@ -710,10 +713,10 @@ int apos_gw_start_apply(bool force)
 	 * result looks best. */
 	if (solve_unverified) {
 		LOG_WRN("{\"apos_warn\":\"COMMITTING AN UNVERIFIED SURVEY: %u "
-			"usable edge(s) against %d free parameters (3N-6) left "
-			"%d spare, so rms_mm was ~0 however bad the ranging "
-			"was.\"}", solve_n_edges, 3 * (int)res.n_placed - 6,
-			solve_redundancy);
+			"usable edge(s) against %d free parameters (3N-6), "
+			"leaving %d spare edge(s), so rms_mm was ~0 however bad "
+			"the ranging was.\"}", solve_n_edges,
+			3 * (int)res.n_placed - 6, solve_redundancy);
 		LOG_WRN("{\"apos_warn\":\"on this array \\\"accepted\\\" means "
 			"only that nothing contradicted the ranges — it does "
 			"NOT mean they are correct. These coordinates are about "
@@ -722,13 +725,16 @@ int apos_gw_start_apply(bool force)
 	return 0;
 }
 
-/* Persist the survey locally, with the gauge origin first.
+/* Persist the survey locally, with the gauge origin first. Returns true only if
+ * the survey is actually on flash.
  *
  * node[0] must be the origin: apos_store.h documents that the geographic
- * reference belongs to it, and pos_json.c relies on the ordering. The solver's
+ * reference belongs to it, and Task 13's rewrite of pos_json.c -- which
+ * replaces today's stub anchors payload with the real survey -- will read
+ * node[0] as the reference the platform places the map against. The solver's
  * node order is the order anchors answered enumeration in, which is arbitrary,
  * so the origin is moved to the front here rather than being assumed. */
-static void persist_survey(void)
+static bool persist_survey(void)
 {
 	struct apos_survey s;
 	struct apos_gauge g;
@@ -738,7 +744,7 @@ static void persist_survey(void)
 	if (resolve_gauge(&g) != 0) {
 		LOG_ERR("{\"apos_error\":\"cannot persist — gauge no longer "
 			"resolves\"}");
-		return;
+		return false;
 	}
 
 	/* The ordering contract above is only satisfiable if the origin is in
@@ -751,7 +757,7 @@ static void persist_survey(void)
 		LOG_ERR("{\"apos_error\":\"cannot persist — the gauge origin "
 			"0x%04X was not placed by the solve\"}",
 			tbl.peer[g.origin].short_addr);
-		return;
+		return false;
 	}
 
 	uint8_t w = 0;
@@ -786,9 +792,11 @@ static void persist_survey(void)
 			"persisted on the gateway (errno %d) — the anchors "
 			"topic will fall back to the stub after a reboot\"}",
 			rc);
-	} else {
-		LOG_INF("{\"apos_store\":\"survey saved\",\"nodes\":%u}", w);
+		return false;
 	}
+
+	LOG_INF("{\"apos_store\":\"survey saved\",\"nodes\":%u}", w);
+	return true;
 }
 
 static void on_setpos_ack(const uint8_t *buf, uint16_t plen)
@@ -838,7 +846,7 @@ static void on_setpos_ack(const uint8_t *buf, uint16_t plen)
 	next_action_ms = 0;
 }
 
-static void step_apply(uint8_t *seq)
+static void step_apply(uint32_t avail_uus, uint8_t *seq)
 {
 	int64_t now = k_uptime_get();
 
@@ -884,14 +892,29 @@ static void step_apply(uint8_t *seq)
 				"their own instead\"}");
 		}
 
+		/* "persisted" is part of the summary, not left to the error
+		 * logged inside persist_survey(): the summary is the last line
+		 * an operator reads off a scrolling monitor, and anchors that
+		 * all took their coordinates while the GATEWAY has no survey is
+		 * the exact split this feature exists to remove -- after a
+		 * reboot the anchors topic falls back to the stub and the
+		 * platform map disagrees with the solver. */
 		LOG_INF("{\"apos_apply_done\":{\"ok\":%u,\"failed\":%u,"
-			"\"skipped\":%u,\"nodes\":%u}}",
-			applied_ok, applied_fail, applied_skip, res.n_nodes);
+			"\"skipped\":%u,\"nodes\":%u,\"persisted\":%u}}",
+			applied_ok, applied_fail, applied_skip, res.n_nodes,
+			apply_persisted ? 1u : 0u);
 		if (applied_fail || applied_skip) {
 			LOG_ERR("{\"apos_error\":\"%u anchor(s) did NOT take the "
 				"new coordinates — the deployment is "
 				"inconsistent. Re-run `apos apply`.\"}",
 				(unsigned int)(applied_fail + applied_skip));
+		}
+		if (!apply_persisted) {
+			LOG_ERR("{\"apos_error\":\"the anchors were updated but "
+				"the gateway did NOT persist the survey — it "
+				"will publish the STUB anchors payload after a "
+				"reboot and the map will disagree with the "
+				"solver. Re-run `apos apply`.\"}");
 		}
 		apply_ending = false;
 		phase = APOS_GW_IDLE;
@@ -913,8 +936,36 @@ static void step_apply(uint8_t *seq)
 
 	if (apply_idx >= res.n_nodes) {
 		/* Persist before SURVEY_END, so a gateway that dies between the
-		 * two still has the survey on flash. */
-		persist_survey();
+		 * two still has the survey on flash.
+		 *
+		 * Gated on the SOLVE budget, not the step budget, for the same
+		 * reason the solve is -- and the reason is stronger here,
+		 * because it is not about thread priority at all. This is a
+		 * WROOM-1-N8R2 executing XIP from the same flash apos_store
+		 * writes to: any write or erase disables the instruction cache
+		 * and stalls ALL code execution for its duration. K_PRIO_COOP(0)
+		 * does not protect the gateway loop from that and nothing else
+		 * can either. A settings append is sub-millisecond of
+		 * programming, but an NVS sector rotation erases 4 kB at ~25-45
+		 * ms -- 5-9x BEACON_ARM_MARGIN_UUS. The beacon then arms late,
+		 * its delayed TX times out waiting for TXFRS, beacon_tx_ts is
+		 * left unadvanced, and every slave's beacon_guard starts
+		 * suppressing against a schedule that has shifted underneath it.
+		 * That is a network-wide timing fault, not a dropped frame.
+		 *
+		 * APOS_GW_SOLVE_BUDGET_UUS (150000, ~154 ms) is reused rather
+		 * than a new constant: it is already sized so that only the
+		 * first step after a beacon can satisfy it, which is exactly the
+		 * ~150 ms of clear air this write wants. That covers a typical
+		 * GC erase with room to spare; it does NOT cover a pathological
+		 * one, and no in-loop gate can. The fully correct fix is to stop
+		 * writing flash from this thread at all -- hand the persist to a
+		 * preemptible worker and poll for its completion, the same
+		 * remedy apos_gw.h names for the solve. */
+		if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
+			return;
+		}
+		apply_persisted = persist_survey();
 		apply_ending = true;
 		return;
 	}
@@ -1053,7 +1104,7 @@ void apos_gw_step(uint32_t avail_uus, uint8_t *seq)
 		step_range(avail_uus, seq);
 		break;
 	case APOS_GW_APPLY:
-		step_apply(seq);
+		step_apply(avail_uus, seq);
 		break;
 	default:
 		/* Every value of enum apos_gw_phase now has a handler, so this
