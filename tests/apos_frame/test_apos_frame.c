@@ -227,6 +227,102 @@ static void test_builders_reject_a_short_buffer(void)
                                     true, 0.0f, 0.0f, 0.0f) == -EINVAL);
 }
 
+/* Raw-byte vectors, independent of any get_*() accessor: a byte swap confined
+ * to put_u32/get_u32 (used by mean_mm and by every xyz field via
+ * put_f32/get_f32) cancels out in a build-then-parse round trip and would
+ * pass every test above this one silently. These assert literal buf[n]
+ * values instead. */
+
+/* mean_mm's four bytes are all distinct and asymmetric (0x01020304), so a
+ * byte swap of any kind -- full reversal, or a 16-bit word swap -- changes
+ * the value and cannot hide. sd_mm (0x0506) is checked the same way. */
+static void test_range_rsp_positive_mean_raw_bytes(void)
+{
+    int n = apos_frame_range_rsp_build(buf, sizeof(buf), 0x0001, 0x0000,
+                                       0xBEEF, 0x0004, 0x01020304, 0x0506, 7);
+
+    CHECK(n == (int)APOS_LEN_RANGE_RSP);
+    /* header */
+    CHECK(buf[0] == 0x41);
+    CHECK(buf[1] == 0x88);
+    CHECK(buf[3] == 0xCA);
+    CHECK(buf[4] == 0xDE);
+    CHECK(buf[5] == 0x00);   /* dest lo (0x0000) */
+    CHECK(buf[6] == 0x00);   /* dest hi */
+    CHECK(buf[7] == 0x01);   /* src  lo (0x0001) */
+    CHECK(buf[8] == 0x00);   /* src  hi */
+    CHECK(buf[9] == APOS_FRAME_TYPE);
+    CHECK(buf[10] == APOS_SUB_RANGE_RSP);
+    /* payload: session(2) peer(2) mean_mm(4) sd_mm(2) n_ok(1) */
+    CHECK(buf[11] == 0xEF); CHECK(buf[12] == 0xBE);           /* session 0xBEEF */
+    CHECK(buf[13] == 0x04); CHECK(buf[14] == 0x00);           /* peer 0x0004 */
+    CHECK(buf[15] == 0x04); CHECK(buf[16] == 0x03);           /* mean_mm LE */
+    CHECK(buf[17] == 0x02); CHECK(buf[18] == 0x01);
+    CHECK(buf[19] == 0x06); CHECK(buf[20] == 0x05);           /* sd_mm LE */
+    CHECK(buf[21] == 7);                                      /* n_ok */
+}
+
+/* -37 pins the two's-complement bytes on the wire: 0xFFFFFFDB little-endian
+ * is DB FF FF FF. */
+static void test_range_rsp_negative_mean_raw_bytes(void)
+{
+    int n = apos_frame_range_rsp_build(buf, sizeof(buf), 0x0001, 0x0000,
+                                       0xBEEF, 0x0004, -37, 21, 39);
+
+    CHECK(n == (int)APOS_LEN_RANGE_RSP);
+    CHECK(buf[15] == 0xDB);
+    CHECK(buf[16] == 0xFF);
+    CHECK(buf[17] == 0xFF);
+    CHECK(buf[18] == 0xFF);
+}
+
+/* x = 1.0f is 00 00 80 3F, y = 0.0f is 00 00 00 00 -- the exact pattern
+ * observed on this project's hardware over a sniffer (see CLAUDE.md's
+ * "Ranging confirmed on the bench" note). z = -1.0f is 00 00 80 BF, pinning
+ * the sign bit too. Asserts the full built frame byte-for-byte. */
+static void test_setpos_raw_bytes(void)
+{
+    int n = apos_frame_setpos_build(buf, sizeof(buf), 0x0000, 0x0002,
+                                    0x1234, 1.0f, 0.0f, -1.0f);
+    static const uint8_t expect[] = {
+        0x41, 0x88, 0x00, 0xCA, 0xDE,   /* fixed header */
+        0x02, 0x00,                     /* dest 0x0002 */
+        0x00, 0x00,                     /* src  0x0000 */
+        APOS_FRAME_TYPE,
+        APOS_SUB_SETPOS,
+        0x34, 0x12,                     /* session 0x1234 */
+        0x00, 0x00, 0x80, 0x3F,         /* x = 1.0f */
+        0x00, 0x00, 0x00, 0x00,         /* y = 0.0f */
+        0x00, 0x00, 0x80, 0xBF,         /* z = -1.0f */
+    };
+
+    CHECK(n == (int)APOS_LEN_SETPOS);
+    CHECK(sizeof(expect) == APOS_LEN_SETPOS);
+    CHECK(memcmp(buf, expect, sizeof(expect)) == 0);
+}
+
+/* EUI-64 bytes must land in the order given -- byte order is exactly the
+ * kind of thing two independent implementations can silently disagree
+ * about. */
+static void test_enum_rsp_eui_raw_bytes(void)
+{
+    int n = apos_frame_enum_rsp_build(buf, sizeof(buf), 0x0003, 0x0000,
+                                      0xBEEF, eui_ref, true,
+                                      1.25f, -2.5f, 3.75f);
+
+    CHECK(n == (int)APOS_LEN_ENUM_RSP);
+    /* payload: session(2) eui(8) pos_valid(1) xyz(12) */
+    CHECK(buf[13] == 0xDE);
+    CHECK(buf[14] == 0xCA);
+    CHECK(buf[15] == 0x01);
+    CHECK(buf[16] == 0x02);
+    CHECK(buf[17] == 0x03);
+    CHECK(buf[18] == 0x04);
+    CHECK(buf[19] == 0x05);
+    CHECK(buf[20] == 0x77);
+    CHECK(buf[21] == 0x01);   /* pos_valid = true */
+}
+
 static void test_seq_is_settable_without_disturbing_the_payload(void)
 {
     uint16_t session = 0, window = 0;
@@ -250,6 +346,10 @@ int main(void)
     test_setpos_round_trip();
     test_setpos_ack_round_trip();
     test_survey_end_round_trip();
+    test_range_rsp_positive_mean_raw_bytes();
+    test_range_rsp_negative_mean_raw_bytes();
+    test_setpos_raw_bytes();
+    test_enum_rsp_eui_raw_bytes();
     test_is_apos_rejects_other_traffic();
     test_truncated_frames_are_refused();
     test_extra_trailing_bytes_are_refused();

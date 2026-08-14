@@ -277,6 +277,10 @@ int apos_frame_range_rsp_build(uint8_t *buf, size_t buf_len, uint16_t src,
 	}
 	put_u16(&buf[OFF_PAYLOAD], session);
 	put_u16(&buf[OFF_PAYLOAD + 2], peer_addr);
+	/* Signed-to-unsigned conversion is intentional and well-defined (C
+	 * requires wraparound, i.e. two's-complement reinterpretation, for this
+	 * cast): the wire carries mean_mm's raw two's-complement bit pattern,
+	 * and the parser reverses the same cast on the way back. */
 	put_u32(&buf[OFF_PAYLOAD + 4], (uint32_t)mean_mm);
 	put_u16(&buf[OFF_PAYLOAD + 8], sd_mm);
 	buf[OFF_PAYLOAD + 10] = n_ok;
