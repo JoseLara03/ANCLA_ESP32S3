@@ -11,6 +11,9 @@
 #include "cal_run.h"
 
 #include "anchor_respond.h"
+#include "cal_initiator.h"
+#include "cal_math.h"
+#include "cal_solve.h"
 #include "uwb_dwtime.h"
 
 #include <zephyr/kernel.h>
@@ -96,14 +99,73 @@ int cal_run_execute(const struct cal_request *req, struct cal_result *out)
 	return g_res.status;
 }
 
-/* Filled in by Task 3. */
+/* Static, not on the stack: CONFIG_MAIN_STACK_SIZE is 4096 and this is 512 B,
+ * which is a large fraction of it. */
+static int32_t samples[CAL_MAX_SAMPLES];
+
 static void run_batch(const struct cal_request *req, struct cal_result *res,
 		      uwb_config_t *cfg)
 {
-	ARG_UNUSED(req);
-	ARG_UNUSED(cfg);
+	uint32_t valid = 0;
 
-	res->status = -ENOSYS;
+	cal_initiator_enter();
+
+	for (uint32_t i = 0; i < CAL_MAX_SAMPLES; i++) {
+		int32_t mm = cal_initiator_range(req->peer_wire_id);
+
+		if (mm != INT32_MIN) {
+			samples[valid++] = mm;
+		}
+
+		/* Yields to the shell (priority 14) so the console stays
+		 * responsive through the batch, and decorrelates consecutive
+		 * exchanges slightly. */
+		k_sleep(K_MSEC(2));
+	}
+
+	cal_initiator_leave();
+
+	res->attempted = CAL_MAX_SAMPLES;
+	res->valid = valid;
+
+	/* Enough samples to mean anything. Below this the peer is not really
+	 * answering -- wrong PHY, wrong peer id, or out of range -- and a mean
+	 * over a handful of lucky frames would look like a calibration. */
+	if (valid < CAL_MAX_SAMPLES / 4U) {
+		res->status = -ENODATA;
+		return;
+	}
+
+	if (!cal_filtered_mean(samples, valid, &res->mean_mm, &res->kept)) {
+		res->status = -EIO;
+		return;
+	}
+
+	res->error_mm = res->mean_mm - res->ref_mm;
+
+	if (!req->persist) {
+		res->status = 0;
+		return;
+	}
+
+	res->old_tx = cfg->ant_delay_tx;
+
+	int rc = cal_solve_tx_delay(res->mean_mm, res->ref_mm,
+				    cfg->ant_delay_tx, cfg->ant_delay_rx,
+				    &res->new_tx);
+
+	if (rc) {
+		res->status = rc;
+		return;
+	}
+
+	/* Applied hot, and the snapshot and the register move together -- see
+	 * the comment on cfg_live in cal_run(). Persistence is the shell's job:
+	 * it owns the uwb_store call, this loop owns the radio. */
+	cfg->ant_delay_tx = res->new_tx;
+	dwt_settxantennadelay(res->new_tx);
+
+	res->status = 0;
 }
 
 void cal_run(const uwb_config_t *cfg)
