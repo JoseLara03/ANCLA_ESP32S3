@@ -98,4 +98,27 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
  * through the three gauge anchors. */
 void apos_geom_zoff(struct apos_result *r, float dz);
 
+/* LM iteration cap. Reached only on a pathological input; a clean full mesh
+ * converges in well under ten. */
+#define APOS_LM_MAX_ITER 200
+
+/* Refine an existing seed in place and fill every diagnostic field.
+ *
+ * The gauge is enforced by construction, not by penalty: the origin node
+ * contributes no free parameters, xaxis only x, plane only x and y. There are
+ * therefore 3N-6 free parameters and the fit cannot translate, rotate or mirror
+ * the frame while minimising.
+ *
+ * Unplaced nodes, and any edge touching one, are excluded entirely.
+ *
+ * Returns 0, -EINVAL on a bad argument, or -ENODATA if no usable edge remains.
+ * Non-convergence is NOT an error: the caller judges the result on rms_m, which
+ * is what acceptance is defined against. */
+int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
+		     const struct apos_gauge *g, struct apos_result *io);
+
+/* apos_geom_seed() then apos_geom_refine(). The normal entry point. */
+int apos_geom_solve(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
+		    const struct apos_gauge *g, struct apos_result *out);
+
 #endif /* APOS_GEOM_H */

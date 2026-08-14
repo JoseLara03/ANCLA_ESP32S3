@@ -248,6 +248,221 @@ static void test_rejects_bad_arguments(void)
     CHECK(apos_geom_seed(e, n, 3, &g_ref, &r) == -EINVAL);
 }
 
+/* Deterministic PRNG: a test must not depend on the host rand(), or the same
+ * plan yields different results on different machines. */
+static uint32_t prng_state = 12345u;
+
+static float noise_m(float amplitude)
+{
+    prng_state = prng_state * 1664525u + 1013904223u;
+    float u = (float)(prng_state >> 8) / (float)(1u << 24);
+
+    return (2.0f * u - 1.0f) * amplitude;
+}
+
+static void test_refine_leaves_an_exact_solution_alone(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    CHECK(apos_geom_solve(e, n, 4, &g_ref, &r) == 0);
+    CHECK(r.rms_m < 1e-4f);
+    for (int i = 0; i < 4; i++) {
+        CLOSE(r.node[i].x, ref_xyz[i][0], 1e-3f);
+        CLOSE(r.node[i].y, ref_xyz[i][1], 1e-3f);
+        CLOSE(r.node[i].z, ref_xyz[i][2], 1e-3f);
+    }
+}
+
+/* 20 mm of range noise must stay inside a few centimetres of coordinate error,
+ * and rms_m must land in the same ballpark as the noise that caused it -- that
+ * correspondence is what makes rms_m usable as an acceptance criterion. */
+static void test_refine_absorbs_realistic_noise(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    prng_state = 999u;
+    for (uint16_t k = 0; k < n; k++) {
+        e[k].d_m += noise_m(0.020f);
+        e[k].sd_m = 0.020f;
+    }
+
+    CHECK(apos_geom_solve(e, n, 4, &g_ref, &r) == 0);
+    CHECK(r.n_placed == 4);
+    CHECK(r.rms_m < 0.030f);
+    for (int i = 0; i < 4; i++) {
+        CLOSE(r.node[i].x, ref_xyz[i][0], 0.06f);
+        CLOSE(r.node[i].y, ref_xyz[i][1], 0.06f);
+        CLOSE(r.node[i].z, ref_xyz[i][2], 0.06f);
+    }
+}
+
+/* The gauge must survive refinement exactly, not approximately: those
+ * coordinates contribute no free parameters at all. */
+static void test_refine_preserves_the_gauge_exactly(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    prng_state = 4242u;
+    for (uint16_t k = 0; k < n; k++) {
+        e[k].d_m += noise_m(0.050f);
+        e[k].sd_m = 0.050f;
+    }
+
+    CHECK(apos_geom_solve(e, n, 4, &g_ref, &r) == 0);
+    CLOSE(r.node[0].x, 0.0f, 1e-6f);
+    CLOSE(r.node[0].y, 0.0f, 1e-6f);
+    CLOSE(r.node[0].z, 0.0f, 1e-6f);
+    CLOSE(r.node[1].y, 0.0f, 1e-6f);
+    CLOSE(r.node[1].z, 0.0f, 1e-6f);
+    CLOSE(r.node[2].z, 0.0f, 1e-6f);
+}
+
+/* One bad edge drags the fit -- that is what least squares does -- but
+ * worst_i/worst_j must name the culprit so the operator re-ranges that pair
+ * instead of re-running everything. */
+/* NOTE (deviation from the brief): the brief's version of this test called
+ * build_full_mesh(e, 4) -- 4 nodes, 6 edges. For n = 4, a full mesh has
+ * exactly 3*4-6 = 6 free parameters for 6 edges: an isostatic system with
+ * zero redundancy. LM therefore finds an *exact* re-embedding of the
+ * perturbed distances (rms_m == 0, worst_edge_m == 0) rather than
+ * distributing a residual -- there is no redundant equation for the
+ * corrupted edge to disagree with. Verified with a standalone repro before
+ * changing anything. A 5..7-node mesh reproduces the classic least-squares
+ * "masking" effect instead: with too little redundancy, the fit can shift
+ * node 1 or node 2 just enough to spread the disagreement onto a different,
+ * merely-correlated edge, so worst_i/worst_j names the wrong pair. Only at
+ * the full 8-node mesh (28 edges against 3*8-6 = 18 free parameters, 10
+ * redundant equations) is node 1 and node 2's position pinned tightly enough
+ * by other measurements that the corrupted (1,2) edge reliably carries the
+ * largest residual. Confirmed by trying 4, 5, 7 and 8 node meshes; only 8
+ * passed. */
+static void test_worst_edge_names_the_bad_pair(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t k = 0;
+    const float eight[8][3] = {
+        {0.0f, 0.0f, 0.0f}, {3.0f, 0.0f, 0.0f},
+        {0.0f, 4.0f, 0.0f}, {1.0f, 1.0f, 2.0f},
+        {2.0f, 1.0f, 1.0f}, {-1.0f, 3.0f, 1.0f},
+        {1.5f, -1.0f, 1.5f}, {0.5f, 2.0f, 2.5f},
+    };
+
+    for (uint8_t i = 0; i < 8; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < 8; j++) {
+            e[k].i = i;
+            e[k].j = j;
+            e[k].d_m = dist3(eight[i], eight[j]);
+            e[k].sd_m = 0.001f;
+            k++;
+        }
+    }
+
+    for (uint16_t m = 0; m < k; m++) {
+        if ((e[m].i == 1 && e[m].j == 2) || (e[m].i == 2 && e[m].j == 1)) {
+            e[m].d_m += 0.40f;
+        }
+    }
+
+    CHECK(apos_geom_solve(e, k, 8, &g_ref, &r) == 0);
+    CHECK(r.worst_edge_m > 0.05f);
+    CHECK((r.worst_i == 1 && r.worst_j == 2) ||
+          (r.worst_i == 2 && r.worst_j == 1));
+}
+
+/* A ceiling-mounted array is nearly coplanar, which is exactly when z stops
+ * meaning anything. planarity_m is the number that has to say so. */
+static void test_planarity_is_small_for_a_coplanar_array(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t k = 0;
+    const float flat[4][3] = {
+        {0.0f, 0.0f, 0.0f}, {3.0f, 0.0f, 0.0f},
+        {0.0f, 3.0f, 0.0f}, {3.0f, 3.0f, 0.0f},
+    };
+
+    for (uint8_t i = 0; i < 4; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < 4; j++) {
+            e[k].i = i;
+            e[k].j = j;
+            e[k].d_m = dist3(flat[i], flat[j]);
+            e[k].sd_m = 0.010f;
+            k++;
+        }
+    }
+
+    CHECK(apos_geom_solve(e, k, 4, &g_ref, &r) == 0);
+    CHECK(r.planarity_m < 0.02f);
+}
+
+/* A genuinely 3D array must NOT be flagged, or the diagnostic is useless. */
+static void test_planarity_is_large_for_a_3d_array(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    CHECK(apos_geom_solve(e, n, 4, &g_ref, &r) == 0);
+    CHECK(r.planarity_m > 0.30f);
+}
+
+/* Sparse: 6 nodes with two pairs unmeasured -- the case that killed the
+ * sequential-bootstrap approach this design replaces. */
+static void test_solves_a_sparse_mesh_with_holes(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t k = 0;
+    const float six[6][3] = {
+        {0.0f, 0.0f, 0.0f}, {5.0f, 0.0f, 0.0f}, {0.0f, 6.0f, 0.0f},
+        {1.0f, 1.0f, 2.0f}, {5.0f, 6.0f, 0.5f}, {2.5f, 3.0f, 1.0f},
+    };
+
+    for (uint8_t i = 0; i < 6; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < 6; j++) {
+            if ((i == 2 && j == 4) || (i == 0 && j == 5)) {
+                continue;   /* out of range of each other */
+            }
+            e[k].i = i;
+            e[k].j = j;
+            e[k].d_m = dist3(six[i], six[j]);
+            e[k].sd_m = 0.010f;
+            k++;
+        }
+    }
+
+    CHECK(apos_geom_solve(e, k, 6, &g_ref, &r) == 0);
+    CHECK(r.n_placed == 6);
+    CHECK(r.rms_m < 0.01f);
+    for (int i = 0; i < 6; i++) {
+        CLOSE(r.node[i].x, six[i][0], 0.02f);
+        CLOSE(r.node[i].y, six[i][1], 0.02f);
+        CLOSE(r.node[i].z, six[i][2], 0.02f);
+    }
+}
+
+/* An unplaced node must not poison the fit for the nodes that were measured. */
+static void test_unplaced_node_does_not_break_the_fit(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    e[n].i = 0; e[n].j = 4; e[n].d_m = 2.0f; e[n].sd_m = 0.010f; n++;
+
+    CHECK(apos_geom_solve(e, n, 5, &g_ref, &r) == 0);
+    CHECK(r.n_placed == 4);
+    CHECK(r.node[4].state == APOS_NODE_UNPLACED);
+    CHECK(r.rms_m < 1e-3f);
+}
+
 int main(void)
 {
     test_gauge_requires_four_distinct_nodes();
@@ -260,6 +475,14 @@ int main(void)
     test_bad_candidate_does_not_block_good_candidate();
     test_zoff_shifts_only_placed_nodes();
     test_rejects_bad_arguments();
+    test_refine_leaves_an_exact_solution_alone();
+    test_refine_absorbs_realistic_noise();
+    test_refine_preserves_the_gauge_exactly();
+    test_worst_edge_names_the_bad_pair();
+    test_planarity_is_small_for_a_coplanar_array();
+    test_planarity_is_large_for_a_3d_array();
+    test_solves_a_sparse_mesh_with_holes();
+    test_unplaced_node_does_not_break_the_fit();
 
     if (g_fail) {
         printf("%d CHECK(s) FAILED\n", g_fail);
