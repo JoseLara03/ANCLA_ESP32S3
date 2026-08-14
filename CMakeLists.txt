@@ -10,6 +10,10 @@ project(ANCLA_ESP32S3)
 target_sources(app PRIVATE
 	src/anchor_respond.c
 	src/anchor_shell.c
+	src/apos_frame.c
+	src/apos_geom.c
+	src/apos_node.c
+	src/apos_table.c
 	src/beacon_guard.c
 	src/disc_schedule.c
 	src/gw_core.c
