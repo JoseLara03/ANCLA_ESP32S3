@@ -297,6 +297,16 @@ void apos_gw_step(uint32_t avail_uus, uint8_t *seq)
 		step_enum(seq);
 		break;
 	default:
+		/* APOS_GW_RANGE and APOS_GW_APPLY are Tasks 11 and 12's to
+		 * implement. Unreachable until one of them sets those phases --
+		 * but a phase with no handler means apos_gw_busy() stays true
+		 * forever with nothing advancing it, which from the console is
+		 * indistinguishable from a wedged radio. Say so loudly rather
+		 * than hanging in silence. */
+		LOG_ERR("{\"apos_error\":\"no step handler for phase %u — "
+			"survey is stuck; `kernel reboot cold` to clear\"}",
+			phase);
+		phase = APOS_GW_IDLE;
 		break;
 	}
 }

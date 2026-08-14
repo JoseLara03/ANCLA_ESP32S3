@@ -46,13 +46,39 @@ enum apos_gw_phase {
  * replies are unioned. One round would be enough if no two EUIs hashed to the
  * same stagger slot; three makes a slot collision cost a retry instead of a
  * missing anchor. The gap must exceed the worst-case stagger
- * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 210 ms) plus reply airtime. */
+ * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 8 * 30 = 240 ms) plus reply airtime;
+ * 400 ms clears 240 ms with ~160 ms to spare, which is ample for a ~1.5 ms
+ * ENUM_RSP. */
 #define APOS_GW_ENUM_ROUNDS  3u
 #define APOS_GW_ENUM_GAP_MS  400u
 
-/* Rough cost of one apos_gw_step() transmission, used to decide whether there
- * is room before the next beacon. One frame plus the bounded TXFRS wait. */
-#define APOS_GW_STEP_BUDGET_UUS 3000u
+/* Worst-case cost of one apos_gw_step() transmission. The gateway loop refuses
+ * to enter a step unless BEACON_ARM_MARGIN_UUS + this much time remains before
+ * the beacon, so this number must cover the step's WORST case, not its typical
+ * one: under-reserving lets a step overrun into the beacon's arming window, and
+ * a delayed beacon TX that misses its slot costs every node in the network its
+ * time base.
+ *
+ * Derivation, in UUS (1 uus = 512/499.2 MHz ~= 1.0256 us, so uus = us/1.0256):
+ *   - the bounded TXFRS wait, apos_gw.c's TX_COMPLETE_TIMEOUT_MS = 8 ms
+ *     -> 8000 / 1.0256 ~= 7800 uus. This dominates, and it is a real bound
+ *        rather than a typical: a TX that never completes burns all of it.
+ *   - airtime of the largest APOS frame this module transmits. That is
+ *     APOS_LEN_SETPOS (25 bytes) + FCS_LEN once Task 12 lands, not today's
+ *     15-byte SURVEY_BEGIN -- sized for the largest so the constant does not
+ *     need revisiting. At PLEN_1024 the preamble alone is ~1.05 ms and 27
+ *     bytes at 850 kbps with 4z overhead is ~0.4 ms: ~1.45 ms -> ~1420 uus,
+ *     rounded to 1500.
+ *   - 700 uus of margin for the SPI register writes around the TX and for
+ *     rounding.
+ * 7800 + 1500 + 700 = 10000 uus (~10.3 ms), against a 200 ms superframe.
+ *
+ * An earlier value of 3000 claimed to cover "one frame plus the bounded TXFRS
+ * wait" while reserving less than half of the TXFRS bound alone. Skipping more
+ * steps is pure latency by design (every survey deadline is absolute
+ * wall-clock); a missed beacon is a real fault. Re-derive if
+ * TX_COMPLETE_TIMEOUT_MS or the largest APOS frame changes. */
+#define APOS_GW_STEP_BUDGET_UUS 10000u
 
 struct apos_gw_status {
 	uint8_t  phase;        /* enum apos_gw_phase */
