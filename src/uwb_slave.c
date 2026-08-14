@@ -16,6 +16,7 @@
 #include "uwb_modes.h"
 
 #include "anchor_respond.h"
+#include "apos_node.h"
 #include "beacon_guard.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
@@ -172,7 +173,15 @@ void uwb_slave_run(const uwb_config_t *cfg)
 	 * documented "changes take effect only on reboot" contract -- notably
 	 * for ant_delay_tx, which resp_tx_ts arithmetic must keep matching the
 	 * antenna delay actually programmed into the radio at boot. */
-	uwb_config_t cfg_snapshot = *cfg;
+	/* Snapshot at mode-entry -- see the comment below for why. Kept as a
+	 * named mutable object as well as the const view: apos_node_on_rx()
+	 * writes a surveyed position straight into it so `apos apply` takes
+	 * effect without a reboot, while every other consumer keeps the const
+	 * view and the documented "changes take effect only on reboot"
+	 * contract for id and antenna delay. */
+	static uwb_config_t cfg_snapshot;
+
+	cfg_snapshot = *cfg;
 	cfg = &cfg_snapshot;
 
 	static dwt_callbacks_s cbs;
@@ -190,6 +199,8 @@ void uwb_slave_run(const uwb_config_t *cfg)
 	LOG_INF("{\"status\":\"listening\",\"mode\":\"slave\",\"id\":%u,"
 		"\"short_addr\":\"0x%04X\"}",
 		cfg->anchor_id, uwb_config_short_addr(cfg));
+
+	apos_node_init();
 
 	beacon_guard_init(&bguard, UUS_TO_HI32(T_SUPERFRAME_UUS),
 			  UUS_TO_HI32(BEACON_GUARD_UUS),
@@ -222,12 +233,21 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		 * it, and two extra bytes corrupt them silently. */
 		uint16_t plen = (uint16_t)(flen - FCS_LEN);
 
-		/* Offered to each in turn; each ignores what is not its own. */
-		anchor_respond_wave_poll(rx_buf, plen, rx_ts, cfg, &frame_seq_nb,
-					 &bguard);
-		anchor_respond_discovery(rx_buf, plen, rx_ts, cfg, &frame_seq_nb,
-					 cir_power, cir_quality, &bguard);
-		observe_beacon(rx_buf, plen, cfg, rx_ts);
+		/* Offered to each in turn; each ignores what is not its
+		 * own. APOS goes first and short-circuits: a survey
+		 * frame is never also a ranging poll or a beacon, and a
+		 * RANGE_CMD blocks for a whole batch, so there is no
+		 * point offering it to anyone else afterwards. */
+		if (!apos_node_on_rx(rx_buf, plen, &cfg_snapshot,
+				     &frame_seq_nb, &bguard)) {
+			anchor_respond_wave_poll(rx_buf, plen, rx_ts, cfg,
+						 &frame_seq_nb, &bguard,
+						 apos_node_window_open());
+			anchor_respond_discovery(rx_buf, plen, rx_ts, cfg,
+						 &frame_seq_nb, cir_power,
+						 cir_quality, &bguard);
+			observe_beacon(rx_buf, plen, cfg, rx_ts);
+		}
 
 		rx_arm();
 	}

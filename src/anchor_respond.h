@@ -15,6 +15,7 @@
 #ifndef ANCHOR_RESPOND_H
 #define ANCHOR_RESPOND_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "beacon_guard.h"
@@ -26,10 +27,23 @@
  *
  * bg may be NULL, which disables suppression. When non-NULL, a response whose
  * scheduled TX would land inside the beacon window is dropped rather than
- * transmitted -- one lost range instead of a corrupted broadcast. */
-void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx_ts,
-			      const uwb_config_t *cfg, uint8_t *seq,
-			      struct beacon_guard *bg);
+ * transmitted -- one lost range instead of a corrupted broadcast.
+ *
+ * allow_unpositioned relaxes the position_valid requirement. An anchor with no
+ * position MUST NOT answer a tag: the response encodes (0, 0) and the tag
+ * cannot tell that apart from a real coordinate, so three unpositioned anchors
+ * produce a confident meaningless fix with no error reported anywhere.
+ *
+ * But during an anchor survey every anchor is unpositioned and must still
+ * answer its PEERS, or the survey can never bootstrap a cold deployment. The
+ * caller resolves that: uwb_slave.c passes apos_node_window_open(), so the
+ * relaxation lasts exactly as long as the gateway-opened survey window;
+ * cal_run.c passes true, because calibrating an unpositioned board is normal
+ * and there is no gateway or tag on air during calibration. */
+void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
+			      uint64_t poll_rx_ts, const uwb_config_t *cfg,
+			      uint8_t *seq, struct beacon_guard *bg,
+			      bool allow_unpositioned);
 
 /* If buf is a DISCOVERY/0xE2 broadcast, schedule an id-staggered
  * RANGE-RESPONSE/0xE4 carrying our short address and CIR metrics. Otherwise

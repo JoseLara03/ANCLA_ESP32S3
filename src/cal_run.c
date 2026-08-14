@@ -267,7 +267,8 @@ void cal_run(const uwb_config_t *cfg)
 				 * unlocked in any case (beacon_guard.c:37). */
 				anchor_respond_wave_poll(rx_buf, plen, rx_ts,
 							 &cfg_live,
-							 &frame_seq_nb, NULL);
+							 &frame_seq_nb, NULL,
+							 true);
 			}
 
 			rx_arm();

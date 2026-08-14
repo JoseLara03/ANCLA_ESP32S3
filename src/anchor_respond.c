@@ -110,9 +110,10 @@ static void tx_delayed(const uint8_t *buf, uint16_t payload_len, uint32_t tx_tim
 	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
 }
 
-void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx_ts,
-			      const uwb_config_t *cfg, uint8_t *seq,
-			      struct beacon_guard *bg)
+void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
+			      uint64_t poll_rx_ts, const uwb_config_t *cfg,
+			      uint8_t *seq, struct beacon_guard *bg,
+			      bool allow_unpositioned)
 {
 	/* The id byte the tag polls with is the low byte of our short address,
 	 * because that is what it read out of our DISCOVERY response
@@ -132,6 +133,20 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx
 		return;
 	}
 	if (buf[POS_ANCHOR_ID_IDX] != wire_id) {
+		return;
+	}
+
+	/* Refusing is strictly better than answering with (0, 0): a silent
+	 * wrong coordinate is undebuggable from the tag's side, while a silent
+	 * anchor shows up immediately as a missing anchor. Mirrors the
+	 * gateway's existing refusal to beacon unpositioned
+	 * (uwb_gateway.c:253). Deliberately placed after the frame-match
+	 * checks above (the brief's supplied code placed it before them):
+	 * this function is offered every received frame regardless of type,
+	 * so gating this early would LOG_WRN on every beacon/DISCOVERY/APOS
+	 * frame too, not just on an actual WAVE poll addressed to us. */
+	if (!cfg->position_valid && !allow_unpositioned) {
+		LOG_WRN("WAVE poll refused — no surveyed position");
 		return;
 	}
 
