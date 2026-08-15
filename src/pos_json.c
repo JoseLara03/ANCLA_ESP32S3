@@ -110,8 +110,19 @@ int pos_json_anchors(char *buf, size_t len, const struct apos_survey *s)
 		 * so it is the axis anchor and the only one carrying a real
 		 * lat/long. Everything else is local-only, in metres relative
 		 * to it -- which is what the schema already meant. */
+		/* The `ANC-LOBBY-%03u` prefix is deliberately UNCHANGED from the
+		 * stub below, even though this branch publishes the real
+		 * survey. The retained anchors document is a live contract with
+		 * a customer platform that probably keys anchor records by
+		 * `name`: renaming them at the first `apos apply` would orphan
+		 * the four existing records and silently create four new ones,
+		 * one-way and customer-visible. Keeping the name means the first
+		 * apply changes only the coordinates, which is the reversible
+		 * direction. Switching to a zone-derived name is a decision for
+		 * whoever owns the platform integration, not a side effect of
+		 * surveying. */
 		n = snprintf(buf + off, len - off,
-			     "%s{\"name\":\"ANC-" POS_JSON_ZONE_NAME "-%03u\","
+			     "%s{\"name\":\"ANC-LOBBY-%03u\","
 			     "\"isAxis\":%s,\"isReferenceAxis\":%s,"
 			     "\"latitude\":%.8f,\"longitude\":%.8f,"
 			     "\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}",

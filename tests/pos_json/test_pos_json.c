@@ -177,11 +177,15 @@ static void test_anchors_emits_the_surveyed_geometry(void)
 
     /* Named from the short address, so the platform's anchor names track the
      * boards rather than a hand-kept list. */
-    CHECK(strstr(buf, "ANC-" POS_JSON_ZONE_NAME "-001") != NULL);
-    CHECK(strstr(buf, "ANC-" POS_JSON_ZONE_NAME "-002") != NULL);
-    CHECK(strstr(buf, "ANC-" POS_JSON_ZONE_NAME "-004") != NULL);
-    /* The stub must be entirely gone -- a document with both would draw twice. */
-    CHECK(strstr(buf, "ANC-LOBBY-001") == NULL);
+    /* The ANC-LOBBY- prefix is deliberately shared with the stub: renaming
+     * anchors at the first `apos apply` would orphan the platform's existing
+     * records. Only the coordinates change. See pos_json.c. */
+    CHECK(strstr(buf, "ANC-LOBBY-001") != NULL);
+    CHECK(strstr(buf, "ANC-LOBBY-002") != NULL);
+    CHECK(strstr(buf, "ANC-LOBBY-004") != NULL);
+    /* The stub's fourth anchor must be gone -- the survey has three nodes and
+     * a document carrying both geometries would draw twice. */
+    CHECK(strstr(buf, "ANC-LOBBY-003") == NULL);
     /* Surveyed coordinates, including a real z. */
     CHECK(strstr(buf, "\"x\":3.25") != NULL);
     CHECK(strstr(buf, "\"y\":4.75") != NULL);
@@ -202,13 +206,13 @@ static void test_anchors_emits_the_surveyed_geometry(void)
      * field order, %.8f/%.2f widths) is frozen the same way the stub's is. */
     CHECK(strcmp(buf,
         "{\"name\":\"852541\",\"anchors\":["
-        "{\"name\":\"ANC-852541-001\",\"isAxis\":true,\"isReferenceAxis\":true,"
+        "{\"name\":\"ANC-LOBBY-001\",\"isAxis\":true,\"isReferenceAxis\":true,"
         "\"latitude\":21.01604200,\"longitude\":-89.65212900,"
         "\"x\":0.00,\"y\":0.00,\"z\":0.00},"
-        "{\"name\":\"ANC-852541-002\",\"isAxis\":false,\"isReferenceAxis\":false,"
+        "{\"name\":\"ANC-LOBBY-002\",\"isAxis\":false,\"isReferenceAxis\":false,"
         "\"latitude\":0.00000000,\"longitude\":0.00000000,"
         "\"x\":3.25,\"y\":0.00,\"z\":0.10},"
-        "{\"name\":\"ANC-852541-004\",\"isAxis\":false,\"isReferenceAxis\":false,"
+        "{\"name\":\"ANC-LOBBY-004\",\"isAxis\":false,\"isReferenceAxis\":false,"
         "\"latitude\":0.00000000,\"longitude\":0.00000000,"
         "\"x\":1.50,\"y\":4.75,\"z\":2.00}"
         "]}") == 0);

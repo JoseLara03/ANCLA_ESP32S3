@@ -53,7 +53,7 @@ int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix);
 /* Format the zone/anchor map for the retained anchors topic.
  *
  * With a valid survey, emits the surveyed geometry: one entry per surveyed
- * anchor, named ANC-<zone>-<NNN> from its short address, with s->node[0] as the
+ * anchor, named ANC-LOBBY-<NNN> from its short address, with s->node[0] as the
  * axis/reference anchor carrying s->ref_lat/ref_lon. Every other anchor is
  * local-only (latitude/longitude 0) and positioned relative to the reference in
  * metres, which is what the schema already meant.
