@@ -70,12 +70,22 @@ static uint8_t applied_fail;
 static uint8_t applied_skip;
 static bool apply_ending;   /* all nodes done; SURVEY_END still to send */
 static bool apply_persisted;
+static bool apply_reopen;   /* SURVEY_BEGIN still to re-broadcast, see step_apply */
 
 /* Result judgement, filled by do_solve()/judge_result(). */
 static bool accepted;
 static int16_t solve_redundancy; /* see apos_gw_result_redundancy() */
 static uint16_t solve_n_edges;
 static bool solve_unverified;
+
+/* Ranging-quality numbers derived from the raw directed measurements, not from
+ * the fit. On the real four-anchor array the fit's rms_m is vacuous (see
+ * apos_gw_result_unverified()), so these are the only quality signals that
+ * actually carry information about the RANGING. They say nothing about whether
+ * the GEOMETRY is over-determined -- a rigid 4-node framework stays isostatic
+ * regardless of how good its edges are. */
+static int32_t max_recip_mm;
+static uint16_t max_sd_mm;
 
 static uint8_t tx_buf[APOS_LEN_MAX];
 
@@ -105,6 +115,9 @@ void apos_gw_init(void)
 	applied_skip = 0;
 	apply_ending = false;
 	apply_persisted = false;
+	apply_reopen = false;
+	max_recip_mm = 0;
+	max_sd_mm = 0;
 }
 
 bool apos_gw_busy(void)
@@ -369,6 +382,16 @@ int apos_gw_result_redundancy(void)
 	return solve_redundancy;
 }
 
+void apos_gw_result_quality(int32_t *out_recip_mm, uint16_t *out_sd_mm)
+{
+	if (out_recip_mm) {
+		*out_recip_mm = max_recip_mm;
+	}
+	if (out_sd_mm) {
+		*out_sd_mm = max_sd_mm;
+	}
+}
+
 int apos_gw_start_run(void)
 {
 	if (apos_gw_busy()) {
@@ -438,13 +461,14 @@ static void judge_result(void)
 	LOG_INF("{\"apos_solve\":{\"nodes\":%u,\"placed\":%u,\"ambiguous\":%u,"
 		"\"rms_mm\":%d,\"worst_mm\":%d,\"worst_pair\":[%u,%u],"
 		"\"planarity_mm\":%d,\"iters\":%u,\"spare_edges\":%d,"
-		"\"rms_meaningful\":%u,\"accepted\":%u}}",
+		"\"rms_meaningful\":%u,\"max_reciprocal_mm\":%d,"
+		"\"max_sd_mm\":%u,\"accepted\":%u}}",
 		res.n_nodes, res.n_placed, res.n_ambiguous,
 		(int)(res.rms_m * 1000.0f), (int)(res.worst_edge_m * 1000.0f),
 		res.worst_i, res.worst_j,
 		(int)(res.planarity_m * 1000.0f), res.iterations,
 		solve_redundancy, solve_unverified ? 0u : 1u,
-		accepted ? 1u : 0u);
+		max_recip_mm, max_sd_mm, accepted ? 1u : 0u);
 
 	for (uint8_t k = 0; k < res.n_nodes; k++) {
 		LOG_INF("{\"apos_node\":{\"idx\":%u,\"addr\":\"0x%04X\","
@@ -479,10 +503,12 @@ static void judge_result(void)
 			solve_redundancy);
 		LOG_WRN("{\"apos_warn\":\"\\\"accepted\\\":%u above therefore "
 			"means only that nothing contradicted the ranges — it "
-			"does NOT mean they are correct. Check the solved "
+			"does NOT mean they are correct. Read max_reciprocal_mm "
+			"(%d) and max_sd_mm (%u) instead: those describe the "
+			"RANGING, not the fit. Then confirm the solved "
 			"node-to-node distances against a tape measure before "
-			"`apos apply`, or add a fifth anchor so the mesh has a "
-			"spare edge.\"}", accepted ? 1u : 0u);
+			"`apos apply`.\"}", accepted ? 1u : 0u, max_recip_mm,
+			max_sd_mm);
 	}
 
 	if (planar && res.n_placed >= 4u) {
@@ -512,6 +538,12 @@ static void do_solve(void)
 						(uint8_t)APOS_MIN_N_OK);
 	uint16_t missing = apos_table_missing_pairs(&tbl,
 						   (uint8_t)APOS_MIN_N_OK);
+
+	/* Computed from the raw directed measurements, before the fit gets a
+	 * say. On this array the fit cannot judge the ranging, so these two are
+	 * the operator's real quality numbers. */
+	apos_table_quality(&tbl, (uint8_t)APOS_MIN_N_OK, &max_recip_mm,
+			   &max_sd_mm);
 
 	/* Logged, never silent: a hole changes what the fit rests on, and
 	 * "covered everything" is exactly the wrong impression to leave. */
@@ -569,6 +601,17 @@ static void on_range_rsp(const uint8_t *buf, uint16_t plen)
 	if (sess != session || !awaiting_rsp) {
 		return;
 	}
+	/* Phase, not just session and awaiting_rsp: the session is unchanged
+	 * across a whole run and APPLY also sets awaiting_rsp. apos_node.c
+	 * deliberately RETRANSMITS a RANGE_RSP once when the first TX fails, so
+	 * duplicates are engineered into this protocol rather than exceptional.
+	 * A straggler arriving during APPLY whose (src, peer) happens to match a
+	 * stale await_*_addr would otherwise clear awaiting_rsp and advance
+	 * pair_idx -- which during APPLY means a spurious duplicate SETPOS and a
+	 * corrupted meas_done. Same reasoning as on_enum_rsp()/on_setpos_ack(). */
+	if (phase != APOS_GW_RANGE) {
+		return;
+	}
 	/* Both endpoints must match what we asked for. Without the peer check a
 	 * late reply from the PREVIOUS pair would be recorded against this one,
 	 * which is a wrong edge rather than a missing one -- far worse. */
@@ -582,6 +625,25 @@ static void on_range_rsp(const uint8_t *buf, uint16_t plen)
 	if (n_ok < APOS_MIN_N_OK) {
 		LOG_WRN("{\"apos_thin\":{\"from\":\"0x%04X\",\"to\":\"0x%04X\","
 			"\"n_ok\":%u}}", await_from_addr, await_peer_addr, n_ok);
+	} else if (mean <= 0) {
+		/* A physically impossible distance, and reachable for real: the
+		 * antenna delays are still on the factory seed
+		 * (UWB_ANT_DELAY_DEFAULT) and on a ~1 m inter-anchor array a
+		 * mis-trimmed delay comfortably exceeds the true range, so the
+		 * reported mean comes back negative. Rejected HERE rather than
+		 * being let into the table: symmetrise() would hand it on as a
+		 * negative edge, which on a gauge edge surfaces as -ENODATA and
+		 * gets reported as "the gauge anchors are not mutually ranged"
+		 * -- sending the operator to chase a line-of-sight problem that
+		 * does not exist -- and on any other edge is squared inside
+		 * trilaterate3() and silently produces garbage geometry that the
+		 * (vacuous) rms check happily accepts. A hole with an accurate
+		 * reason beats a bad edge with a misleading one. */
+		LOG_WRN("{\"apos_bad_range\":{\"from\":\"0x%04X\",\"to\":"
+			"\"0x%04X\",\"mean_mm\":%d,\"why\":\"non-positive "
+			"distance — almost certainly uncalibrated antenna "
+			"delay; see docs/antenna-delay-calibration.md\"}}",
+			await_from_addr, await_peer_addr, mean);
 	} else if (from >= 0 && to >= 0) {
 		apos_table_add_meas(&tbl, (uint8_t)from, (uint8_t)to, mean, sd,
 				    n_ok);
@@ -697,6 +759,7 @@ int apos_gw_start_apply(bool force)
 	applied_skip = 0;
 	apply_ending = false;
 	apply_persisted = false;
+	apply_reopen = true;
 	awaiting_rsp = false;
 	tx_fails = 0;
 	next_action_ms = 0;
@@ -719,8 +782,11 @@ int apos_gw_start_apply(bool force)
 			3 * (int)res.n_placed - 6, solve_redundancy);
 		LOG_WRN("{\"apos_warn\":\"on this array \\\"accepted\\\" means "
 			"only that nothing contradicted the ranges — it does "
-			"NOT mean they are correct. These coordinates are about "
-			"to be written to every anchor's NVS.\"}");
+			"NOT mean they are correct. Read max_reciprocal_mm (%d) "
+			"and max_sd_mm (%u), and confirm the solved "
+			"node-to-node distances against a tape measure. These "
+			"coordinates are about to be written to every anchor's "
+			"NVS.\"}", max_recip_mm, max_sd_mm);
 	}
 	return 0;
 }
@@ -871,6 +937,49 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 			tx_fails = 0;
 			apply_idx++;
 		}
+		return;
+	}
+
+	/* One-shot: re-open every anchor's survey window before the first
+	 * SETPOS goes out.
+	 *
+	 * Without this the whole apply fails, on every anchor, for a reason that
+	 * looks like a dead radio. A node's window is refreshed only by an
+	 * in-session SETPOS or RANGE_CMD addressed to it, and a node's LAST
+	 * RANGE_CMD is in its own row of the row-major pair walk -- node 0's row
+	 * is the first three of twelve pairs. Nothing between the end of RANGE
+	 * and the start of APPLY refreshes anything, and the operator is
+	 * deliberately told (docs/anchor-auto-positioning.md §5) to tape-measure
+	 * the solved distances before applying, which takes minutes against a
+	 * 60 s APOS_NODE_REFRESH_S. handle_setpos() would then refuse every
+	 * SETPOS (its session check compares against a window_session that has
+	 * been lazily zeroed by an expiring window) and apply would end
+	 * `failed:4`.
+	 *
+	 * Sent with the SAME session, so handle_survey_begin() re-opens on it
+	 * and every later SETPOS matches. It costs one extra frame and one
+	 * settle interval per apply.
+	 *
+	 * One frame per step is respected: this arm transmits and returns. The
+	 * staggered ENUM_RSPs it provokes are discarded by on_enum_rsp()'s
+	 * `phase != APOS_GW_ENUM` guard -- phase is APOS_GW_APPLY throughout --
+	 * so they cannot append peers or trip the -EADDRINUSE abort. */
+	if (apply_reopen) {
+		apply_reopen = false;
+		send_survey_begin(seq);
+		/* Enough for the worst-case enumeration stagger
+		 * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 240 ms) to drain
+		 * before the first SETPOS competes with it on the air. Not
+		 * retried on TX failure: a SETPOS refused for a closed window is
+		 * already reported per anchor, loudly, by the retry path below. */
+		next_action_ms = now + APOS_GW_APPLY_SETTLE_MS;
+		return;
+	}
+
+	/* Settle interval after the re-broadcast above. Every other path sets
+	 * next_action_ms to 0 or is gated by the awaiting_rsp arm, so this is a
+	 * no-op outside that window. */
+	if (now < next_action_ms) {
 		return;
 	}
 

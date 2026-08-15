@@ -43,9 +43,17 @@ enum apos_gw_phase {
 #define APOS_GW_WINDOW_S 120u
 
 /* SURVEY_BEGIN is broadcast this many times, spaced this far apart, and the
- * replies are unioned. One round would be enough if no two EUIs hashed to the
- * same stagger slot; three makes a slot collision cost a retry instead of a
- * missing anchor. The gap must exceed the worst-case stagger
+ * replies are unioned (apos_table_add_peer() is idempotent on EUI).
+ *
+ * Three rounds only help because apos_node.c salts its stagger hash with the
+ * round counter, so each round is an INDEPENDENT slot draw: two anchors that
+ * collide in one round are very unlikely to collide in the next, and the union
+ * still enumerates both. With an unsalted hash the same pair would collide in
+ * every round and the extra broadcasts would buy nothing at all -- see
+ * enum_slot() in apos_node.c. With 8 slots, 4 anchors and 3 independent draws,
+ * the chance an anchor is lost in all three is under 2 %.
+ *
+ * The gap must exceed the worst-case stagger
  * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 8 * 30 = 240 ms) plus reply airtime;
  * 400 ms clears 240 ms with ~160 ms to spare, which is ample for a ~1.5 ms
  * ENUM_RSP. */
@@ -149,6 +157,13 @@ enum apos_gw_phase {
  * tight compared with APOS_GW_RANGE_TIMEOUT_MS. */
 #define APOS_GW_APPLY_TIMEOUT_MS 1500u
 
+/* Settle time between APPLY's one-shot SURVEY_BEGIN re-broadcast and the first
+ * SETPOS. Must clear the anchors' worst-case enumeration stagger
+ * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 240 ms) so the ENUM_RSPs that
+ * re-broadcast provokes -- harmless, and discarded by the gateway's phase
+ * guard -- are off the air before the first SETPOS needs an acknowledgement. */
+#define APOS_GW_APPLY_SETTLE_MS 400u
+
 /* Three attempts per anchor. Unlike a failed range, a failed SETPOS cannot be
  * shrugged off as a hole: an anchor left on its old coordinates while its peers
  * move to new ones is a silently inconsistent deployment, so this retries hard
@@ -240,11 +255,34 @@ bool apos_gw_accepted(void);
  * apos_gw_accepted() means only "nothing contradicted the ranges", never "the
  * ranges are good".
  *
- * This is not a corner case: the deployment is four ranging slaves, and a
- * four-node full mesh has exactly 6 edges against exactly 6 free parameters.
- * Anything that reports acceptance to an operator must report this alongside
- * it. See the long note on apos_geom_refine(). */
+ * This is not a corner case, it is EVERY case. UWB_MAX_ANCHORS is 4, `anchor
+ * id` is bounded 0..3, and apos_node.c refuses any peer_addr at or above
+ * UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS -- so a four-node full mesh, with
+ * exactly 6 edges against exactly 6 free parameters, is the only deployment the
+ * firmware supports and this flag is true on every real run. APOS_MAX_NODES (8)
+ * is headroom in the data structures, not a supported configuration.
+ *
+ * Raising the anchor count is NOT an operator action and must never be
+ * suggested as one. It is engineering work touching UWB_MAX_ANCHORS,
+ * disc_schedule's response stagger, anchor_respond.c's TX_COMPLETE_TIMEOUT_MS
+ * (which is derived from that stagger's worst case), and the tag project's
+ * UWB_FRAME_MAX_ANCHORS on the far side of a frozen wire format.
+ *
+ * What an operator CAN read on the array they have is
+ * apos_gw_result_quality(): reciprocal disagreement and per-pair sd. Those make
+ * the RANGING observable. They do not make the GEOMETRY over-determined --
+ * a rigid 4-node framework stays isostatic either way -- so they are a check on
+ * the measurements, not a substitute for the tape measure.
+ *
+ * See the long note on apos_geom_refine(). */
 bool apos_gw_result_unverified(void);
+
+/* Ranging-quality maxima behind the last solve, straight from the directed
+ * measurements rather than from the fit: the largest |d(A->B) - d(B->A)| over
+ * pairs measured both ways (-1 if there is no such pair), and the largest
+ * per-measurement sd. Either pointer may be NULL. Meaningful only when
+ * have_result. See apos_table_quality(). */
+void apos_gw_result_quality(int32_t *max_recip_mm, uint16_t *max_sd_mm);
 
 /* Spare edges in the last solve: usable_edges - (3 * n_placed - 6). <= 0 is the
  * unverified regime above. Meaningful only when have_result. */
