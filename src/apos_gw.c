@@ -1122,3 +1122,34 @@ void apos_gw_step(uint32_t avail_uus, uint8_t *seq)
 		break;
 	}
 }
+
+int apos_gw_trigger_from_mqtt(const char *payload, size_t len)
+{
+	/* Bounded copy so strstr() cannot run off a payload the broker did not
+	 * NUL-terminate. 64 bytes is far more than the accepted documents need
+	 * and anything longer is not one of them. */
+	char tmp[64];
+
+	if (!payload || len == 0) {
+		return -EINVAL;
+	}
+	if (len >= sizeof(tmp)) {
+		LOG_WRN("survey trigger payload too long (%u) — ignored",
+			(unsigned int)len);
+		return -EINVAL;
+	}
+	memcpy(tmp, payload, len);
+	tmp[len] = '\0';
+
+	if (strstr(tmp, "\"run\"") != NULL) {
+		LOG_INF("{\"apos\":\"triggered by MQTT\",\"cmd\":\"run\"}");
+		return apos_gw_start_run();
+	}
+	if (strstr(tmp, "\"apply\"") != NULL) {
+		LOG_INF("{\"apos\":\"triggered by MQTT\",\"cmd\":\"apply\"}");
+		return apos_gw_start_apply(false);
+	}
+
+	LOG_WRN("unrecognised survey trigger: %s", tmp);
+	return -EINVAL;
+}

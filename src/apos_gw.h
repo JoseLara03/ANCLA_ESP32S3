@@ -268,4 +268,25 @@ int apos_gw_start_apply(bool force);
  * requires a re-run rather than silently rewriting a reported result. */
 void apos_gw_set_zoff(float dz);
 
+/* Parse and act on a survey trigger document.
+ *
+ * UNWIRED: net_uplink.c does not subscribe to anything, so nothing calls this
+ * yet. It exists complete and tested-by-inspection so that wiring a subscribe
+ * path later is a transport change only, with no protocol decisions left open.
+ *
+ * Accepts a minimal document, matched by substring rather than parsed with a
+ * JSON library -- this project links no JSON parser and one command word does
+ * not justify adding one:
+ *   {"cmd":"run"}     -> apos_gw_start_run()
+ *   {"cmd":"apply"}   -> apos_gw_start_apply(false)
+ *
+ * Deliberately NOT accepted: "apply force" and any form of setting the gauge.
+ * The gauge is a physical claim about which box is where and a forced apply
+ * overrides a failed acceptance check -- neither should be assertable by a
+ * broker message. Both stay console-only.
+ *
+ * Returns 0, -EINVAL on an unrecognised document, or whatever the underlying
+ * start function returned. */
+int apos_gw_trigger_from_mqtt(const char *payload, size_t len);
+
 #endif /* APOS_GW_H */

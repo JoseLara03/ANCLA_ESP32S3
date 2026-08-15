@@ -23,6 +23,15 @@
  * anchors topic instead. */
 #define POS_JSON_ZONE_NAME "852541"
 
+/* Topic the survey trigger will arrive on. Declared here with the other topics,
+ * composed from POS_JSON_ZONE_NAME, so a topic can never disagree with the zone
+ * in its payload -- the same rule the position and anchors topics follow.
+ *
+ * NOT SUBSCRIBED YET: net_uplink.c has no subscribe path. Reserved so the name
+ * is settled and visible next to its siblings rather than being invented later
+ * in whichever file happens to add the subscription. */
+#define POS_JSON_TOPIC_SURVEY "uwb/anchor/survey/" POS_JSON_ZONE_NAME
+
 /* Buffer size that fits either document plus its NUL. Sized on the LARGER of the
  * two: a full APOS_MAX_NODES surveyed document (~150 bytes per anchor at the
  * widest coordinate and lat/long values), not the four-anchor stub it used to be
