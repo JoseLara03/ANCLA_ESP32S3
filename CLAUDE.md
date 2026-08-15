@@ -133,12 +133,15 @@ hit them running `docs/anchor-auto-positioning.md`:
   solve, or the persist. `APOS_GW_SOLVE_BUDGET_UUS` (150000) and the
   survey-persist gate that reuses it have **never been timed on hardware**.
 - The solved node-to-node distances match a **tape measure**. On a four-anchor
-  array this is the only real check — see the hard-won fact below on why
-  `rms_mm` cannot be one.
+  array this is the only real check on the GEOMETRY — see the hard-won fact
+  below on why `rms_mm` cannot be one, and read `max_reciprocal_mm` /
+  `max_sd_mm` for the ranging.
 - `apos apply` reports `ok:4, failed:0, skipped:0, persisted:1`; every anchor
   reports its new coordinates immediately and they survive `kernel reboot cold`.
 - `apos ref` set and the retained anchors payload carrying the surveyed
-  geometry rather than `ANC-LOBBY-001..004`.
+  COORDINATES. The anchor names stay `ANC-LOBBY-00N` on purpose — the customer
+  platform may key its records on `name`, so a survey changes coordinates only
+  (`src/pos_json.c`).
 - The point of the branch: a tag ranging four surveyed anchors, with `0xEA`
   `residual` under ~0.1 m and `(x, y)` stable between fixes.
 
@@ -636,8 +639,21 @@ thresholds.
   (`apos_gw_result_unverified()`, the `spare_edges`/`rms_meaningful` fields, a
   `LOG_WRN` pair at solve and again at apply, and a `shell_warn` under the
   operator's own `apos apply`); the check that actually validates the geometry
-  is a tape measure or a fifth anchor. Do not "fix" this by loosening a
-  threshold — the thresholds are not the problem, the edge count is.
+  is a **tape measure**. Do not "fix" this by loosening a threshold — the
+  thresholds are not the problem, the edge count is. **There is no fifth-anchor
+  option to suggest to an operator**: `UWB_MAX_ANCHORS` is 4, `anchor id` is
+  bounded 0..3, and `apos_node.c` refuses a `RANGE_CMD` naming a peer at or
+  beyond `UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS`, so `APOS_MAX_NODES` (8) is
+  structural headroom and **every** supported deployment is the degenerate case.
+  Growing past four ranging anchors is engineering work — `UWB_MAX_ANCHORS`,
+  `disc_schedule`'s stagger, `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS`
+  re-derived from that stagger, and the tag's `UWB_FRAME_MAX_ANCHORS` behind a
+  frozen wire format. What the operator CAN read on the array they have is
+  `max_reciprocal_mm` (largest `|d(A→B) − d(B→A)|`, computed by
+  `apos_table_quality()` before `symmetrise()` averages it away) and
+  `max_sd_mm`, both in the `apos_solve` JSON and in `apos show`. Those make the
+  RANGING observable; they do **not** make the geometry over-determined — a
+  rigid 4-node framework stays isostatic either way.
 - **`ss_initiator.c` is compiled into the PRODUCTION image.** It was
   `cal_initiator.c` and calibration-only, and the old safety property — "a
   deployed anchor can never initiate a poll" — came from the build set. It no

@@ -62,14 +62,30 @@ ranges"**. The checks that actually validate the geometry are
 
 1. a **tape measure** against the solved node-to-node distances printed by
    `{"apos_node":...}`, and
-2. a **fifth ranging anchor**, which gives the mesh a spare edge and makes
-   `rms_mm` a real witness.
+2. the two **ranging-quality** numbers the solve reports alongside `rms_mm`:
+   `max_reciprocal_mm` and `max_sd_mm` (also printed by `apos show`).
 
-Note that a fifth *ranging* anchor is not a drop-in today: the survey handles
-`APOS_MAX_NODES` = 8, but an anchor refuses a `RANGE_CMD` naming a peer outside
-`UWB_ANCHOR_ADDR_BASE .. +UWB_MAX_ANCHORS` (4) — `src/apos_node.c` — and the
-tag-facing MAC caps at four regardless. Growing past four ranging anchors is
-separate work (see `CLAUDE.md`, hard-won facts).
+`max_reciprocal_mm` is the largest `|d(A→B) − d(B→A)|` over the pairs measured
+in both directions — a number the fit never sees, because
+`apos_table_symmetrise()` averages the two directions away. `max_sd_mm` is the
+largest per-pair spread within a batch. Both describe the **ranging**: a
+`max_reciprocal_mm` in the tens of millimetres is a healthy array, and one in the
+hundreds means a bad pair however clean `rms_mm` looks.
+
+**Be precise about what they do:** they make the ranging *observable*. They do
+**not** make the geometry over-determined. A rigid four-node framework is
+isostatic whatever its edges measure, so `rms_mm` stays vacuous and the tape
+measure stays the check on the geometry itself.
+
+There is no fifth-anchor option. `UWB_MAX_ANCHORS` is 4, `anchor id` is bounded
+`0..3`, and an anchor refuses a `RANGE_CMD` naming a peer at or beyond
+`UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS` (`src/apos_node.c`) — so
+`APOS_MAX_NODES` = 8 is headroom in the data structures, not a configuration.
+Raising the anchor count is **engineering work, never an operator action**: it
+touches `UWB_MAX_ANCHORS`, `disc_schedule`'s response stagger,
+`anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS` (derived from that stagger's worst
+case), and the tag project's `UWB_FRAME_MAX_ANCHORS` on the far side of a frozen
+wire format. Every supported deployment is the degenerate case.
 
 ## 1. Prerequisites
 
@@ -150,7 +166,7 @@ it never silently rewrites a result you have already read.
 ## 4. Walkthrough
 
 Everything below is typed on the **GATEWAY's** console (`uwb:~$`). Every `apos`
-subcommand refuses on a slave with
+subcommand except `show` refuses on a slave with
 
 ```
 error: `apos` runs on the GATEWAY — this board is a SLAVE. Set `anchor mode gateway` and reboot.
@@ -226,13 +242,25 @@ cancels residual antenna-delay asymmetry.
 Note the `rms_mm:0` / `spare_edges:0` / `rms_meaningful:0` combination in that
 example. That is the normal, expected output of a healthy four-anchor run — and
 it is exactly the output §0 is about. **Check the `apos_node` coordinates
-against a tape measure now**, before applying.
+against a tape measure now**, and read `max_reciprocal_mm` / `max_sd_mm`
+(§0), before applying. Taking your time here is safe: `apos apply` re-opens the
+anchors' survey windows before it pushes anything (§4.5).
 
 ### 4.5 Apply
 
 ```
 apos apply
 ```
+
+Apply first re-broadcasts one `SURVEY_BEGIN` on the **same session**, then
+settles for `APOS_GW_APPLY_SETTLE_MS` (400 ms) before the first `SETPOS`. That
+re-opens every anchor's survey window: a window is refreshed only by an
+in-session `SETPOS` or `RANGE_CMD` addressed to that anchor, the last
+`RANGE_CMD` an anchor sees can be near the *start* of the ranging phase, and
+`APOS_NODE_REFRESH_S` is 60 s — far less than the time §4.4 tells you to spend
+with a tape measure. Without the re-broadcast every `SETPOS` in the array would
+be refused. The staggered `ENUM_RSP` replies the re-broadcast provokes are
+discarded by the gateway (its enumeration handler is phase-guarded).
 
 Pushes each node's coordinates to its anchor as a `SETPOS`, waits for a
 `SETPOS_ACK` from each (up to `APOS_GW_APPLY_RETRIES` + 1 attempts), persists the
@@ -246,7 +274,7 @@ error: the last run FAILED acceptance (rms=… mm, worst=… mm on pair [i,j], p
 ```
 
 `apos apply force` is the only argument accepted; anything else is
-`error: the only argument is 'force'`. `force` overrides the **thresholds**
+``error: the only argument is `force` ``. `force` overrides the **thresholds**
 only — the unverified-mesh warning still prints.
 
 The line to read at the end:
@@ -406,7 +434,14 @@ z values are not survey-quality. Raise or lower one anchor and re-run.
 
 That anchor kept its previous position while its peers moved to new ones — a
 silently inconsistent deployment. Also reported as a nonzero `failed` in
-`apos_apply_done`. Re-run `apos apply`.
+`apos_apply_done`. Re-run `apos apply`: each apply re-opens the anchors' survey
+windows before its first `SETPOS` (§4.5), so a second attempt starts from the
+same clean state as the first, however long you spent between them.
+
+If **every** anchor fails this way, and the anchors' own consoles show
+`SETPOS for session … ignored — current is 0`, the windows had lapsed and were
+not re-opened — which would mean the re-broadcast in §4.5 did not go out. Look
+for the `apos` `TX failed` warnings on the gateway in the same window.
 
 ### `0x000N applied but could not persist — it will revert on reboot`
 
@@ -464,14 +499,17 @@ None of these have been run. Tick them in order.
 - [ ] Coordinates survive `kernel reboot cold` on every anchor and on the
       gateway (`apos show` still says `stored survey: yes`).
 - [ ] `apos ref` set, and the retained `uwb/anchor/setup/852541` payload carries
-      the surveyed geometry rather than `ANC-LOBBY-001..004`.
+      the surveyed COORDINATES. The anchor **names** stay `ANC-LOBBY-00N`
+      deliberately — the platform may key its records on them, so a survey
+      changes coordinates only (`src/pos_json.c`).
 - [ ] A tag ranges all four anchors and its `0xEA` `residual` is under ~0.1 m,
       with `(x, y)` stable between consecutive fixes with nothing moving.
 
 ## 8. What this procedure does not fix
 
 - **It does not validate itself on a four-anchor array.** §0. A tape measure or
-  a fifth anchor does.
+  the ranging-quality numbers plus a tape measure do (§0). There is no fifth
+  anchor to add.
 - **It does not calibrate antenna delay**, and cannot detect an uncalibrated
   array — a uniform delay error looks like a slightly larger room.
 - **It does not survey the gateway.** §2.
