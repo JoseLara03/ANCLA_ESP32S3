@@ -103,6 +103,23 @@ uint16_t apos_table_symmetrise(const struct apos_table *t,
 			       struct apos_edge *out, uint16_t out_cap,
 			       uint8_t min_n_ok);
 
+/* Ranging-quality maxima over the usable directed measurements.
+ *
+ * *max_recip_mm receives the largest |d(A->B) - d(B->A)| across every pair that
+ * was measured in BOTH directions, or -1 if no such pair exists. *max_sd_mm
+ * receives the largest per-measurement sd_mm, or 0 if there is nothing usable.
+ * Either output pointer may be NULL.
+ *
+ * These describe the RANGING, and are the only quality signals that carry
+ * information on a four-anchor array, where the fit's rms_m is vacuous (see
+ * apos_gw_result_unverified()). They do NOT make the geometry over-determined:
+ * a rigid 4-node framework is isostatic whatever its edges measure. Reciprocal
+ * disagreement is computed here rather than inside apos_table_symmetrise(),
+ * whose averaging is exactly what throws the information away -- the averaging
+ * itself is unchanged. */
+void apos_table_quality(const struct apos_table *t, uint8_t min_n_ok,
+			int32_t *max_recip_mm, uint16_t *max_sd_mm);
+
 /* Unordered pairs with no usable measurement in either direction. These are the
  * holes the fit works around, and the number an operator needs to see before
  * deciding whether to move an anchor. */

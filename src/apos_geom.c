@@ -315,7 +315,13 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 	float d02 = edge_d(e, n_edges, g->origin, g->plane);
 	float d12 = edge_d(e, n_edges, g->xaxis, g->plane);
 
-	if (d01 <= 0.0f || d02 < 0.0f || d12 < 0.0f) {
+	/* All three <= 0, not just d01. edge_d() returns a negative sentinel for
+	 * "not measured", but zero is a distinct and reachable failure: a
+	 * genuinely zero-length gauge edge. A d02 of exactly 0 used to pass,
+	 * after which py2 = -px*px is negative, py clamps to 0, and the `plane`
+	 * node is placed COLLINEAR with origin and xaxis -- a silently
+	 * degenerate gauge reported as a successful solve. */
+	if (d01 <= 0.0f || d02 <= 0.0f || d12 <= 0.0f) {
 		return -ENODATA;
 	}
 

@@ -313,6 +313,77 @@ static void test_empty_table_symmetrise_and_missing_pairs_are_zero(void)
     CHECK(apos_table_missing_pairs(&t, 10) == 0);
 }
 
+/* The ranging-quality maxima: reciprocal disagreement over both-way pairs and
+ * the largest per-measurement sd. These are the only quality numbers that carry
+ * information on a four-anchor array, so they must survive the averaging in
+ * symmetrise() -- which is exactly what throws them away. */
+static void test_quality_reports_reciprocal_and_sd_maxima(void)
+{
+    struct apos_table t;
+    int32_t recip = 999;
+    uint16_t sd = 999;
+
+    apos_table_init(&t);
+    add(&t, 1, 0x0001);
+    add(&t, 2, 0x0002);
+    add(&t, 3, 0x0003);
+
+    /* Pair 0-1 both ways, disagreeing by 40 mm. */
+    apos_table_add_meas(&t, 0, 1, 1000, 12, 40);
+    apos_table_add_meas(&t, 1, 0, 1040, 30, 40);
+    /* Pair 0-2 both ways, disagreeing by 7 mm but carrying the worst sd. */
+    apos_table_add_meas(&t, 0, 2, 2000, 55, 40);
+    apos_table_add_meas(&t, 2, 0, 1993, 11, 40);
+    /* Pair 1-2 one way only: no reciprocal, and a thin/unusable one after it. */
+    apos_table_add_meas(&t, 1, 2, 1500, 20, 40);
+    apos_table_add_meas(&t, 2, 1, 9999, 900, 2);
+
+    apos_table_quality(&t, 10, &recip, &sd);
+    CHECK(recip == 40);
+    /* 900 belongs to a measurement below min_n_ok and must not count. */
+    CHECK(sd == 55);
+
+    /* A non-positive mean is not a usable measurement, so it can neither
+     * contribute a reciprocal nor an sd. */
+    apos_table_init(&t);
+    add(&t, 1, 0x0001);
+    add(&t, 2, 0x0002);
+    apos_table_add_meas(&t, 0, 1, -50, 700, 40);
+    apos_table_add_meas(&t, 1, 0, 1000, 20, 40);
+    apos_table_quality(&t, 10, &recip, &sd);
+    CHECK(recip == -1);   /* no pair measured usably in BOTH directions */
+    CHECK(sd == 20);
+    CHECK(apos_table_missing_pairs(&t, 10) == 0); /* the good direction stands */
+
+    /* Empty table: -1 and 0, and NULL outputs are tolerated. */
+    apos_table_init(&t);
+    apos_table_quality(&t, 10, &recip, &sd);
+    CHECK(recip == -1);
+    CHECK(sd == 0);
+    apos_table_quality(&t, 10, NULL, NULL);
+    apos_table_quality(NULL, 10, &recip, &sd);
+    CHECK(recip == -1);
+    CHECK(sd == 0);
+}
+
+/* A negative mean is physically impossible and reachable while the antenna
+ * delays are uncalibrated. It must never become an edge: squared inside
+ * trilaterate3() it produces plausible-looking garbage geometry. */
+static void test_non_positive_mean_is_not_an_edge(void)
+{
+    struct apos_table t;
+    struct apos_edge e[APOS_MAX_EDGES];
+
+    apos_table_init(&t);
+    add(&t, 1, 0x0001);
+    add(&t, 2, 0x0002);
+    apos_table_add_meas(&t, 0, 1, -120, 20, 40);
+    apos_table_add_meas(&t, 1, 0, 0, 20, 40);
+
+    CHECK(apos_table_symmetrise(&t, e, APOS_MAX_EDGES, 10) == 0);
+    CHECK(apos_table_missing_pairs(&t, 10) == 1);
+}
+
 int main(void)
 {
     test_peers_get_sequential_indices();
@@ -331,6 +402,8 @@ int main(void)
     test_symmetrise_respects_out_cap();
     test_measurement_table_fills_to_exact_capacity();
     test_empty_table_symmetrise_and_missing_pairs_are_zero();
+    test_quality_reports_reciprocal_and_sd_maxima();
+    test_non_positive_mean_is_not_an_edge();
 
     if (g_fail) {
         printf("%d CHECK(s) FAILED\n", g_fail);

@@ -186,6 +186,32 @@ static void test_missing_gauge_edge_is_enodata(void)
     CHECK(apos_geom_seed(e, w, 4, &g_ref, &r) == -ENODATA);
 }
 
+/* A gauge edge of length exactly zero is degenerate, not merely unmeasured, and
+ * must be refused just as a missing one is. The zero-length d02 case is the
+ * dangerous one: it used to pass the guard, after which py clamps to 0 and the
+ * `plane` node is placed collinear with origin and xaxis -- a degenerate frame
+ * reported as a successful solve. A non-positive measured distance is reachable
+ * on this hardware while the antenna delays are uncalibrated. */
+static void test_zero_length_gauge_edge_is_enodata(void)
+{
+    for (int which = 0; which < 3; which++) {
+        struct apos_edge e[APOS_MAX_EDGES];
+        struct apos_result r;
+        uint16_t n = build_full_mesh(e, 4);
+        /* 0-1 is d01, 0-2 is d02, 1-2 is d12. */
+        const uint8_t ii[3] = {0, 0, 1};
+        const uint8_t jj[3] = {1, 2, 2};
+
+        for (uint16_t k = 0; k < n; k++) {
+            if (e[k].i == ii[which] && e[k].j == jj[which]) {
+                e[k].d_m = 0.0f;
+            }
+        }
+
+        CHECK(apos_geom_seed(e, n, 4, &g_ref, &r) == -ENODATA);
+    }
+}
+
 static void test_zoff_shifts_only_placed_nodes(void)
 {
     struct apos_edge e[APOS_MAX_EDGES];
@@ -472,6 +498,7 @@ int main(void)
     test_node_with_three_edges_is_flagged_ambiguous();
     test_fourth_edge_resolves_the_mirror();
     test_missing_gauge_edge_is_enodata();
+    test_zero_length_gauge_edge_is_enodata();
     test_bad_candidate_does_not_block_good_candidate();
     test_zoff_shifts_only_placed_nodes();
     test_rejects_bad_arguments();

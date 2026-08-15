@@ -123,8 +123,14 @@ static const struct apos_dir_meas *find_meas(const struct apos_table *t,
 					     uint8_t min_n_ok)
 {
 	for (uint16_t k = 0; k < t->n_meas; k++) {
+		/* mean_mm <= 0 is rejected at the gateway before it ever gets
+		 * here (apos_gw.c's on_range_rsp), so this is belt and braces --
+		 * but it is cheap, and a non-positive distance reaching
+		 * symmetrise() would be squared inside trilaterate3() and
+		 * silently produce plausible-looking garbage geometry. Treated
+		 * as "no usable measurement", i.e. a reported hole. */
 		if (t->meas[k].from == a && t->meas[k].to == b &&
-		    t->meas[k].n_ok >= min_n_ok) {
+		    t->meas[k].n_ok >= min_n_ok && t->meas[k].mean_mm > 0) {
 			return &t->meas[k];
 		}
 	}
@@ -188,6 +194,56 @@ uint16_t apos_table_symmetrise(const struct apos_table *t,
 		}
 	}
 	return n;
+}
+
+void apos_table_quality(const struct apos_table *t, uint8_t min_n_ok,
+			int32_t *max_recip_mm, uint16_t *max_sd_mm)
+{
+	int32_t worst_recip = -1;
+	uint16_t worst_sd = 0;
+
+	if (!t) {
+		goto out;
+	}
+
+	for (uint8_t i = 0; i < t->n_peers; i++) {
+		for (uint8_t j = (uint8_t)(i + 1); j < t->n_peers; j++) {
+			const struct apos_dir_meas *f = find_meas(t, i, j,
+								  min_n_ok);
+			const struct apos_dir_meas *r = find_meas(t, j, i,
+								  min_n_ok);
+
+			if (f && f->sd_mm > worst_sd) {
+				worst_sd = f->sd_mm;
+			}
+			if (r && r->sd_mm > worst_sd) {
+				worst_sd = r->sd_mm;
+			}
+			if (!f || !r) {
+				/* A one-way edge has no reciprocal to disagree
+				 * with. Excluded rather than counted as zero,
+				 * which would flatter the reported maximum. */
+				continue;
+			}
+
+			int32_t d = f->mean_mm - r->mean_mm;
+
+			if (d < 0) {
+				d = -d;
+			}
+			if (d > worst_recip) {
+				worst_recip = d;
+			}
+		}
+	}
+
+out:
+	if (max_recip_mm) {
+		*max_recip_mm = worst_recip;
+	}
+	if (max_sd_mm) {
+		*max_sd_mm = worst_sd;
+	}
 }
 
 uint16_t apos_table_missing_pairs(const struct apos_table *t, uint8_t min_n_ok)
