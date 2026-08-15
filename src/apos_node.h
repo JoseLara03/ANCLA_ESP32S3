@@ -35,8 +35,15 @@
  * The slot is chosen by hashing this board's EUI-64, NOT by anchor_id: assuming
  * anything about ids is the coupling this design exists to remove, and a
  * duplicate id must remain DETECTABLE rather than being silently folded into
- * one reply. EUI-64 is unique by manufacture, so the stagger is collision-free
- * with no configuration and is stable across reboots.
+ * one reply. EUI-64 is unique by manufacture, so the slot needs no
+ * configuration.
+ *
+ * The hash is salted with the SURVEY_BEGIN round counter and the session
+ * (apos_node.c's enum_slot()), so it is deliberately NOT stable across rounds or
+ * across runs. Uniqueness of the EUI does not make the SLOT unique -- 8 slots
+ * and 4 anchors collide with probability ~59 % -- and an unsalted hash would
+ * repeat that same collision in every round of every run, which is a permanently
+ * missing anchor rather than a retryable one.
  *
  * 8 slots x 30 ms bounds the worst-case reply delay at 210 ms, which is about
  * one superframe -- short enough for the SLAVE loop to simply sleep through it. */

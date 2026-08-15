@@ -40,6 +40,11 @@ LOG_MODULE_REGISTER(apos_node, LOG_LEVEL_INF);
 static int64_t window_deadline_ms;
 static uint16_t window_session;
 
+/* SURVEY_BEGIN broadcasts seen so far for the CURRENT session, used to salt the
+ * enumeration stagger so successive rounds draw independent slots. Reset when a
+ * new session opens; see enum_slot(). */
+static uint8_t begin_seen;
+
 static uint8_t eui[APOS_EUI_LEN];
 static bool eui_ready;
 
@@ -49,6 +54,7 @@ void apos_node_init(void)
 {
 	window_deadline_ms = 0;
 	window_session = 0;
+	begin_seen = 0;
 
 	/* hwinfo may return fewer than 8 bytes. Zero-pad rather than leaving
 	 * the tail uninitialised: the tail is hashed for the stagger and
@@ -149,13 +155,30 @@ static bool tx_now(const uint8_t *buf, uint16_t len, struct beacon_guard *bg)
 	return true;
 }
 
-/* FNV-1a over the EUI, reduced to a slot. Any cheap avalanche would do; what
- * matters is that it depends on every byte, since boards from one batch differ
- * only in the last one or two. */
-static uint32_t enum_slot(void)
+/* FNV-1a over a per-round salt and then the EUI, reduced to a slot. Depending
+ * on every EUI byte is what makes boards from one batch -- which differ only in
+ * the last byte or two -- land in unrelated slots.
+ *
+ * The salt is what makes the gateway's repeated SURVEY_BEGIN rounds worth
+ * repeating. Hashing the EUI ALONE gives a board one fixed slot forever, so two
+ * anchors that collide collide identically in every round and one of them is
+ * simply never enumerated -- with 8 slots and 4 anchors that is a ~59 % chance
+ * of a survey that reports a missing anchor and no operator action that fixes
+ * it (the EUI is burned into eFuse). Mixing in the round counter makes each
+ * round an independent draw; mixing in the session makes a re-run reshuffle too,
+ * so an unlucky session is never repeatable either.
+ *
+ * Salt first, EUI after: FNV-1a's avalanche then carries the salt through every
+ * subsequent byte, rather than letting it perturb only the final multiply. */
+static uint32_t enum_slot(uint16_t sess, uint8_t round)
 {
+	const uint8_t salt[3] = {round, (uint8_t)sess, (uint8_t)(sess >> 8)};
 	uint32_t h = 2166136261u;
 
+	for (int i = 0; i < (int)sizeof(salt); i++) {
+		h ^= salt[i];
+		h *= 16777619u;
+	}
 	for (int i = 0; i < APOS_EUI_LEN; i++) {
 		h ^= eui[i];
 		h *= 16777619u;
@@ -179,16 +202,30 @@ static void handle_survey_begin(const uint8_t *buf, uint16_t plen,
 		return;
 	}
 
+	/* Round counter for the stagger salt. Observed BEFORE window_open()
+	 * overwrites window_session: a SURVEY_BEGIN for a session we are not
+	 * already in starts the count over, so round 0 of every survey is a
+	 * fresh draw and the counter cannot creep across runs. */
+	if (session != window_session) {
+		begin_seen = 0;
+	}
+
+	uint8_t round = begin_seen;
+
+	if (begin_seen < UINT8_MAX) {
+		begin_seen++;
+	}
+
 	window_open(session, window_s);
-	LOG_INF("{\"apos\":\"window open\",\"session\":%u,\"window_s\":%u}",
-		session, window_s);
+	LOG_INF("{\"apos\":\"window open\",\"session\":%u,\"window_s\":%u,"
+		"\"round\":%u}", session, window_s, round);
 
 	/* Sleep out our stagger slot before replying. Blocking the SLAVE loop
 	 * for up to 210 ms is acceptable here and nowhere else: this happens
 	 * only when an operator triggers a survey, and the alternative -- a
 	 * timer plus a deferred TX path -- would add a second thread touching
 	 * the SPI bus. */
-	k_sleep(K_MSEC(enum_slot() * APOS_ENUM_SLOT_MS));
+	k_sleep(K_MSEC(enum_slot(session, round) * APOS_ENUM_SLOT_MS));
 
 	int n = apos_frame_enum_rsp_build(tx_buf, sizeof(tx_buf),
 					 uwb_config_short_addr(cfg),
@@ -273,6 +310,7 @@ static void handle_survey_end(const uint8_t *buf, uint16_t plen)
 		return;
 	}
 	window_session = 0;
+	begin_seen = 0;
 	LOG_INF("{\"apos\":\"window closed\",\"reason\":\"survey end\"}");
 }
 
