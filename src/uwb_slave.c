@@ -172,13 +172,13 @@ void uwb_slave_run(const uwb_config_t *cfg)
 	 * against the shell thread. Operating on a stable copy restores the
 	 * documented "changes take effect only on reboot" contract -- notably
 	 * for ant_delay_tx, which resp_tx_ts arithmetic must keep matching the
-	 * antenna delay actually programmed into the radio at boot. */
-	/* Snapshot at mode-entry -- see the comment below for why. Kept as a
-	 * named mutable object as well as the const view: apos_node_on_rx()
-	 * writes a surveyed position straight into it so `apos apply` takes
-	 * effect without a reboot, while every other consumer keeps the const
-	 * view and the documented "changes take effect only on reboot"
-	 * contract for id and antenna delay. */
+	 * antenna delay actually programmed into the radio at boot.
+	 *
+	 * Kept as a named MUTABLE object as well as the const view:
+	 * apos_node_on_rx() writes a surveyed position straight into it, so
+	 * `apos apply` takes effect without a reboot, while every other consumer
+	 * keeps the const view and the reboot contract above for id and antenna
+	 * delay. */
 	static uwb_config_t cfg_snapshot;
 
 	cfg_snapshot = *cfg;

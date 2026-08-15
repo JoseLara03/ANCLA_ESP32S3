@@ -157,6 +157,20 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 		    st.phase, st.session, apos_gw_gauge_set() ? 1u : 0u,
 		    st.have_result ? 1u : 0u);
 
+	if (st.have_result) {
+		int32_t recip = -1;
+		uint16_t sd = 0;
+
+		apos_gw_result_quality(&recip, &sd);
+		/* The ranging-quality pair, printed unconditionally alongside
+		 * the result: on a four-anchor array these are the only numbers
+		 * that say anything about the measurements. */
+		shell_print(sh, "{\"max_reciprocal_mm\":%d,\"max_sd_mm\":%u,"
+				"\"spare_edges\":%d,\"rms_meaningful\":%u}",
+			    recip, sd, apos_gw_result_redundancy(),
+			    apos_gw_result_unverified() ? 0u : 1u);
+	}
+
 	shell_print(sh, "enumerated (%u):", t->n_peers);
 	for (uint8_t k = 0; k < t->n_peers; k++) {
 		shell_print(sh, "  {\"idx\":%u,\"addr\":\"0x%04X\","
@@ -259,20 +273,36 @@ static int cmd_zoff(const struct shell *sh, size_t argc, char **argv)
  * `force` overrides ACCEPTANCE, not physics. */
 static void warn_unverified(const struct shell *sh)
 {
+	int32_t recip = -1;
+	uint16_t sd = 0;
+
 	if (!apos_gw_result_unverified()) {
 		return;
 	}
+
+	apos_gw_result_quality(&recip, &sd);
 
 	shell_warn(sh, "WARNING: this survey is UNVERIFIED. The mesh has %d "
 		       "spare edge(s) (usable edges minus 3N-6), so the fit "
 		       "reproduced the ranges exactly and rms/worst came back "
 		       "at ~0 however bad the ranging was.",
 		   apos_gw_result_redundancy());
+	/* Deliberately NOT "add a fifth anchor". UWB_MAX_ANCHORS is 4 and
+	 * `anchor id` is bounded 0..3, so there is no fifth anchor an operator
+	 * can add -- see apos_gw_result_unverified(). Point them at numbers
+	 * that are real on the array they have instead. */
 	shell_warn(sh, "A PASS here means only that nothing contradicted the "
-		       "ranges — NOT that they are correct. These coordinates "
-		       "are being written to every anchor's NVS now. Check the "
-		       "solved node-to-node distances against a tape measure, "
-		       "or add a fifth anchor so the mesh has a spare edge.");
+		       "ranges — NOT that they are correct. rms is not a check "
+		       "on this array and no anchor count you can configure "
+		       "makes it one.");
+	shell_warn(sh, "Read these instead: max_reciprocal_mm=%d (largest "
+		       "|A->B minus B->A|, -1 if no pair was measured both "
+		       "ways) and max_sd_mm=%u. They make the RANGING "
+		       "observable — they do NOT make the geometry "
+		       "over-determined. Then confirm the solved node-to-node "
+		       "distances against a tape measure. These coordinates are "
+		       "being written to every anchor's NVS now.",
+		   recip, sd);
 }
 
 static int cmd_apply(const struct shell *sh, size_t argc, char **argv)

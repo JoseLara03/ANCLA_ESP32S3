@@ -451,7 +451,7 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 /* Publish the zone/anchor map: the surveyed geometry if one has been applied,
  * otherwise the stub. Retained and QoS 1: it is slow-changing state that a
  * late subscriber needs, which is exactly the opposite of a position fix. */
-static void publish_anchor_stub(void)
+static void publish_anchor_map(void)
 {
 	int n = pos_json_anchors(payload_buf, sizeof(payload_buf),
 				  apos_store_get());
@@ -563,7 +563,7 @@ static void uplink_thread(void *a, void *b, void *c)
 			}
 
 			mqtt_backoff_s = BACKOFF_START_S;
-			publish_anchor_stub();
+			publish_anchor_map();
 
 			while (mqtt_connected && wifi_associated) {
 				struct zsock_pollfd fds = {
