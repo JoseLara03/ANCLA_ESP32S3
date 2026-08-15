@@ -14,7 +14,9 @@ the gateway republishes it to the customer platform over MQTT. Position fixes
 are visible on the platform.
 
 **The numbers it produces are not yet trustworthy.** Two things below must land
-before any position is worth reading.
+before any position is worth reading. Both are now written, built and
+code-reviewed; **neither has been run on hardware**, and until they have, the
+residuals recorded below are still the current measurement.
 
 ## URGENT next work
 
@@ -37,7 +39,8 @@ solver host-tested against the tag's own vectors (`src/cal_math.{c,h}`,
 `src/cal_solve.{c,h}`), a separate calibration firmware image that is an
 ordinary WAVE responder until told otherwise (`src/cal_run.{c,h}`, `cal.conf`),
 an SS-TWR initiator so an anchor can poll a peer from the console
-(`src/cal_initiator.{c,h}`), and the `cal ref`/`cal peer` shell commands
+(`src/ss_initiator.{c,h}`, then named `cal_initiator`), and the
+`cal ref`/`cal peer` shell commands
 (`src/cal_shell.c`) that solve, apply hot, and persist. The full runnable
 procedure — DWM3001CDK prerequisites, physical setup, per-anchor `cal ref`,
 the `cal peer` cross-check and its acceptance threshold, and troubleshooting —
@@ -86,24 +89,60 @@ the top of this section are still the current, unresolved measurement.
 
 ### 2. Anchor auto-positioning
 
-Anchor coordinates are hand-entered with `anchor pos` and are **silently wrong**
-when unset: `position_valid` gates only the GATEWAY's beaconing, so a SLAVE with
-no position happily answers ranging polls reporting **(0, 0)**. Three anchors all
-claiming the origin yields a confidently meaningless fix with no error anywhere.
-This has already cost a bench session — after an `anchor id` swap the
-coordinates did *not* follow the ids, leaving two live anchors on the same
-baseline and the apex coordinate stranded on a third board.
+Anchor coordinates used to be hand-entered with `anchor pos` and **silently
+wrong** when unset — a SLAVE with no position answered ranging polls reporting
+**(0, 0)**, and three anchors all claiming the origin yielded a confidently
+meaningless fix with no error anywhere. That cost a bench session: after an
+`anchor id` swap the coordinates did *not* follow the ids, leaving two live
+anchors on the same baseline and the apex coordinate stranded on a third board.
 
-The anchors payload published retained to `uwb/anchor/setup/<zone>` is also
-**still the stub** (`ANC-LOBBY-001..004` at the corners of a 2 m square, only
-`-001` carrying a real lat/long — see `pos_json.c`). The platform therefore draws
-the stub geometry, not the deployment. Auto-positioning should feed this payload
-too, so the map and the solver agree by construction.
+**The survey is now fully implemented, built, and code-reviewed** — branch
+`feat/anchor-auto-positioning`, fifteen tasks. A gateway enumerates its anchors
+by EUI-64, commands every ordered pair to range, solves the inter-anchor
+geometry in 3D with a gauge-constrained Levenberg-Marquardt fit
+(`src/apos_geom.c`, host-tested), and pushes the solved coordinates back into
+each anchor's NVS (`src/apos_gw.c`, `src/apos_node.c`, `src/apos_shell.c`). Both
+motivating defects above are closed: `anchor_respond_wave_poll()` now **refuses**
+to answer unpositioned rather than reporting `(0, 0)`, and `pos_json_anchors()`
+publishes the surveyed geometry on `uwb/anchor/setup/<zone>` instead of the
+stub, falling back to the stub only when no survey has ever been applied. The
+full runnable procedure is `docs/anchor-auto-positioning.md`.
 
-Approach to evaluate: **DS-TWR between anchors only.** Anchors are static and can
-afford the extra exchange for precision, then the inter-anchor geometry is
-solved. This is Phase 5 of the sibling project's roadmap and is deliberately
-distinct from the tag-facing SS-TWR path.
+**The approach is SS-TWR between anchors, not DS-TWR.** DS-TWR was evaluated
+and deliberately deferred: the SS-TWR responder path is already written,
+bench-confirmed and about to be antenna-delay-calibrated, the mandatory
+`dwt_readclockoffset()` correction already handles the clock offset DS-TWR
+would cancel by construction, and measuring **both directions of every pair and
+averaging them** removes the antenna-delay asymmetry a single direction bakes
+into the geometry. DS-TWR would have cost a new initiator, a new production
+responder path and four new frame types for that. See
+`docs/superpowers/specs/2026-08-14-anchor-auto-positioning-design.md` §4 — do
+not silently re-litigate this.
+
+**What has not happened yet: any hardware run at all.** Not one survey has been
+executed on a board. The outstanding hardware gates, in the order a human would
+hit them running `docs/anchor-auto-positioning.md`:
+
+- Anchors are antenna-delay calibrated first (§1 above). A survey run before
+  calibration produces confidently wrong geometry that nothing will flag.
+- `apos enum` on a gateway lists exactly four peers with distinct EUI-64s and
+  distinct short addresses `0x0001`–`0x0004`.
+- `apos run` completes with `missing_pairs:0`, all nodes placed, none
+  ambiguous, and the beacon stays on time throughout — no
+  `"beacon started but TXFRS never completed"` during the ranging phase, the
+  solve, or the persist. `APOS_GW_SOLVE_BUDGET_UUS` (150000) and the
+  survey-persist gate that reuses it have **never been timed on hardware**.
+- The solved node-to-node distances match a **tape measure**. On a four-anchor
+  array this is the only real check — see the hard-won fact below on why
+  `rms_mm` cannot be one.
+- `apos apply` reports `ok:4, failed:0, skipped:0, persisted:1`; every anchor
+  reports its new coordinates immediately and they survive `kernel reboot cold`.
+- `apos ref` set and the retained anchors payload carrying the surveyed
+  geometry rather than `ANC-LOBBY-001..004`.
+- The point of the branch: a tag ranging four surveyed anchors, with `0xEA`
+  `residual` under ~0.1 m and `(x, y)` stable between fixes.
+
+None of these have been run.
 
 ## Build & flash
 
@@ -131,7 +170,9 @@ from the console, to become a temporary SS-TWR initiator for one batch of
 antenna-delay calibration exchanges — see `docs/antenna-delay-calibration.md`
 for the full procedure. Never flash this image to a deployed anchor: a board
 transmitting unsolicited polls would collide with tag ranging traffic. The
-production build (no `EXTRA_CONF_FILE`) compiles none of the `cal_*.c` files.
+production build (no `EXTRA_CONF_FILE`) compiles none of the `cal_*.c` files —
+but it *does* compile `ss_initiator.c`, which the anchor survey needs; see the
+hard-won fact below for where the safety property moved to.
 
 ## Console
 
@@ -155,6 +196,36 @@ net user <username>            MQTT username
 net mqttpass <password>        MQTT password — NOT the WiFi passphrase
 net reset                      restore network defaults
 ```
+
+The anchor survey adds an `apos` tree. It is in the **production** image, and
+every subcommand except `show` refuses unless `anchor mode` is `gateway`. No
+`apos` command transmits: each sets state and returns, and the gateway loop does
+the radio work and logs the outcome as JSON.
+
+```
+apos enum                      broadcast SURVEY_BEGIN and list the anchors that
+                               answer, by EUI-64 and short address
+apos gauge origin=<addr> xaxis=<addr> plane=<addr> up=<addr>
+                               pin the coordinate frame; named arguments, any
+                               order, four distinct non-zero short addresses
+apos run                       re-enumerate, range every ordered pair, solve,
+                               and REPORT ONLY — persists NOTHING
+apos apply [force]             push the result to every anchor, persist it and
+                               close the survey. `force` overrides the
+                               acceptance thresholds, not the unverified-mesh
+                               warning
+apos ref <lat> <lon>           the origin anchor's real-world position, for the
+                               platform map; persists immediately, refuses
+                               while a survey is running
+apos zoff <metres>             shift z so z=0 is the floor rather than the
+                               plane through the gauge anchors; applied on the
+                               next `apos run`
+apos show                      phase, enumerated anchors and the stored survey
+                               as JSON — the one subcommand a SLAVE accepts
+```
+
+See `docs/anchor-auto-positioning.md` for the full procedure, and read its §0
+before trusting an `"accepted":1`.
 
 The calibration image (`CONFIG_ANCLA_CAL_MODE`, see "Build & flash") adds a
 `cal` tree that exists **only** in that build, not in production:
@@ -221,10 +292,14 @@ thresholds.
   `fix->src_addr` as a **plain decimal number** (not hex, not a string; e.g.
   `0x1234` → `4660`), `z` is the integer `0`, there is no `zoneName` (the
   consumer gets the zone from the anchors topic), and the diagnostic fields
-  are deliberately absent. The anchors stub publishes zone `"852541"` and
-  four named anchors (`ANC-LOBBY-001..004`) at the corners of a 2 m × 2 m
-  square; only `ANC-LOBBY-001` is the axis/reference anchor and carries a
-  real (building-level) lat/long — the rest are local-only placeholders.
+  are deliberately absent. `pos_json_anchors()` takes a
+  `const struct apos_survey *` and publishes the **surveyed** geometry when one
+  has been applied — one entry per surveyed anchor, `node[0]` (the gauge origin)
+  carrying the `apos ref` lat/long and the rest local-only in metres relative to
+  it. With no survey it falls back to the original four-anchor stub
+  (`ANC-LOBBY-001..004` at the corners of a 2 m × 2 m square) so an unsurveyed
+  gateway still publishes a schema-valid document. The stub's coordinates are
+  placeholders; its schema is the contract.
 - `src/net_config.{c,h}` — WiFi and MQTT settings. Pure C, host-tested in
   `tests/net_config/`. Explicitly initialised from `main()`, **not** lazily like
   `uwb_config_get()`, because `net_uplink` is a second thread.
@@ -240,8 +315,39 @@ thresholds.
   of `cal_math.c`: converts a solved combined antenna delay back into a
   TX-only value, holding `ant_delay_rx` fixed. Host-tested in
   `tests/cal_solve/`.
-- `src/cal_initiator.{c,h}` — one SS-TWR exchange with this board as the
-  initiator, the role the tag normally plays. Calibration image only.
+- `src/ss_initiator.{c,h}` — one SS-TWR exchange with this board as the
+  initiator, the role the tag normally plays. Was `cal_initiator.{c,h}` and
+  calibration-image-only; it is now in **both** images, because the anchor
+  survey needs an anchor to poll its peers. Renamed accordingly — nothing about
+  it is calibration-specific.
+- `src/apos_frame.{c,h}` — the survey wire format: one message type (`0xEB`)
+  with a subtype byte carrying seven messages (SURVEY_BEGIN, ENUM_RSP,
+  RANGE_CMD, RANGE_RSP, SETPOS, SETPOS_ACK, SURVEY_END). Deliberately *not*
+  added to `uwb_frame_802_15_4z.c`, which must stay byte-identical to the tag's
+  copy. Pure C, host-tested in `tests/apos_frame/`.
+- `src/apos_geom.{c,h}` — the sparse 3D solver: a closed-form seed then a
+  gauge-constrained Levenberg-Marquardt refine over a flat edge list, with
+  residual, planarity and reflection-ambiguity diagnostics. Pure C, host-tested
+  in `tests/apos_geom/`. `APOS_MAX_NODES` is 8, not `UWB_MAX_ANCHORS`.
+- `src/apos_table.{c,h}` — the gateway's working set for one survey: peers keyed
+  by **EUI-64** (an `anchor id` swap must not strand a coordinate again),
+  directed measurements, and their symmetrisation into inverse-variance-weighted
+  undirected edges. Pure C, host-tested in `tests/apos_table/`.
+- `src/apos_store.{c,h}` — the last applied survey plus the site's geographic
+  reference, persisted under the `apos/` settings subtree. Header is pure C so
+  `pos_json.c` can consume `struct apos_survey` in a host test.
+- `src/apos_gw.{c,h}` — GATEWAY orchestration: enumerate, range every ordered
+  pair, solve, push, persist. A **step machine**, not a thread — `apos_gw_step()`
+  emits at most one frame and returns, so a survey unfolds over many superframes
+  and never delays the beacon. Also holds the acceptance thresholds and the
+  unwired MQTT survey trigger.
+- `src/apos_node.{c,h}` — the anchor side: answer enumeration in an
+  EUI-64-hashed stagger slot, run exactly the ranging batch the gateway
+  commands, store exactly the coordinates it is given. Holds the survey window
+  that is the whole safety boundary for this board ever initiating anything.
+- `src/apos_shell.c` — the `apos` console command tree. Gateway-only in
+  practice, registered unconditionally so a slave gets a clear refusal rather
+  than a missing command.
 - `src/cal_run.{c,h}` — CAL mode's main loop: an ordinary WAVE responder that
   can be told, from the console, to become a temporary SS-TWR initiator for
   one batch of exchanges.
@@ -254,6 +360,10 @@ thresholds.
 - `docs/antenna-delay-calibration.md` — the operator procedure for the above:
   DWM3001CDK prerequisites, physical setup, `cal ref`, the `cal peer`
   cross-check and its acceptance threshold, troubleshooting.
+- `docs/anchor-auto-positioning.md` — the operator procedure for the survey:
+  prerequisites, the gauge, the `apos` walkthrough, how to read the report,
+  troubleshooting, and — §0, read it first — why the acceptance check cannot
+  validate a four-anchor array.
 - `docs/dw3000-zephyr-port.md` — the port reference: local deltas, the DW3000
   call-order footgun, resolved RESET polarity, verification status.
 - `docs/superpowers/{specs,plans}/` — board design spec and implementation plan.
@@ -509,8 +619,77 @@ thresholds.
   450 uus turnaround would require the response to leave before the poll's
   preamble finished decoding — physically impossible. ANCLA's own responder
   already turns around at 2000 uus; matching it on the reference node is what
-  lets `cal_initiator.c` use a single RX window for both peer types. See
+  lets `ss_initiator.c` use a single RX window for both peer types. See
   `docs/antenna-delay-calibration.md` §1.1.
+- **On a four-anchor array the survey's `rms_m` is identically zero and proves
+  nothing.** The gauge pins 6 degrees of freedom, so a fit over N placed nodes
+  has `3N-6` free parameters. At N = 4 a full mesh has exactly 6 edges against
+  exactly 6 free parameters — an isostatic system with no spare equation — and
+  LM re-embeds *any* set of distances exactly: `rms_m` and `worst_edge_m` come
+  back at zero however bad the ranging was. From N = 5 to 7 there is enough
+  redundancy for a nonzero `rms_m` but not always enough for `worst_i`/`worst_j`
+  to name the pair actually at fault, because least-squares masking can spread
+  the disagreement onto a merely-correlated edge. Both were reproduced in
+  `tests/apos_geom/test_apos_geom.c`. **The deployment is four ranging slaves,
+  i.e. exactly the degenerate case**, so `"accepted":1` there means only
+  "nothing contradicted the ranges". The code says so rather than hiding it
+  (`apos_gw_result_unverified()`, the `spare_edges`/`rms_meaningful` fields, a
+  `LOG_WRN` pair at solve and again at apply, and a `shell_warn` under the
+  operator's own `apos apply`); the check that actually validates the geometry
+  is a tape measure or a fifth anchor. Do not "fix" this by loosening a
+  threshold — the thresholds are not the problem, the edge count is.
+- **`ss_initiator.c` is compiled into the PRODUCTION image.** It was
+  `cal_initiator.c` and calibration-only, and the old safety property — "a
+  deployed anchor can never initiate a poll" — came from the build set. It no
+  longer does: the anchor survey needs an anchor to poll its peers. The property
+  now comes from `apos_node.c`'s two gates (a gateway-opened survey window, plus
+  a session-matched `RANGE_CMD` from `0x0000`), plus the `APOS_MAX_EXCHANGES`
+  count cap and the `APOS_RANGE_BATCH_DEADLINE_MS` wall-clock cap. Remove or
+  weaken either gate and the collision hazard the cal image was kept separate to
+  avoid is back, in production. What must stay out of production is the `cal`
+  shell tree and `cal_run.c`'s unsolicited-poll loop, and it does.
+- **Any flash write or erase stalls ALL execution on this part, whatever the
+  thread priority.** The WROOM-1-N8R2 executes XIP from the same flash the
+  settings subsystem writes, and a write or erase disables the instruction
+  cache for its duration. `K_PRIO_COOP(0)` does not protect the gateway loop
+  from that and nothing else can either. A settings append is sub-millisecond,
+  but an NVS sector rotation erases 4 kB at ~25–45 ms — 5–9× the 5 ms
+  `BEACON_ARM_MARGIN_UUS`. The beacon then arms late, its delayed TX times out
+  on TXFRS, `beacon_tx_ts` is left unadvanced, and every slave's `beacon_guard`
+  starts suppressing against a schedule that has shifted underneath it: a
+  network-wide timing fault, not a dropped frame. So NVS writes on the gateway
+  loop are budget-gated — `step_apply()`'s survey persist reuses
+  `APOS_GW_SOLVE_BUDGET_UUS` (150000 uus, sized so only the first step after a
+  beacon can satisfy it), and `apos ref` refuses outright while a survey is
+  running. Neither is a hard bound and no in-loop gate can be one; the real fix,
+  if this ever hurts, is to stop writing flash from this thread at all.
+- **`APOS_MAX_NODES` (8) is not `UWB_MAX_ANCHORS` (4), deliberately — and
+  surveying eight does not make eight rangeable.** The solver and table handle
+  eight nodes so the survey does not inherit the tag-facing ranging MAC's limit,
+  but an anchor refuses a `RANGE_CMD` naming a peer outside
+  `UWB_ANCHOR_ADDR_BASE .. +UWB_MAX_ANCHORS` (`apos_node.c`), because anything
+  above that would silently alias onto another anchor's wire id once truncated
+  to a byte. Growing the deployment past four ranging anchors needs
+  `disc_schedule.h`'s stagger and `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS`
+  re-derived (18 ms is sized for `disc_resp_delay_uus(3)` = 12500 uus; an id 5
+  would need ~19.5 ms and would silently lose every DISCOVERY response), plus
+  `UWB_MAX_ANCHORS` and the tag's `UWB_FRAME_MAX_ANCHORS`.
+- **An unpositioned anchor is now silent to tags, not `(0, 0)` — but it still
+  answers DISCOVERY.** `anchor_respond_wave_poll()` refuses unless
+  `position_valid` or a survey window is open; `anchor_respond_discovery()` is
+  deliberately *not* gated. So an unsurveyed board enters the tag's anchor list
+  and then never answers a poll, which on a sniffer looks exactly like an RF
+  fault: `0xE2`/`0xE4` DISCOVERY traffic with no matching `0xE0`/`0xE1`. Look for
+  `WAVE poll refused — no surveyed position` in the monitor before suspecting
+  the radio. The survey-window exception is what lets the gate exist at all: in
+  a cold deployment every anchor is unpositioned yet must answer its peers.
+- **`apos_gw_step()` may emit at most one frame per call.** It runs on the
+  `K_PRIO_COOP(0)` loop that arms the beacon, so a step that transmits twice, or
+  blocks, delays the beacon for the whole network. Same class of hazard as the
+  unbounded TXFRS wait that once froze the console. Survey deadlines are all
+  absolute wall-clock (`k_uptime_get()` deltas observed across steps), so a
+  skipped step costs latency and never correctness — which is what makes
+  refusing to step cheap enough to do liberally.
 
 ## System context
 
@@ -548,7 +727,7 @@ Plain gcc, no Zephyr, following the sibling projects' pattern:
 gcc -Wall -Wextra -o tests/uwb_config/test_uwb_config.exe tests/uwb_config/test_uwb_config.c src/uwb_config.c
 ./tests/uwb_config/test_uwb_config.exe          # PASSED, exits 0
 
-gcc -Wall -Wextra -o tests/uwb_frame/test_uwb_frame.exe tests/uwb_frame/test_uwb_frame.c src/uwb_frame_802_15_4z.c
+gcc -Wall -Wextra -Isrc -o tests/uwb_frame/test_uwb_frame.exe tests/uwb_frame/test_uwb_frame.c src/uwb_frame_802_15_4z.c
 ./tests/uwb_frame/test_uwb_frame.exe            # ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -o tests/disc_schedule/test_disc_schedule.exe tests/disc_schedule/test_disc_schedule.c src/disc_schedule.c
@@ -568,7 +747,19 @@ gcc -Wall -Wextra -Isrc -o tests/net_config/test_net_config.exe tests/net_config
 
 gcc -Wall -Wextra -Isrc -o tests/cal_solve/test_cal_solve.exe tests/cal_solve/test_cal_solve.c src/cal_solve.c src/cal_math.c
 ./tests/cal_solve/test_cal_solve.exe            # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/apos_geom/test_apos_geom.exe tests/apos_geom/test_apos_geom.c src/apos_geom.c -lm
+./tests/apos_geom/test_apos_geom.exe            # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/apos_table/test_apos_table.exe tests/apos_table/test_apos_table.c src/apos_table.c src/apos_geom.c -lm
+./tests/apos_table/test_apos_table.exe          # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/apos_frame/test_apos_frame.exe tests/apos_frame/test_apos_frame.c src/apos_frame.c
+./tests/apos_frame/test_apos_frame.exe          # PASSED, exits 0
 ```
+
+`-lm` is required by the two suites that link `apos_geom.c` — the solver calls
+`sqrtf`/`fabsf`. The others do not need it.
 
 ## Repo
 
