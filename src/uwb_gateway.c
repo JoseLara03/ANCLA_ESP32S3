@@ -19,6 +19,8 @@
 
 #include "uwb_modes.h"
 
+#include "apos_frame.h"
+#include "apos_gw.h"
 #include "gw_core.h"
 #include "pos_sink.h"
 #include "uwb_dwtime.h"
@@ -199,7 +201,9 @@ static void send_grant(const uint8_t eui[UWB_FRAME_EUI_LEN],
 static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 		     uint64_t rx_ts)
 {
-	if (uwb_frame_is_join(buf, len)) {
+	if (apos_frame_is_apos(buf, len)) {
+		apos_gw_on_rx(buf, len);
+	} else if (uwb_frame_is_join(buf, len)) {
 		uint8_t eui[UWB_FRAME_EUI_LEN];
 		uint8_t req_tier = 0;
 		struct gw_grant g;
@@ -271,6 +275,7 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 	struct gw_core_ctx ctx;
 
 	gw_core_init(&ctx);
+	apos_gw_init();
 
 	LOG_INF("{\"status\":\"gateway\",\"x\":%.2f,\"y\":%.2f,"
 		"\"superframe_ms\":200,\"slots\":%u}",
@@ -293,6 +298,45 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 
 			if (to_beacon <= (int32_t)UUS_TO_HI32(BEACON_ARM_MARGIN_UUS)) {
 				break;
+			}
+
+			/* Advance any running survey by at most one frame.
+			 *
+			 * Deliberately at the TOP of the loop body, not after
+			 * dispatch(): the two `continue`s below (no RX event
+			 * within the window, and a runt frame) would otherwise
+			 * skip the step entirely, and an RX timeout is the
+			 * NORMAL outcome on a quiet network. Since the first
+			 * SURVEY_BEGIN must go out before any anchor has
+			 * anything to reply to, a step reachable only after a
+			 * successful RX would never start an enumeration at
+			 * all.
+			 *
+			 * to_beacon was just read, so no recomputation is
+			 * needed before the step; it is re-read afterwards
+			 * because the step may have transmitted, and arming
+			 * the RX window from a stale figure would push its
+			 * expiry past the beacon. */
+			if (apos_gw_busy()) {
+				int32_t reserve = (int32_t)UUS_TO_HI32(
+					BEACON_ARM_MARGIN_UUS +
+					APOS_GW_STEP_BUDGET_UUS);
+
+				if (to_beacon > reserve) {
+					uint32_t span = (uint32_t)to_beacon -
+						UUS_TO_HI32(BEACON_ARM_MARGIN_UUS);
+					uint32_t avail_uus = (uint32_t)(
+						((uint64_t)span << 8) / UUS_TO_DWT_TIME);
+
+					apos_gw_step(avail_uus, &gw_seq);
+
+					now = dwt_readsystimestamphi32();
+					to_beacon = (int32_t)(next_beacon - now);
+					if (to_beacon <=
+					    (int32_t)UUS_TO_HI32(BEACON_ARM_MARGIN_UUS)) {
+						break;
+					}
+				}
 			}
 
 			/* Expire the RX window BEACON_ARM_MARGIN_UUS before the

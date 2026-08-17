@@ -16,6 +16,7 @@
  * pos_sink.c call it unconditionally) without dragging in net_if.h et al. */
 #ifdef CONFIG_NETWORKING
 
+#include "apos_store.h"
 #include "net_config.h"
 #include "pos_json.h"
 #include "uwb_config.h"
@@ -447,12 +448,13 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 	return true;
 }
 
-/* Publish the stubbed zone/anchor map. Retained and QoS 1: it is slow-changing
- * state that a late subscriber needs, which is exactly the opposite of a
- * position fix. */
-static void publish_anchor_stub(void)
+/* Publish the zone/anchor map: the surveyed geometry if one has been applied,
+ * otherwise the stub. Retained and QoS 1: it is slow-changing state that a
+ * late subscriber needs, which is exactly the opposite of a position fix. */
+static void publish_anchor_map(void)
 {
-	int n = pos_json_anchors(payload_buf, sizeof(payload_buf));
+	int n = pos_json_anchors(payload_buf, sizeof(payload_buf),
+				  apos_store_get());
 
 	if (n < 0) {
 		LOG_ERR("anchors payload does not fit POS_JSON_MAX_LEN");
@@ -561,7 +563,7 @@ static void uplink_thread(void *a, void *b, void *c)
 			}
 
 			mqtt_backoff_s = BACKOFF_START_S;
-			publish_anchor_stub();
+			publish_anchor_map();
 
 			while (mqtt_connected && wifi_associated) {
 				struct zsock_pollfd fds = {

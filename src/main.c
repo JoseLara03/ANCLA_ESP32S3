@@ -14,6 +14,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
+#include "apos_store.h"
 #include "net_config.h"
 #include "net_uplink.h"
 #include "uwb_config.h"
@@ -50,6 +51,10 @@ int main(void)
 	net_config_init();
 
 	uwb_store_init();
+	/* After uwb_store_init(): its settings_load() is what runs this
+	 * module's handler and fills the cache. Before net_uplink_start():
+	 * the uplink publishes the anchors payload on connect and reads it. */
+	apos_store_init();
 	log_config(cfg);
 
 	ret = uwb_radio_init(cfg);

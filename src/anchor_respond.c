@@ -16,6 +16,7 @@
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
 
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 #include <deca_device_api.h>
@@ -39,6 +40,11 @@ LOG_MODULE_REGISTER(anchor_respond, LOG_LEVEL_INF);
  * Revisit this constant if DISC_BASE_UUS/DISC_SLOT_UUS/
  * POLL_RX_TO_RESP_TX_DLY_UUS are ever tuned further. */
 #define TX_COMPLETE_TIMEOUT_MS 18
+
+/* Minimum gap between two "WAVE poll refused" lines. A tag polls at superframe
+ * rate, so on a cold (unsurveyed) deployment this refusal is continuous, not
+ * occasional; 10 s keeps it visible without letting it own the log pool. */
+#define UNPOSITIONED_LOG_GAP_MS 10000
 
 /* Legacy responder turnaround. Was 2000, carried over unchanged from the
  * nRF5 anchor and the working (non-Zephyr) ESP32S3UWB responder; measured
@@ -110,9 +116,10 @@ static void tx_delayed(const uint8_t *buf, uint16_t payload_len, uint32_t tx_tim
 	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
 }
 
-void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx_ts,
-			      const uwb_config_t *cfg, uint8_t *seq,
-			      struct beacon_guard *bg)
+void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
+			      uint64_t poll_rx_ts, const uwb_config_t *cfg,
+			      uint8_t *seq, struct beacon_guard *bg,
+			      bool allow_unpositioned)
 {
 	/* The id byte the tag polls with is the low byte of our short address,
 	 * because that is what it read out of our DISCOVERY response
@@ -132,6 +139,50 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len, uint64_t poll_rx
 		return;
 	}
 	if (buf[POS_ANCHOR_ID_IDX] != wire_id) {
+		return;
+	}
+
+	/* Refusing is strictly better than answering with (0, 0): a silent
+	 * wrong coordinate is undebuggable from the tag's side, while a silent
+	 * anchor shows up immediately as a missing anchor. Mirrors the
+	 * gateway's existing refusal to beacon unpositioned
+	 * (uwb_gateway.c:253). Deliberately placed after the frame-match
+	 * checks above (the brief's supplied code placed it before them):
+	 * this function is offered every received frame regardless of type,
+	 * so gating this early would LOG_WRN on every beacon/DISCOVERY/APOS
+	 * frame too, not just on an actual WAVE poll addressed to us. */
+	if (!cfg->position_valid && !allow_unpositioned) {
+		/* Rate-limited, because this is not a rare condition: it fires
+		 * on EVERY addressed poll during exactly the situation it was
+		 * written for -- a cold deployment where all four anchors are
+		 * unpositioned and a tag is polling at superframe rate. Deferred
+		 * logging formats into a shared CONFIG_LOG_BUFFER_SIZE pool, the
+		 * same pool the survey's own diagnostics use, so an unbounded
+		 * version of this line would flush the messages an operator
+		 * actually needs. First occurrence is immediate and full;
+		 * repeats are folded into one line per interval. */
+		static int64_t last_ms;
+		static uint32_t suppressed;
+		int64_t now = k_uptime_get();
+
+		if (last_ms == 0 || now - last_ms >= UNPOSITIONED_LOG_GAP_MS) {
+			if (suppressed) {
+				LOG_WRN("WAVE poll refused — no surveyed "
+					"position (%u more since the last "
+					"line). Run `apos run` + `apos apply` "
+					"on the gateway, or set `anchor pos`.",
+					suppressed);
+			} else {
+				LOG_WRN("WAVE poll refused — no surveyed "
+					"position. Run `apos run` + `apos "
+					"apply` on the gateway, or set "
+					"`anchor pos`.");
+			}
+			last_ms = now;
+			suppressed = 0;
+		} else {
+			suppressed++;
+		}
 		return;
 	}
 
