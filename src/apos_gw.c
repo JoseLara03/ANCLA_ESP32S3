@@ -895,6 +895,7 @@ static bool persist_survey(void)
 	}
 
 	s.n_nodes = w;
+	s.dim = res.dim;
 	s.valid = w > 0u;
 
 	int rc = apos_store_save(&s);

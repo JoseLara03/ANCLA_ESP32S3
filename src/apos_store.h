@@ -34,6 +34,8 @@ struct apos_survey {
 	struct apos_survey_node node[APOS_MAX_NODES];
 	uint8_t  n_nodes;
 	bool     valid;      /* false until a survey has been applied */
+	enum apos_geom_dim dim; /* whether this survey solved z, or fixed it
+				 * at 0 -- see apos_geom.h */
 
 	/* Geographic anchor for the local frame, from `apos ref`. The platform
 	 * needs one real lat/long to place the survey on a map; every other

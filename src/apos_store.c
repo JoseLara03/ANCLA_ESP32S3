@@ -34,6 +34,8 @@ struct stored_survey {
 	struct apos_survey_node node[APOS_MAX_NODES];
 	uint8_t                 n_nodes;
 	uint8_t                 valid;
+	uint8_t                 dim; /* enum apos_geom_dim, stored as a plain
+				      * uint8_t like valid above */
 };
 
 struct stored_ref {
@@ -79,6 +81,7 @@ static int apos_settings_set(const char *key, size_t len,
 		memcpy(g_survey.node, s.node, sizeof(g_survey.node));
 		g_survey.n_nodes = s.n_nodes;
 		g_survey.valid = s.valid != 0u;
+		g_survey.dim = (enum apos_geom_dim)s.dim;
 		return 0;
 	}
 
@@ -141,6 +144,7 @@ int apos_store_save(const struct apos_survey *s)
 	memcpy(rec.node, s->node, sizeof(rec.node));
 	rec.n_nodes = s->n_nodes;
 	rec.valid = s->valid ? 1u : 0u;
+	rec.dim = (uint8_t)s->dim;
 
 	int ret = settings_save_one(KEY_SURVEY, &rec, sizeof(rec));
 
@@ -154,6 +158,7 @@ int apos_store_save(const struct apos_survey *s)
 	memcpy(g_survey.node, s->node, sizeof(g_survey.node));
 	g_survey.n_nodes = s->n_nodes;
 	g_survey.valid = s->valid;
+	g_survey.dim = s->dim;
 
 	return 0;
 }
