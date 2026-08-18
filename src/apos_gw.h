@@ -229,13 +229,26 @@ int apos_gw_start_enum(void);
  * point at different boards after a re-enumeration. Addresses are resolved to
  * indices at solve time.
  *
- * Returns 0, -EINVAL if the four are not distinct, or -EBUSY while a survey
- * runs. Does NOT require the addresses to be enumerated yet -- an operator may
- * legitimately set the gauge from a site sketch before powering the array. */
+ * up == -1 selects 2D mode (no up designation, no reflection to resolve).
+ * -1 is a dedicated sentinel, not 0: 0x0000 is UWB_ADDR_GATEWAY_RESERVED and
+ * must stay rejected as an address on its own terms, distinct from "not
+ * given".
+ *
+ * Returns 0, -EINVAL if origin/xaxis/plane are not distinct (or up, when
+ * given, is not additionally distinct from them), or -EBUSY while a survey
+ * runs. Does NOT require the addresses to be enumerated yet -- an operator
+ * may legitimately set the gauge from a site sketch before powering the
+ * array. */
 int apos_gw_set_gauge(uint16_t origin, uint16_t xaxis, uint16_t plane,
-		      uint16_t up);
+		      int32_t up);
 
 bool apos_gw_gauge_set(void);
+
+/* The dimensionality implied by the currently-stored gauge. Only ever
+ * meaningful once apos_gw_gauge_set() is true -- see apos_gw.c's
+ * step_enum() for the one call site, which is only reached after that
+ * precondition already holds. */
+enum apos_geom_dim apos_gw_gauge_dim(void);
 
 /* Begin a full run: re-enumerate, range every ordered pair, solve, report.
  * Persists NOTHING. Returns 0, -EBUSY if a survey runs, or -EINVAL if the gauge

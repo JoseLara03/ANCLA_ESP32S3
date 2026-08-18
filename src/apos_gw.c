@@ -38,7 +38,7 @@ static uint16_t session;
 
 /* Gauge as short addresses; 0 means unset, since 0x0000 is the gateway and can
  * never be a survey node. */
-static uint16_t gauge_addr[4];
+static int32_t gauge_addr[4]; /* gauge_addr[3] (up) == -1 means 2D mode */
 
 static float zoff_m;
 
@@ -94,6 +94,7 @@ void apos_gw_init(void)
 	apos_table_init(&tbl);
 	memset(&res, 0, sizeof(res));
 	memset(gauge_addr, 0, sizeof(gauge_addr));
+	gauge_addr[3] = -1; /* up unset means 2D, not "address 0x0000" */
 	have_result = false;
 	phase = APOS_GW_IDLE;
 	session = 0;
@@ -132,8 +133,7 @@ const struct apos_table *apos_gw_table(void)
 
 bool apos_gw_gauge_set(void)
 {
-	return gauge_addr[0] != 0u && gauge_addr[1] != 0u &&
-	       gauge_addr[2] != 0u && gauge_addr[3] != 0u;
+	return gauge_addr[0] != 0 && gauge_addr[1] != 0 && gauge_addr[2] != 0;
 }
 
 void apos_gw_get_status(struct apos_gw_status *out)
@@ -153,26 +153,45 @@ void apos_gw_get_status(struct apos_gw_status *out)
 }
 
 int apos_gw_set_gauge(uint16_t origin, uint16_t xaxis, uint16_t plane,
-		      uint16_t up)
+		      int32_t up)
 {
 	if (apos_gw_busy()) {
 		return -EBUSY;
 	}
 
-	const uint16_t a[4] = {origin, xaxis, plane, up};
+	const int32_t a[3] = {origin, xaxis, plane};
 
-	for (int i = 0; i < 4; i++) {
-		if (a[i] == 0u || a[i] == UWB_ADDR_GATEWAY_RESERVED) {
+	for (int i = 0; i < 3; i++) {
+		if (a[i] == 0 || a[i] == (int32_t)UWB_ADDR_GATEWAY_RESERVED) {
 			return -EINVAL;
 		}
-		for (int j = i + 1; j < 4; j++) {
+		for (int j = i + 1; j < 3; j++) {
 			if (a[i] == a[j]) {
 				return -EINVAL;
 			}
 		}
 	}
-	memcpy(gauge_addr, a, sizeof(gauge_addr));
+	if (up != -1) {
+		if (up == 0 || up == (int32_t)UWB_ADDR_GATEWAY_RESERVED) {
+			return -EINVAL;
+		}
+		for (int i = 0; i < 3; i++) {
+			if (up == a[i]) {
+				return -EINVAL;
+			}
+		}
+	}
+
+	gauge_addr[0] = a[0];
+	gauge_addr[1] = a[1];
+	gauge_addr[2] = a[2];
+	gauge_addr[3] = up;
 	return 0;
+}
+
+enum apos_geom_dim apos_gw_gauge_dim(void)
+{
+	return (gauge_addr[3] == -1) ? APOS_GEOM_2D : APOS_GEOM_3D;
 }
 
 /* Transmit immediately. No beacon guard here, unlike apos_node: the caller only
@@ -323,11 +342,12 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 		return;
 	}
 
-	LOG_INF("{\"apos_peer\":{\"idx\":%d,\"addr\":\"0x%04X\","
+	LOG_INF("{\"apos_peer\":{\"idx\":%d,\"id\":%d,\"addr\":\"0x%04X\","
 		"\"eui\":\"%02X%02X%02X%02X%02X%02X%02X%02X\",\"pos_valid\":%u,"
 		"\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}}",
-		idx, addr, eui[0], eui[1], eui[2], eui[3], eui[4], eui[5],
-		eui[6], eui[7], pv ? 1u : 0u, (double)x, (double)y, (double)z);
+		idx, (int)(addr - UWB_ANCHOR_ADDR_BASE), addr, eui[0], eui[1],
+		eui[2], eui[3], eui[4], eui[5], eui[6], eui[7],
+		pv ? 1u : 0u, (double)x, (double)y, (double)z);
 }
 
 /* ---- RANGE phase ---- */
@@ -432,18 +452,39 @@ int apos_gw_start_run(void)
  * table. Returns 0, or -ENOENT with the offending address logged. */
 static int resolve_gauge(struct apos_gauge *g)
 {
-	uint8_t *out[4] = {&g->origin, &g->xaxis, &g->plane, &g->up};
+	uint8_t *out3[3] = {&g->origin, &g->xaxis, &g->plane};
 
-	for (int k = 0; k < 4; k++) {
-		int idx = apos_table_find_addr(&tbl, gauge_addr[k]);
+	for (int k = 0; k < 3; k++) {
+		int idx = apos_table_find_addr(&tbl, (uint16_t)gauge_addr[k]);
 
 		if (idx < 0) {
-			LOG_ERR("{\"apos_error\":\"gauge address 0x%04X did not "
-				"answer enumeration\"}", gauge_addr[k]);
+			LOG_ERR("{\"apos_error\":\"gauge address 0x%04X did "
+				"not answer enumeration\"}",
+				(uint16_t)gauge_addr[k]);
 			return -ENOENT;
 		}
-		*out[k] = (uint8_t)idx;
+		*out3[k] = (uint8_t)idx;
 	}
+
+	if (gauge_addr[3] == -1) {
+		g->dim = APOS_GEOM_2D;
+		/* Never read by apos_geom_gauge_valid()/apos_geom_seed() in
+		 * 2D mode, but must still be a valid index (< n_nodes) since
+		 * struct apos_gauge carries no separate "up is absent" bit at
+		 * this layer -- see apos_geom.h. g->origin is always valid. */
+		g->up = g->origin;
+		return 0;
+	}
+
+	int idx = apos_table_find_addr(&tbl, (uint16_t)gauge_addr[3]);
+
+	if (idx < 0) {
+		LOG_ERR("{\"apos_error\":\"gauge address 0x%04X did not "
+			"answer enumeration\"}", (uint16_t)gauge_addr[3]);
+		return -ENOENT;
+	}
+	g->up = (uint8_t)idx;
+	g->dim = APOS_GEOM_3D;
 	return 0;
 }
 
@@ -496,10 +537,12 @@ static void judge_result(void)
 		 * dropped the first still carries the finding. */
 		LOG_WRN("{\"apos_warn\":\"rms_mm and worst_mm are NOT a quality "
 			"check on this array: %u usable edge(s) against %d free "
-			"parameters (3N-6) leaves %d spare. With no spare edge "
+			"parameters (%s) leaves %d spare. With no spare edge "
 			"the fit reproduces ANY set of ranges exactly, so "
 			"rms_mm is ~0 however bad the ranging was.\"}",
-			solve_n_edges, 3 * (int)res.n_placed - 6,
+			solve_n_edges,
+			apos_geom_free_params(res.dim, res.n_placed),
+			(res.dim == APOS_GEOM_2D) ? "2N-3" : "3N-6",
 			solve_redundancy);
 		LOG_WRN("{\"apos_warn\":\"\\\"accepted\\\":%u above therefore "
 			"means only that nothing contradicted the ranges — it "
@@ -511,7 +554,7 @@ static void judge_result(void)
 			max_sd_mm);
 	}
 
-	if (planar && res.n_placed >= 4u) {
+	if (res.dim == APOS_GEOM_3D && planar && res.n_placed >= 4u) {
 		LOG_WRN("{\"apos_warn\":\"array is near-coplanar (%d mm) — x and "
 			"y are good but the solved z values are not "
 			"survey-quality\"}",
@@ -580,7 +623,8 @@ static void do_solve(void)
 	 * anything this overestimates only moves further into it. */
 	solve_n_edges = n_edges;
 	solve_redundancy = (int16_t)((int)n_edges -
-				     (3 * (int)res.n_placed - 6));
+				     apos_geom_free_params(res.dim,
+							   res.n_placed));
 	solve_unverified = solve_redundancy <= 0;
 
 	have_result = true;
@@ -776,10 +820,12 @@ int apos_gw_start_apply(bool force)
 	 * result looks best. */
 	if (solve_unverified) {
 		LOG_WRN("{\"apos_warn\":\"COMMITTING AN UNVERIFIED SURVEY: %u "
-			"usable edge(s) against %d free parameters (3N-6), "
+			"usable edge(s) against %d free parameters (%s), "
 			"leaving %d spare edge(s), so rms_mm was ~0 however bad "
 			"the ranging was.\"}", solve_n_edges,
-			3 * (int)res.n_placed - 6, solve_redundancy);
+			apos_geom_free_params(res.dim, res.n_placed),
+			(res.dim == APOS_GEOM_2D) ? "2N-3" : "3N-6",
+			solve_redundancy);
 		LOG_WRN("{\"apos_warn\":\"on this array \\\"accepted\\\" means "
 			"only that nothing contradicted the ranges — it does "
 			"NOT mean they are correct. Read max_reciprocal_mm (%d) "
@@ -1168,10 +1214,16 @@ static void step_enum(uint8_t *seq)
 			phase = APOS_GW_IDLE;
 			return;
 		}
-		if (tbl.n_peers < APOS_MIN_NODES) {
-			LOG_ERR("{\"apos_error\":\"%u anchor(s) answered; a 3D "
-				"gauge needs at least %u\"}",
-				tbl.n_peers, APOS_MIN_NODES);
+		uint8_t min_nodes = (apos_gw_gauge_dim() == APOS_GEOM_2D)
+					    ? APOS_MIN_NODES_2D
+					    : APOS_MIN_NODES_3D;
+
+		if (tbl.n_peers < min_nodes) {
+			LOG_ERR("{\"apos_error\":\"%u anchor(s) answered; a "
+				"%s gauge needs at least %u\"}",
+				tbl.n_peers,
+				(min_nodes == APOS_MIN_NODES_2D) ? "2D" : "3D",
+				min_nodes);
 			phase = APOS_GW_IDLE;
 			return;
 		}
