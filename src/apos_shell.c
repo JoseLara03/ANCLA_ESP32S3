@@ -23,18 +23,29 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Same reasoning as anchor_shell.c's parse_ul: strtoul() reports a non-numeric
- * argument as 0, and 0 must be rejected here rather than accepted as an
- * address. Accepts 0x-prefixed input, which is how `apos enum` prints them. */
-static bool parse_addr(const char *arg, uint16_t *out)
+/* Anchor id, 0..UWB_MAX_ANCHORS-1 -- the same space `anchor id` uses, so the
+ * operator never does hex arithmetic to use `apos gauge`. allow_none permits
+ * exactly "-1" as a second valid parse, for up=, which is the only one of
+ * the four gauge designations that may be omitted (selecting 2D mode).
+ * strtol() reports a non-numeric argument as 0, which must be rejected as
+ * ambiguous with a real id 0 -- same reasoning as the address parser this
+ * replaces. */
+static bool parse_id(const char *arg, bool allow_none, int32_t *out)
 {
 	char *endptr;
-	unsigned long v = strtoul(arg, &endptr, 0);
+	long v = strtol(arg, &endptr, 0);
 
-	if (endptr == arg || *endptr != '\0' || v == 0u || v > 0xFFFFu) {
+	if (endptr == arg || *endptr != '\0') {
 		return false;
 	}
-	*out = (uint16_t)v;
+	if (allow_none && v == -1) {
+		*out = -1;
+		return true;
+	}
+	if (v < 0 || v >= (long)UWB_MAX_ANCHORS) {
+		return false;
+	}
+	*out = (int32_t)v;
 	return true;
 }
 
@@ -75,15 +86,23 @@ static int cmd_enum(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
-/* origin=<addr> xaxis=<addr> plane=<addr> up=<addr>, in any order. Named rather
- * than positional because four bare hex addresses in a row is exactly the kind
+/* origin=<id> xaxis=<id> plane=<id> [up=<id>], in any order; up may be
+ * omitted (or given as -1) for a 2D, 3-anchor survey. Named rather than
+ * positional because three or four bare ids in a row is exactly the kind
  * of argument list that gets silently transposed, and a transposed gauge
  * produces a plausible-looking but wrong coordinate frame. */
 static int cmd_gauge(const struct shell *sh, size_t argc, char **argv)
 {
 	static const char *const keys[4] = {"origin=", "xaxis=", "plane=",
 					    "up="};
-	uint16_t val[4] = {0, 0, 0, 0};
+	static const char *const req_keys[3] = {"origin=", "xaxis=",
+						"plane="};
+	/* -1 in every slot: for origin/xaxis/plane it means "not yet given"
+	 * (parse_id() with allow_none=false can never itself produce -1 for
+	 * those, so this is unambiguous with a real parse) and is rejected
+	 * below if still -1 after the argument loop. For up= it is a valid
+	 * parse result meaning "2D mode", exactly like an omitted key. */
+	int32_t val[4] = {-1, -1, -1, -1};
 
 	int rc = require_gateway(sh);
 
@@ -100,9 +119,11 @@ static int cmd_gauge(const struct shell *sh, size_t argc, char **argv)
 			if (strncmp(argv[a], keys[k], klen) != 0) {
 				continue;
 			}
-			if (!parse_addr(argv[a] + klen, &val[k])) {
-				shell_error(sh, "error: bad address in \"%s\"",
-					    argv[a]);
+			if (!parse_id(argv[a] + klen, k == 3, &val[k])) {
+				shell_error(sh, "error: bad id in \"%s\" — "
+						"expected 0..%u%s", argv[a],
+					    UWB_MAX_ANCHORS - 1u,
+					    (k == 3) ? " or -1" : "");
 				return -EINVAL;
 			}
 			matched = true;
@@ -116,17 +137,27 @@ static int cmd_gauge(const struct shell *sh, size_t argc, char **argv)
 		}
 	}
 
-	for (int k = 0; k < 4; k++) {
-		if (val[k] == 0u) {
-			shell_error(sh, "error: missing %s<addr>", keys[k]);
+	for (int k = 0; k < 3; k++) {
+		if (val[k] == -1) {
+			shell_error(sh, "error: missing %s<id>", req_keys[k]);
 			return -EINVAL;
 		}
 	}
 
-	rc = apos_gw_set_gauge(val[0], val[1], val[2], val[3]);
+	uint16_t addr[3];
+
+	for (int k = 0; k < 3; k++) {
+		addr[k] = (uint16_t)(UWB_ANCHOR_ADDR_BASE + val[k]);
+	}
+
+	rc = apos_gw_set_gauge(addr[0], addr[1], addr[2],
+			       (val[3] == -1)
+				       ? (int32_t)-1
+				       : (int32_t)(UWB_ANCHOR_ADDR_BASE +
+						   val[3]));
 	if (rc == -EINVAL) {
-		shell_error(sh, "error: the four addresses must be distinct and "
-				"none may be 0x0000 (the gateway)");
+		shell_error(sh, "error: the given ids must be distinct and "
+				"in range 0..%u", UWB_MAX_ANCHORS - 1u);
 		return rc;
 	}
 	if (rc) {
@@ -134,10 +165,10 @@ static int cmd_gauge(const struct shell *sh, size_t argc, char **argv)
 		return rc;
 	}
 
-	shell_print(sh, "{\"apos_gauge\":{\"origin\":\"0x%04X\","
-			"\"xaxis\":\"0x%04X\",\"plane\":\"0x%04X\","
-			"\"up\":\"0x%04X\"}}",
-		    val[0], val[1], val[2], val[3]);
+	shell_print(sh, "{\"apos_gauge\":{\"origin\":%d,\"xaxis\":%d,"
+			"\"plane\":%d,\"up\":%d,\"dim\":\"%s\"}}",
+		    val[0], val[1], val[2], val[3],
+		    (val[3] == -1) ? "2D" : "3D");
 	return 0;
 }
 
@@ -152,10 +183,16 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 
 	apos_gw_get_status(&st);
 
+	const char *dim_str = "unset";
+
+	if (apos_gw_gauge_set()) {
+		dim_str = (apos_gw_gauge_dim() == APOS_GEOM_2D) ? "2D" : "3D";
+	}
+
 	shell_print(sh, "{\"phase\":%u,\"session\":%u,\"gauge_set\":%u,"
-			"\"have_result\":%u}",
+			"\"dim\":\"%s\",\"have_result\":%u}",
 		    st.phase, st.session, apos_gw_gauge_set() ? 1u : 0u,
-		    st.have_result ? 1u : 0u);
+		    dim_str, st.have_result ? 1u : 0u);
 
 	if (st.have_result) {
 		int32_t recip = -1;
@@ -173,10 +210,13 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 
 	shell_print(sh, "enumerated (%u):", t->n_peers);
 	for (uint8_t k = 0; k < t->n_peers; k++) {
-		shell_print(sh, "  {\"idx\":%u,\"addr\":\"0x%04X\","
+		shell_print(sh, "  {\"idx\":%u,\"id\":%u,\"addr\":\"0x%04X\","
 				"\"eui\":\"%02X%02X%02X%02X%02X%02X%02X%02X\","
 				"\"pos_valid\":%u}",
-			    k, t->peer[k].short_addr,
+			    k,
+			    (unsigned)(t->peer[k].short_addr -
+				       UWB_ANCHOR_ADDR_BASE),
+			    t->peer[k].short_addr,
 			    t->peer[k].eui[0], t->peer[k].eui[1],
 			    t->peer[k].eui[2], t->peer[k].eui[3],
 			    t->peer[k].eui[4], t->peer[k].eui[5],
@@ -219,8 +259,8 @@ static int cmd_run(const struct shell *sh, size_t argc, char **argv)
 	}
 	if (rc == -EINVAL) {
 		shell_error(sh, "error: set the frame first — `apos gauge "
-				"origin=<addr> xaxis=<addr> plane=<addr> "
-				"up=<addr>` (run `apos enum` to list addresses)");
+				"origin=<id> xaxis=<id> plane=<id> [up=<id>]` "
+				"(run `apos enum` to list ids)");
 		return rc;
 	}
 	if (rc) {
@@ -413,9 +453,11 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_apos,
 		      "EUI-64 and short address",
 		      cmd_enum, 1, 0),
 	SHELL_CMD_ARG(gauge, NULL,
-		      "gauge origin=<addr> xaxis=<addr> plane=<addr> up=<addr> "
-		      "— pin the coordinate frame",
-		      cmd_gauge, 5, 0),
+		      "gauge origin=<id> xaxis=<id> plane=<id> [up=<id>] "
+		      "— pin the coordinate frame. ids are 0..3, the same "
+		      "space `anchor id` uses. Omit up= (or pass up=-1) for "
+		      "a 2D (3-anchor) survey.",
+		      cmd_gauge, 4, 1),
 	SHELL_CMD_ARG(run,   NULL,
 		      "run — range every anchor pair, solve, and REPORT ONLY "
 		      "(persists nothing)",
