@@ -23,6 +23,7 @@
 #include "apos_gw.h"
 #include "gw_core.h"
 #include "pos_sink.h"
+#include "tag_id.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_mac.h"
@@ -232,6 +233,7 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 		gw_core_release(ctx, sa);
 	} else if (uwb_frame_is_pos(buf, len)) {
 		struct pos_fix fix;
+		uint8_t eui[UWB_FRAME_EUI_LEN];
 
 		/* Deliberately not gated on gw_core seat state: a fix from a tag
 		 * whose lease just expired is still a real measurement, and
@@ -240,6 +242,25 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 		uwb_frame_parse_pos(buf, len, &fix.src_addr, &fix.x, &fix.y,
 				    &fix.residual_m, &fix.n_anchors,
 				    &fix.batt_soc);
+
+		/* Tid must be the tag's stable EUI-derived id, not its
+		 * reallocatable short address (see pos_json.h). The seat table
+		 * is the only place that EUI lives -- look it up by the
+		 * address this frame just arrived from. A miss here means the
+		 * sender's lease expired between its last KEEPALIVE and this
+		 * POS frame (the "not gated on seat state" comment above): the
+		 * fix is still real and must still be published, just without
+		 * the stability guarantee for this one straggler. Falling back
+		 * to fix.src_addr matches this path's old (pre-tag_id)
+		 * behavior exactly, so this is a narrowing of a known gap, not
+		 * a new failure mode. */
+		if (gw_core_find_eui(ctx, fix.src_addr, eui)) {
+			fix.tag_id = tag_id_from_eui(eui, UWB_FRAME_EUI_LEN);
+		} else {
+			LOG_WRN("POS from 0x%04X: no live seat, Tid falls back to short address",
+				fix.src_addr);
+			fix.tag_id = fix.src_addr;
+		}
 		pos_sink_publish(&fix);
 	}
 	/* Anything else is tag<->anchor ranging traffic. MAC-only: not ours,
