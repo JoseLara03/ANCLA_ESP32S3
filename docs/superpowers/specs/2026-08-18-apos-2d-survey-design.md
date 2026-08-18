@@ -291,15 +291,27 @@ lets `apos show` and any future re-survey workflow distinguish "this survey
 never solved Z" from "Z happened to come out zero" — directly serving the
 stated future intent to use real Z once the deployment is ready for it.
 
+`apos_store.c` deliberately persists a *separate*, narrower `struct
+stored_survey` (geometry only — `node[]`, `n_nodes`, `valid`), not
+`struct apos_survey` itself, specifically so a new field on the public
+struct never silently changes the on-flash layout. `dim` must therefore be
+added to `stored_survey` too (as a plain `uint8_t`, matching the style of
+its existing `valid` field) and threaded through `apos_settings_set()`'s
+read path and `apos_store_save()`'s write path explicitly — it does not
+persist "for free" just by existing on `apos_survey`.
+
 **Compatibility:** no anchor survey has yet been successfully `apos
 apply`'d and persisted on real hardware (the `0x0002` flakiness has blocked
 every attempt so far), so there is no existing persisted data to migrate.
-This falls out for free from the enum ordering fixed in §3.1 rather than
-needing dedicated loader logic: a record persisted before this field
-existed reads back with `dim` at its zero value, which is `APOS_GEOM_3D` —
-correctly describing any real pre-existing record (every survey ever
-actually run before this feature existed was 3D) with no special-case code
-needed.
+If that assumption is wrong, `apos_settings_set()`'s existing
+`len != sizeof(s)` guard is what actually protects against it: adding a
+field changes `sizeof(struct stored_survey)`, so an old-format record fails
+that check and is treated as "no survey" (falling back to the stub) rather
+than being loaded with a wrong or garbage `dim` — no new code needed for
+that case. The `APOS_GEOM_3D == 0` ordering from §3.1 is a second,
+independent layer of the same protection, for the parts of the codebase
+that zero-initialize a `struct apos_survey` in memory rather than reading
+one off flash (e.g. test fixtures).
 
 ## 7. What does not change
 
@@ -335,9 +347,10 @@ needed.
   stamped from `g->dim` regardless of call order (§3.3).
 
 **Unaffected test suites:** `tests/apos_frame/`, `tests/apos_table/`,
-`tests/pos_json/` need no new cases — see §7. `tests/pos_json/`'s existing
-fixtures that construct `struct apos_survey` literals need the new `dim`
-field added to compile, with no behavioural assertions changing.
+`tests/pos_json/` need no new cases or fixture edits — see §7.
+`tests/pos_json/`'s fixtures all `memset(&s, 0, sizeof(s))` before setting
+individual fields, so the new `dim` field zero-initializes to
+`APOS_GEOM_3D` automatically and compiles unchanged.
 
 **Hardware verification:** the existing procedure, unchanged in shape —
 `apos enum` → `apos gauge origin=<id> xaxis=<id> plane=<id>` (3 ids, no
