@@ -71,7 +71,9 @@ struct apos_gauge {
 };
 
 enum apos_node_state {
-	APOS_NODE_UNPLACED  = 0, /* fewer than 3 edges to placed nodes */
+	APOS_NODE_UNPLACED  = 0, /* fewer than 3 edges to placed nodes in 3D,
+				 * fewer than 2 in 2D (no reflection to resolve
+				 * out of the plane) */
 	APOS_NODE_PLACED    = 1,
 	APOS_NODE_AMBIGUOUS = 2, /* placed, but its reflection was a guess */
 };
@@ -94,11 +96,27 @@ struct apos_result {
 	uint8_t  worst_j;
 	float    planarity_m;  /* RMS distance of placed nodes from their own
 				* best-fit plane. Small means the array is
-				* near-coplanar and z is not trustworthy. */
+				* near-coplanar and z is not trustworthy.
+				* 3D only -- identically 0 in 2D mode, where
+				* three or fewer distinct z values make the
+				* metric meaningless by construction. */
+	float    gauge_collinearity_ratio; /* 2D only; 0 in 3D mode. Perpendicular
+				* distance of `plane` from the origin-xaxis
+				* line, divided by the origin-xaxis baseline
+				* length. Small means the three gauge nodes are
+				* nearly in a line, so the solved +y direction
+				* (and therefore every placed node's y) is
+				* noise-dominated -- the 2D analogue of
+				* planarity_m above. Origin sits at (0,0,0) and
+				* xaxis always has y = z = 0 by construction
+				* (neither is a free LM parameter on that axis),
+				* so this reduces to |plane.y| / xaxis.x. */
 	uint16_t iterations;   /* LM iterations used; 0 after seed alone */
 };
 
-/* Four distinct indices, each < n_nodes, and n_nodes in range. */
+/* Four distinct indices (origin/xaxis/plane/up), each < n_nodes, and n_nodes
+ * in range -- or three (origin/xaxis/plane, up unchecked) when dim ==
+ * APOS_GEOM_2D. */
 bool apos_geom_gauge_valid(const struct apos_gauge *g, uint8_t n_nodes);
 
 /* Closed-form initial placement. Fills out->node[].{x,y,z,state}, n_nodes,
@@ -107,14 +125,23 @@ bool apos_geom_gauge_valid(const struct apos_gauge *g, uint8_t n_nodes);
  *
  * Returns 0 on success, -EINVAL on a bad argument or invalid gauge, or -ENODATA
  * if the gauge nodes lack the edges needed to place them (the three gauge-plane
- * edges plus at least three edges from `up`). Nodes that cannot be placed are
- * left APOS_NODE_UNPLACED and are NOT an error -- they are reported. */
+ * edges, plus in 3D mode at least three more edges from `up` -- 2D has no `up`
+ * to place). Nodes that cannot be placed are left APOS_NODE_UNPLACED and are
+ * NOT an error -- they are reported. */
 int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 		   const struct apos_gauge *g, struct apos_result *out);
 
 /* Shift every placed node's z by dz, moving the z = 0 plane. Applied after
  * solving so the operator can put z = 0 on the floor rather than on the plane
- * through the three gauge anchors. */
+ * through the three gauge anchors.
+ *
+ * In 2D mode every z is 0 before this call, so a nonzero dz here shifts the
+ * whole 2D survey off the z = 0 plane it is otherwise defined to occupy. This
+ * function does not know or care which mode produced `r` -- a stale nonzero
+ * zoff_m left over from a previous 3D survey applies just as literally to the
+ * next 2D one. Callers that want 2D surveys to stay at z = 0 must not call
+ * this with a nonzero dz for them; apos_gw.c does not currently special-case
+ * this. */
 void apos_geom_zoff(struct apos_result *r, float dz);
 
 /* Free parameters for a solve of this dimensionality: translation +

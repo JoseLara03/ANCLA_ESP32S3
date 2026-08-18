@@ -683,6 +683,60 @@ static void test_refine_stamps_dim_without_seed(void)
     }
 }
 
+/* The 2D analogue of test_planarity_is_small_for_a_coplanar_array(): a gauge
+ * triangle with `plane` almost on the origin-xaxis line carries almost no
+ * information about which way +y points, so a range error on an unrelated
+ * edge can swing every placed node's y sharply with nothing else flagging it
+ * (rms_m stays ~0 -- this is the isostatic 3-node case, same as
+ * test_2d_three_node_survey_is_degenerate()). gauge_collinearity_ratio is the
+ * diagnostic that has to say so. */
+static void test_gauge_collinearity_is_small_for_a_near_collinear_triangle(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    const float thin[3][2] = {
+        {0.0f, 0.0f}, {3.0f, 0.0f}, {3.0f, 0.05f}, /* plane 50 mm off the line */
+    };
+    uint16_t k = 0;
+
+    for (uint8_t i = 0; i < 3; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < 3; j++) {
+            e[k].i = i;
+            e[k].j = j;
+            e[k].d_m = dist2(thin[i], thin[j]);
+            e[k].sd_m = 0.001f;
+            k++;
+        }
+    }
+
+    CHECK(apos_geom_solve(e, k, 3, &g_ref_2d, &r) == 0);
+    CHECK(r.gauge_collinearity_ratio < 0.05f);
+}
+
+/* A well-spread triangle (the existing g_ref_2d/ref_xy layout, a 3-4-5 right
+ * triangle) must NOT be flagged, or the diagnostic is useless. */
+static void test_gauge_collinearity_is_large_for_a_well_spread_triangle(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh_2d(e, 3);
+
+    CHECK(apos_geom_solve(e, n, 3, &g_ref_2d, &r) == 0);
+    CHECK(r.gauge_collinearity_ratio > 0.5f);
+}
+
+/* 3D mode does not compute this metric at all -- planarity_m is its analogue
+ * there. */
+static void test_gauge_collinearity_is_zero_in_3d_mode(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    CHECK(apos_geom_solve(e, n, 4, &g_ref, &r) == 0);
+    CHECK(r.gauge_collinearity_ratio == 0.0f);
+}
+
 static void test_free_params_matches_each_dimensionality(void)
 {
     /* 3D: 3N-6. 2D: 2N-3. */
@@ -701,6 +755,9 @@ int main(void)
     test_2d_two_neighbours_is_flagged_ambiguous();
     test_2d_solve_refines_a_five_node_layout();
     test_2d_three_node_survey_is_degenerate();
+    test_gauge_collinearity_is_small_for_a_near_collinear_triangle();
+    test_gauge_collinearity_is_large_for_a_well_spread_triangle();
+    test_gauge_collinearity_is_zero_in_3d_mode();
     test_refine_stamps_dim_without_seed();
     test_free_params_matches_each_dimensionality();
     test_seed_reproduces_the_exact_layout();

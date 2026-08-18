@@ -190,6 +190,14 @@ enum apos_gw_phase {
  * mean anything. Does NOT block acceptance on its own -- x and y are still
  * good -- but it is reported, and the operator is told z is not survey-quality. */
 #define APOS_ACCEPT_PLANARITY_MM 100u
+/* Below this ratio, a 2D gauge's origin/xaxis/plane triangle is too close to
+ * a straight line for the solved +y direction to mean anything -- the 2D
+ * analogue of APOS_ACCEPT_PLANARITY_MM above, and does NOT block acceptance
+ * on its own either. See apos_geom.h's gauge_collinearity_ratio note: a
+ * `plane` anchor only 50 mm off a 1 m origin-xaxis baseline (ratio 0.05) was
+ * enough for an injected 30 mm range error elsewhere in the mesh to move the
+ * solved y by 5x, with rms_mm staying at 0. */
+#define APOS_ACCEPT_GAUGE_COLLINEARITY 0.10f
 
 struct apos_gw_status {
 	uint8_t  phase;        /* enum apos_gw_phase */

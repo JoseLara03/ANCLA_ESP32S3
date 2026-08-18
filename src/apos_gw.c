@@ -79,11 +79,14 @@ static uint16_t solve_n_edges;
 static bool solve_unverified;
 
 /* Ranging-quality numbers derived from the raw directed measurements, not from
- * the fit. On the real four-anchor array the fit's rms_m is vacuous (see
- * apos_gw_result_unverified()), so these are the only quality signals that
- * actually carry information about the RANGING. They say nothing about whether
- * the GEOMETRY is over-determined -- a rigid 4-node framework stays isostatic
- * regardless of how good its edges are. */
+ * the fit. On a 3D gauge over the real four-anchor array the fit's rms_m is
+ * vacuous (see apos_gw_result_unverified()) -- a rigid 4-node framework stays
+ * isostatic regardless of how good its edges are -- so these are the only
+ * quality signals that actually carry information about the RANGING there.
+ * A 2D (3-anchor) gauge run over the same four anchors is NOT that case: it
+ * has one spare edge (2*4-3 = 5 free parameters against 6 edges), so rms_m
+ * becomes a real, if weak, signal for the first time. Either way these two
+ * numbers say nothing about whether the GEOMETRY is over-determined. */
 static int32_t max_recip_mm;
 static uint16_t max_sd_mm;
 
@@ -448,8 +451,9 @@ int apos_gw_start_run(void)
 	return 0;
 }
 
-/* Resolve the four gauge addresses to node indices in the freshly enumerated
- * table. Returns 0, or -ENOENT with the offending address logged. */
+/* Resolve the gauge addresses -- origin/xaxis/plane always, plus up when the
+ * gauge is 3D -- to node indices in the freshly enumerated table. Returns 0,
+ * or -ENOENT with the offending address logged. */
 static int resolve_gauge(struct apos_gauge *g)
 {
 	uint8_t *out3[3] = {&g->origin, &g->xaxis, &g->plane};
@@ -492,6 +496,9 @@ static void judge_result(void)
 {
 	bool planar = res.planarity_m * 1000.0f <
 		      (float)APOS_ACCEPT_PLANARITY_MM;
+	bool gauge_thin = res.dim == APOS_GEOM_2D &&
+			  res.gauge_collinearity_ratio <
+				  APOS_ACCEPT_GAUGE_COLLINEARITY;
 
 	accepted = res.n_placed == res.n_nodes &&
 		   res.n_ambiguous == 0u &&
@@ -501,13 +508,15 @@ static void judge_result(void)
 
 	LOG_INF("{\"apos_solve\":{\"nodes\":%u,\"placed\":%u,\"ambiguous\":%u,"
 		"\"rms_mm\":%d,\"worst_mm\":%d,\"worst_pair\":[%u,%u],"
-		"\"planarity_mm\":%d,\"iters\":%u,\"spare_edges\":%d,"
+		"\"planarity_mm\":%d,\"gauge_collinearity_permille\":%d,"
+		"\"iters\":%u,\"spare_edges\":%d,"
 		"\"rms_meaningful\":%u,\"max_reciprocal_mm\":%d,"
 		"\"max_sd_mm\":%u,\"accepted\":%u}}",
 		res.n_nodes, res.n_placed, res.n_ambiguous,
 		(int)(res.rms_m * 1000.0f), (int)(res.worst_edge_m * 1000.0f),
 		res.worst_i, res.worst_j,
-		(int)(res.planarity_m * 1000.0f), res.iterations,
+		(int)(res.planarity_m * 1000.0f),
+		(int)(res.gauge_collinearity_ratio * 1000.0f), res.iterations,
 		solve_redundancy, solve_unverified ? 0u : 1u,
 		max_recip_mm, max_sd_mm, accepted ? 1u : 0u);
 
@@ -559,6 +568,20 @@ static void judge_result(void)
 			"y are good but the solved z values are not "
 			"survey-quality\"}",
 			(int)(res.planarity_m * 1000.0f));
+	}
+	/* The 2D analogue of the coplanarity warning above: a near-collinear
+	 * origin/xaxis/plane triangle carries almost no information about
+	 * which way +y points, so the solved y of EVERY placed node is
+	 * noise-dominated -- and unlike the 3D case, nothing else here catches
+	 * it: rms_mm can read ~0 on this same mesh regardless (see
+	 * solve_unverified above), so this is the only warning that exists for
+	 * this specific failure mode. */
+	if (gauge_thin) {
+		LOG_WRN("{\"apos_warn\":\"2D gauge triangle is near-collinear "
+			"(collinearity ratio %d/1000) — the solved +y direction "
+			"is noise-dominated; move the `plane` anchor further off "
+			"the origin-xaxis line and re-run\"}",
+			(int)(res.gauge_collinearity_ratio * 1000.0f));
 	}
 	if (res.n_ambiguous) {
 		LOG_WRN("{\"apos_warn\":\"%u node(s) reflection-ambiguous — each "
@@ -613,8 +636,9 @@ static void do_solve(void)
 	}
 
 	/* Redundancy of the fit that just ran: the gauge fixes 6 of the 3N
-	 * degrees of freedom, so n_edges must EXCEED 3*n_placed - 6 before
-	 * rms_m can disagree with anything. n_edges is an upper bound on the
+	 * degrees of freedom in 3D (3 of the 2N in 2D), so n_edges must EXCEED
+	 * apos_geom_free_params(res.dim, res.n_placed) before rms_m can
+	 * disagree with anything. n_edges is an upper bound on the
 	 * edges the fit actually used (edges touching an unplaced node are
 	 * dropped), so this is an OPTIMISTIC estimate of the spare count: the
 	 * fit may have had fewer spare edges than this says, never more. That is

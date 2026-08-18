@@ -763,8 +763,32 @@ static float planarity(const struct apos_result *r)
 	return (ev > 0.0f) ? sqrtf(ev) : 0.0f;
 }
 
+/* Perpendicular distance of `plane` from the origin-xaxis line, divided by
+ * the origin-xaxis baseline length. 2D only -- see apos_geom.h. Origin is
+ * always (0,0,0) and xaxis always has y = z = 0 (neither is ever a free LM
+ * parameter on those axes), so the general point-to-line formula collapses to
+ * |plane.y| / xaxis.x. Returns 0 (indistinguishable from "perfectly spread")
+ * on a degenerate zero-length baseline -- apos_geom_seed() already refuses a
+ * zero origin-xaxis edge (d01 <= 0.0f), so that baseline is never actually
+ * zero once a result exists, but a caller who hand-builds a struct
+ * apos_result should not get a divide-by-zero for one that is. */
+static float gauge_collinearity(const struct apos_result *r,
+				const struct apos_gauge *g)
+{
+	if (r->dim != APOS_GEOM_2D) {
+		return 0.0f;
+	}
+
+	float base = r->node[g->xaxis].x;
+
+	if (fabsf(base) < EPS) {
+		return 0.0f;
+	}
+	return fabsf(r->node[g->plane].y) / fabsf(base);
+}
+
 static void fill_diagnostics(const struct apos_edge *e, uint16_t n_edges,
-			     struct apos_result *r)
+			     struct apos_result *r, const struct apos_gauge *g)
 {
 	float sum = 0.0f;
 	uint16_t used = 0;
@@ -815,6 +839,7 @@ static void fill_diagnostics(const struct apos_edge *e, uint16_t n_edges,
 	}
 
 	r->planarity_m = planarity(r);
+	r->gauge_collinearity_ratio = gauge_collinearity(r, g);
 }
 
 int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
@@ -823,14 +848,16 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 	if (!e || !g || !io) {
 		return -EINVAL;
 	}
-	/* Stamped here independently of apos_geom_seed() (which also stamps
-	 * it): a caller that builds a struct apos_result by hand and calls
-	 * refine() directly, without seeding first, still gets the right
-	 * dim from the one authoritative source, g->dim. */
-	io->dim = g->dim;
 	if (!apos_geom_gauge_valid(g, io->n_nodes)) {
 		return -EINVAL;
 	}
+	/* Stamped here independently of apos_geom_seed() (which also stamps
+	 * it): a caller that builds a struct apos_result by hand and calls
+	 * refine() directly, without seeding first, still gets the right
+	 * dim from the one authoritative source, g->dim. Stamped only after
+	 * the gauge validates, so a rejected call leaves io->dim exactly as
+	 * the caller passed it in rather than mutating it on a -EINVAL path. */
+	io->dim = g->dim;
 
 	struct pmap m;
 	uint16_t usable = 0;
@@ -846,7 +873,7 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 		return -ENODATA;
 	}
 	if (m.n_params == 0) {
-		fill_diagnostics(e, n_edges, io);
+		fill_diagnostics(e, n_edges, io, g);
 		return 0;
 	}
 
@@ -963,7 +990,7 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 		}
 	}
 
-	fill_diagnostics(e, n_edges, io);
+	fill_diagnostics(e, n_edges, io, g);
 	return 0;
 }
 

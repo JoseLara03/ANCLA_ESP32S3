@@ -27,9 +27,10 @@
  * operator never does hex arithmetic to use `apos gauge`. allow_none permits
  * exactly "-1" as a second valid parse, for up=, which is the only one of
  * the four gauge designations that may be omitted (selecting 2D mode).
- * strtol() reports a non-numeric argument as 0, which must be rejected as
- * ambiguous with a real id 0 -- same reasoning as the address parser this
- * replaces. */
+ * A non-numeric argument also parses as v == 0 via strtol(), but leaves
+ * `endptr` unadvanced from `arg` -- that is what the `endptr == arg` check
+ * below actually rejects, so it does not collide with a genuine id 0, which
+ * advances endptr normally. */
 static bool parse_id(const char *arg, bool allow_none, int32_t *out)
 {
 	char *endptr;
@@ -224,7 +225,9 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 			    t->peer[k].pos_valid ? 1u : 0u);
 	}
 
-	shell_print(sh, "stored survey: %s", s->valid ? "yes" : "none");
+	shell_print(sh, "stored survey: %s%s%s", s->valid ? "yes" : "none",
+		    s->valid ? ", dim=" : "",
+		    s->valid ? ((s->dim == APOS_GEOM_2D) ? "2D" : "3D") : "");
 	for (uint8_t k = 0; k < s->n_nodes; k++) {
 		shell_print(sh, "  {\"addr\":\"0x%04X\",\"x\":%.3f,\"y\":%.3f,"
 				"\"z\":%.3f}",
