@@ -42,9 +42,15 @@ board is fixed for good and a 4th anchor is reliably present).
 ### 3.1 Data model
 
 ```c
+/* APOS_GEOM_3D is deliberately the zero value, not APOS_GEOM_2D: every
+ * existing struct apos_gauge literal (in apos_gw.c and in
+ * tests/apos_geom/test_apos_geom.c) predates this field and does not
+ * mention .dim, so it zero-initializes. Zero must mean "today's existing
+ * 3D behaviour" or every one of those untouched call sites silently
+ * becomes a 2D solve the moment this field exists. */
 enum apos_geom_dim {
-	APOS_GEOM_2D = 0,
-	APOS_GEOM_3D = 1,
+	APOS_GEOM_3D = 0,
+	APOS_GEOM_2D = 1,
 };
 
 struct apos_gauge {
@@ -288,11 +294,12 @@ stated future intent to use real Z once the deployment is ready for it.
 **Compatibility:** no anchor survey has yet been successfully `apos
 apply`'d and persisted on real hardware (the `0x0002` flakiness has blocked
 every attempt so far), so there is no existing persisted data to migrate.
-If that assumption turns out to be wrong by the time this is implemented,
-the settings loader should default a record with no stored `dim` value to
-`APOS_GEOM_3D` — every survey ever actually run before this feature existed
-was 3D, so that default correctly describes any real pre-existing record
-rather than silently reinterpreting it as 2D.
+This falls out for free from the enum ordering fixed in §3.1 rather than
+needing dedicated loader logic: a record persisted before this field
+existed reads back with `dim` at its zero value, which is `APOS_GEOM_3D` —
+correctly describing any real pre-existing record (every survey ever
+actually run before this feature existed was 3D) with no special-case code
+needed.
 
 ## 7. What does not change
 
