@@ -2,10 +2,11 @@
 
 Date: 2026-08-14
 
-Measures every anchor pair over the air, solves the inter-anchor geometry in 3D,
-and writes the solved coordinates into each anchor's NVS and into the gateway's
-retained anchors payload — so the platform map and the tag's solver agree by
-construction instead of by hand-typed `anchor pos` commands.
+Measures every anchor pair over the air, solves the inter-anchor geometry — in
+3D (a 4-anchor gauge) or in 2D (a 3-anchor gauge, §3) — and writes the solved
+coordinates into each anchor's NVS and into the gateway's retained anchors
+payload — so the platform map and the tag's solver agree by construction
+instead of by hand-typed `anchor pos` commands.
 
 **Status of this procedure at time of writing:** implemented, built, and code
 reviewed (branch `feat/anchor-auto-positioning`). It has **not been run against
@@ -107,8 +108,10 @@ Check `anchor show` on each board for `ant_tx != 16385` before you start.
 ### 1.2 Boards
 
 - **Four ranging anchors**, `anchor mode slave`, ids `0..3` (short addresses
-  `0x0001`–`0x0004`). Four distinct nodes is the minimum a 3D gauge can pin
-  (`APOS_MIN_NODES`), and it is what `apos run` refuses below.
+  `0x0001`–`0x0004`). Four distinct nodes is the minimum a **3D** gauge can pin
+  (`APOS_MIN_NODES_3D`); a **2D** gauge needs only three (`APOS_MIN_NODES_2D`,
+  §3). Either way `apos run` refuses a gauge with fewer than the mode's
+  minimum.
 - **One gateway**, `anchor mode gateway`, with its own `anchor pos` set. Five
   boards in total.
 - The production image on all five — `west build -b ancla_esp32s3/esp32s3/procpu`
@@ -134,29 +137,35 @@ A 1 + 4 deployment surveys **four** nodes.
 
 Mount every anchor in its final position first. Ranging fixes the array's
 *shape* but not its placement — the solution is free up to translation, rotation
-and reflection — so four operator designations pin the frame:
+and reflection — so operator designations pin the frame. Three are always
+required; a fourth is optional and is the 2D/3D switch (see §4.2 for the exact
+`apos gauge` syntax):
 
 | designation | meaning |
 |---|---|
 | `origin` | becomes `(0, 0, 0)` |
 | `xaxis`  | becomes `(d, 0, 0)`, `d > 0` — defines +x |
-| `plane`  | becomes `(x, y, 0)`, `y > 0` — defines the +y side |
-| `up`     | forced to `z > 0` — resolves the reflection |
+| `plane`  | becomes `(x, y, 0)`, `y > 0` in 3D (`(x, y, 0)` with `y > 0` and `z` pinned at 0 for every node in 2D) — defines the +y side |
+| `up` (optional) | forced to `z > 0` — resolves the reflection. Present -> **3D**. Omitted (or `-1`) -> **2D**, and there is no reflection to resolve in a plane. |
 
-Pick the four against a **site sketch**, not against whichever board is nearest.
-The gauge is entered as short addresses, not indices, precisely so it survives a
-re-enumeration and an `anchor id` change; a transposed gauge produces a
-plausible-looking but wrong coordinate frame that nothing downstream can detect.
+Pick them against a **site sketch**, not against whichever board is nearest.
+`apos gauge` takes **`anchor id`s** (`0..3`, §4.2), the same 0-based space
+`anchor id` uses, so the operator never does hex arithmetic to name a peer.
+A transposed gauge produces a plausible-looking but wrong coordinate frame
+that nothing downstream can detect, so double-check ids against the site
+sketch before running.
 
-**Put at least one anchor at a clearly different height.** A coplanar array has
-no information about z, and the solver reports this as a small `planarity_mm`
-with the warning
+**In 3D mode, put at least one anchor at a clearly different height.** A
+coplanar array has no information about z, and the solver reports this as a
+small `planarity_mm` with the warning
 
 ```
 {"apos_warn":"array is near-coplanar (… mm) — x and y are good but the solved z values are not survey-quality"}
 ```
 
-x and y remain usable in that case; z does not.
+x and y remain usable in that case; z does not. (2D mode has no `planarity_mm`
+warning — z is always 0 there by definition — but it has its own analogous
+trap; see §4.2's note on keeping the gauge triangle spread out.)
 
 `apos zoff <metres>` adds a constant to every placed node's z after the solve,
 which is how you move `z = 0` off the plane through the three gauge anchors and
@@ -206,8 +215,20 @@ a fourth id as `up=` to pin a real out-of-plane axis and get the existing full
 **3D** solve. Pick 2D when a fourth anchor is not reliably reachable that day,
 or when the deployment does not need height data yet; nothing about a 2D
 survey is provisional — it is a first-class result, just over fewer degrees of
-freedom (see §0's note on why three anchors in 2D are exactly as isostatic as
-four in 3D).
+freedom (by the same isostatic reasoning §0 gives for the 4-anchor 3D case:
+three named anchors in 2D is `2*3-3 = 3` free parameters against exactly 3
+edges, the same isostatic floor).
+
+**Do not mount the three 2D gauge anchors (`origin`/`xaxis`/`plane`) in a
+line, or close to one.** The solve reports a small `gauge_collinearity_ratio`
+and a `LOG_WRN` when they're too close to collinear, but the acceptance check
+does not block on it: a near-collinear triangle carries almost no information
+about which way +y points, so the solved +y direction (and everything placed
+from it) becomes noise-dominated even while `rms_mm` and `accepted:1` look
+fine — a `plane` anchor only 50 mm off a 1 m origin-xaxis baseline was enough
+for an unrelated 30 mm range error to move the solved y by 5x in testing.
+Spread the triangle out — as close to a right angle at `plane` as the site
+allows.
 
 ```
 apos gauge origin=0 xaxis=1 plane=2
@@ -347,13 +368,14 @@ From `{"apos_solve":...}`:
 
 | field | meaning |
 |---|---|
-| `nodes` / `placed` | enumerated nodes, and how many the solve could place. A node with fewer than three edges to placed nodes stays unplaced. |
-| `ambiguous` | placed, but its reflection was a guess — it needs a fourth measured edge. |
+| `nodes` / `placed` | enumerated nodes, and how many the solve could place. A node stays unplaced with fewer than three edges to placed nodes in **3D**, or fewer than two in **2D** (there's no reflection to resolve out of a plane). |
+| `ambiguous` | placed, but its reflection was a guess — it needs a fourth measured edge in 3D, or a third in 2D. |
 | `rms_mm` | RMS residual over usable edges. **Meaningless unless `rms_meaningful` is 1 — see §0.** |
 | `worst_mm`, `worst_pair` | largest single-edge residual and the node-index pair that produced it. Same caveat, plus masking (§0). |
-| `planarity_mm` | RMS distance of placed nodes from their own best-fit plane. **Small is bad**: it means near-coplanar and untrustworthy z. |
+| `planarity_mm` | **3D only** (identically 0 in 2D, where it means nothing — see §3). RMS distance of placed nodes from their own best-fit plane. **Small is bad**: it means near-coplanar and untrustworthy z. |
+| `gauge_collinearity_permille` | **2D only** (identically 0 in 3D). Perpendicular distance of `plane` from the origin-xaxis line, divided by the origin-xaxis baseline, ×1000. **Small is bad**: it means a near-collinear gauge triangle and a noise-dominated +y — see §3. Not gated on acceptance, same as `planarity_mm`. |
 | `iters` | LM iterations used, capped at `APOS_LM_MAX_ITER` (200). A clean mesh converges in under ten. |
-| `spare_edges` | usable edges minus `3*placed - 6`. `<= 0` is the unverified regime. |
+| `spare_edges` | usable edges minus the fit's free-parameter count: `3*placed - 6` in 3D, `2*placed - 3` in 2D. `<= 0` is the unverified regime. |
 | `rms_meaningful` | 0 exactly when `spare_edges <= 0`. |
 | `accepted` | whether every threshold below passed. |
 
@@ -419,9 +441,9 @@ addresses listed against the gauge you typed.
 
 ### `the gauge anchors are not mutually ranged`
 
-The seed needs the three gauge-plane edges plus at least three edges from `up`.
-Move the gauge anchors into line of sight of each other and re-run, or pick a
-different four.
+The seed needs the three gauge-plane edges, plus (in 3D mode only) at least
+three more edges from `up`. Move the gauge anchors into line of sight of each
+other and re-run, or pick a different gauge.
 
 ### `{"apos_hole":{"from":…,"to":…,"why":"no RANGE_RSP"}}`
 
@@ -447,6 +469,15 @@ node, or a repositioned anchor. Ambiguity blocks acceptance.
 
 All the anchors are at effectively the same height. x and y are fine; the solved
 z values are not survey-quality. Raise or lower one anchor and re-run.
+
+### `2D gauge triangle is near-collinear (collinearity ratio …/1000)`
+
+**2D mode only.** `origin`, `xaxis` and `plane` are too close to a straight
+line, so the solved +y direction (and every node's y) is noise-dominated. This
+does not block acceptance, and — unlike the near-coplanar warning above — it
+does not even correlate with a bad `rms_mm`: `rms_mm` can read ~0 on the exact
+same mesh (§0). Reposition `plane` further off the origin-xaxis line and
+re-run. See §4.2.
 
 ### `0x000N never acknowledged SETPOS after 4 attempts — it is still on its OLD coordinates`
 
@@ -497,7 +528,19 @@ means `apos_gw_busy()` is true. Wait for the current phase to report.
 
 ## 7. Acceptance gates for a first hardware session
 
-None of these have been run. Tick them in order.
+None of these have been run. Tick them in order. This checklist is written for
+the **3D, 4-anchor** gauge, the deployment's normal mode; if the day's array is
+running a **2D, 3-anchor** gauge instead (§4.2 — a 4th anchor unreachable, or
+height not needed yet), run the same steps with `apos gauge origin=<id>
+xaxis=<id> plane=<id>` (no `up=`) and adjust the node-count-specific items
+accordingly: `apos enum` lists **three** peers, not four; `apos run` reports
+`gauge_collinearity_permille` (not `planarity_mm`) comfortably above the
+`APOS_ACCEPT_GAUGE_COLLINEARITY` floor instead; and `apos apply` reports
+`ok:3, failed:0, skipped:0, persisted:1`. A bare 3-anchor 2D gauge is
+isostatic, same as the 4-anchor 3D case (§0), so its `rms_mm` is exactly as
+uninformative — the tape measure is still the real check. If a 4th anchor
+rides along as an ordinary placed node in 2D mode, that array is NOT
+isostatic and `rms_mm` becomes meaningful (see CLAUDE.md's hard-won facts).
 
 - [ ] Every anchor calibrated per `docs/antenna-delay-calibration.md`
       (`anchor show` reports `ant_tx != 16385` on each).
