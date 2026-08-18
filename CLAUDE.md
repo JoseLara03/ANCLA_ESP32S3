@@ -208,9 +208,12 @@ the radio work and logs the outcome as JSON.
 ```
 apos enum                      broadcast SURVEY_BEGIN and list the anchors that
                                answer, by EUI-64 and short address
-apos gauge origin=<addr> xaxis=<addr> plane=<addr> up=<addr>
+apos gauge origin=<id> xaxis=<id> plane=<id> [up=<id>]
                                pin the coordinate frame; named arguments, any
-                               order, four distinct non-zero short addresses
+                               order, ids are 0..3 (the same space `anchor id`
+                               uses). Omit up= (or pass up=-1) for a 2D
+                               (3-anchor) survey; a 4th id there selects the
+                               existing full 3D solve.
 apos run                       re-enumerate, range every ordered pair, solve,
                                and REPORT ONLY — persists NOTHING
 apos apply [force]             push the result to every anchor, persist it and
@@ -654,6 +657,13 @@ thresholds.
   `max_sd_mm`, both in the `apos_solve` JSON and in `apos show`. Those make the
   RANGING observable; they do **not** make the geometry over-determined — a
   rigid 4-node framework stays isostatic either way.
+- **A 2D survey (3-anchor gauge) is exactly as degenerate as the 4-anchor 3D
+  case, for the same reason.** `2N-3` free parameters against exactly 3 edges
+  at `N = 3` is isostatic, so `rms_mm` reproduces any input exactly regardless
+  of ranging quality -- identical to the 4-anchor 3D floor this file already
+  documents at length. A 4th (or 5th+) anchor riding along in 2D mode is what
+  turns it verified, exactly as a 5th does in 3D. See
+  `docs/superpowers/specs/2026-08-18-apos-2d-survey-design.md`.
 - **`ss_initiator.c` is compiled into the PRODUCTION image.** It was
   `cal_initiator.c` and calibration-only, and the old safety property — "a
   deployed anchor can never initiate a poll" — came from the build set. It no

@@ -197,14 +197,32 @@ and then the summary:
 
 ### 4.2 Pin the frame
 
+The gauge takes **ids**, not raw short addresses — the same 0..3 space `anchor
+id` uses, not `0x0001`-style wire addresses. `origin=`, `xaxis=` and `plane=`
+are always required; `up=` is optional and is the 2D/3D switch. Leave it out
+(or pass `up=-1`) to run a **2D** survey over the three named anchors — the
+solve fixes z at the gauge plane for every node and only x/y are trusted. Add
+a fourth id as `up=` to pin a real out-of-plane axis and get the existing full
+**3D** solve. Pick 2D when a fourth anchor is not reliably reachable that day,
+or when the deployment does not need height data yet; nothing about a 2D
+survey is provisional — it is a first-class result, just over fewer degrees of
+freedom (see §0's note on why three anchors in 2D are exactly as isostatic as
+four in 3D).
+
 ```
-apos gauge origin=0x0001 xaxis=0x0002 plane=0x0003 up=0x0004
+apos gauge origin=0 xaxis=1 plane=2
 ```
 
-Named arguments, in any order; all four are required and must be distinct and
-non-zero. Confirmed with `{"apos_gauge":{…}}`. The addresses need not be
-enumerated yet — setting the gauge from a site sketch before powering the array
-is legitimate.
+or, to keep the 3D solve:
+
+```
+apos gauge origin=0 xaxis=1 plane=2 up=3
+```
+
+Named arguments, in any order; the required three (plus the optional fourth)
+must be distinct ids in range 0..3. Confirmed with `{"apos_gauge":{…}}`. The
+ids need not be enumerated yet — setting the gauge from a site sketch before
+powering the array is legitimate.
 
 ### 4.3 Optionally move z = 0 to the floor
 
