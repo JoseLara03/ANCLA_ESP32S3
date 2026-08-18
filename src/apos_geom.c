@@ -542,7 +542,12 @@ static void pmap_build(const struct apos_result *r, const struct apos_gauge *g,
 			continue;
 		}
 		m->idx[n][1] = (int8_t)p++;
-		if (n == g->plane) {
+		/* No node, gauge or otherwise, ever gets a z slot in 2D mode
+		 * -- this one condition is the entire 2D LM story. Every
+		 * downstream consumer (cost(), the Jacobian assembly,
+		 * apply_step()) only ever walks pmap, so z stays pinned at
+		 * its seeded 0.0f with no other code needing to change. */
+		if (n == g->plane || r->dim == APOS_GEOM_2D) {
 			continue;
 		}
 		m->idx[n][2] = (int8_t)p++;
@@ -818,6 +823,11 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 	if (!e || !g || !io) {
 		return -EINVAL;
 	}
+	/* Stamped here independently of apos_geom_seed() (which also stamps
+	 * it): a caller that builds a struct apos_result by hand and calls
+	 * refine() directly, without seeding first, still gets the right
+	 * dim from the one authoritative source, g->dim. */
+	io->dim = g->dim;
 	if (!apos_geom_gauge_valid(g, io->n_nodes)) {
 		return -EINVAL;
 	}

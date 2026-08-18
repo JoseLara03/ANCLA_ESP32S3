@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 static int g_fail = 0;
 
@@ -598,6 +599,90 @@ static void test_unplaced_node_does_not_break_the_fit(void)
     CHECK(r.rms_m < 1e-3f);
 }
 
+/* The core reuse claim: cost()/the Jacobian/apply_step() need no 2D-specific
+ * code at all, because pmap_build() never hands out a z slot in 2D mode. A
+ * 5-node 2D layout with real edge redundancy (2*5-3 = 7 free parameters
+ * against a full 10-edge mesh) exercises the LM loop exactly as the 3D tests
+ * already do. */
+static void test_2d_solve_refines_a_five_node_layout(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh_2d(e, 5);
+
+    CHECK(apos_geom_solve(e, n, 5, &g_ref_2d, &r) == 0);
+    CHECK(r.dim == APOS_GEOM_2D);
+    CHECK(r.n_placed == 5);
+    CHECK(r.rms_m < 1e-3f);
+
+    for (int i = 0; i < 5; i++) {
+        CLOSE(r.node[i].x, ref_xy[i][0], 1e-2f);
+        CLOSE(r.node[i].y, ref_xy[i][1], 1e-2f);
+        /* The core claim: z was never a free parameter, so it never
+         * moved off its seeded 0.0f, regardless of how many LM
+         * iterations ran. */
+        CHECK(r.node[i].z == 0.0f);
+    }
+}
+
+/* A bare 3-anchor 2D survey is exactly the degenerate isostatic case,
+ * mirroring the existing 4-anchor 3D case: 2*3-3 = 3 free parameters
+ * against exactly 3 edges, so rms_m reproduces any input exactly. */
+static void test_2d_three_node_survey_is_degenerate(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh_2d(e, 3);
+
+    /* Deliberately wrong (disagrees with ref_xy's true origin-xaxis
+     * distance of 3.0), yet still a legal triangle against the unchanged
+     * 0-2/1-2 edges (4.0/5.0: 4+5=9 > 6), so with 0 spare edges the fit
+     * must still report rms_m ~ 0 -- it has re-embedded whatever it was
+     * given, not validated it.
+     * DEVIATION FROM BRIEF: the brief used 10.0f here, but 10.0f together
+     * with the unchanged 4.0/5.0 edges violates the triangle inequality
+     * (4+5=9 < 10), which is a property of any three mutual distances
+     * regardless of embedding dimension -- no solver, correct or not, can
+     * re-embed it with near-zero residual. Verified by hand (closest
+     * achievable unweighted sum-of-squares over the 0-2/1-2 pair is 0.5,
+     * giving rms_m ~ 0.41, not the LM implementation failing to converge)
+     * and by a standalone repro before changing the value. 6.0f preserves
+     * the test's intent -- a wrong-but-isostatic edge -- while keeping the
+     * triangle realizable, and reproduces rms_m == 0.0 exactly. */
+    e[0].d_m = 6.0f; /* origin-xaxis, was 3.0 */
+
+    CHECK(apos_geom_solve(e, n, 3, &g_ref_2d, &r) == 0);
+    CHECK(apos_geom_free_params(r.dim, r.n_placed) == 3);
+    CHECK(r.rms_m < 1e-3f);
+}
+
+/* apos_geom_refine() called directly, without apos_geom_seed() first, still
+ * gets the right dim -- the belt-and-suspenders stamp from g->dim, not
+ * reliance on a caller having already run seed(). */
+static void test_refine_stamps_dim_without_seed(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh_2d(e, 3);
+
+    memset(&r, 0, sizeof(r));
+    r.n_nodes = 3;
+    r.dim = APOS_GEOM_3D; /* deliberately wrong, to prove refine() corrects it */
+    for (int i = 0; i < 3; i++) {
+        r.node[i].x = ref_xy[i][0];
+        r.node[i].y = ref_xy[i][1];
+        r.node[i].z = 0.0f;
+        r.node[i].state = APOS_NODE_PLACED;
+    }
+    r.n_placed = 3;
+
+    CHECK(apos_geom_refine(e, n, &g_ref_2d, &r) == 0);
+    CHECK(r.dim == APOS_GEOM_2D);
+    for (int i = 0; i < 3; i++) {
+        CHECK(r.node[i].z == 0.0f);
+    }
+}
+
 static void test_free_params_matches_each_dimensionality(void)
 {
     /* 3D: 3N-6. 2D: 2N-3. */
@@ -614,6 +699,9 @@ int main(void)
     test_2d_seed_reproduces_the_exact_layout();
     test_2d_fourth_neighbour_resolves_the_mirror();
     test_2d_two_neighbours_is_flagged_ambiguous();
+    test_2d_solve_refines_a_five_node_layout();
+    test_2d_three_node_survey_is_degenerate();
+    test_refine_stamps_dim_without_seed();
     test_free_params_matches_each_dimensionality();
     test_seed_reproduces_the_exact_layout();
     test_gauge_constraints_hold_exactly();
