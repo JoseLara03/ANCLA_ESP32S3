@@ -5,7 +5,14 @@
 
 /* One decoded tag position report. */
 struct pos_fix {
-    uint16_t src_addr;    /* tag short address, from the frame header */
+    uint16_t src_addr;    /* tag short address, from the frame header -- MAC
+                           * layer only; reallocated across a rejoin, so this
+                           * must never be published to the platform as Tid.
+                           * See tag_id below. */
+    uint32_t tag_id;      /* stable per-physical-tag id: tag_id_from_eui() of
+                           * the seat's EUI, resolved by the caller (the
+                           * gateway's dispatch path) before publish. This is
+                           * what pos_json_fix() emits as Tid. */
     float    x;           /* metres */
     float    y;           /* metres */
     float    residual_m;  /* RMS range residual; larger means less trustworthy */

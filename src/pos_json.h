@@ -41,9 +41,11 @@
 /* Format one fix as the position payload:
  *   {"Tid":4660,"x":1.23,"y":4.56,"z":0}
  *
- * Tid is fix->src_addr as a plain decimal number (NOT hex, NOT a string) --
- * 0x1234 formats as 4660. z is the integer literal 0: the solver is 2D and
- * there is no z measurement yet.
+ * Tid is fix->tag_id (a stable per-physical-tag id derived from the tag's
+ * EUI -- see src/tag_id.c) as a plain decimal number (NOT hex, NOT a
+ * string). It is NOT fix->src_addr, which is only the tag's current MAC
+ * short address and is reallocated across a rejoin. z is the integer
+ * literal 0: the solver is 2D and there is no z measurement yet.
  *
  * Returns the number of bytes written excluding the NUL, or -1 if the buffer
  * was too small. On -1 the caller MUST drop the message: publishing a
