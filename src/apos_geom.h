@@ -33,8 +33,22 @@
 #define APOS_MAX_NODES 8
 #define APOS_MAX_EDGES ((APOS_MAX_NODES * (APOS_MAX_NODES - 1)) / 2)
 
-/* Gauge needs four distinct nodes, so a survey below this cannot be solved. */
-#define APOS_MIN_NODES 4
+/* APOS_GEOM_3D is deliberately the zero value, not APOS_GEOM_2D: every
+ * struct apos_gauge literal that predates this field (in apos_gw.c and in
+ * tests/apos_geom/test_apos_geom.c) does not mention .dim and therefore
+ * zero-initializes it. Zero must mean "today's existing 3D behaviour", or
+ * every one of those untouched call sites would silently become a 2D solve
+ * the moment this field exists. */
+enum apos_geom_dim {
+	APOS_GEOM_3D = 0,
+	APOS_GEOM_2D = 1,
+};
+
+/* A 3D gauge needs four distinct nodes (origin/xaxis/plane/up); a 2D gauge
+ * needs three (origin/xaxis/plane, no up -- there is no reflection to
+ * resolve in a plane). */
+#define APOS_MIN_NODES_3D 4
+#define APOS_MIN_NODES_2D 3
 
 struct apos_edge {
 	uint8_t i;    /* node index, < n_nodes */
@@ -43,13 +57,17 @@ struct apos_edge {
 	float   sd_m; /* standard deviation, metres; must be > 0 */
 };
 
-/* Four operator designations, as node indices into the same array the edges
- * index. All four must be distinct. */
+/* Operator designations, as node indices into the same array the edges
+ * index. origin/xaxis/plane must always be distinct. up is a fourth,
+ * additionally distinct designation used only when dim == APOS_GEOM_3D --
+ * apos_geom_gauge_valid() does not read it at all in 2D mode, so its value
+ * is a "don't care" there, not a sentinel that needs separate validation. */
 struct apos_gauge {
 	uint8_t origin; /* -> (0, 0, 0) */
 	uint8_t xaxis;  /* -> (d, 0, 0), d > 0 */
-	uint8_t plane;  /* -> (x, y, 0), y > 0 */
-	uint8_t up;     /* -> z > 0 */
+	uint8_t plane;  /* -> (x, y, 0), y > 0 in 3D; z is always 0 in 2D */
+	uint8_t up;     /* -> z > 0; ignored when dim == APOS_GEOM_2D */
+	enum apos_geom_dim dim;
 };
 
 enum apos_node_state {
@@ -69,6 +87,7 @@ struct apos_result {
 	uint8_t  n_nodes;
 	uint8_t  n_placed;
 	uint8_t  n_ambiguous;
+	enum apos_geom_dim dim;
 	float    rms_m;        /* RMS residual over all usable edges */
 	float    worst_edge_m; /* largest |residual| over usable edges */
 	uint8_t  worst_i;      /* the pair that produced worst_edge_m */
@@ -97,6 +116,13 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
  * solving so the operator can put z = 0 on the floor rather than on the plane
  * through the three gauge anchors. */
 void apos_geom_zoff(struct apos_result *r, float dz);
+
+/* Free parameters for a solve of this dimensionality: translation +
+ * rotation only, the gauge having already fixed the rest. 2N-3 in 2D (2
+ * translation + 1 rotation), 3N-6 in 3D (3 translation + 3 rotation).
+ * Centralizes the formula apos_gw.c otherwise duplicates as a literal
+ * expression. */
+int apos_geom_free_params(enum apos_geom_dim dim, uint8_t n_placed);
 
 /* LM iteration cap. Reached only on a pathological input; a clean full mesh
  * converges in well under ten. */

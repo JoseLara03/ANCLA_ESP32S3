@@ -77,7 +77,7 @@ int pos_json_anchors(char *buf, size_t len, const struct apos_survey *s)
 	 * whole by the platform's parser, which is worse than the stub it
 	 * replaced. Refuse the whole document up front, for the same reason
 	 * truncation below is refused rather than published partially.
-	 * APOS_MIN_NODES (4) is isostatic (6 edges == 3N-6 free parameters), so
+	 * APOS_MIN_NODES_3D (4) is isostatic (6 edges == 3N-6 free parameters), so
 	 * a degenerate/near-collinear solve can be accepted by the solver with
 	 * a non-finite coordinate in it -- this is the last check before MQTT. */
 	if (s->ref_valid && (!isfinite(s->ref_lat) || !isfinite(s->ref_lon))) {

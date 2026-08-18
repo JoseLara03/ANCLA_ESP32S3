@@ -23,6 +23,12 @@
  * genuinely coincident or collinear inputs. */
 #define EPS 1.0e-6f
 
+int apos_geom_free_params(enum apos_geom_dim dim, uint8_t n_placed)
+{
+	return (dim == APOS_GEOM_2D) ? (2 * (int)n_placed - 3)
+				      : (3 * (int)n_placed - 6);
+}
+
 /* Find the edge joining a and b in either order. Returns its distance, or a
  * negative value if the pair was not measured. The linear scan is deliberate:
  * n_edges is at most 28, and an index would cost more code than it saves. */
@@ -135,17 +141,26 @@ static int trilaterate3(const float p[3][3], const float r[3],
 
 bool apos_geom_gauge_valid(const struct apos_gauge *g, uint8_t n_nodes)
 {
-	if (!g || n_nodes < APOS_MIN_NODES || n_nodes > APOS_MAX_NODES) {
+	if (!g || n_nodes > APOS_MAX_NODES) {
+		return false;
+	}
+
+	uint8_t min_nodes = (g->dim == APOS_GEOM_2D) ? APOS_MIN_NODES_2D : APOS_MIN_NODES_3D;
+	if (n_nodes < min_nodes) {
 		return false;
 	}
 
 	const uint8_t idx[4] = {g->origin, g->xaxis, g->plane, g->up};
 
-	for (int a = 0; a < 4; a++) {
+	/* In 2D mode, only the first three indices matter (origin, xaxis, plane).
+	 * The up index is a "don't care". */
+	int max_idx = (g->dim == APOS_GEOM_2D) ? 3 : 4;
+
+	for (int a = 0; a < max_idx; a++) {
 		if (idx[a] >= n_nodes) {
 			return false;
 		}
-		for (int b = a + 1; b < 4; b++) {
+		for (int b = a + 1; b < max_idx; b++) {
 			if (idx[a] == idx[b]) {
 				return false;
 			}

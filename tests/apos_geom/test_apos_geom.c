@@ -489,9 +489,19 @@ static void test_unplaced_node_does_not_break_the_fit(void)
     CHECK(r.rms_m < 1e-3f);
 }
 
+static void test_free_params_matches_each_dimensionality(void)
+{
+    /* 3D: 3N-6. 2D: 2N-3. */
+    CHECK(apos_geom_free_params(APOS_GEOM_3D, 4) == 6);
+    CHECK(apos_geom_free_params(APOS_GEOM_3D, 5) == 9);
+    CHECK(apos_geom_free_params(APOS_GEOM_2D, 3) == 3);
+    CHECK(apos_geom_free_params(APOS_GEOM_2D, 4) == 5);
+}
+
 int main(void)
 {
     test_gauge_requires_four_distinct_nodes();
+    test_free_params_matches_each_dimensionality();
     test_seed_reproduces_the_exact_layout();
     test_gauge_constraints_hold_exactly();
     test_node_with_two_edges_is_unplaced_not_an_error();

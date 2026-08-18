@@ -218,7 +218,7 @@ static void test_anchors_emits_the_surveyed_geometry(void)
         "]}") == 0);
 }
 
-/* Node counts APOS_MIN_NODES-1 (1, 3, 8) are exercised elsewhere; fill in the
+/* Node counts APOS_MIN_NODES_3D-1 (1, 3, 8) are exercised elsewhere; fill in the
  * untested middle of the range (4..8) so the comma logic isn't only proven at
  * the edges. */
 static void test_anchors_well_formed_across_node_counts(void)
@@ -256,7 +256,7 @@ static void test_anchors_well_formed_across_node_counts(void)
 /* A non-finite coordinate must never reach the wire: %f on a NaN/Inf prints a
  * bare, unquoted token that is not valid JSON, and the platform's parser would
  * reject the WHOLE retained document -- worse than the stub it replaced. This
- * is not hypothetical: at APOS_MIN_NODES the accept criterion is isostatic
+ * is not hypothetical: at APOS_MIN_NODES_3D the accept criterion is isostatic
  * (6 edges == 3N-6 free parameters), so a degenerate/near-collinear solve can
  * be accepted with a non-finite coordinate already in it. */
 static void test_anchors_refuses_a_nonfinite_coordinate(void)
