@@ -251,9 +251,12 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 		 * POS frame (the "not gated on seat state" comment above): the
 		 * fix is still real and must still be published, just without
 		 * the stability guarantee for this one straggler. Falling back
-		 * to fix.src_addr matches this path's old (pre-tag_id)
-		 * behavior exactly, so this is a narrowing of a known gap, not
-		 * a new failure mode. */
+		 * to fix.src_addr reproduces this path's old (pre-tag_id)
+		 * per-frame VALUE exactly, but note the straggler's Tid
+		 * (src_addr) will differ from every other fix this same tag
+		 * has ever sent (hash(EUI)), so the platform sees a one-record
+		 * phantom device for that single frame -- a narrow, accepted
+		 * cost, not a dropped fix. */
 		if (gw_core_find_eui(ctx, fix.src_addr, eui)) {
 			fix.tag_id = tag_id_from_eui(eui, UWB_FRAME_EUI_LEN);
 		} else {

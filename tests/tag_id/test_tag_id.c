@@ -1,6 +1,5 @@
 #include "tag_id.h"
 #include <stdio.h>
-#include <string.h>
 
 static int g_fail = 0;
 #define CHECK(c) do { if(!(c)){ printf("FAIL %s:%d %s\n",__FILE__,__LINE__,#c); g_fail++; } } while(0)
