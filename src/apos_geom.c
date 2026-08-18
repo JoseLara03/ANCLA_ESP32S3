@@ -139,6 +139,49 @@ static int trilaterate3(const float p[3][3], const float r[3],
 	return 0;
 }
 
+/* Intersect two circles, both implicitly at z = 0, centred on p0, p1 (2D)
+ * with radii r0, r1. Writes the two solutions, mirrored across the line
+ * p0-p1, into sa, sb. Returns 0, or -EDOM if the centres coincide or the
+ * circles do not reach a common point. Same noise-tolerant clamping as
+ * trilaterate3(): a near-miss within measurement noise is clamped to the
+ * tangent point rather than rejected. Roughly a third the size of
+ * trilaterate3() -- there is no third axis to resolve. */
+static int trilaterate2(const float p0[2], const float p1[2], float r0,
+			float r1, float sa[2], float sb[2])
+{
+	float dx = p1[0] - p0[0];
+	float dy = p1[1] - p0[1];
+	float d = sqrtf(dx * dx + dy * dy);
+
+	if (d < EPS) {
+		return -EDOM;
+	}
+
+	float exx = dx / d, exy = dy / d;   /* unit vector p0 -> p1 */
+	float eyx = -exy, eyy = exx;        /* rotated 90 deg, in-plane */
+
+	float x = (r0 * r0 - r1 * r1 + d * d) / (2.0f * d);
+	float y2 = r0 * r0 - x * x;
+	float y;
+
+	if (y2 < 0.0f) {
+		float slack = 0.1f * r0;
+
+		if (-y2 > slack * slack) {
+			return -EDOM;
+		}
+		y = 0.0f;
+	} else {
+		y = sqrtf(y2);
+	}
+
+	sa[0] = p0[0] + x * exx + y * eyx;
+	sa[1] = p0[1] + x * exy + y * eyy;
+	sb[0] = p0[0] + x * exx - y * eyx;
+	sb[1] = p0[1] + x * exy - y * eyy;
+	return 0;
+}
+
 bool apos_geom_gauge_valid(const struct apos_gauge *g, uint8_t n_nodes)
 {
 	if (!g) {
@@ -261,11 +304,60 @@ static bool place_from_neighbours(const struct apos_edge *e, uint16_t n_edges,
 {
 	uint8_t nb[APOS_MAX_NODES];
 	float rr[APOS_MAX_NODES];
+	uint8_t min_needed = (r->dim == APOS_GEOM_2D) ? 2u : 3u;
 	uint8_t cnt = placed_neighbours(e, n_edges, r, n, nb, rr,
 					APOS_MAX_NODES);
 
-	if (cnt < 3) {
+	if (cnt < min_needed) {
 		return false;
+	}
+
+	if (r->dim == APOS_GEOM_2D) {
+		float p0[2] = {r->node[nb[0]].x, r->node[nb[0]].y};
+		float p1[2] = {r->node[nb[1]].x, r->node[nb[1]].y};
+		float sa[2], sb[2];
+
+		if (trilaterate2(p0, p1, rr[0], rr[1], sa, sb) != 0) {
+			return false;
+		}
+
+		float pa[3] = {sa[0], sa[1], 0.0f};
+		float pb[3] = {sb[0], sb[1], 0.0f};
+
+		if (cnt >= 3) {
+			/* A third range breaks the mirror across the line
+			 * p0-p1: keep whichever branch agrees with it
+			 * better, the 2D analogue of the 3D 4th-neighbour
+			 * disambiguation below. */
+			float p2[2] = {r->node[nb[2]].x, r->node[nb[2]].y};
+			float da = fabsf(hypotf(sa[0] - p2[0], sa[1] - p2[1])
+					  - rr[2]);
+			float db = fabsf(hypotf(sb[0] - p2[0], sb[1] - p2[1])
+					  - rr[2]);
+
+			set_node(r, n, (da <= db) ? pa : pb, APOS_NODE_PLACED);
+			return true;
+		}
+
+		/* Exactly two: nothing in this node's own edges can choose a
+		 * side of the line p0-p1. Take the branch on the same side
+		 * as the placed centroid, and flag it -- the 2D analogue of
+		 * the 3-neighbour 3D fallback below. */
+		float c[3];
+		float u[2] = {p1[0] - p0[0], p1[1] - p0[1]};
+		float v[2];
+
+		placed_centroid(r, c);
+		v[0] = c[0] - p0[0];
+		v[1] = c[1] - p0[1];
+
+		float cs = u[0] * v[1] - u[1] * v[0]; /* 2D cross, signed area */
+		float va[2] = {sa[0] - p0[0], sa[1] - p0[1]};
+		float as = u[0] * va[1] - u[1] * va[0];
+
+		set_node(r, n, ((cs >= 0.0f) == (as >= 0.0f)) ? pa : pb,
+			 APOS_NODE_AMBIGUOUS);
+		return true;
 	}
 
 	float p[3][3], rad[3], sa[3], sb[3];
@@ -325,6 +417,7 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 	}
 
 	memset(out, 0, sizeof(*out));
+	out->dim = g->dim;
 	out->n_nodes = n_nodes;
 
 	float d01 = edge_d(e, n_edges, g->origin, g->xaxis);
@@ -354,26 +447,31 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 
 	set_node(out, g->plane, (float[3]){px, py, 0.0f}, APOS_NODE_PLACED);
 
-	/* up: the only node whose reflection the operator resolved for us. */
 	uint8_t nb[APOS_MAX_NODES];
 	float rr[APOS_MAX_NODES];
-	uint8_t cnt = placed_neighbours(e, n_edges, out, g->up, nb, rr,
-					APOS_MAX_NODES);
 
-	if (cnt < 3) {
-		return -ENODATA;
-	}
+	if (g->dim == APOS_GEOM_3D) {
+		/* up: the only node whose reflection the operator resolved
+		 * for us. */
+		uint8_t cnt = placed_neighbours(e, n_edges, out, g->up, nb,
+						rr, APOS_MAX_NODES);
 
-	float p[3][3], rad[3], sa[3], sb[3];
+		if (cnt < 3) {
+			return -ENODATA;
+		}
 
-	for (int k = 0; k < 3; k++) {
-		node_xyz(out, nb[k], p[k]);
-		rad[k] = rr[k];
+		float p[3][3], rad[3], sa[3], sb[3];
+
+		for (int k = 0; k < 3; k++) {
+			node_xyz(out, nb[k], p[k]);
+			rad[k] = rr[k];
+		}
+		if (trilaterate3(p, rad, sa, sb) != 0) {
+			return -ENODATA;
+		}
+		set_node(out, g->up, (sa[2] >= sb[2]) ? sa : sb,
+			 APOS_NODE_PLACED);
 	}
-	if (trilaterate3(p, rad, sa, sb) != 0) {
-		return -ENODATA;
-	}
-	set_node(out, g->up, (sa[2] >= sb[2]) ? sa : sb, APOS_NODE_PLACED);
 
 	/* Everything else, best-determined first: re-scan after each placement
 	 * so a node that gains a fourth neighbour is placed unambiguously
@@ -382,6 +480,7 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 	 * neighbours) so it is excluded from the best_cnt competition on later
 	 * scans, without stopping the loop from placing every other node. */
 	bool tried[APOS_MAX_NODES] = {0};
+	uint8_t min_needed = (g->dim == APOS_GEOM_2D) ? 2u : 3u;
 
 	for (;;) {
 		uint8_t best = APOS_MAX_NODES;
@@ -394,7 +493,7 @@ int apos_geom_seed(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 			uint8_t c = placed_neighbours(e, n_edges, out, n, nb,
 						      rr, APOS_MAX_NODES);
 
-			if (c >= 3 && c > best_cnt) {
+			if (c >= min_needed && c > best_cnt) {
 				best = n;
 				best_cnt = c;
 			}

@@ -77,6 +77,98 @@ static void test_2d_gauge_needs_only_three_distinct_nodes(void)
     CHECK(!apos_geom_gauge_valid(&g2, 2));
 }
 
+/* A 3-node 2D reference layout: same origin/xaxis convention as the 3D
+ * gauge, but z is always 0 -- there is no up. */
+static const float ref_xy[5][2] = {
+    {0.0f, 0.0f},  /* origin */
+    {3.0f, 0.0f},  /* xaxis  */
+    {0.0f, 4.0f},  /* plane  */
+    {3.0f, 4.0f},  /* extra node #1, riding along */
+    {1.5f, 2.0f},  /* extra node #2, riding along */
+};
+
+static const struct apos_gauge g_ref_2d = {
+    .origin = 0, .xaxis = 1, .plane = 2, .up = 0, .dim = APOS_GEOM_2D
+};
+
+static float dist2(const float a[2], const float b[2])
+{
+    float dx = a[0] - b[0], dy = a[1] - b[1];
+
+    return sqrtf(dx * dx + dy * dy);
+}
+
+static uint16_t build_full_mesh_2d(struct apos_edge *out, uint8_t n)
+{
+    uint16_t k = 0;
+
+    for (uint8_t i = 0; i < n; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < n; j++) {
+            out[k].i = i;
+            out[k].j = j;
+            out[k].d_m = dist2(ref_xy[i], ref_xy[j]);
+            out[k].sd_m = 0.001f;
+            k++;
+        }
+    }
+    return k;
+}
+
+static void test_2d_seed_reproduces_the_exact_layout(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh_2d(e, 3);
+
+    CHECK(apos_geom_seed(e, n, 3, &g_ref_2d, &r) == 0);
+    CHECK(r.dim == APOS_GEOM_2D);
+    CHECK(r.n_placed == 3);
+    CHECK(r.n_ambiguous == 0);
+
+    for (int i = 0; i < 3; i++) {
+        CHECK(r.node[i].state == APOS_NODE_PLACED);
+        CLOSE(r.node[i].x, ref_xy[i][0], 1e-3f);
+        CLOSE(r.node[i].y, ref_xy[i][1], 1e-3f);
+        CLOSE(r.node[i].z, 0.0f, 1e-6f);
+    }
+}
+
+/* A 4th node with 3 placed neighbours: enough to disambiguate the mirror
+ * across the plane line, the 2D analogue of the 3D 4th-neighbour case. */
+static void test_2d_fourth_neighbour_resolves_the_mirror(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = build_full_mesh_2d(e, 4);
+
+    CHECK(apos_geom_seed(e, n, 4, &g_ref_2d, &r) == 0);
+    CHECK(r.node[3].state == APOS_NODE_PLACED);
+    CLOSE(r.node[3].x, ref_xy[3][0], 1e-3f);
+    CLOSE(r.node[3].y, ref_xy[3][1], 1e-3f);
+}
+
+/* Exactly two neighbours: nothing in this node's own edges can choose a
+ * side of the line through them. The centroid heuristic guesses and must
+ * flag the guess, the 2D analogue of the 3D 3-neighbour case. */
+static void test_2d_two_neighbours_is_flagged_ambiguous(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    uint16_t n = 0;
+
+    /* Only the gauge triangle plus node 3's two edges to origin/xaxis --
+     * not the full mesh, so node 3 has exactly 2 placed neighbours. */
+    n = build_full_mesh_2d(e, 3);
+    e[n].i = 0; e[n].j = 3; e[n].d_m = dist2(ref_xy[0], ref_xy[3]);
+    e[n].sd_m = 0.001f; n++;
+    e[n].i = 1; e[n].j = 3; e[n].d_m = dist2(ref_xy[1], ref_xy[3]);
+    e[n].sd_m = 0.001f; n++;
+
+    CHECK(apos_geom_seed(e, n, 4, &g_ref_2d, &r) == 0);
+    CHECK(r.node[3].state == APOS_NODE_AMBIGUOUS);
+    CHECK(r.n_ambiguous == 1);
+}
+
 static void test_seed_reproduces_the_exact_layout(void)
 {
     struct apos_edge e[APOS_MAX_EDGES];
@@ -519,6 +611,9 @@ int main(void)
 {
     test_gauge_requires_four_distinct_nodes();
     test_2d_gauge_needs_only_three_distinct_nodes();
+    test_2d_seed_reproduces_the_exact_layout();
+    test_2d_fourth_neighbour_resolves_the_mirror();
+    test_2d_two_neighbours_is_flagged_ambiguous();
     test_free_params_matches_each_dimensionality();
     test_seed_reproduces_the_exact_layout();
     test_gauge_constraints_hold_exactly();
