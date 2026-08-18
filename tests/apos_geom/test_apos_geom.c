@@ -60,6 +60,23 @@ static void test_gauge_requires_four_distinct_nodes(void)
     CHECK(!apos_geom_gauge_valid(&g_ref, 3));
 }
 
+static void test_2d_gauge_needs_only_three_distinct_nodes(void)
+{
+    struct apos_gauge g2 = {.origin = 0, .xaxis = 1, .plane = 2, .up = 0,
+				    .dim = APOS_GEOM_2D};
+    struct apos_gauge bad2 = {.origin = 0, .xaxis = 1, .plane = 1, .up = 0,
+				      .dim = APOS_GEOM_2D};
+
+    /* Three nodes is enough in 2D -- unlike the 3D case in the previous
+     * test, which correctly rejects n_nodes == 3. */
+    CHECK(apos_geom_gauge_valid(&g2, 3));
+    /* origin/xaxis/plane must still be distinct; up (0, same as origin)
+     * is not checked in 2D mode and must NOT be the reason this fails. */
+    CHECK(!apos_geom_gauge_valid(&bad2, 3));
+    /* Below 3 nodes is still invalid. */
+    CHECK(!apos_geom_gauge_valid(&g2, 2));
+}
+
 static void test_seed_reproduces_the_exact_layout(void)
 {
     struct apos_edge e[APOS_MAX_EDGES];
@@ -501,6 +518,7 @@ static void test_free_params_matches_each_dimensionality(void)
 int main(void)
 {
     test_gauge_requires_four_distinct_nodes();
+    test_2d_gauge_needs_only_three_distinct_nodes();
     test_free_params_matches_each_dimensionality();
     test_seed_reproduces_the_exact_layout();
     test_gauge_constraints_hold_exactly();

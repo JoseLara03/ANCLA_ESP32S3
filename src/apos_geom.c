@@ -141,21 +141,27 @@ static int trilaterate3(const float p[3][3], const float r[3],
 
 bool apos_geom_gauge_valid(const struct apos_gauge *g, uint8_t n_nodes)
 {
-	if (!g || n_nodes > APOS_MAX_NODES) {
+	if (!g) {
 		return false;
 	}
 
-	if (n_nodes < APOS_MIN_NODES_3D) {
+	uint8_t min_nodes = (g->dim == APOS_GEOM_2D) ? APOS_MIN_NODES_2D
+						      : APOS_MIN_NODES_3D;
+
+	if (n_nodes < min_nodes || n_nodes > APOS_MAX_NODES) {
 		return false;
 	}
 
+	/* up is the 4th designation and is not read at all in 2D mode -- its
+	 * value there is a "don't care", not a sentinel. */
+	uint8_t n_check = (g->dim == APOS_GEOM_2D) ? 3u : 4u;
 	const uint8_t idx[4] = {g->origin, g->xaxis, g->plane, g->up};
 
-	for (int a = 0; a < 4; a++) {
+	for (uint8_t a = 0; a < n_check; a++) {
 		if (idx[a] >= n_nodes) {
 			return false;
 		}
-		for (int b = a + 1; b < 4; b++) {
+		for (uint8_t b = (uint8_t)(a + 1); b < n_check; b++) {
 			if (idx[a] == idx[b]) {
 				return false;
 			}
