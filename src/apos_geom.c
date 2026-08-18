@@ -145,22 +145,17 @@ bool apos_geom_gauge_valid(const struct apos_gauge *g, uint8_t n_nodes)
 		return false;
 	}
 
-	uint8_t min_nodes = (g->dim == APOS_GEOM_2D) ? APOS_MIN_NODES_2D : APOS_MIN_NODES_3D;
-	if (n_nodes < min_nodes) {
+	if (n_nodes < APOS_MIN_NODES_3D) {
 		return false;
 	}
 
 	const uint8_t idx[4] = {g->origin, g->xaxis, g->plane, g->up};
 
-	/* In 2D mode, only the first three indices matter (origin, xaxis, plane).
-	 * The up index is a "don't care". */
-	int max_idx = (g->dim == APOS_GEOM_2D) ? 3 : 4;
-
-	for (int a = 0; a < max_idx; a++) {
+	for (int a = 0; a < 4; a++) {
 		if (idx[a] >= n_nodes) {
 			return false;
 		}
-		for (int b = a + 1; b < max_idx; b++) {
+		for (int b = a + 1; b < 4; b++) {
 			if (idx[a] == idx[b]) {
 				return false;
 			}
