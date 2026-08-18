@@ -97,13 +97,18 @@ meaningless fix with no error anywhere. That cost a bench session: after an
 anchors on the same baseline and the apex coordinate stranded on a third board.
 
 **The survey is now fully implemented, built, and code-reviewed** — branch
-`feat/anchor-auto-positioning`, fifteen tasks. A gateway enumerates its anchors
-by EUI-64, commands every ordered pair to range, solves the inter-anchor
-geometry in 3D with a gauge-constrained Levenberg-Marquardt fit
-(`src/apos_geom.c`, host-tested), and pushes the solved coordinates back into
-each anchor's NVS (`src/apos_gw.c`, `src/apos_node.c`, `src/apos_shell.c`). Both
-motivating defects above are closed: `anchor_respond_wave_poll()` now **refuses**
-to answer unpositioned rather than reporting `(0, 0)`, and `pos_json_anchors()`
+`feat/anchor-auto-positioning`, fifteen tasks, plus a later branch
+(`feat/apos-2d-survey`) that added a 2D solve mode alongside the original 3D
+one. A gateway enumerates its anchors by EUI-64, commands every ordered pair
+to range, solves the inter-anchor geometry with a gauge-constrained
+Levenberg-Marquardt fit — in 3D (a 4-anchor gauge: origin/xaxis/plane/up) or
+in 2D (a 3-anchor gauge: origin/xaxis/plane, no `up`) — (`src/apos_geom.c`,
+host-tested), and pushes the solved coordinates back into each anchor's NVS
+(`src/apos_gw.c`, `src/apos_node.c`, `src/apos_shell.c`). `apos gauge
+origin=<id> xaxis=<id> plane=<id> [up=<id>]` selects the mode: omitting
+`up=` (or passing `up=-1`) runs a 2D survey. Both motivating defects above
+are closed: `anchor_respond_wave_poll()` now **refuses** to answer
+unpositioned rather than reporting `(0, 0)`, and `pos_json_anchors()`
 publishes the surveyed geometry on `uwb/anchor/setup/<zone>` instead of the
 stub, falling back to the stub only when no survey has ever been applied. The
 full runnable procedure is `docs/anchor-auto-positioning.md`.
@@ -331,10 +336,14 @@ thresholds.
   RANGE_CMD, RANGE_RSP, SETPOS, SETPOS_ACK, SURVEY_END). Deliberately *not*
   added to `uwb_frame_802_15_4z.c`, which must stay byte-identical to the tag's
   copy. Pure C, host-tested in `tests/apos_frame/`.
-- `src/apos_geom.{c,h}` — the sparse 3D solver: a closed-form seed then a
-  gauge-constrained Levenberg-Marquardt refine over a flat edge list, with
-  residual, planarity and reflection-ambiguity diagnostics. Pure C, host-tested
-  in `tests/apos_geom/`. `APOS_MAX_NODES` is 8, not `UWB_MAX_ANCHORS`.
+- `src/apos_geom.{c,h}` — the sparse geometry solver, 2D or 3D: a closed-form
+  seed then a gauge-constrained Levenberg-Marquardt refine over a flat edge
+  list, with residual, planarity (3D) / gauge-collinearity (2D) and
+  reflection-ambiguity diagnostics. `enum apos_geom_dim` (`APOS_GEOM_3D`,
+  the zero value for backward compatibility, or `APOS_GEOM_2D`) selects a
+  4-node (origin/xaxis/plane/up) or 3-node (origin/xaxis/plane) gauge; z stays
+  pinned at 0 for every node in 2D mode. Pure C, host-tested in
+  `tests/apos_geom/`. `APOS_MAX_NODES` is 8, not `UWB_MAX_ANCHORS`.
 - `src/apos_table.{c,h}` — the gateway's working set for one survey: peers keyed
   by **EUI-64** (an `anchor id` swap must not strand a coordinate again),
   directed measurements, and their symmetrisation into inverse-variance-weighted
@@ -627,28 +636,31 @@ thresholds.
   already turns around at 2000 uus; matching it on the reference node is what
   lets `ss_initiator.c` use a single RX window for both peer types. See
   `docs/antenna-delay-calibration.md` §1.1.
-- **On a four-anchor array the survey's `rms_m` is identically zero and proves
-  nothing.** The gauge pins 6 degrees of freedom, so a fit over N placed nodes
-  has `3N-6` free parameters. At N = 4 a full mesh has exactly 6 edges against
-  exactly 6 free parameters — an isostatic system with no spare equation — and
-  LM re-embeds *any* set of distances exactly: `rms_m` and `worst_edge_m` come
-  back at zero however bad the ranging was. From N = 5 to 7 there is enough
-  redundancy for a nonzero `rms_m` but not always enough for `worst_i`/`worst_j`
-  to name the pair actually at fault, because least-squares masking can spread
-  the disagreement onto a merely-correlated edge. Both were reproduced in
-  `tests/apos_geom/test_apos_geom.c`. **The deployment is four ranging slaves,
-  i.e. exactly the degenerate case**, so `"accepted":1` there means only
-  "nothing contradicted the ranges". The code says so rather than hiding it
-  (`apos_gw_result_unverified()`, the `spare_edges`/`rms_meaningful` fields, a
-  `LOG_WRN` pair at solve and again at apply, and a `shell_warn` under the
-  operator's own `apos apply`); the check that actually validates the geometry
-  is a **tape measure**. Do not "fix" this by loosening a threshold — the
-  thresholds are not the problem, the edge count is. **There is no fifth-anchor
-  option to suggest to an operator**: `UWB_MAX_ANCHORS` is 4, `anchor id` is
+- **On a four-anchor array solved in 3D mode, the survey's `rms_m` is
+  identically zero and proves nothing** — but this is a 3D-mode-specific
+  fact, not a hardware ceiling; see the 2D bullet just below for the
+  exception this branch added. The 3D gauge pins 6 degrees of freedom, so a
+  fit over N placed nodes has `3N-6` free parameters. At N = 4 a full mesh has
+  exactly 6 edges against exactly 6 free parameters — an isostatic system with
+  no spare equation — and LM re-embeds *any* set of distances exactly: `rms_m`
+  and `worst_edge_m` come back at zero however bad the ranging was. From N = 5
+  to 7 there is enough redundancy for a nonzero `rms_m` but not always enough
+  for `worst_i`/`worst_j` to name the pair actually at fault, because
+  least-squares masking can spread the disagreement onto a merely-correlated
+  edge. Both were reproduced in `tests/apos_geom/test_apos_geom.c`. **The
+  deployment is four ranging slaves, i.e. exactly the degenerate case when
+  solved in 3D**, so `"accepted":1` there means only "nothing contradicted the
+  ranges". The code says so rather than hiding it (`apos_gw_result_unverified()`,
+  the `spare_edges`/`rms_meaningful` fields, a `LOG_WRN` pair at solve and
+  again at apply, and a `shell_warn` under the operator's own `apos apply`);
+  the check that actually validates the geometry is a **tape measure**. Do not
+  "fix" this by loosening a threshold — the thresholds are not the problem,
+  the edge count is. **There is no fifth-anchor option to suggest to an
+  operator** for growing the 3D case: `UWB_MAX_ANCHORS` is 4, `anchor id` is
   bounded 0..3, and `apos_node.c` refuses a `RANGE_CMD` naming a peer at or
   beyond `UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS`, so `APOS_MAX_NODES` (8) is
-  structural headroom and **every** supported deployment is the degenerate case.
-  Growing past four ranging anchors is engineering work — `UWB_MAX_ANCHORS`,
+  structural headroom, not a way to add a 5th ranging anchor. Growing past
+  four ranging anchors is engineering work — `UWB_MAX_ANCHORS`,
   `disc_schedule`'s stagger, `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS`
   re-derived from that stagger, and the tag's `UWB_FRAME_MAX_ANCHORS` behind a
   frozen wire format. What the operator CAN read on the array they have is
@@ -657,12 +669,22 @@ thresholds.
   `max_sd_mm`, both in the `apos_solve` JSON and in `apos show`. Those make the
   RANGING observable; they do **not** make the geometry over-determined — a
   rigid 4-node framework stays isostatic either way.
-- **A 2D survey (3-anchor gauge) is exactly as degenerate as the 4-anchor 3D
-  case, for the same reason.** `2N-3` free parameters against exactly 3 edges
-  at `N = 3` is isostatic, so `rms_mm` reproduces any input exactly regardless
-  of ranging quality -- identical to the 4-anchor 3D floor this file already
-  documents at length. A 4th (or 5th+) anchor riding along in 2D mode is what
-  turns it verified, exactly as a 5th does in 3D. See
+- **A bare 3-anchor 2D survey is exactly as degenerate as the 4-anchor 3D
+  case above, for the same reason — but 2D mode run over the actual
+  4-anchor deployment is NOT degenerate, and this is the one case on this
+  hardware where `rms_mm` is a real (if weak) quality signal.** `2N-3` free
+  parameters against exactly 3 edges at `N = 3` is isostatic, identical in
+  kind to the 4-anchor 3D floor above. But the deployment described
+  throughout this file is **four** ranging anchors, not three: a 2D gauge
+  only *names* three of them (origin/xaxis/plane); the 4th rides along as an
+  ordinary placed node, exactly as `apos gauge` already supports. At N = 4 in
+  2D that is `2*4-3 = 5` free parameters against the full mesh's 6 edges — one
+  spare equation, confirmed empirically in `tests/apos_geom/test_apos_geom.c`
+  and by hand (corrupting one edge by 300 mm in a 4-node 2D mesh yields
+  `rms_mm ≈ 36.4`, not zero). So on THIS hardware, running the survey in 2D
+  mode over all four anchors is the one configuration where `rms_mm` actually
+  means something; running it in 3D mode, or in 2D with only three anchors
+  total, is not. See
   `docs/superpowers/specs/2026-08-18-apos-2d-survey-design.md`.
 - **`ss_initiator.c` is compiled into the PRODUCTION image.** It was
   `cal_initiator.c` and calibration-only, and the old safety property — "a
