@@ -18,6 +18,7 @@
 #include "anchor_respond.h"
 #include "apos_node.h"
 #include "beacon_guard.h"
+#include "uwb_debug.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_mac.h"
@@ -29,7 +30,11 @@
 
 #include <string.h>
 
-LOG_MODULE_REGISTER(uwb_slave, LOG_LEVEL_INF);
+/* ANCLA_LOG_LEVEL, not LOG_LEVEL_INF: observe_beacon()'s per-beacon line is a
+ * LOG_DBG that an INF cap makes unreachable from a .conf overlay, and the
+ * beacon-guard lock state it prints is an input to every suppression decision
+ * in anchor_respond.c. Still LOG_LEVEL_INF in production -- see uwb_debug.h. */
+LOG_MODULE_REGISTER(uwb_slave, ANCLA_LOG_LEVEL);
 
 /* Longest frame the contract defines is a 37-byte beacon; +FCS, rounded up. */
 #define RX_BUF_LEN 64
@@ -164,6 +169,81 @@ static void observe_beacon(const uint8_t *buf, uint16_t len,
 		beacon_guard_locked(&bguard));
 }
 
+#ifdef CONFIG_ANCLA_RANGING_DEBUG
+
+/* Type byte offset in every frame this network uses -- the module frames and
+ * the legacy WAVE/VEWA pair alike (OFF_TYPE in uwb_frame_802_15_4z.c). Counted
+ * here rather than inside each responder so one place sees every frame that
+ * reached the loop, including the ones every responder declines. */
+#define DBG_OFF_TYPE 9
+#define DBG_HEARTBEAT_MS 1000
+
+static struct {
+	uint32_t rx_ok;
+	uint32_t rx_err;
+	uint32_t wave;   /* 0xE0 legacy poll, addressed to any anchor */
+	uint32_t disc;   /* 0xE2 DISCOVERY broadcast */
+	uint32_t beacon; /* 0xE5 */
+	uint32_t apos;   /* 0xEB survey traffic */
+	uint32_t other;
+} dbg;
+
+static void dbg_count(const uint8_t *buf, uint16_t plen)
+{
+	dbg.rx_ok++;
+	if (plen <= DBG_OFF_TYPE) {
+		dbg.other++;
+		return;
+	}
+	switch (buf[DBG_OFF_TYPE]) {
+	case 0xE0: dbg.wave++;   break;
+	case 0xE2: dbg.disc++;   break;
+	case 0xE5: dbg.beacon++; break;
+	case 0xEB: dbg.apos++;   break;
+	default:
+		dbg.other++;
+		/* Type and length of anything the responders will not claim. A
+		 * DISCOVERY that is well-formed enough to carry 0xE2 but too
+		 * short for UWB_FRAME_LEN_DISC counts as disc above and yet
+		 * produces no {"disc":...} verdict line, so comparing the two is
+		 * what separates a malformed frame from a refused one. */
+		LOG_DBG("{\"rx_other\":{\"type\":\"0x%02X\",\"plen\":%u,"
+			"\"src\":\"0x%04X\"}}",
+			buf[DBG_OFF_TYPE], plen,
+			uwb_frame_get_src_addr(buf));
+		break;
+	}
+}
+
+/* Emitted every second whether or not a single frame arrived.
+ *
+ * An all-zero line is the most decisive observation this board can make on its
+ * own: it separates "deaf" from "hears the tag and declines to answer" with no
+ * sniffer and no tag-side visibility. It also has to keep printing while the
+ * board is deaf -- per-frame logging alone goes silent in exactly the failure it
+ * was added to catch, and that silence is indistinguishable from a wedged
+ * thread, a crashed board or a disconnected console.
+ *
+ * sys is SYS_STATUS_LO, the receiver's own account of itself. "A board that
+ * transmits once per boot and then goes silent is a wedged DW3220" is already a
+ * known failure on this hardware; a heartbeat that keeps ticking with rx_ok at
+ * zero and an unchanging sys word says so directly instead of by elimination.
+ */
+static void dbg_heartbeat(const uwb_config_t *cfg, struct beacon_guard *bg)
+{
+	LOG_INF("{\"slave_hb\":{\"id\":%u,\"addr\":\"0x%04X\","
+		"\"pos_valid\":%u,\"rx_ok\":%u,\"rx_err\":%u,\"wave\":%u,"
+		"\"disc\":%u,\"beacon\":%u,\"apos\":%u,\"other\":%u,"
+		"\"sys\":\"0x%08X\",\"locked\":%u,\"misses\":%u}}",
+		cfg->anchor_id, uwb_config_short_addr(cfg),
+		cfg->position_valid ? 1u : 0u,
+		dbg.rx_ok, dbg.rx_err, dbg.wave, dbg.disc, dbg.beacon,
+		dbg.apos, dbg.other, dwt_readsysstatuslo(),
+		beacon_guard_locked(bg) ? 1u : 0u, beacon_guard_misses(bg));
+	memset(&dbg, 0, sizeof(dbg));
+}
+#endif /* CONFIG_ANCLA_RANGING_DEBUG */
+
 void uwb_slave_run(const uwb_config_t *cfg)
 {
 	/* Snapshot at mode-entry: anchor_shell.c's "anchor id/ant/pos" commands
@@ -208,16 +288,50 @@ void uwb_slave_run(const uwb_config_t *cfg)
 
 	rx_arm();
 
+#ifdef CONFIG_ANCLA_RANGING_DEBUG
+	int64_t next_hb = k_uptime_get() + DBG_HEARTBEAT_MS;
+#endif
+
 	while (1) {
+#ifdef CONFIG_ANCLA_RANGING_DEBUG
+		/* Bounded instead of K_FOREVER so the heartbeat still fires on a
+		 * board that is receiving nothing -- which is the case being
+		 * chased, and the one a purely event-driven log cannot report.
+		 *
+		 * The timeout path deliberately does NOT call rx_arm(). Re-arming
+		 * a receiver on a timer would change the very radio behaviour this
+		 * image exists to observe, and if RX really has been left off,
+		 * the sys word in the heartbeat is the evidence for it; quietly
+		 * repairing the symptom here would destroy that evidence. */
+		int64_t wait_ms = next_hb - k_uptime_get();
+
+		if (wait_ms < 0) {
+			wait_ms = 0;
+		}
+		if (k_sem_take(&rx_sem, K_MSEC(wait_ms)) != 0) {
+			dbg_heartbeat(cfg, &bguard);
+			next_hb = k_uptime_get() + DBG_HEARTBEAT_MS;
+			continue;
+		}
+		if (k_uptime_get() >= next_hb) {
+			dbg_heartbeat(cfg, &bguard);
+			next_hb = k_uptime_get() + DBG_HEARTBEAT_MS;
+		}
+#else
 		k_sem_take(&rx_sem, K_FOREVER);
+#endif
 
 		uint32_t status = rx_status;
 		uint16_t flen = rx_len;
 		rx_pending = false;
 
 		/* flen counts the FCS. Anything that cannot hold one is not a
-		 * frame we can reason about. */
+		 * frame we can reason about. cb_rx_fail() reports flen 0, so this
+		 * is also where an RX error or timeout lands. */
 		if (flen <= FCS_LEN || flen > RX_BUF_LEN) {
+#ifdef CONFIG_ANCLA_RANGING_DEBUG
+			dbg.rx_err++;
+#endif
 			rx_arm();
 			continue;
 		}
@@ -232,6 +346,10 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		/* Payload length: every consumer below derives field counts from
 		 * it, and two extra bytes corrupt them silently. */
 		uint16_t plen = (uint16_t)(flen - FCS_LEN);
+
+#ifdef CONFIG_ANCLA_RANGING_DEBUG
+		dbg_count(rx_buf, plen);
+#endif
 
 		/* Offered to each in turn; each ignores what is not its
 		 * own. APOS goes first and short-circuits: a survey

@@ -15,6 +15,7 @@
 #include <zephyr/logging/log.h>
 
 #include "apos_store.h"
+#include "disc_schedule.h"
 #include "net_config.h"
 #include "net_uplink.h"
 #include "uwb_config.h"
@@ -30,14 +31,21 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 static void log_config(const uwb_config_t *cfg)
 {
+	/* disc_delay_uus is derived from anchor_id, not stored -- printed because
+	 * it is the number that actually decides whether two boards collide.
+	 * Three consoles side by side must show three different values here; two
+	 * boards sharing one answer the tag's DISCOVERY broadcast in the same
+	 * slot, and neither board can detect that locally. */
 	LOG_INF("{\"mode\":\"%s\",\"id\":%u,\"short_addr\":\"0x%04X\","
 		"\"ant_tx\":%u,\"ant_rx\":%u,"
-		"\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"pos_valid\":%u}",
+		"\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"pos_valid\":%u,"
+		"\"disc_delay_uus\":%u}",
 		uwb_config_mode_name(cfg->mode), cfg->anchor_id,
 		uwb_config_short_addr(cfg),
 		cfg->ant_delay_tx, cfg->ant_delay_rx,
 		(double)cfg->x, (double)cfg->y, (double)cfg->z,
-		cfg->position_valid ? 1u : 0u);
+		cfg->position_valid ? 1u : 0u,
+		disc_resp_delay_uus(cfg->anchor_id));
 }
 
 int main(void)

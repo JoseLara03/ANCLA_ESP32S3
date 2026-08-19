@@ -71,4 +71,12 @@ bool beacon_guard_tx_allowed(struct beacon_guard *g, uint32_t tx_at);
 /* Whether the prediction is currently trusted. Diagnostics and tests. */
 bool beacon_guard_locked(const struct beacon_guard *g);
 
+/* The currently predicted start of the next beacon, and how many predicted
+ * beacons have been rolled past unseen. Diagnostics only -- read alongside a
+ * suppressed transmission, they are what turn "the response was suppressed"
+ * into "the response was suppressed because it landed N us from a beacon
+ * predicted from a reception M superframes ago". Meaningless while unlocked. */
+uint32_t beacon_guard_next(const struct beacon_guard *g);
+uint8_t beacon_guard_misses(const struct beacon_guard *g);
+
 #endif /* BEACON_GUARD_H */
