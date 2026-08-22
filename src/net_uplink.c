@@ -480,9 +480,13 @@ static bool drain_fix_queue(void)
 		int n = pos_json_fix(payload_buf, sizeof(payload_buf), &fix);
 
 		if (n < 0) {
-			/* A formatting bug, not a network problem. Never publish
-			 * a truncated JSON document. */
-			LOG_ERR("position payload truncated — dropping fix from 0x%04X",
+			/* A formatting bug or an unresolved tag identity, not a
+			 * network problem. Never publish a truncated JSON
+			 * document, and never publish a fix whose Tid could not
+			 * be derived from an EUI-64 (pos_sink.c should already
+			 * have dropped that one, so reaching here means the two
+			 * guards disagree). */
+			LOG_ERR("position payload refused — dropping fix from 0x%04X",
 				fix.src_addr);
 			continue;
 		}

@@ -174,6 +174,92 @@ static void test_addr_pool_skips_live_seats(void)
     CHECK(gc.short_addr != gb.short_addr);
 }
 
+static void test_tag_id_is_the_low_32_bits_big_endian(void)
+{
+    /* Frozen by hand, because this value is a contract with the customer
+     * platform: it keys its tag records on it. Big-endian read of eui[4..7],
+     * the same byte order `apos enum` prints an EUI-64 in. */
+    const uint8_t eui[UWB_FRAME_EUI_LEN] = {
+        0x70, 0xB8, 0xF6, 0x12, 0x34, 0xAB, 0xCD, 0xEF
+    };
+
+    CHECK(gw_core_tag_id(eui) == 0x34ABCDEFu);   /* 883032047 */
+
+    /* The high four bytes must NOT influence it: two tags sharing an OUI or a
+     * FICR->DEVICEID[0] must still be told apart, and one whose low half
+     * matches must NOT be. */
+    const uint8_t same_low[UWB_FRAME_EUI_LEN] = {
+        0x00, 0x00, 0x00, 0x00, 0x34, 0xAB, 0xCD, 0xEF
+    };
+    CHECK(gw_core_tag_id(same_low) == gw_core_tag_id(eui));
+
+    /* Widest value survives the shifts without sign trouble. */
+    const uint8_t all_ones[UWB_FRAME_EUI_LEN] = {
+        0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF
+    };
+    CHECK(gw_core_tag_id(all_ones) == 0xFFFFFFFFu);
+
+    CHECK(gw_core_tag_id(NULL) == 0);
+}
+
+static void test_eui_by_addr(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui_a[UWB_FRAME_EUI_LEN], eui_b[UWB_FRAME_EUI_LEN];
+    struct gw_grant ga, gb;
+    const uint8_t *got;
+
+    gw_core_init(&c);
+    mk_eui(eui_a, 0x10);
+    mk_eui(eui_b, 0x20);
+    CHECK(gw_core_join(&c, eui_a, 1, &ga));
+    CHECK(gw_core_join(&c, eui_b, 1, &gb));
+
+    got = gw_core_eui_by_addr(&c, ga.short_addr);
+    CHECK(got != NULL && memcmp(got, eui_a, UWB_FRAME_EUI_LEN) == 0);
+    got = gw_core_eui_by_addr(&c, gb.short_addr);
+    CHECK(got != NULL && memcmp(got, eui_b, UWB_FRAME_EUI_LEN) == 0);
+
+    /* No seat holds these: the gateway must say so rather than return a
+     * neighbouring seat's EUI, which would publish one tag's position under
+     * another tag's identity. */
+    CHECK(gw_core_eui_by_addr(&c, 0xBEEF) == NULL);
+    CHECK(gw_core_eui_by_addr(&c, 0) == NULL);          /* 0 == free marker */
+
+    gw_core_release(&c, ga.short_addr);
+    CHECK(gw_core_eui_by_addr(&c, ga.short_addr) == NULL);
+}
+
+/* The regression test for the defect this whole mechanism exists to fix: a tag
+ * that loses its seat and re-JOINs is issued a DIFFERENT short address, but must
+ * keep the SAME platform identity. Publishing the short address as "Tid" made
+ * the platform create a second record for the same physical tag and let the
+ * first go stale. */
+static void test_tag_id_survives_a_lease_expiry_and_rejoin(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant before, after;
+    uint32_t id_before, id_after;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x10);
+
+    CHECK(gw_core_join(&c, eui, 1, &before));
+    id_before = gw_core_tag_id(gw_core_eui_by_addr(&c, before.short_addr));
+
+    /* Silence for a full lease: no KEEPALIVE, so the seat is reclaimed. */
+    for (unsigned i = 0; i < GW_LEASE_SF; i++) gw_core_superframe_tick(&c);
+    CHECK(gw_core_eui_by_addr(&c, before.short_addr) == NULL);
+
+    /* Same tag comes back. */
+    CHECK(gw_core_join(&c, eui, 1, &after));
+    id_after = gw_core_tag_id(gw_core_eui_by_addr(&c, after.short_addr));
+
+    CHECK(after.short_addr != before.short_addr);   /* the lease DID change */
+    CHECK(id_after == id_before);                   /* the identity did NOT */
+}
+
 int main(void)
 {
     test_init();
@@ -185,6 +271,9 @@ int main(void)
     test_release();
     test_slotmap();
     test_addr_pool_skips_live_seats();
+    test_tag_id_is_the_low_32_bits_big_endian();
+    test_eui_by_addr();
+    test_tag_id_survives_a_lease_expiry_and_rejoin();
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;
 }

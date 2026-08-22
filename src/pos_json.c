@@ -15,19 +15,35 @@ int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix)
 {
 	int n;
 
-	/* Tid is fix->src_addr as a PLAIN DECIMAL NUMBER, not hex and not a
-	 * quoted string -- 0x1234 formats as 4660, not "1234". This matches the
-	 * downstream consumer's actual schema; there is no zoneName here, the
-	 * consumer gets the zone from the anchors topic instead.
+	/* Tid is fix->tag_id -- the low 32 bits of the tag's EUI-64, see
+	 * gw_core_tag_id() -- as a PLAIN DECIMAL NUMBER, not hex and not a
+	 * quoted string. This matches the downstream consumer's actual schema;
+	 * there is no zoneName here, the consumer gets the zone from the anchors
+	 * topic instead.
+	 *
+	 * It was fix->src_addr, and that was a bug: the short address is a MAC
+	 * lease the gateway re-issues from a monotonic pool whenever a tag's
+	 * seat expires (gw_core_superframe_tick()), so a tag that dropped out
+	 * for ten seconds came back to the platform as a brand-new device and
+	 * its existing record went stale forever. Tid is the platform's primary
+	 * key for a tag, so it has to be an identity, not a lease.
+	 *
+	 * An unresolved tag_id is refused rather than substituted. pos_sink.c
+	 * already declines to queue those, so this is defence in depth on the
+	 * one field that must never carry a lease-scoped value again.
 	 *
 	 * z is the integer literal 0, not %.2f: the solver is 2D and there is
 	 * no z measurement yet.
 	 *
 	 * residual_m, n_anchors and batt_soc are deliberately absent. They stay
 	 * on pos_sink.c's console log line. */
+	if (!fix->tag_id_valid) {
+		return -1;
+	}
+
 	n = snprintf(buf, len,
 		     "{\"Tid\":%u,\"x\":%.2f,\"y\":%.2f,\"z\":0}",
-		     (unsigned int)fix->src_addr,
+		     (unsigned int)fix->tag_id,
 		     (double)fix->x, (double)fix->y);
 
 	if (n < 0 || (size_t)n >= len) {

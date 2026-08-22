@@ -232,14 +232,27 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 		gw_core_release(ctx, sa);
 	} else if (uwb_frame_is_pos(buf, len)) {
 		struct pos_fix fix;
+		const uint8_t *eui;
 
-		/* Deliberately not gated on gw_core seat state: a fix from a tag
-		 * whose lease just expired is still a real measurement, and
-		 * silently dropping it would be close to undebuggable from the
-		 * broker's side. */
+		/* Decoding is deliberately not gated on gw_core seat state: a fix
+		 * from a tag whose lease just expired is still a real
+		 * measurement, and silently dropping it would be close to
+		 * undebuggable from the broker's side. pos_sink logs every fix
+		 * that gets this far for exactly that reason.
+		 *
+		 * The seat table IS consulted, but only to resolve an identity:
+		 * the 0xEA frame carries the tag's short address, and the EUI-64
+		 * behind it lives in the seat gw_core_join() filled from the
+		 * tag's JOIN. Without that lookup "Tid" is a MAC lease that
+		 * changes on every re-JOIN. */
 		uwb_frame_parse_pos(buf, len, &fix.src_addr, &fix.x, &fix.y,
 				    &fix.residual_m, &fix.n_anchors,
 				    &fix.batt_soc);
+
+		eui = gw_core_eui_by_addr(ctx, fix.src_addr);
+		fix.tag_id = gw_core_tag_id(eui);
+		fix.tag_id_valid = (eui != NULL);
+
 		pos_sink_publish(&fix);
 	}
 	/* Anything else is tag<->anchor ranging traffic. MAC-only: not ours,

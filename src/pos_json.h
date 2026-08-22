@@ -39,15 +39,21 @@
 #define POS_JSON_MAX_LEN 1536
 
 /* Format one fix as the position payload:
- *   {"Tid":4660,"x":1.23,"y":4.56,"z":0}
+ *   {"Tid":305419896,"x":1.23,"y":4.56,"z":0}
  *
- * Tid is fix->src_addr as a plain decimal number (NOT hex, NOT a string) --
- * 0x1234 formats as 4660. z is the integer literal 0: the solver is 2D and
- * there is no z measurement yet.
+ * Tid is fix->tag_id as a plain decimal number (NOT hex, NOT a string): the low
+ * 32 bits of the tag's EUI-64, resolved by the gateway from its seat table. It
+ * is the platform's primary key for a tag and is stable for the life of the
+ * hardware -- see gw_core_tag_id(). It is NOT the short address, which changes
+ * every time a tag's seat expires and it re-JOINs.
  *
- * Returns the number of bytes written excluding the NUL, or -1 if the buffer
- * was too small. On -1 the caller MUST drop the message: publishing a
- * truncated JSON document is worse than publishing nothing. */
+ * z is the integer literal 0: the solver is 2D and there is no z measurement
+ * yet.
+ *
+ * Returns the number of bytes written excluding the NUL, or -1 if the buffer was
+ * too small OR fix->tag_id_valid is false. On -1 the caller MUST drop the
+ * message: publishing a truncated JSON document, or one whose Tid is not a real
+ * tag identity, is worse than publishing nothing. */
 int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix);
 
 /* Format the zone/anchor map for the retained anchors topic.

@@ -287,13 +287,16 @@ thresholds.
   MAC-only for *ranging*; it does not answer ranging polls. It does decode
   `0xEA` POS frames and hand them to `pos_sink`.
 - `src/pos_sink.{c,h}` — consumes decoded tag position fixes. Logs one JSON line
-  per fix (the only place `residual`/`batt` stay visible) and hands the fix to
-  `net_uplink` through a bounded queue.
+  per fix (the only place `residual`/`batt` stay visible, and the only place the
+  short-address ↔ `Tid` mapping is) and hands the fix to `net_uplink` through a
+  bounded queue. A fix whose short address no seat holds is **logged but not
+  uplinked** — see the `Tid` hard-won fact below.
 - `src/pos_json.{c,h}` — MQTT payload formatting. Pure C, host-tested in
   `tests/pos_json/`. The position payload is a **fixed contract** with the
   downstream consumer: `{"Tid":<decimal>,"x":...,"y":...,"z":0}` — `Tid` is
-  `fix->src_addr` as a **plain decimal number** (not hex, not a string; e.g.
-  `0x1234` → `4660`), `z` is the integer `0`, there is no `zoneName` (the
+  `fix->tag_id`, the **low 32 bits of the tag's EUI-64**, as a plain decimal
+  number (not hex, not a string; see the hard-won fact below for why it is no
+  longer `fix->src_addr`), `z` is the integer `0`, there is no `zoneName` (the
   consumer gets the zone from the anchors topic), and the diagnostic fields
   are deliberately absent. `pos_json_anchors()` takes a
   `const struct apos_survey *` and publishes the **surveyed** geometry when one
@@ -505,9 +508,32 @@ thresholds.
   wrong across the wrap and the failure is rare, timing-dependent and looks
   like a radio fault. `beacon_guard.c` does this correctly and
   `tests/beacon_guard/` covers both directions across the boundary.
-- **POS (`0xEA`) is not gated on lease state.** The gateway publishes a fix from
-  any tag, including one whose seat has expired. Telemetry should not depend on
-  MAC bookkeeping, and a silently dropped fix is undebuggable from the broker.
+- **POS (`0xEA`) decoding is not gated on lease state, but publishing is —
+  because `Tid` must be an identity, not a lease.** The gateway decodes and
+  logs a fix from any tag; telemetry should not depend on MAC bookkeeping, and
+  a silently dropped fix is undebuggable. What it will **not** do is publish a
+  fix it cannot tie to an EUI-64. `Tid` used to be `fix->src_addr`, the granted
+  short address — and that address is a lease: `gw_core_superframe_tick()`
+  wipes a seat after `GW_LEASE_SF` (50 superframes ≈ 10 s) with no KEEPALIVE,
+  the next JOIN from that same tag misses `find_seat_by_eui()`, and
+  `alloc_short_addr()` hands out a **fresh** address from the monotonic pool.
+  The customer platform keys its tag records on `Tid`, so a tag that dropped
+  out for ten seconds reappeared as a brand-new device and its existing record
+  went stale — permanently, since the old address is never re-issued until the
+  gateway reboots. `Tid` is now `gw_core_tag_id()` of the EUI-64 the seat
+  carries: the **low 32 bits, read big-endian** (`eui[4..7]`, the byte order
+  `apos enum` prints an EUI in). Not the full 64 bits, deliberately — a decimal
+  EUI-64 exceeds 2^53 and any JSON layer backed by an IEEE-754 double would
+  round it, so two tags could collide on one mangled key. The tag's EUI is
+  `NRF_FICR->DEVICEID` (`tag_testting/src/main.c`), both words random, so the
+  low half carries full entropy. A fix whose address resolves to no live seat
+  is logged (with `"tid":null`) and **dropped**, rate-limited at 10 s: the only
+  fallback available is the short address, i.e. exactly the unstable value this
+  removes. That should be unreachable in normal operation — a tag cannot range
+  without a seat — and is reachable only if the lease expires mid-exchange or
+  the gateway reboots under tags still using granted addresses.
+  `pos_json_fix()` refuses `!tag_id_valid` as well, so the guard holds even if
+  a future caller forgets.
 - **The gateway is MAC-only and holds two reserved values at once.** It uses
   short address `0x0000` per the contract and consumes no `anchor_id`, so the
   four ranging slaves take ids 0..3 (`0x0001`–`0x0004`). The deployment is

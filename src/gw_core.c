@@ -43,6 +43,24 @@ static int find_seat_by_eui(const struct gw_core_ctx *c, const uint8_t eui[UWB_F
     return -1;
 }
 
+uint32_t gw_core_tag_id(const uint8_t eui[UWB_FRAME_EUI_LEN])
+{
+    /* Big-endian read of the last four bytes -- see the rationale in gw_core.h.
+     * Written out rather than memcpy'd into a uint32_t so the result does not
+     * depend on the host's endianness: this value is a wire/platform contract,
+     * and it is host-tested. */
+    if (!eui) return 0;
+    return ((uint32_t)eui[4] << 24) | ((uint32_t)eui[5] << 16) |
+           ((uint32_t)eui[6] << 8)  | (uint32_t)eui[7];
+}
+
+const uint8_t *gw_core_eui_by_addr(const struct gw_core_ctx *c, uint16_t short_addr)
+{
+    int idx = find_seat_by_addr(c, short_addr);
+    if (idx < 0) return NULL;
+    return c->seats[idx].eui;
+}
+
 static uint16_t alloc_short_addr(struct gw_core_ctx *c)
 {
     /* Monotonic pool from GW_TAG_ADDR_BASE; skip any address held by a live

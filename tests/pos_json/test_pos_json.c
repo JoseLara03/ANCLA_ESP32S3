@@ -9,14 +9,72 @@ static int g_fail = 0;
 static void test_fix_exact_contract(void)
 {
     /* The byte-for-byte contract with the downstream consumer. */
-    struct pos_fix f = { .src_addr = 0x1234, .x = 1.23f, .y = 4.56f,
+    struct pos_fix f = { .src_addr = 0x1234, .tag_id = 0x12345678,
+                         .tag_id_valid = true, .x = 1.23f, .y = 4.56f,
                          .residual_m = 0.12f, .n_anchors = 3, .batt_soc = 87 };
     char buf[POS_JSON_MAX_LEN];
     int n = pos_json_fix(buf, sizeof(buf), &f);
 
     CHECK(n > 0);
-    CHECK(strcmp(buf, "{\"Tid\":4660,\"x\":1.23,\"y\":4.56,\"z\":0}") == 0);
+    CHECK(strcmp(buf, "{\"Tid\":305419896,\"x\":1.23,\"y\":4.56,\"z\":0}") == 0);
     CHECK(n == (int)strlen(buf));
+}
+
+/* The whole point of the change: Tid tracks the tag's EUI-derived identity, and
+ * the short address -- a MAC lease that is re-issued whenever a seat expires --
+ * must not appear in the payload at all. */
+static void test_tid_is_the_tag_id_not_the_short_address(void)
+{
+    struct pos_fix f = { .src_addr = 0x0103, .tag_id = 883032047,
+                         .tag_id_valid = true, .x = 0.0f, .y = 0.0f,
+                         .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
+    char buf[POS_JSON_MAX_LEN];
+
+    CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
+    CHECK(strstr(buf, "\"Tid\":883032047,") != NULL);
+    CHECK(strstr(buf, "259") == NULL);   /* 0x0103 decimal, the old Tid */
+
+    /* Same tag after a lease expiry and re-JOIN: new address, same Tid. */
+    f.src_addr = 0x0107;
+    CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
+    CHECK(strstr(buf, "\"Tid\":883032047,") != NULL);
+}
+
+/* An unresolved identity must never be published: the only fallback available
+ * is the short address, i.e. exactly the unstable value this change removes. */
+static void test_fix_refuses_an_unresolved_tag_id(void)
+{
+    struct pos_fix f = { .src_addr = 0x0103, .tag_id = 0,
+                         .tag_id_valid = false, .x = 1.0f, .y = 2.0f,
+                         .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
+    char buf[POS_JSON_MAX_LEN];
+
+    CHECK(pos_json_fix(buf, sizeof(buf), &f) == -1);
+
+    /* A non-zero tag_id with the flag clear is refused too -- the flag is the
+     * authority, not the value, because 0 is a legal tag id. */
+    f.tag_id = 883032047;
+    CHECK(pos_json_fix(buf, sizeof(buf), &f) == -1);
+
+    /* ...and a genuine tag id of 0 (p = 2^-32, but legal) publishes. */
+    f.tag_id = 0;
+    f.tag_id_valid = true;
+    CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
+    CHECK(strstr(buf, "\"Tid\":0,") != NULL);
+}
+
+/* The full 32-bit range must format unsigned: a signed %d would print
+ * 0xFFFFFFFF as -1 and the platform would key a record on a negative id. */
+static void test_tid_spans_the_full_32_bit_range(void)
+{
+    struct pos_fix f = { .src_addr = 0x0101, .tag_id = 0xFFFFFFFFu,
+                         .tag_id_valid = true, .x = 0.0f, .y = 0.0f,
+                         .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
+    char buf[POS_JSON_MAX_LEN];
+
+    CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
+    CHECK(strstr(buf, "\"Tid\":4294967295,") != NULL);
+    CHECK(strstr(buf, "-") == NULL);
 }
 
 static void test_fix_drops_diagnostics(void)
@@ -25,7 +83,8 @@ static void test_fix_drops_diagnostics(void)
      * on the console log line. zoneName is also gone: the consumer looks the
      * zone up via the anchors topic instead. Changing this breaks the
      * consumer contract. */
-    struct pos_fix f = { .src_addr = 0x0001, .x = 0.0f, .y = 0.0f,
+    struct pos_fix f = { .src_addr = 0x0001, .tag_id = 305419896,
+                         .tag_id_valid = true, .x = 0.0f, .y = 0.0f,
                          .residual_m = 9.99f, .n_anchors = 4, .batt_soc = 42 };
     char buf[POS_JSON_MAX_LEN];
 
@@ -39,9 +98,10 @@ static void test_fix_drops_diagnostics(void)
 
 static void test_tid_is_plain_decimal_not_hex(void)
 {
-    /* Tid is fix->src_addr as a bare decimal NUMBER, not a hex string:
-     * 0x00AB must be 171, not "00AB" and not quoted at all. */
-    struct pos_fix f = { .src_addr = 0x00AB, .x = 0.0f, .y = 0.0f,
+    /* Tid is fix->tag_id as a bare decimal NUMBER, not a hex string:
+     * 0x000000AB must be 171, not "000000AB" and not quoted at all. */
+    struct pos_fix f = { .src_addr = 0x0101, .tag_id = 0x000000AB,
+                         .tag_id_valid = true, .x = 0.0f, .y = 0.0f,
                          .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
     char buf[POS_JSON_MAX_LEN];
 
@@ -49,7 +109,7 @@ static void test_tid_is_plain_decimal_not_hex(void)
     CHECK(strstr(buf, "\"Tid\":171,") != NULL);
     CHECK(strstr(buf, "\"Tid\":\"") == NULL);
 
-    f.src_addr = 0xBEEF;
+    f.tag_id = 0xBEEF;
     CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
     CHECK(strstr(buf, "\"Tid\":48879,") != NULL);
 }
@@ -57,7 +117,8 @@ static void test_tid_is_plain_decimal_not_hex(void)
 static void test_z_is_an_integer_literal(void)
 {
     /* The solver is 2D. The consumer expects 0, not 0.00. */
-    struct pos_fix f = { .src_addr = 0x0001, .x = 1.0f, .y = 2.0f,
+    struct pos_fix f = { .src_addr = 0x0001, .tag_id = 305419896,
+                         .tag_id_valid = true, .x = 1.0f, .y = 2.0f,
                          .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
     char buf[POS_JSON_MAX_LEN];
 
@@ -68,7 +129,8 @@ static void test_z_is_an_integer_literal(void)
 
 static void test_negative_and_large_coordinates(void)
 {
-    struct pos_fix f = { .src_addr = 0x0002, .x = -12.345f, .y = 1234.5f,
+    struct pos_fix f = { .src_addr = 0x0002, .tag_id = 305419896,
+                         .tag_id_valid = true, .x = -12.345f, .y = 1234.5f,
                          .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
     char buf[POS_JSON_MAX_LEN];
 
@@ -82,7 +144,8 @@ static void test_negative_and_large_coordinates(void)
 static void test_fix_truncation_is_reported(void)
 {
     /* A partial JSON document must never be published. */
-    struct pos_fix f = { .src_addr = 0x1234, .x = 1.23f, .y = 4.56f,
+    struct pos_fix f = { .src_addr = 0x1234, .tag_id = 305419896,
+                         .tag_id_valid = true, .x = 1.23f, .y = 4.56f,
                          .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
     char small[8];
 
@@ -370,6 +433,9 @@ int main(void)
 {
     test_fix_exact_contract();
     test_fix_drops_diagnostics();
+    test_tid_is_the_tag_id_not_the_short_address();
+    test_fix_refuses_an_unresolved_tag_id();
+    test_tid_spans_the_full_32_bit_range();
     test_tid_is_plain_decimal_not_hex();
     test_z_is_an_integer_literal();
     test_negative_and_large_coordinates();
