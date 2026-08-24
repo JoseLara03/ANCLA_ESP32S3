@@ -237,8 +237,25 @@ static void handle_survey_begin(const uint8_t *buf, uint16_t plen,
 		LOG_ERR("ENUM_RSP build failed (%d)", n);
 		return;
 	}
+
+	/* A suppressed or failed TX here must not be silently lost: with the
+	 * stagger spanning up to APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS (210 ms)
+	 * against a 200 ms superframe, a board that draws one of the longer
+	 * slots is landing its reply right against the next beacon -- exactly
+	 * where beacon_guard_tx_allowed() is designed to refuse. Without a
+	 * retry that board simply never appears in this round's enumeration,
+	 * indistinguishable from it never having answered at all. Same
+	 * one-retry pattern as handle_range_cmd()'s RANGE_RSP below. */
 	apos_frame_set_seq(tx_buf, (*seq)++);
-	tx_now(tx_buf, (uint16_t)n, bg);
+	if (!tx_now(tx_buf, (uint16_t)n, bg)) {
+		LOG_WRN("ENUM_RSP TX failed — retrying once");
+		k_sleep(K_MSEC(5));
+		apos_frame_set_seq(tx_buf, (*seq)++);
+		if (!tx_now(tx_buf, (uint16_t)n, bg)) {
+			LOG_ERR("ENUM_RSP TX failed twice — this board will be "
+				"absent from session %u's enumeration", session);
+		}
+	}
 }
 
 static void handle_setpos(const uint8_t *buf, uint16_t plen,
