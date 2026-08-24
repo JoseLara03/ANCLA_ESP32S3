@@ -36,7 +36,7 @@
 #define UWB_PHY_TXCONFIG_INITIALIZER                                           \
 	{                                                                      \
 		0x34,       /* PG delay */                                     \
-		0xffffffff, /* TX power */                                     \
+		0xfafafafa, /* TX power */                                     \
 		0x0         /* PG count */                                     \
 	}
 

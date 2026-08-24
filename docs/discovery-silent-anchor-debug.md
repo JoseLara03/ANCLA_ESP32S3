@@ -154,13 +154,20 @@ Two known leads, both about the link, neither yet resolved:
   A `verdict:"sent"` the tag never hears is exactly this shape, and it would hit
   the **farthest** anchor first — which fits "not always the same board".
 
-- **`src/uwb_phy.h` carries an uncommitted TX-power change**,
-  `UWB_PHY_TXCONFIG_INITIALIZER` from `0xffffffff` to `0xfafafafa`. Per byte the
-  coarse gain is unchanged and the fine gain drops 63 → 58, roughly 1.25 dB.
-  Small in isolation; not small on a link already 25 dB under budget and failing
-  at 2–3 m. **Establish which value is on each board before reading any
-  capture** — three anchors flashed at different times may not agree.
-  `git diff src/uwb_phy.h` shows the working-tree value.
+- **`src/uwb_phy.h` now carries a reduced TX power**,
+  `UWB_PHY_TXCONFIG_INITIALIZER` at `0xfafafafa` where it was `0xffffffff`. Per
+  byte the coarse gain is unchanged and the fine gain drops 63 → 58, roughly
+  1.25 dB. It is committed as of this branch, but **it has never been measured**.
+  Lowering drive on a link already 25 dB under budget and failing at 2–3 m looks
+  backwards, and it is only defensible under one hypothesis: that the DW3220
+  overdrives the QM14070 PA into compression, so backing off 1.25 dB raises net
+  radiated power instead of lowering it. That hypothesis is untested — the same
+  controlled before/after that was never run for `dwt_setfinegraintxseq(0)`
+  would settle both at once. If a range test gets *worse* after this branch,
+  this line is the first thing to revert.
+  **Establish which value is on each board before reading any capture** — three
+  anchors flashed at different times may not agree, and boards flashed before
+  this commit are still at `0xffffffff`.
 
 `pwr` and `q` in the `{"disc":...}` line are the anchor's Ipatov CIR metrics for
 the **tag's** transmission, so they measure the tag→anchor direction only. The
