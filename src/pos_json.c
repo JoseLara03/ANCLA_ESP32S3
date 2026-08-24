@@ -15,10 +15,18 @@ int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix)
 {
 	int n;
 
-	/* Tid is fix->src_addr as a PLAIN DECIMAL NUMBER, not hex and not a
-	 * quoted string -- 0x1234 formats as 4660, not "1234". This matches the
-	 * downstream consumer's actual schema; there is no zoneName here, the
-	 * consumer gets the zone from the anchors topic instead.
+	/* Tid is fix->tag_id as a PLAIN DECIMAL NUMBER, not hex and not a
+	 * quoted string. tag_id is a stable per-physical-tag value derived
+	 * from the tag's EUI (tag_id_from_eui(), src/tag_id.c) -- NOT
+	 * fix->src_addr, which is only the tag's current MAC short address
+	 * and gets reallocated across a rejoin (gw_core.c's seat table wipes
+	 * a tag's record, EUI included, once its lease expires). Publishing
+	 * src_addr here would make the platform see one physical tag as many
+	 * different Tid values over its lifetime -- this is why the fixed
+	 * contract's *format* (plain decimal, unquoted) survives unchanged
+	 * while its *source field* does not. This matches the downstream
+	 * consumer's actual schema; there is no zoneName here, the consumer
+	 * gets the zone from the anchors topic instead.
 	 *
 	 * z is the integer literal 0, not %.2f: the solver is 2D and there is
 	 * no z measurement yet.
@@ -27,7 +35,7 @@ int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix)
 	 * on pos_sink.c's console log line. */
 	n = snprintf(buf, len,
 		     "{\"Tid\":%u,\"x\":%.2f,\"y\":%.2f,\"z\":0}",
-		     (unsigned int)fix->src_addr,
+		     (unsigned int)fix->tag_id,
 		     (double)fix->x, (double)fix->y);
 
 	if (n < 0 || (size_t)n >= len) {

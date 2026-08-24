@@ -313,11 +313,18 @@ thresholds.
 - `src/pos_sink.{c,h}` — consumes decoded tag position fixes. Logs one JSON line
   per fix (the only place `residual`/`batt` stay visible) and hands the fix to
   `net_uplink` through a bounded queue.
+- `src/tag_id.{c,h}` — FNV-1a 32-bit hash used to derive a tag's stable
+  platform identity (`Tid`) from its EUI. Pure C, host-tested in
+  `tests/tag_id/`.
 - `src/pos_json.{c,h}` — MQTT payload formatting. Pure C, host-tested in
   `tests/pos_json/`. The position payload is a **fixed contract** with the
   downstream consumer: `{"Tid":<decimal>,"x":...,"y":...,"z":0}` — `Tid` is
-  `fix->src_addr` as a **plain decimal number** (not hex, not a string; e.g.
-  `0x1234` → `4660`), `z` is the integer `0`, there is no `zoneName` (the
+  `fix->tag_id` (`src/tag_id.c`'s `tag_id_from_eui()` of the tag's EUI, a
+  **stable per-physical-device id**, resolved from the gateway's seat table
+  at dispatch time — see the "stable tag identity" entry below for why this
+  is not `fix->src_addr`) as a **plain decimal number** (not hex, not a
+  string; e.g. `0x1234` → `4660`), `z` is the integer `0`, there is no
+  `zoneName` (the
   consumer gets the zone from the anchors topic), and the diagnostic fields
   are deliberately absent. `pos_json_anchors()` takes a
   `const struct apos_survey *` and publishes the **surveyed** geometry when one
@@ -777,6 +784,61 @@ thresholds.
   absolute wall-clock (`k_uptime_get()` deltas observed across steps), so a
   skipped step costs latency and never correctness — which is what makes
   refusing to step cheap enough to do liberally.
+- **Stable tag identity (Tid) is derived from the tag's EUI, not its MAC
+  short address — the two are not interchangeable, and this was a real
+  field bug.** `gw_core_superframe_tick()` wipes a seat's entire record,
+  EUI included, the instant its lease ages to zero, and `alloc_short_addr()`
+  is a bare monotonic counter with no memory of previously-issued
+  addresses. So any rejoin after a lease gap — including a plain battery
+  disconnect, which guarantees the old lease can't be renewed in time —
+  got a brand-new, permanently higher short address, and the platform saw
+  one physical tag as several different `Tid` values over its lifetime
+  (`0x0101`, `0x0102`, `0x0103`, ... observed directly on the bench).
+  Fixed without touching the wire format or the tag firmware at all: the
+  gateway already learns a tag's full EUI at JOIN (`struct gw_seat.eui`),
+  and a tag can only be transmitting a POS frame while some gateway is
+  tracking it, so `uwb_gateway.c`'s POS dispatch looks up the sender's EUI
+  from the seat table (`gw_core_find_eui()`) and hashes it (FNV-1a 32-bit,
+  `tag_id_from_eui()`) into `fix.tag_id`, which `pos_json_fix()` now
+  publishes as `Tid` instead of `fix.src_addr`. A single EUI half (either
+  32-bit `NRF_FICR->DEVICEID` word alone) was deliberately rejected as the
+  source: Nordic only guarantees the *combined* 64-bit value unique, and a
+  single half can plausibly repeat within one production batch since these
+  words are typically wafer/lot/die-position derived — hash the whole
+  8-byte EUI, never a slice of it. **`gw_core`'s POS dispatch is
+  deliberately not gated on seat state** (`uwb_gateway.c`'s existing
+  comment on the `uwb_frame_is_pos` branch) — a fix can arrive after its
+  sender's lease, and therefore its seat and the EUI in it, has already
+  expired. `gw_core_find_eui()` returning false is this documented case,
+  not a new error: the fallback is `tag_id = src_addr` for that one
+  straggler fix, logged, and the fix is still published — never dropped.
+  The **per-frame value** of that fallback matches today's pre-fix
+  behavior exactly, not a regression — but the **system-level
+  consequence** is genuinely new, and small: under the old code every fix
+  from a given tag carried the same `Tid` (its `src_addr`), so a straggler
+  after lease expiry was still correctly attributed. Under the new code,
+  that straggler's `Tid` (`src_addr`) differs from every other fix that
+  same tag has ever sent (`hash(EUI)`), so the platform sees a one-record
+  "phantom device" for that single frame — a narrow, accepted cost, not a
+  strict narrowing of an existing gap. This is why `Tid`'s stability is a
+  strong guarantee for a live tag and a best-effort one for a fix that
+  lands in the same superframe as a lease expiry, not an absolute one.
+  Three more honesty notes worth keeping on hand rather than re-deriving:
+  (1) the accepted 32-bit hash-collision bound — for a well-mixed 32-bit
+  hash, P(any collision) is already ~25% at 50,000 devices and ~1.2% at
+  10,000 — "negligible" holds for a single site or a few-thousand-unit
+  fleet and is an accepted tradeoff at large scale, not a mathematical
+  guarantee; (2) a fallback `Tid` (`= src_addr`, which lives in
+  `0x0100..0xFFFD`) has roughly a 1.5×10⁻⁵ per-tag chance of coincidentally
+  landing on some other real tag's hashed `tag_id` — in that rare case the
+  straggler would be silently misattributed to a real (wrong) device
+  rather than merely creating an uninformative phantom record, the one
+  path by which the fallback can be silently wrong about a real tag, not
+  just uninformative; (3) an all-zero EUI (unprogrammed FICR) is accepted
+  by `gw_core_join()` and would hash to a fixed constant value shared by
+  every such tag — not a new hole this fix introduces (the old code had
+  the identical issue via `src_addr` for that scenario), but still true
+  under the new scheme.
 
 ## System context
 
@@ -843,6 +905,9 @@ gcc -Wall -Wextra -Isrc -o tests/apos_table/test_apos_table.exe tests/apos_table
 
 gcc -Wall -Wextra -Isrc -o tests/apos_frame/test_apos_frame.exe tests/apos_frame/test_apos_frame.c src/apos_frame.c
 ./tests/apos_frame/test_apos_frame.exe          # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/tag_id/test_tag_id.exe tests/tag_id/test_tag_id.c src/tag_id.c
+./tests/tag_id/test_tag_id.exe                  # OK, exits 0
 ```
 
 `-lm` is required by the two suites that link `apos_geom.c` — the solver calls

@@ -174,6 +174,80 @@ static void test_addr_pool_skips_live_seats(void)
     CHECK(gc.short_addr != gb.short_addr);
 }
 
+static void test_find_eui_by_addr(void)
+{
+    struct gw_core_ctx c;
+    gw_core_init(&c);
+
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g;
+    mk_eui(eui, 0x42);
+
+    CHECK(gw_core_join(&c, eui, 1, &g));
+
+    uint8_t out[UWB_FRAME_EUI_LEN];
+    CHECK(gw_core_find_eui(&c, g.short_addr, out));
+    CHECK(memcmp(out, eui, UWB_FRAME_EUI_LEN) == 0);
+
+    /* An address with no live seat must fail cleanly, not read garbage. */
+    uint8_t out2[UWB_FRAME_EUI_LEN];
+    CHECK(!gw_core_find_eui(&c, (uint16_t)(g.short_addr + 999), out2));
+
+    /* Address 0 is never a valid seat (0 means "free" in struct gw_seat). */
+    uint8_t out3[UWB_FRAME_EUI_LEN];
+    CHECK(!gw_core_find_eui(&c, 0, out3));
+}
+
+/* The motivating case for the tag_id fallback path (see
+ * uwb_gateway.c's dispatch() and CLAUDE.md's "Stable tag identity" entry):
+ * a tag joins, its lease ages all the way to expiry, and gw_core_find_eui()
+ * must then report false for its former address -- not stale data, not a
+ * crash. Mirrors test_lease_expiry()'s tick pattern. */
+static void test_find_eui_after_lease_expiry(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x10);
+    CHECK(gw_core_join(&c, eui, 1, &g));
+
+    uint8_t out[UWB_FRAME_EUI_LEN];
+    CHECK(gw_core_find_eui(&c, g.short_addr, out));    /* live: resolves */
+
+    for (int i = 0; i < GW_LEASE_SF; i++) gw_core_superframe_tick(&c);
+    CHECK(c.seats[g.slot_index].short_addr == 0);      /* reclaimed */
+
+    uint8_t out2[UWB_FRAME_EUI_LEN];
+    CHECK(!gw_core_find_eui(&c, g.short_addr, out2));  /* expired: false */
+}
+
+/* Second-seat selectivity: each address must resolve to its OWN eui, never
+ * the other tag's -- a lookup that silently returned a neighboring seat's
+ * EUI would be worse than a clean miss. */
+static void test_find_eui_selectivity(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui_a[UWB_FRAME_EUI_LEN], eui_b[UWB_FRAME_EUI_LEN];
+    struct gw_grant ga, gb;
+
+    gw_core_init(&c);
+    mk_eui(eui_a, 0x10);
+    mk_eui(eui_b, 0x20);
+    CHECK(gw_core_join(&c, eui_a, 1, &ga));
+    CHECK(gw_core_join(&c, eui_b, 1, &gb));
+
+    uint8_t out_a[UWB_FRAME_EUI_LEN], out_b[UWB_FRAME_EUI_LEN];
+    CHECK(gw_core_find_eui(&c, ga.short_addr, out_a));
+    CHECK(gw_core_find_eui(&c, gb.short_addr, out_b));
+
+    CHECK(memcmp(out_a, eui_a, UWB_FRAME_EUI_LEN) == 0);
+    CHECK(memcmp(out_b, eui_b, UWB_FRAME_EUI_LEN) == 0);
+    CHECK(memcmp(out_a, eui_b, UWB_FRAME_EUI_LEN) != 0);
+    CHECK(memcmp(out_b, eui_a, UWB_FRAME_EUI_LEN) != 0);
+}
+
 int main(void)
 {
     test_init();
@@ -185,6 +259,9 @@ int main(void)
     test_release();
     test_slotmap();
     test_addr_pool_skips_live_seats();
+    test_find_eui_by_addr();
+    test_find_eui_after_lease_expiry();
+    test_find_eui_selectivity();
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;
 }

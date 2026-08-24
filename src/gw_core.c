@@ -55,6 +55,18 @@ static uint16_t alloc_short_addr(struct gw_core_ctx *c)
     return GW_TAG_ADDR_BASE; /* unreachable with < GW_N_CFP live seats */
 }
 
+bool gw_core_find_eui(const struct gw_core_ctx *c, uint16_t short_addr,
+                      uint8_t eui_out[UWB_FRAME_EUI_LEN])
+{
+    int idx = find_seat_by_addr(c, short_addr);
+
+    if (idx < 0) {
+        return false;
+    }
+    memcpy(eui_out, c->seats[idx].eui, UWB_FRAME_EUI_LEN);
+    return true;
+}
+
 bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
                   uint8_t req_tier, struct gw_grant *out)
 {

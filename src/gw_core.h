@@ -49,4 +49,13 @@ void gw_core_release(struct gw_core_ctx *c, uint16_t short_addr);
 void gw_core_superframe_tick(struct gw_core_ctx *c);
 void gw_core_build_slotmap(const struct gw_core_ctx *c, uint16_t out[GW_N_CFP]);
 
+/* Look up the EUI of whichever seat currently holds `short_addr`. Returns
+ * false (and leaves eui_out untouched) if no live seat holds that address --
+ * this can legitimately happen for a POS frame that arrives just after its
+ * sender's lease expired (see uwb_gateway.c's dispatch(), which does not
+ * gate POS on seat state). Callers must have a fallback for false, not
+ * treat it as an error. */
+bool gw_core_find_eui(const struct gw_core_ctx *c, uint16_t short_addr,
+                      uint8_t eui_out[UWB_FRAME_EUI_LEN]);
+
 #endif /* GW_CORE_H */

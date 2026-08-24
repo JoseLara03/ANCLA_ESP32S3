@@ -8,8 +8,10 @@ static int g_fail = 0;
 
 static void test_fix_exact_contract(void)
 {
-    /* The byte-for-byte contract with the downstream consumer. */
-    struct pos_fix f = { .src_addr = 0x1234, .x = 1.23f, .y = 4.56f,
+    /* The byte-for-byte contract with the downstream consumer. src_addr and
+     * tag_id are deliberately different: if the code ever regresses back to
+     * reading src_addr, this test must fail rather than pass by coincidence. */
+    struct pos_fix f = { .src_addr = 0x9999, .tag_id = 4660, .x = 1.23f, .y = 4.56f,
                          .residual_m = 0.12f, .n_anchors = 3, .batt_soc = 87 };
     char buf[POS_JSON_MAX_LEN];
     int n = pos_json_fix(buf, sizeof(buf), &f);
@@ -39,9 +41,12 @@ static void test_fix_drops_diagnostics(void)
 
 static void test_tid_is_plain_decimal_not_hex(void)
 {
-    /* Tid is fix->src_addr as a bare decimal NUMBER, not a hex string:
-     * 0x00AB must be 171, not "00AB" and not quoted at all. */
-    struct pos_fix f = { .src_addr = 0x00AB, .x = 0.0f, .y = 0.0f,
+    /* Tid is fix->tag_id as a bare decimal NUMBER, not a hex string:
+     * 0x00AB must be 171, not "00AB" and not quoted at all. src_addr is
+     * held at a fixed, distinguishable value throughout so a regression
+     * back to reading src_addr would be caught rather than pass by
+     * coincidence. */
+    struct pos_fix f = { .src_addr = 0x0001, .tag_id = 0x00AB, .x = 0.0f, .y = 0.0f,
                          .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
     char buf[POS_JSON_MAX_LEN];
 
@@ -49,9 +54,24 @@ static void test_tid_is_plain_decimal_not_hex(void)
     CHECK(strstr(buf, "\"Tid\":171,") != NULL);
     CHECK(strstr(buf, "\"Tid\":\"") == NULL);
 
-    f.src_addr = 0xBEEF;
+    f.tag_id = 0xBEEF;
     CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
     CHECK(strstr(buf, "\"Tid\":48879,") != NULL);
+}
+
+static void test_tid_is_tag_id_not_src_addr(void)
+{
+    /* If this ever regresses back to reading src_addr, this is the test
+     * that catches it: src_addr and tag_id are deliberately different
+     * values here, and only one of them may appear as Tid. */
+    struct pos_fix f = { .src_addr = 0x0001, .tag_id = 999888777,
+                         .x = 0.0f, .y = 0.0f,
+                         .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 0 };
+    char buf[POS_JSON_MAX_LEN];
+
+    CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
+    CHECK(strstr(buf, "\"Tid\":999888777") != NULL);
+    CHECK(strstr(buf, "\"Tid\":1,") == NULL);   /* src_addr's decimal value must NOT appear */
 }
 
 static void test_z_is_an_integer_literal(void)
@@ -371,6 +391,7 @@ int main(void)
     test_fix_exact_contract();
     test_fix_drops_diagnostics();
     test_tid_is_plain_decimal_not_hex();
+    test_tid_is_tag_id_not_src_addr();
     test_z_is_an_integer_literal();
     test_negative_and_large_coordinates();
     test_fix_truncation_is_reported();
