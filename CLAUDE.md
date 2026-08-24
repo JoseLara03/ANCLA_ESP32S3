@@ -824,11 +824,11 @@ thresholds.
   strong guarantee for a live tag and a best-effort one for a fix that
   lands in the same superframe as a lease expiry, not an absolute one.
   Three more honesty notes worth keeping on hand rather than re-deriving:
-  (1) the accepted 32-bit hash-collision bound — for a well-mixed 32-bit
-  hash, P(any collision) is already ~25% at 50,000 devices and ~1.2% at
-  10,000 — "negligible" holds for a single site or a few-thousand-unit
-  fleet and is an accepted tradeoff at large scale, not a mathematical
-  guarantee; (2) a fallback `Tid` (`= src_addr`, which lives in
+  (1) the accepted hash-collision bound — the space is **2^31, not 2^32**
+  (see the int32 entry below), so P(any collision) is ~44% at 50,000
+  devices, ~2.3% at 10,000 and ~0.02% at 1,000 — "negligible" holds for a
+  single site or a few-thousand-unit fleet and is an accepted tradeoff at
+  large scale, not a mathematical guarantee; (2) a fallback `Tid` (`= src_addr`, which lives in
   `0x0100..0xFFFD`) has roughly a 1.5×10⁻⁵ per-tag chance of coincidentally
   landing on some other real tag's hashed `tag_id` — in that rare case the
   straggler would be silently misattributed to a real (wrong) device
@@ -839,6 +839,35 @@ thresholds.
   every such tag — not a new hole this fix introduces (the old code had
   the identical issue via `src_addr` for that scenario), but still true
   under the new scheme.
+
+- **`Tid` must fit a POSITIVE signed 32-bit integer — the platform's column
+  is `int32`, not `uint32`, and it drops anything above `INT32_MAX` in
+  silence.** Diagnosed on the bench 2026-08-24 with three tags connected:
+  the two at `Tid` 693116308 and 2082962887 appeared on the platform and
+  the one at 2728562623 (`0xA2A28FBF`, the only one with bit 31 set) never
+  did. **The gateway was blameless and proving that first is what made this
+  quick** — `struct pos_fix.tag_id` is `uint32_t`, `uwb_gateway.c` fills it
+  from `tag_id_from_eui()`, `pos_sink.c`'s console line and
+  `pos_json_fix()` both format `%u`, and `net_uplink.c` publishes the
+  buffer verbatim; compiling `pos_json.c` on the host and running that
+  exact value through it emits `{"Tid":2728562623,...}`, correct and
+  unsigned. So the truncation is downstream, in a consumer this project
+  does not own and cannot change. Not a float64/2^53 rounding problem
+  either — all three values are exactly representable as doubles; the
+  boundary is specifically 2^31. Fixed at the only place that can enforce
+  it structurally: `tag_id_from_eui()` now returns `hash & 0x7FFFFFFF`.
+  **Masking, not remapping, and that choice is load-bearing** — the mask is
+  the identity for every hash that already fits, so tags already visible on
+  the platform keep their existing `Tid` and only the broken ones move
+  (2728562623 → 581078975). A modulo or a fold would have renumbered every
+  tag at once and orphaned every existing platform record. The other
+  `fix.tag_id` writer, the `= src_addr` straggler fallback, is a `uint16_t`
+  and can never exceed the bound, so both assignment sites are covered by
+  construction. Cost is the halved id space, already folded into the
+  collision bound above. `tests/tag_id/` pins the range as a contract, and
+  its FNV-1a reference vectors are written as `<published value> &
+  0x7FFFFFFF` so they still check the hash itself rather than only the
+  masking layered on top.
 
 ## System context
 

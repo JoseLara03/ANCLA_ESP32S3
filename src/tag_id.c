@@ -14,5 +14,11 @@ uint32_t tag_id_from_eui(const uint8_t *data, size_t len)
         hash ^= data[i];
         hash *= 16777619u;         /* FNV-1a 32-bit prime */
     }
-    return hash;
+
+    /* Clear bit 31 so the result always fits a POSITIVE signed 32-bit
+     * integer. The downstream platform stores Tid in a signed 32-bit column;
+     * a value above INT32_MAX arrives there negative and the record is
+     * silently dropped. See tag_id.h for why this is masked and not
+     * remapped. */
+    return hash & 0x7FFFFFFFu;
 }
