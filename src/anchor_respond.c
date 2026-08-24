@@ -14,6 +14,7 @@
 
 #include "disc_schedule.h"
 #include "uwb_dwtime.h"
+#include "uwb_debug.h"
 #include "uwb_frame_802_15_4z.h"
 
 #include <zephyr/kernel.h>
@@ -23,7 +24,11 @@
 
 #include <string.h>
 
-LOG_MODULE_REGISTER(anchor_respond, LOG_LEVEL_INF);
+/* ANCLA_LOG_LEVEL, not LOG_LEVEL_INF: the two LOG_DBG lines below (the
+ * beacon-guard suppression verdicts) are the whole point of the debug image
+ * and a per-module INF cap makes them unreachable from a .conf overlay. Still
+ * LOG_LEVEL_INF in production -- see src/uwb_debug.h. */
+LOG_MODULE_REGISTER(anchor_respond, ANCLA_LOG_LEVEL);
 
 /* Bound for tx_delayed()'s post-dwt_starttx() TXFRS wait. Must exceed the
  * WORST-CASE scheduled delay across both responders, not just a frame's
@@ -86,8 +91,39 @@ static uint8_t tx_resp_msg[] = {
 	0, 0        /* FCS        @27..28 */
 };
 
-static void tx_delayed(const uint8_t *buf, uint16_t payload_len, uint32_t tx_time,
-		       int ranging)
+/* Why a verdict rather than void: "the anchor did not answer" has four
+ * distinct causes on this path -- the frame was not for us, the beacon guard
+ * refused, dwt_starttx() rejected the slot, or the transmission was armed and
+ * never completed -- and from the tag's side, from a sniffer, and in the log as
+ * it stood, all four look identical. Separating them is the point of the debug
+ * image; the caller pairs this with the beacon-guard state to name the cause. */
+enum tx_verdict {
+	TX_SENT = 0,
+	TX_MISSED_SLOT,  /* dwt_starttx() rejected the scheduled time */
+	TX_NO_TXFRS,     /* armed, but TXFRS never set within the bound */
+};
+
+/* The fourth cause, a beacon-guard refusal, never reaches this enum: the
+ * callers check the guard first and return without touching the radio, so they
+ * report "suppressed" themselves.
+ *
+ * Unconditional and static inline, not guarded on CONFIG_ANCLA_RANGING_DEBUG:
+ * Zephyr's LOG_DBG expands its arguments even where the level is compiled out
+ * (Z_LOG_TO_PRINTK), so a helper hidden behind the flag fails to compile in the
+ * production image. static inline is what keeps it from warning as unused
+ * there. Same reason for hi32_delta_uus() below. */
+static inline const char *tx_verdict_name(enum tx_verdict v)
+{
+	switch (v) {
+	case TX_SENT:        return "sent";
+	case TX_MISSED_SLOT: return "missed_slot";
+	case TX_NO_TXFRS:    return "no_txfrs";
+	default:             return "?";
+	}
+}
+
+static enum tx_verdict tx_delayed(const uint8_t *buf, uint16_t payload_len,
+				  uint32_t tx_time, int ranging)
 {
 	dwt_setdelayedtrxtime(tx_time);
 	dwt_writetxdata(payload_len, (uint8_t *)(uintptr_t)buf, 0);
@@ -96,7 +132,7 @@ static void tx_delayed(const uint8_t *buf, uint16_t payload_len, uint32_t tx_tim
 	if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
 		dwt_forcetrxoff();
 		LOG_WRN("delayed TX missed its slot — response dropped");
-		return;
+		return TX_MISSED_SLOT;
 	}
 
 	/* Safe to poll: TXFRS is not in the enabled interrupt mask (uwb_slave.c
@@ -111,9 +147,19 @@ static void tx_delayed(const uint8_t *buf, uint16_t payload_len, uint32_t tx_tim
 	if (!uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK, TX_COMPLETE_TIMEOUT_MS)) {
 		dwt_forcetrxoff();
 		LOG_WRN("delayed TX started but TXFRS never completed — forced off");
-		return;
+		return TX_NO_TXFRS;
 	}
 	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+	return TX_SENT;
+}
+
+/* Signed hi32 tick difference expressed in UUS, for "how far was this
+ * transmission from the beacon". hi32 wraps every ~17.2 s, so the subtraction
+ * has to be signed before it is scaled -- see UUS_TO_HI32 in uwb_dwtime.h.
+ * UUS_TO_HI32(1) is 256, hence the divisor. */
+static inline int32_t hi32_delta_uus(uint32_t a, uint32_t b)
+{
+	return (int32_t)(a - b) / 256;
 }
 
 void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
@@ -139,6 +185,13 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
 		return;
 	}
 	if (buf[POS_ANCHOR_ID_IDX] != wire_id) {
+		/* Not ours -- but proof that this board is hearing the tag poll
+		 * SOMEBODY. That distinction is the first fork in diagnosing a
+		 * silent anchor: a board logging polls for other ids has a
+		 * working receiver and a live tag, so the fault is downstream
+		 * of RX. A board logging nothing at all does not. */
+		LOG_DBG("{\"wave_other\":{\"polled_id\":%u,\"our_id\":%u}}",
+			buf[POS_ANCHOR_ID_IDX], wire_id);
 		return;
 	}
 
@@ -192,7 +245,10 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
 		(((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + cfg->ant_delay_tx;
 
 	if (bg && !beacon_guard_tx_allowed(bg, resp_tx_time)) {
-		LOG_DBG("WAVE response suppressed — would land on the beacon");
+		LOG_DBG("{\"wave\":{\"id\":%u,\"verdict\":\"suppressed\","
+			"\"to_beacon_uus\":%d,\"misses\":%u}}",
+			wire_id, hi32_delta_uus(beacon_guard_next(bg), resp_tx_time),
+			beacon_guard_misses(bg));
 		return;
 	}
 
@@ -205,7 +261,18 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
 
 	/* tx_resp_msg already carries the two FCS placeholder bytes, hence
 	 * ranging=1 and no extra FCS_LEN in writetxfctrl. */
-	tx_delayed(tx_resp_msg, sizeof(tx_resp_msg), resp_tx_time, 1);
+	enum tx_verdict verdict =
+		tx_delayed(tx_resp_msg, sizeof(tx_resp_msg), resp_tx_time, 1);
+
+	/* After the transmission, never before: this path has a 2000 uus
+	 * turnaround budget (POLL_RX_TO_RESP_TX_DLY_UUS) and a formatting call
+	 * ahead of dwt_starttx() spends it. Nothing logged here is needed to
+	 * build the frame, so it all waits. */
+	LOG_DBG("{\"wave\":{\"id\":%u,\"verdict\":\"%s\","
+		"\"to_beacon_uus\":%d,\"locked\":%u}}",
+		wire_id, tx_verdict_name(verdict),
+		bg ? hi32_delta_uus(beacon_guard_next(bg), resp_tx_time) : 0,
+		(bg && beacon_guard_locked(bg)) ? 1u : 0u);
 }
 
 void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx_ts,
@@ -228,14 +295,35 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 		LOG_WRN("response build failed (%d)", n);
 		return;
 	}
-	uwb_frame_set_seq_num(out, (*seq)++);
+	uint8_t used_seq = (*seq)++;
+
+	uwb_frame_set_seq_num(out, used_seq);
 
 	uint32_t delay_uus = disc_resp_delay_uus(cfg->anchor_id);
 	uint32_t resp_tx_time = (uint32_t)((disc_rx_ts +
 		((uint64_t)delay_uus * UUS_TO_DWT_TIME)) >> 8);
 
 	if (bg && !beacon_guard_tx_allowed(bg, resp_tx_time)) {
-		LOG_DBG("DISCOVERY response suppressed — would land on the beacon");
+		/* Logged in full here rather than deferred: there is no
+		 * transmission left to delay on this branch, so the whole
+		 * turnaround budget is already forfeit.
+		 *
+		 * to_beacon_uus is the measurement that makes this branch
+		 * actionable. The stagger puts anchor id N's reply at
+		 * DISC_BASE_UUS + N*DISC_SLOT_UUS after the tag's broadcast, and
+		 * the forbidden window is guard+occupancy+guard = 4500 uus wide
+		 * against a 3500 uus slot pitch -- so where the tag's broadcast
+		 * falls in the superframe decides WHICH id gets refused, and one
+		 * id being refused every round while its neighbours pass is what
+		 * this line proves. seq is consumed above, before this refusal,
+		 * so a gap in this board's sequence numbers on a sniffer capture
+		 * lines up against these lines one-for-one. */
+		LOG_DBG("{\"disc\":{\"tag\":\"0x%04X\",\"id\":%u,\"seq\":%u,"
+			"\"delay_uus\":%u,\"verdict\":\"suppressed\","
+			"\"to_beacon_uus\":%d,\"misses\":%u}}",
+			tag_addr, cfg->anchor_id, used_seq, delay_uus,
+			hi32_delta_uus(beacon_guard_next(bg), resp_tx_time),
+			beacon_guard_misses(bg));
 		return;
 	}
 
@@ -243,11 +331,28 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 	 * Logged after, not before: a synchronous log call ahead of the
 	 * delayed-TX setup would eat into DISC_BASE_UUS/DISC_SLOT_UUS's already
 	 * tight budget on this port (see disc_schedule.h). */
-	tx_delayed(out, (uint16_t)n, resp_tx_time, 0);
+	enum tx_verdict verdict = tx_delayed(out, (uint16_t)n, resp_tx_time, 0);
 
-	/* LOG_DBG, not LOG_INF: compiles out at this module's LOG_LEVEL_INF.
-	 * Link-budget timing matters more than per-DISCOVERY visibility here --
-	 * bump the module's registered level to re-enable for debugging. */
-	LOG_DBG("DISC from 0x%04X -> resp src 0x%04X pwr=%d q=%u", tag_addr,
-		uwb_config_short_addr(cfg), cir_power, cir_quality);
+	/* One line per DISCOVERY, carrying every input to the decision as well
+	 * as its outcome, because "this anchor did not answer" has to be
+	 * resolvable from the anchor's own console without a sniffer:
+	 *   - the line existing at all proves the frame was received and
+	 *     accepted as a DISCOVERY (the two silent early returns above);
+	 *   - id/delay_uus is this board's stagger slot, which is what a
+	 *     duplicate `anchor id` across two boards collapses -- two anchors
+	 *     printing the same id here answer in the same slot and collide on
+	 *     air, and neither board sees anything wrong locally;
+	 *   - verdict separates sent / missed_slot / no_txfrs, which are three
+	 *     different faults that used to share one silence;
+	 *   - to_beacon_uus and locked place the reply against the beacon the
+	 *     guard is predicting, so a suppression is readable as a timing
+	 *     relationship rather than a verdict to be taken on faith. */
+	LOG_DBG("{\"disc\":{\"tag\":\"0x%04X\",\"id\":%u,\"seq\":%u,"
+		"\"delay_uus\":%u,\"verdict\":\"%s\",\"to_beacon_uus\":%d,"
+		"\"locked\":%u,\"pwr\":%d,\"q\":%u}}",
+		tag_addr, cfg->anchor_id, used_seq, delay_uus,
+		tx_verdict_name(verdict),
+		bg ? hi32_delta_uus(beacon_guard_next(bg), resp_tx_time) : 0,
+		(bg && beacon_guard_locked(bg)) ? 1u : 0u,
+		cir_power, cir_quality);
 }

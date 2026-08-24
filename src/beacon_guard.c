@@ -60,3 +60,13 @@ bool beacon_guard_locked(const struct beacon_guard *g)
 {
 	return g->locked;
 }
+
+uint32_t beacon_guard_next(const struct beacon_guard *g)
+{
+	return g->next_beacon;
+}
+
+uint8_t beacon_guard_misses(const struct beacon_guard *g)
+{
+	return g->misses;
+}

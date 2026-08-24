@@ -182,6 +182,22 @@ production build (no `EXTRA_CONF_FILE`) compiles none of the `cal_*.c` files —
 but it *does* compile `ss_initiator.c`, which the anchor survey needs; see the
 hard-won fact below for where the safety property moved to.
 
+There is also a **debug image**, same mechanism, for the ranging path:
+
+```powershell
+west build -b ancla_esp32s3/esp32s3/procpu --pristine -d build_dbg -- "-DEXTRA_CONF_FILE=debug.conf"
+west flash -d build_dbg
+```
+
+Quote the `-D`: PowerShell splits an unquoted `-DEXTRA_CONF_FILE=debug.conf` at
+the dot and the build fails looking for a file named `debug`. `debug.conf` sets
+`CONFIG_ANCLA_RANGING_DEBUG=y`, which compiles in a per-DISCOVERY and per-WAVE
+verdict line, a per-second SLAVE RX heartbeat, and the beacon-guard state behind
+every suppression. It changes no frame, no timing constant and no gate, so a
+debug board is an ordinary peer on air and mixes with production boards — but it
+is not a deployment image (per-frame console traffic plus one extra SPI read per
+second on the SLAVE loop). See `docs/discovery-silent-anchor-debug.md`.
+
 ## Console
 
 Native USB-JTAG (not UART0), prompt `uwb:~$ `.
@@ -372,6 +388,15 @@ thresholds.
   defines `CONFIG_ANCLA_CAL_MODE`.
 - `cal.conf` — the `EXTRA_CONF_FILE` overlay that builds the calibration image
   instead of production (see "Build & flash").
+- `src/uwb_debug.h` — `ANCLA_LOG_LEVEL`, the one symbol the ranging modules
+  register their log level through, so `CONFIG_ANCLA_RANGING_DEBUG` can reach
+  their `LOG_DBG` lines. Resolves to `LOG_LEVEL_INF` in production.
+- `debug.conf` — the `EXTRA_CONF_FILE` overlay that builds the debug image (see
+  "Build & flash").
+- `docs/discovery-silent-anchor-debug.md` — the capture procedure and decision
+  table for the open "a surveyed anchor stops answering DISCOVERY after a power
+  cycle" fault: what each debug line means, and which candidate cause each log
+  pattern confirms or kills.
 - `docs/antenna-delay-calibration.md` — the operator procedure for the above:
   DWM3001CDK prerequisites, physical setup, `cal ref`, the `cal peer`
   cross-check and its acceptance threshold, troubleshooting.
@@ -731,6 +756,20 @@ thresholds.
   `WAVE poll refused — no surveyed position` in the monitor before suspecting
   the radio. The survey-window exception is what lets the gate exist at all: in
   a cold deployment every anchor is unpositioned yet must answer its peers.
+- **A per-module log level is a compile-time cap that no `.conf` and no shell
+  command can lift.** Every module on the ranging path registers explicitly
+  (`LOG_MODULE_REGISTER(anchor_respond, LOG_LEVEL_INF)`), and `LOG_DBG` under
+  such a module is not filtered at runtime — it is not in the binary.
+  `CONFIG_LOG_DEFAULT_LEVEL` only supplies a level to modules that register
+  WITHOUT one, so raising it does nothing for these and merely promotes the whole
+  WiFi/net/mbedTLS stack to DBG. `CONFIG_LOG_RUNTIME_FILTERING` is already `y`
+  here, so `log enable dbg <module>` exists in production and is useless for the
+  same reason: it can only narrow what a build compiled in. Recovering those
+  lines takes a rebuild, which is what `ANCLA_LOG_LEVEL` (`src/uwb_debug.h`) and
+  `debug.conf` exist for. Corollary, learned the hard way: Zephyr's `LOG_DBG`
+  still **expands its arguments** where the level is compiled out
+  (`Z_LOG_TO_PRINTK`), so any helper a debug-only log line calls must exist in
+  the production build too — `static inline` keeps it from warning as unused.
 - **`apos_gw_step()` may emit at most one frame per call.** It runs on the
   `K_PRIO_COOP(0)` loop that arms the beacon, so a step that transmits twice, or
   blocks, delays the beacon for the whole network. Same class of hazard as the

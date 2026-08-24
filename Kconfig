@@ -14,6 +14,23 @@ config ANCLA_CAL_MODE
 	  enable this: a deployed anchor transmitting unsolicited polls would
 	  collide with tag ranging traffic.
 
+config ANCLA_RANGING_DEBUG
+	bool "Ranging-path diagnostics"
+	help
+	  Compile in the DISCOVERY/WAVE responder verdict lines, the SLAVE
+	  loop's RX heartbeat and frame counters, and raise the ranging
+	  modules' per-module log levels to DBG.
+
+	  Needed because those modules register at LOG_LEVEL_INF explicitly,
+	  which hard-caps them no matter what CONFIG_LOG_DEFAULT_LEVEL says --
+	  the beacon-guard suppression verdict in particular is a LOG_DBG that
+	  a .conf overlay alone cannot reach. See src/uwb_debug.h.
+
+	  Changes no frame, no timing constant and no gate, so a debug board
+	  is a normal peer on air. It is still not a deployment image: the
+	  per-frame logging and the heartbeat's extra SPI read both cost time
+	  on the SLAVE loop.
+
 endmenu
 
 source "Kconfig.zephyr"
