@@ -311,8 +311,14 @@ thresholds.
   the functions are wrappers so `tests/mac_budget/` can sweep parameters. Byte
   counts **exclude** the FCS, matching `UWB_FRAME_LEN_*`. See
   `docs/superpowers/specs/2026-08-25-rtls-scale-tdoa-design.md` §3.
-- `src/gw_core.{c,h}` — CFP seat table, leases and the tag address pool. Pure
-  C, ported unchanged from the nRF5 gateway, host-tested in `tests/gw_core/`.
+- `src/gw_core.{c,h}` — seat table, leases, tag address pool, and the
+  per-superframe slot schedule. Pure C, host-tested in `tests/gw_core/`. No
+  longer "ported unchanged from the nRF5 gateway": **seats and slots are now
+  separate things.** `seats[GW_MAX_SEATS]` (128) is indexed by seat id, and the
+  beacon's slot map is an earliest-deadline-first schedule over them, rebuilt
+  every superframe inside `gw_core_superframe_tick()`. Admission control counts
+  slot-superframes against `GW_SCHED_CAPACITY` (275), the same accounting
+  `mac_budget.h` uses.
 - `src/beacon_guard.{c,h}` — predicts the next beacon and refuses any delayed
   TX that would land on it. Pure C, host-tested in `tests/beacon_guard/`.
 - `src/anchor_respond.{c,h}` — the WAVE/0xE1 and DISCOVERY/0xE4 responders.
@@ -562,6 +568,40 @@ thresholds.
   wrong across the wrap and the failure is rare, timing-dependent and looks
   like a radio fault. `beacon_guard.c` does this correctly and
   `tests/beacon_guard/` covers both directions across the boundary.
+- **A tag missing from the beacon's slot map means "not your turn", NOT "seat
+  reclaimed" — since proto_ver 3.** The map used to be an ownership table and
+  `seats[]` was indexed by CFP slot, so 11 slots meant 11 tags
+  (`gw_core_join()` returned false for the 12th) and every seat was named in
+  every superframe whatever its tier. That is why the MAC contract's §5.1 claim
+  that low tiers "hand airtime back" was never true: tiers saved tag battery
+  and no network capacity at all. Now the map is a schedule, 100 tags share 11
+  slots, and the tag sleeps through superframes it is not named in. The wire
+  FORMAT did not change — only its meaning, which is exactly why `proto_ver`
+  had to move: a v2 tag reads one absence as a reclaim and tears down.
+- **`gw_core`'s monotonic short-address pool is a QUARANTINE, not an oversight
+  — do not turn it into prompt reuse.** `0x0100..0xFFFD` is 65278 values, so a
+  freed address is not handed out again for that many joins. That gap is what
+  protects the `Tid` fallback: a POS frame arriving just after its sender's
+  lease expired finds no seat, falls back to `tag_id = src_addr`, and creates
+  one uninformative phantom record — documented and accepted. Reuse the address
+  promptly and another tag now holds it, so `gw_core_find_eui()` returns the
+  WRONG tag's EUI and the straggler is attributed to a real live device
+  instead. Hashing the EUI does not help: the point is that the EUI looked up
+  belongs to someone else. Full reasoning is in `alloc_short_addr()`.
+- **Function codes are allocated across BOTH repos, and `0xEB` was handed out
+  twice.** The tag defined `UWB_FRAME_TYPE_ALERT = 0xEB` while this project had
+  been using the same byte as `APOS_FRAME_TYPE` for the survey since before
+  ALERT existed. The collision was exact, not approximate: `APOS_LEN_ENUM_RSP`
+  is 34 bytes, identical to `UWB_FRAME_LEN_ALERT`, with the discriminating byte
+  at the same offset 10 — ALERT's `state` against apos's subtype. It never bit,
+  but only via two single-point saves: an `ENUM_RSP` reaching a tag is rejected
+  solely because subtype `0x02` trips `UWB_ALERT_STATE_RESERVED_MASK` by one
+  bit, and a HELP alert's `state = 0x01` **is** `APOS_SUB_SURVEY_BEGIN` and
+  survives only on a length mismatch. ALERT moved to `0xEE` on 2026-08-25.
+  Current allocation: `0xE0`–`0xEA` as before, `0xEB` apos, `0xEC`/`0xED`
+  reserved for CONFIG_SET/CONFIG_ACK, `0xEE` ALERT. **Check both repos before
+  claiming a code is free** — the tag's codec is the same file but its
+  neighbours are not.
 - **POS (`0xEA`) is not gated on lease state.** The gateway publishes a fix from
   any tag, including one whose seat has expired. Telemetry should not depend on
   MAC bookkeeping, and a silently dropped fix is undebuggable from the broker.
