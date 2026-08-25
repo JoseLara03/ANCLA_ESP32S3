@@ -652,14 +652,23 @@ thresholds.
   answered every single one. That distinction is what separates an RF problem
   from a firmware problem without touching the boards. Note the sniffer's
   `RX[n]` length **excludes** the FCS, unlike `dwt_getframelength()`.
-- **The ANCLA boards transmit well below free-space expectation, and this is
-  unresolved.** Measured with the sniffer 0.5 m from the gateway: beacons at
-  −84 dBm where ~−57 dBm is predicted, while the tag at ~3 m arrived at
-  −74.5 dBm against ~−72.5 dBm predicted — i.e. the tag matches physics and the
-  ANCLA boards are ~25 dB down. That ceiling is why early range tests died at
-  2–3 m. The fine-grain TX fix above was applied but a controlled before/after
-  (same positions, firmware toggled) was **never run**, so its contribution is
-  unknown. Re-measure before trusting any range budget.
+- **The ANCLA boards' ~25 dB TX deficit was a PA soldering defect, not
+  firmware — RESOLVED (2026-08-25).** The symptom: measured with the sniffer
+  0.5 m from the gateway, beacons arrived at −84 dBm where ~−57 dBm is
+  predicted, while the tag at ~3 m arrived at −74.5 dBm against ~−72.5 dBm
+  predicted — i.e. the tag matched physics and the ANCLA boards were ~25 dB
+  down. That ceiling is why early range tests died at 2–3 m. **Root cause was
+  bad solder joints on the QM14070 PA**, found and corrected in rework; it was
+  never a firmware or configuration fault. Two corollaries worth keeping:
+  (1) the `dwt_setfinegraintxseq(0)` / `dwt_setlnapamode()` ordering fix
+  documented above is still **required** (the API forbids fine-grain
+  sequencing with an external PA), but it was never the cause of this deficit
+  and its contribution was never separately measured — do not cite this
+  entry as evidence either way; (2) any board showing a large unexplained TX
+  deficit should be reflow-inspected at the PA before firmware is suspected,
+  since this failure looked exactly like a configuration bug from the console.
+  A link budget measured before the rework is not valid — re-measure on a
+  reworked board.
 - **The DWM3001CDK reference node used for antenna-delay calibration must run
   `POLL_RX_TO_RESP_TX_DLY_UUS = 2000`, not the Qorvo `ss_twr_responder`
   example's stock 450.** At PLEN_1024 the preamble alone takes ~1.05 ms, so a
