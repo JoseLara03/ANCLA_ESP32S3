@@ -29,6 +29,7 @@ target_sources(app PRIVATE
 	src/pos_json.c
 	src/pos_sink.c
 	src/ss_initiator.c
+	src/sync_model.c
 	src/tag_id.c
 	src/uwb_config.c
 	src/uwb_dwtime.c

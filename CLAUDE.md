@@ -303,6 +303,15 @@ thresholds.
   `T_GUARD_UUS` (488, the 0.5 ms superframe partition guard from the MAC
   contract §2) is **not** `BEACON_GUARD_UUS` (1500, the slave's TX-suppression
   window around the beacon). Confusing the two triples the charged overhead.
+- `src/sync_model.{c,h}` — anchor clock synchronisation: converts a local
+  DW3220 timestamp into a master anchor's time base from a stream of CCPs.
+  Integer-only, pure C, host-tested in `tests/sync_model/`. **This is the Phase
+  2 de-risk for TDoA and the whole migration turns on it** — the MAC contract
+  §1 assumed sub-ns wireless sync was unachievable. Long baseline for the rate
+  (copying `tag_testting/src/beacon_sched_core.c`'s 1/n scaling) plus a residual
+  EMA for the phase, because the phase reference's own noise is the limiting
+  term here, not the drift. The header carries the measured error tables and the
+  one number the hardware gate reduces to.
 - `src/mac_budget.{c,h}` — the airtime and capacity model: frame airtime, the
   SS-TWR exchange span, the turnaround floor, the SFD timeout, the cell budget
   and tag capacity, all in integer picoseconds so the expressions can live in a
@@ -1040,6 +1049,9 @@ gcc -Wall -Wextra -Isrc -o tests/tag_id/test_tag_id.exe tests/tag_id/test_tag_id
 
 gcc -Wall -Wextra -Isrc -o tests/mac_budget/test_mac_budget.exe tests/mac_budget/test_mac_budget.c src/mac_budget.c
 ./tests/mac_budget/test_mac_budget.exe          # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/sync_model/test_sync_model.exe tests/sync_model/test_sync_model.c src/sync_model.c
+./tests/sync_model/test_sync_model.exe          # ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/mac_budget/test_uwb_mac_asserts.exe tests/mac_budget/test_uwb_mac_asserts.c src/mac_budget.c
 ./tests/mac_budget/test_uwb_mac_asserts.exe     # ALL TESTS PASSED, exits 0
