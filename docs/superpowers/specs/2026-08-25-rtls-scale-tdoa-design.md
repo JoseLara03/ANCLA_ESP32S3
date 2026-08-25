@@ -247,11 +247,40 @@ El gateway rota los asientos de tier bajo por los slots disponibles, de modo que
 un tag IDLE consume 1 slot-superframe de 25 en vez de 25 de 25.
 
 **Cambio en el tag (`uwb_net.c`):** `!in_map` deja de significar "me reclamaron"
-y pasa a significar "no me toca, duermo". La pérdida de asiento se detecta por lo
-que **ya existe y ya es correcto**: `lease_remaining` envejecido desde
-`frame_counter` (`lease_age()`, `uwb_net.c:162`) más el keepalive. El chequeo de
-`in_map` era redundante con el lease; el lease es el que tiene la semántica
-correcta.
+y pasa a significar "no me toca, duermo".
+
+**CORRECCIÓN (implementado 2026-08-25).** Una versión anterior de esta sección
+decía que la pérdida de asiento "se detecta por lo que ya existe y ya es
+correcto: `lease_remaining` más el keepalive", y que el chequeo de `in_map` era
+"redundante con el lease". **Es falso, y verificarlo antes de escribir código
+evitó un bug peor que el original.**
+
+`lease_remaining` **no es un detector**. Sus únicos consumidores son el umbral de
+keepalive — que la resetea a full **optimistamente**, se haya recibido el
+keepalive o no — y la asignación del GRANT. Ninguno provoca transición de estado.
+Así que `!in_map` era el **único** detector de pérdida de asiento en v2, y
+borrarlo sin más habría dejado al tag durmiendo y auto-renovándose para siempre
+contra un gateway que ya lo había olvidado.
+
+Lo implementado es una **cota explícita de ausencia**: `UWB_NET_SCHED_GAP_MAX`
+superframes sin aparecer en el mapa ⇒ el asiento se presume perdido. El valor es
+`UWB_NET_LEASE_SF` y no un número inventado, porque es exactamente la ventana en
+que el gateway recicla un asiento sin renovar: si todavía tuviera nuestro
+asiento, nos habría programado dentro de ella. Además cubre 2× la cadencia
+legítima más lenta (IDLE, 25 superframes).
+
+**Y el KEEPALIVE debe emitirse esté o no programado el tag.** Es tráfico de CAP y
+no le debe nada al horario de CFP; condicionarlo al horario haría que un tag de
+tier lento dejara de renovar exactamente mientras espera ser programado, y el
+gateway reciclaría el asiento que está esperando.
+
+**Además hubo que partir `slot_index` en dos**, porque el runner ya lo usaba para
+dos cosas distintas: `uwb_frame_keepalive_build()` quiere una identidad estable
+(`seat_id`), y el cálculo de dormir-hasta-mi-slot quiere el offset de **este**
+superframe (`tx_slot`). Eran el mismo campo solo porque asiento y slot eran la
+misma cosa. Dejarlos unidos habría sido la parte más peligrosa del cambio: los
+seat ids llegan a `GW_MAX_SEATS` (128), y uno usado como offset de slot coloca el
+poll muy fuera del superframe.
 
 **Esto es un bump `proto_ver` 2 → 3** y por tanto un día-bandera en ambos
 firmwares. Es aceptable porque los dos son nuestros y ambos se reflashean; **no
@@ -411,6 +440,7 @@ para cobertura es Fase 5, no Fase 1 — aunque el backhaul ya lo permitiría.
 | Fase | Contenido | Estado tras la fase |
 |---|---|---|
 | **1** | Scheduler asiento/horario (§4.1), `proto_ver` v3 | TWR sirve ~275 tags IDLE / 11 movedores. Cap de 11 roto. |
+| **1a** | **Decisión de producto pendiente de revisión:** `GW_SCHED_OVERSUB_SF`. 11 asientos FAST cuestan exactamente los 275 disponibles, y con control de admisión estricto el tag 12 se rechaza **incluso pidiendo IDLE** — once personas caminando y la doceava queda *invisible* en vez de solo lenta. Lo implementado permite un sobrepaso acotado (4%) **solo para el peldaño IDLE**, que el scheduler EDF absorbe como ~1 superframe de retraso. Ponerlo en 0 revierte al rechazo estricto. | |
 | **2** | `sync_model` + CCP entre anclas, medido en hardware | Sincronía sub-ns demostrada o refutada. **Gate de decisión.** |
 | **3** | Blink TDoA + solve en gateway (§4.3) + backhaul de timestamps | 100 tags a 5 Hz. Objetivo de producto alcanzado. |
 | **4** | Downlink `0xEC`/`0xED` (§4.4) + zonas en NVS (§4.5) | Configurable desde plataforma, multi-celda. |
