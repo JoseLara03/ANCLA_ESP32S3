@@ -141,32 +141,55 @@ SFD 4z 8 símbolos = 8.1 µs; PHR estándar = 22.4 µs.
 **Validación del modelo contra el código existente**, que es lo que lo hace
 confiable y no autoconsistente:
 
-- Beacon 1439 µs vs `BEACON_OCCUPANCY_UUS` = 1500 uus (1538 µs) ✓
-- `POLL_RX_TO_RESP_TX_DLY_UUS` = 2000 uus (2051 µs): el piso derivable es
-  `122 µs (payload RX) + ~200 µs (SPI/cómputo medido) + 1042 µs (preámbulo de la
-  respuesta, que debe transmitirse antes del RMARKER)` = **1364 µs**, dejando
-  687 µs de margen ✓
-- Slot TWR de 4 anclas = `4 × (1.194 + 2.051 + 1.279)` = **18.1 ms**; CFP usable
-  = `200 − 1.44 − 3.08 − 6.15` = 189.3 ms → `189.3/18.1` = **10.5 slots** vs el
-  `N_CFP = 11` real ✓ (el 11 es ligeramente optimista)
+Cifras generadas por `src/mac_budget.h` y ancladas en `tests/mac_budget/`:
+
+- Beacon **1439.6 µs** vs `BEACON_OCCUPANCY_UUS` = 1500 uus (1538.5 µs) ✓,
+  98.9 µs de margen
+- `POLL_RX_TO_RESP_TX_DLY_UUS` = 2000 uus (2051.3 µs): el piso derivable es
+  `144.7 µs (PHR + payload + FCS del poll tras el RMARKER) + ~200 µs
+  (SPI/cómputo medido) + 1050.2 µs (SHR de la respuesta, que debe salir antes
+  de que aterrice su propio RMARKER)` = **1394.9 µs**, dejando **656.4 µs** de
+  margen ✓. Y el 450 uus del ejemplo stock de Qorvo queda por debajo del piso,
+  que es exactamente lo que `CLAUDE.md` afirma del nodo DWM3001CDK ✓
+- Intercambio SS-TWR = **3330.9 µs**; slot de 4 anclas = **13.32 ms**; CFP
+  usable = **191.8 ms** → **14 slots factibles** contra el `N_CFP = 11` real ✓
+
+**Corrección a una versión anterior de este documento:** decía que el slot de 4
+anclas era 18.1 ms y que por tanto solo caben 10.5 slots, lo que hacía ver el
+`N_CFP = 11` como *ligeramente optimista*. Estaba mal, por **doble conteo de los
+SHR**: la forma ingenua `airtime_poll + turnaround + airtime_respuesta` cobra
+los dos SHR *además* de un turnaround que ya contiene uno de ellos, e infla el
+resultado ~1194 µs por intercambio. El turnaround se mide **RMARKER a RMARKER** y
+cada RMARKER está al final de su propio SHR, así que el tramo correcto es
+`SHR del poll + turnaround + (PHR + payload + FCS de la respuesta)`. Con eso el
+`N_CFP = 11` real resulta **conservador**, con 3 slots de holgura, no optimista.
+La trampa está codificada en `MAC_SSTWR_EXCHANGE_PS()` con su comentario, y
+`test_sstwr_exchange()` fija la diferencia entre la forma correcta y la ingenua
+para que nadie la reintroduzca. Nótese que la estimación a mano de
+`T_slot ≈ 15 ms` del contrato MAC §2.1 era **correcta** y ligeramente
+conservadora — el error fue mío, no del contrato.
 
 ### 3.2 Capacidad comparada, 100 tags
 
 Presupuesto en *slot-superframes por ventana de 25 SF*. Costo por tag:
 FAST (5 Hz) = 25, SLOW (1 Hz) = 5, IDLE (0.2 Hz) = 1.
 
-TWR: `N_CFP = 11` → 275 slot-superframes.
-TDoA: slot de blink = `1223 µs + 100 µs` de guarda ≈ 1.32 ms; presupuesto
-`200 − 1.44 (beacon) − 6 (CAP) − 3.1 (guardas)` = 189.5 ms → **143 slots**.
+TWR: el techo es `N_CFP = 11` → **275** slot-superframes. Nótese que el límite
+de TWR **no es airtime** (caben 14 slots) sino el conteo de asientos.
+TDoA: slot de blink = `1223.2 µs + 100 µs` de guarda = **1323.2 µs**; sobre los
+mismos 191.8 ms usables → **144 slots** → **3 600** slot-superframes.
 
 | Caso de carga, 100 tags | TWR (hoy) | **TDoA** |
 |---|---|---|
-| Todos IDLE (0.2 Hz) | 36% ✓ | 6% ✓ |
+| Todos IDLE (0.2 Hz) | 36% ✓ | 3% ✓ |
 | Todos a 1 Hz | 182% ✗ | 14% ✓ |
-| 20% en movimiento | 211% ✗ | 30% ✓ |
-| **Cambio de turno: 100 a 5 Hz** | **✗ 9× corto** | **✓ 70%** |
-| Movedores simultáneos máx a 5 Hz | **11** | **143** |
-| Capacidad máx a 0.2 Hz | 275 | **~3 575** |
+| 20% en movimiento | 211% ✗ | 16% ✓ |
+| **Cambio de turno: 100 a 5 Hz** | **✗ 9× corto** | **✓ 69%** |
+| Movedores simultáneos máx a 5 Hz | **11** | **144** |
+| Capacidad máx a 0.2 Hz | 275 | **~3 600** |
+
+Todas estas cifras están ancladas en `test_capacity_100_tags()`, incluido el
+`9×` del cambio de turno y el ~69% de utilización de TDoA.
 
 **Conclusión: TDoA es requisito de producto, no optimización.** TWR a PLEN_1024
 es permanentemente 9× corto en el caso que decide, y ninguna cantidad de celdas

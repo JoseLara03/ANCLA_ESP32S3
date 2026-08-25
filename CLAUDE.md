@@ -295,9 +295,22 @@ thresholds.
 - `src/disc_schedule.{c,h}` — per-anchor discovery response stagger. Host-tested
   in `tests/disc_schedule/`.
 - `src/uwb_mac.h` — the single source of truth for the superframe constants
-  (`T_SUPERFRAME_UUS`, `BEACON_OCCUPANCY_UUS`, `BEACON_GUARD_UUS`) that the
-  gateway schedules the beacon from and the slaves predict it against; no
-  header, no code file.
+  (`T_SUPERFRAME_UUS`, `BEACON_OCCUPANCY_UUS`, `BEACON_GUARD_UUS`, and
+  `T_GUARD_UUS`) that the gateway schedules the beacon from and the slaves
+  predict it against; no header, no code file. Now also carries the two
+  `BUILD_ASSERT`s that check those hand-set constants against the airtime
+  `mac_budget.h` derives — see the entry below, and note that
+  `T_GUARD_UUS` (488, the 0.5 ms superframe partition guard from the MAC
+  contract §2) is **not** `BEACON_GUARD_UUS` (1500, the slave's TX-suppression
+  window around the beacon). Confusing the two triples the charged overhead.
+- `src/mac_budget.{c,h}` — the airtime and capacity model: frame airtime, the
+  SS-TWR exchange span, the turnaround floor, the SFD timeout, the cell budget
+  and tag capacity, all in integer picoseconds so the expressions can live in a
+  `BUILD_ASSERT`. Exists so `N_CFP`, `POLL_RX_TO_RESP_TX_DLY_UUS` and
+  `BEACON_OCCUPANCY_UUS` stop being magic numbers. The macros are the contract;
+  the functions are wrappers so `tests/mac_budget/` can sweep parameters. Byte
+  counts **exclude** the FCS, matching `UWB_FRAME_LEN_*`. See
+  `docs/superpowers/specs/2026-08-25-rtls-scale-tdoa-design.md` §3.
 - `src/gw_core.{c,h}` — CFP seat table, leases and the tag address pool. Pure
   C, ported unchanged from the nRF5 gateway, host-tested in `tests/gw_core/`.
 - `src/beacon_guard.{c,h}` — predicts the next beacon and refuses any delayed
@@ -669,6 +682,21 @@ thresholds.
   since this failure looked exactly like a configuration bug from the console.
   A link budget measured before the rework is not valid — re-measure on a
   reworked board.
+- **An SS-TWR exchange is NOT `poll_airtime + turnaround + resp_airtime` — that
+  form double-counts both SHRs and inflates the span by ~1194 us per exchange
+  at this PHY.** `POLL_RX_TO_RESP_TX_DLY_UUS` is measured **RMARKER to
+  RMARKER**, and the RMARKER sits at the *end* of its own SHR, so the poll's
+  payload and the whole response SHR both fall **inside** the turnaround
+  window rather than beside it. The correct span is `poll SHR + turnaround +
+  (response PHR + payload + FCS)` = **3330.9 us**, so a 4-anchor sweep is
+  **13.32 ms**, not the 18.1 ms the naive form gives. This matters because the
+  wrong figure makes `N_CFP = 11` look like it barely fits (10.5 slots) when
+  the budget actually affords **14** and the shipped constant is conservative
+  with 3 slots of headroom. Encoded in `MAC_SSTWR_EXCHANGE_PS()`
+  (`src/mac_budget.h`) and pinned both ways — correct and naive — by
+  `test_sstwr_exchange()`. The MAC contract's own hand estimate of
+  `T_slot ~= 15 ms` was right; it was the design spec's first draft that got
+  this wrong, and the model is what caught it.
 - **The DWM3001CDK reference node used for antenna-delay calibration must run
   `POLL_RX_TO_RESP_TX_DLY_UUS = 2000`, not the Qorvo `ss_twr_responder`
   example's stock 450.** At PLEN_1024 the preamble alone takes ~1.05 ms, so a
@@ -946,10 +974,23 @@ gcc -Wall -Wextra -Isrc -o tests/apos_frame/test_apos_frame.exe tests/apos_frame
 
 gcc -Wall -Wextra -Isrc -o tests/tag_id/test_tag_id.exe tests/tag_id/test_tag_id.c src/tag_id.c
 ./tests/tag_id/test_tag_id.exe                  # OK, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/mac_budget/test_mac_budget.exe tests/mac_budget/test_mac_budget.c src/mac_budget.c
+./tests/mac_budget/test_mac_budget.exe          # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/mac_budget/test_uwb_mac_asserts.exe tests/mac_budget/test_uwb_mac_asserts.c src/mac_budget.c
+./tests/mac_budget/test_uwb_mac_asserts.exe     # ALL TESTS PASSED, exits 0
 ```
 
 `-lm` is required by the two suites that link `apos_geom.c` — the solver calls
 `sqrtf`/`fabsf`. The others do not need it.
+
+`tests/mac_budget/test_uwb_mac_asserts.c` needs `-Itests/mac_budget/shim`, which
+supplies a `zephyr/sys/util.h` defining `BUILD_ASSERT` as `_Static_assert`. That
+is the whole point of that test: **including `src/uwb_mac.h` is the test**, so a
+budget that no longer holds fails to *compile* under plain gcc instead of
+waiting for a Zephyr build. Same shim pattern as the tag's
+`tests/uwb_radio_owner/shim`.
 
 ## Repo
 
