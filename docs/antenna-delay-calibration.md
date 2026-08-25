@@ -145,6 +145,17 @@ cal ref 2000
 — first run reports a large `error_mm` (this is the measurement of the
 uncalibrated factory-default offset) and `ok: ant_tx 16385 -> <new>`.
 
+**There is a ceiling on how much one run can correct: 4680 mm**
+(`CAL_MAX_STEP_MM` = `CAL_MAX_STEP_UNITS` × 2.34 mm/unit). A measured error
+larger than that is refused with `-ERANGE` rather than partially applied, and
+the correct response is to **fix the setup, not to run it again** — see §6.
+This is comfortable headroom for the expected case: a real per-unit factory
+variance on this hardware is tens to a few hundred delay units (one board
+measured ~450 units ≈ 1.05 m), and the largest position residuals ever recorded
+on this system were ~2 m. An error above 4.68 m means the declared distance,
+the units, or the peer identity is wrong — not that the board needs that much
+trim.
+
 ```
 cal ref 2000
 ```
@@ -201,7 +212,7 @@ reference) and only shows up here, in the anchor-to-anchor comparison.
 | Error | Where it comes from | Likely physical cause |
 |---|---|---|
 | `error: too few valid responses` (`-ENODATA`) | `run_batch()` in `src/cal_run.c`: fewer than a quarter of the 128 attempted exchanges produced a decodable response | Peer is powered off or out of range; peer's PHY does not match `src/uwb_phy.h` (wrong channel/PRF/preamble/SFD); wrong peer id (`cal peer <id>` pointed at an anchor id that isn't actually there, or the DWM3001CDK isn't answering `0xFF`); no line of sight |
-| `error: solved ant_tx out of range ... NOT applied` (`-ERANGE`) | `cal_solve_tx_delay()` in `src/cal_solve.c`, surfaced by `cmd_ref()` in `src/cal_shell.c` | The declared reference distance is wrong (wrong tape measurement, wrong units — the command takes millimetres, not metres); the peer answering is not actually the reference node (e.g. another ANCLA anchor answered instead of the DWM); a multipath reflection is present and biasing the whole batch mean, not just a few samples. **Do not raise `CAL_TX_DLY_MIN`/`CAL_TX_DLY_MAX`, or the `< CAL_MAX_SAMPLES/4` floor, to make this pass** — they are diagnostics that a bad measurement is being taken, not conservative defaults to relax |
+| `error: solved ant_tx out of range ... NOT applied` (`-ERANGE`) | `cal_solve_tx_delay()` in `src/cal_solve.c`, surfaced by `cmd_ref()` in `src/cal_shell.c`. **Two independent causes now return this**, and the operator response is the same for both: (a) the solved delay fell outside `CAL_TX_DLY_MIN..MAX`; (b) the measured error exceeded `CAL_MAX_STEP_MM` (4680 mm), so the solver saturated and its output is not a solution. Case (b) exists because `cal_solve_step()` bounds one correction to ±2000 units — without the check, a saturated step lands *inside* the accepted window and would be reported as a successful calibration carrying several metres of error. See the `cal_solve.c` guard note in `CLAUDE.md` | The declared reference distance is wrong (wrong tape measurement, wrong units — the command takes millimetres, not metres); the peer answering is not actually the reference node (e.g. another ANCLA anchor answered instead of the DWM); a multipath reflection is present and biasing the whole batch mean, not just a few samples. **Do not raise `CAL_TX_DLY_MIN`/`CAL_TX_DLY_MAX`, `CAL_MAX_STEP_UNITS`, or the `< CAL_MAX_SAMPLES/4` floor, to make this pass** — they are diagnostics that a bad measurement is being taken, not conservative defaults to relax. In particular do **not** re-run `cal ref` repeatedly hoping to converge in ±2000-unit steps: if the error is that large the measurement is wrong, and iterating would walk the delay toward a wrong value |
 | `error: the ranging loop did not answer` (`-ETIMEDOUT`) | `cal_run_execute()` in `src/cal_run.c`: the responder/initiator loop never completed a batch within 30 s | The cal image's main loop is stuck or was never reached (check for the `{"status":"listening",...}` boot line); extremely unlikely in normal operation since a fully-failing 128-sample batch is bounded at ~6 s of timeouts — a full 30 s stall points at a firmware or radio fault, not a bad measurement, and is worth a `kernel reboot cold` before re-running |
 | `error: a calibration batch is already running` (`-EBUSY`) | `cal_run_execute()` rejecting a second command | A previous `cal ref`/`cal peer` is still in flight (up to ~6 s for a fully failing batch); just wait and retry |
 
