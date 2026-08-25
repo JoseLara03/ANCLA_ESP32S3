@@ -349,7 +349,43 @@ extiende su ventana RX. Frames nuevos:
 | `0xEC` | CONFIG_SET | gateway → tag, direccionado |
 | `0xED` | CONFIG_ACK | tag → gateway, en CAP |
 
-(`0xEB` está tomado por ALERT — no reusar.)
+**`0xEB` NO está disponible, y peor: ya está doblemente asignado.** Este
+documento afirmaba antes que "`0xEB` está tomado por ALERT", copiando la
+declaración del codec del tag sin verificar el lado del ancla. Los dos lo usan:
+
+| Repo | Símbolo | Significado |
+|---|---|---|
+| `tag_testting` | `UWB_FRAME_TYPE_ALERT = 0xEB` | HELP/CANCEL, 34 bytes |
+| `ANCLA_ESP32S3` | `APOS_FRAME_TYPE = 0xEB` | survey de anclas, 7 subtipos |
+
+Y la colisión es exacta, no aproximada: `APOS_HDR_LEN` (11) + 23 hace
+`APOS_LEN_ENUM_RSP` = **34** = `UWB_FRAME_LEN_ALERT`, y el byte discriminante
+está en el **mismo offset** (`OFF_AL_STATE` = 10 es el byte de subtipo de apos).
+Mismo function code, misma longitud, mismo offset.
+
+Hoy no muerde, pero por dos salvadas de un solo punto cada una:
+
+- Un `ENUM_RSP` llega al tag con longitud y tipo válidos; lo rechaza solo porque
+  el subtipo `0x02` tiene el bit 1 puesto y `state & UWB_ALERT_STATE_RESERVED_MASK`
+  sale distinto de cero. **Un bit.**
+- Un ALERT de HELP lleva `state = 0x01`, que **es exactamente**
+  `APOS_SUB_SURVEY_BEGIN`; lo salva solo que SURVEY_BEGIN mide 15 bytes y ALERT
+  34. **Un chequeo de longitud.**
+
+Cualquier subtipo apos nuevo de 34 bytes con el bit 1 en cero, o cualquier
+cambio a `UWB_FRAME_LEN_ALERT`, convierte esto en corrupción real entre dos
+funciones sin relación. **Resolverlo requiere reasignar un function code, que es
+día-bandera** — se agenda junto al bump de `proto_ver` v3 de la Fase 1, no
+aparte. Los códigos nuevos de este diseño (`0xEC`, `0xED`) se eligieron por
+encima de ambos y no colisionan.
+
+Consecuencia adicional: el ancla **no implementa ALERT en absoluto** — no hay
+`alert_relay.c` en su `CMakeLists.txt` ni `0xEB`/ALERT en su codec, aunque el
+`CLAUDE.md` del tag afirma que `alert_relay.c` "se compila en ambos firmwares".
+Esa afirmación es falsa hoy: un tag que levanta HELP transmite frames que ningún
+ancla ni gateway de este proyecto decodifica. Es un hueco de feature
+preexistente, fuera del alcance de este diseño, registrado aquí para que no se
+descubra dos veces.
 
 **Ruta:** plataforma → MQTT → gateway → UWB → tag.
 
@@ -444,7 +480,37 @@ compartido** — debe salir vacío:
 ```bash
 diff "ANCLA_ESP32S3/src/uwb_frame_802_15_4z.c" "tag_testting/src/uwb_frame_802_15_4z.c"
 diff "ANCLA_ESP32S3/src/uwb_frame_802_15_4z.h" "tag_testting/src/uwb_frame_802_15_4z.h"
+diff "ANCLA_ESP32S3/src/cal_math.c" "tag_testting/src/cal_math.c"
+diff "ANCLA_ESP32S3/src/cal_math.h" "tag_testting/src/cal_math.h"
 ```
+
+### 8.0.1 Los cuatro archivos YA divergieron — tarea A0/T0, antes que nada
+
+Verificado el 2026-08-25: **los cuatro salen distintos.** La regla de propiedad
+de arriba, aplicada literalmente sobre este estado, **destruiría trabajo
+funcionando**, así que la reconciliación va primero y en la dirección correcta
+archivo por archivo.
+
+| Archivo | Divergencia | Dirección de la reconciliación |
+|---|---|---|
+| `uwb_frame_802_15_4z.{c,h}` | el **tag** tiene ALERT (`0xEB`, `struct uwb_alert`, builder/parser/validator); la copia del ancla es un subconjunto estricto | **ANCLA debe ABSORBER las adiciones del tag** antes de declararse fuente de verdad. Copiar ANCLA→tag tal cual **borraría la feature de HELP del tag.** |
+| `cal_math.{c,h}` | el **tag** tiene `CAL_MAX_STEP_UNITS` (2000) y su clamp, más dos asserts de test; el ancla no | **tag → ANCLA**, y es URGENTE (ver abajo). |
+
+**La divergencia de `cal_math` bloquea la calibración, que es justo lo que
+arranca esta semana.** Sin el clamp, el propio comentario del tag explica el modo
+de falla: una medición corrupta puede mover el retardo combinado ~32000 unidades
+en un solo paso, llevarlo al clamp de 0 o `CAL_MAX_TOTAL_DLY`, y si la siguiente
+lectura de ese retardo degenerado casualmente lee como convergida, **se persiste
+una calibración rota a NVS sin error en ningún lado.** `tests/cal_solve/` del
+ancla pasa hoy porque no contiene los dos asserts que el tag agregó.
+
+→ **A0 (bloqueante, antes de correr `cal ref` en cualquier ancla):** portar
+`CAL_MAX_STEP_UNITS` y su clamp de `tag_testting/src/cal_math.{c,h}` a ANCLA,
+copiar también los dos asserts nuevos a `tests/cal_solve/`, y confirmar `diff`
+vacío.
+
+→ **A0b (con el bump de `proto_ver` v3, Fase 1):** absorber ALERT en el codec
+del ancla y resolver la doble asignación de `0xEB` descrita en §4.4.
 
 ### 8.1 Agente-ANCLA — repo `ANCLA_ESP32S3`
 
