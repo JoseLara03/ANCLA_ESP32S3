@@ -92,29 +92,57 @@
  * GW_MAX_SEATS caps the seat count at 128 first. */
 #define GW_SCHED_CAPACITY (GW_N_CFP * GW_SCHED_WINDOW_SF)
 
-/* Bounded oversubscription, available ONLY to the bottom rung of the tier
- * ladder (IDLE).
+/* ---- Admission policy: presence is guaranteed, RATE is best-effort ------
  *
- * Why it exists: GW_N_CFP FAST seats cost 11 * 25 = 275, which is exactly
- * GW_SCHED_CAPACITY. Under strict admission control the next tag is then
- * refused outright -- even asking for IDLE, because not one slot-superframe
- * remains. That is arithmetically right and a bad product: eleven people
- * walking, and the twelfth tag cannot associate at all, so it is INVISIBLE to
- * the platform rather than merely slow.
+ * The capacity above is genuinely oversubscribed by the product target, and no
+ * scheduler can conjure airtime: 100 tags merely PRESENT at 0.2 Hz cost 100
+ * slot-superframes, while 11 tags MOVING at 5 Hz cost all 275. You cannot have
+ * both. So admission has to choose what gives, and the choice is a policy.
  *
- * Allowing a bounded overshoot for IDLE only is the trade. IDLE is 0.2 Hz
- * presence telemetry, and the EDF scheduler degrades gracefully rather than
- * breaking: an oversubscribed seat is simply served a little late, and the
- * lateness ordering means the delay lands on whoever has waited longest. At
- * GW_N_CFP the worst case is 286/275 = 4 % over, i.e. an IDLE grant arriving
- * up to about one superframe late. Nothing about the FAST or SLOW guarantees
- * is touched: only IDLE may overshoot, so a rate-guaranteed tier can never be
- * admitted into capacity that does not exist.
+ * The policy here is that a tag can ALWAYS associate. An invisible tag is a
+ * far worse failure than a slow one -- the platform cannot show a person it
+ * has never heard of, whereas a person updating at 1 Hz instead of 5 Hz is a
+ * degradation an operator can live with and can see.
  *
- * If a deployment would rather refuse a tag than let presence reports slip,
- * set this to 0 -- the behaviour reverts to strict admission control and the
- * twelfth tag is refused. That is a product decision, not a tuning knob. */
-#define GW_SCHED_OVERSUB_SF  GW_N_CFP
+ * So capacity splits in two:
+ *
+ *   IDLE FLOOR    GW_MAX_SEATS * cost(IDLE), reserved up front for the WHOLE
+ *                 seat table -- not for the seats currently taken. Reserving
+ *                 only for current occupancy is what fails: the first movers
+ *                 to join see an empty cell, take the airtime greedily, and
+ *                 tags arriving later are refused. Measured directly before
+ *                 this policy existed: 100 tags with 10 movers admitted only
+ *                 46, with 54 refused outright.
+ *
+ *   UPGRADE POOL  whatever is left. FAST and SLOW compete for it first-come,
+ *                 charged only the INCREMENT over IDLE, since the IDLE part of
+ *                 their cost already came out of the floor.
+ *
+ * The consequence to be honest about: concurrent 5 Hz movers drop from the 11
+ * an empty cell could theoretically hold to GW_SCHED_MAX_FAST below, because
+ * those 11 only ever coexisted with zero other tags. That is not a regression
+ * introduced here -- it is the pre-existing physical limit finally being
+ * allocated deliberately instead of by arrival order. It is also more evidence
+ * for the TDoA migration, where ~144 blink slots make the tension vanish.
+ *
+ * This replaces an earlier GW_SCHED_OVERSUB_SF hack, which allowed a bounded
+ * overshoot for IDLE joins. That was papering over this problem: it let a few
+ * extra tags in past a full cell without addressing why the cell was full of
+ * upgrades in the first place. The floor makes presence a guarantee by
+ * construction, so no overshoot is needed and none is permitted. */
+#define GW_SCHED_IDLE_FLOOR    (GW_MAX_SEATS * 1u)
+#define GW_SCHED_UPGRADE_POOL  (GW_SCHED_CAPACITY - GW_SCHED_IDLE_FLOOR)
+
+/* Slot-superframes a seat at `tier` costs ABOVE the IDLE floor it already
+ * holds. IDLE is 0 by definition; that is what makes presence free. */
+uint32_t gw_core_tier_upgrade_cost(uint8_t tier);
+
+/* Derived, for the boot log and the tests: the most seats that can hold each
+ * rate-guaranteed tier at once, given the floor. */
+#define GW_SCHED_FAST_UPGRADE  (GW_SCHED_WINDOW_SF - 1u)        /* 24 */
+#define GW_SCHED_SLOW_UPGRADE  ((GW_SCHED_WINDOW_SF / 5u) - 1u)  /* 4  */
+#define GW_SCHED_MAX_FAST  (GW_SCHED_UPGRADE_POOL / GW_SCHED_FAST_UPGRADE)
+#define GW_SCHED_MAX_SLOW  (GW_SCHED_UPGRADE_POOL / GW_SCHED_SLOW_UPGRADE)
 
 /* Cost of one seat at `tier`, in slot-superframes per window. An unknown tier
  * is charged as IDLE, matching gw_core_normalize_tier(). */
@@ -209,5 +237,8 @@ bool gw_core_find_eui(const struct gw_core_ctx *c, uint16_t short_addr,
 /* Live seats, and the slot-superframes they consume of GW_SCHED_CAPACITY. */
 uint16_t gw_core_seats_used(const struct gw_core_ctx *c);
 uint32_t gw_core_cost_used(const struct gw_core_ctx *c);
+/* Slot-superframes of GW_SCHED_UPGRADE_POOL currently spent on tiers above
+ * IDLE. gw_core_cost_used() remains the total, floor included. */
+uint32_t gw_core_upgrades_used(const struct gw_core_ctx *c);
 
 #endif /* GW_CORE_H */

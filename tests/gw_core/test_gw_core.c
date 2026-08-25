@@ -349,46 +349,76 @@ static void test_tier_cadence(void)
     }
 }
 
-/* Airtime, not seats, is what limits a FAST fleet: GW_N_CFP FAST seats cost
- * 11 * 25 = 275 = GW_SCHED_CAPACITY exactly. The next FAST request is not
- * refused -- it is DEGRADED to the best tier that still fits, and the GRANT
- * reports that back. The contract has always permitted this (section 5.1). */
-static void test_fast_saturation_degrades_rather_than_refuses(void)
+/* Presence is guaranteed; RATE is what runs out. A cell filled with FAST
+ * requests admits every tag up to the seat table and grants FAST only to as
+ * many as GW_SCHED_UPGRADE_POOL affords -- the rest are seated at a lower tier
+ * rather than refused. Before the IDLE-floor policy this test asserted the
+ * opposite arrangement, where movers took the airtime greedily and later tags
+ * were turned away entirely. */
+static void test_presence_is_guaranteed_rate_is_not(void)
 {
     struct gw_core_ctx c;
-    gw_core_init(&c);
+    unsigned int admitted = 0, fast = 0;
 
-    for (unsigned int i = 0; i < GW_N_CFP; i++) {
+    gw_core_init(&c);
+    for (unsigned int i = 0; i < GW_MAX_SEATS + 8u; i++) {
         uint8_t eui[UWB_FRAME_EUI_LEN];
         struct gw_grant g;
         mk_eui(eui, (uint8_t)i);
-        CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
-        CHECK(g.tier == GW_TIER_FAST);
+        eui[7] = (uint8_t)i;
+        eui[6] = (uint8_t)(i >> 8);
+        if (!gw_core_join(&c, eui, GW_TIER_FAST, &g)) continue;
+        admitted++;
+        if (g.tier == GW_TIER_FAST) fast++;
     }
-    CHECK(gw_core_cost_used(&c) == GW_SCHED_CAPACITY);
 
-    /* Airtime is full but seats remain, so the tag is admitted -- slower. */
-    uint8_t extra[UWB_FRAME_EUI_LEN];
-    struct gw_grant g;
-    mk_eui(extra, 0xE0);
-    CHECK(gw_core_join(&c, extra, GW_TIER_FAST, &g));
-    CHECK(g.tier == GW_TIER_IDLE);      /* bottom rung, via the overshoot */
-    CHECK(gw_core_cost_used(&c) <= GW_SCHED_CAPACITY + GW_SCHED_OVERSUB_SF);
+    /* Every seat filled -- nobody refused for lack of airtime. */
+    CHECK(admitted == GW_MAX_SEATS);
+    CHECK(gw_core_seats_used(&c) == GW_MAX_SEATS);
 
-    /* The overshoot is BOUNDED: it cannot be used indefinitely. */
-    for (unsigned int i = 0; i < GW_SCHED_OVERSUB_SF + 4u; i++) {
-        uint8_t e[UWB_FRAME_EUI_LEN];
-        struct gw_grant gg;
-        mk_eui(e, 0xA0);
-        e[7] = (uint8_t)i;
-        (void)gw_core_join(&c, e, GW_TIER_FAST, &gg);
+    /* FAST is rationed to what the upgrade pool affords, and no further. */
+    CHECK(fast == (unsigned int)GW_SCHED_MAX_FAST);
+    CHECK(gw_core_upgrades_used(&c) <= GW_SCHED_UPGRADE_POOL);
+
+    /* And the total never exceeds the airtime that physically exists. */
+    CHECK(gw_core_cost_used(&c) <= GW_SCHED_CAPACITY);
+}
+
+/* The regression the capacity demo caught: 100 tags where the movers join
+ * FIRST. Reserving only for current occupancy let those movers take the
+ * airtime and refused 54 of the 100; reserving the floor for the whole seat
+ * table admits all of them. */
+static void test_movers_first_does_not_lock_out_later_tags(void)
+{
+    struct gw_core_ctx c;
+    unsigned int admitted = 0;
+
+    gw_core_init(&c);
+    for (unsigned int i = 0; i < 100; i++) {
+        uint8_t eui[UWB_FRAME_EUI_LEN];
+        struct gw_grant g;
+        mk_eui(eui, (uint8_t)i);
+        eui[7] = (uint8_t)i;
+        if (gw_core_join(&c, eui, (i < 10u) ? GW_TIER_FAST : GW_TIER_IDLE, &g))
+            admitted++;
     }
-    CHECK(gw_core_cost_used(&c) <= GW_SCHED_CAPACITY + GW_SCHED_OVERSUB_SF);
+    CHECK(admitted == 100);
+    CHECK(gw_core_cost_used(&c) <= GW_SCHED_CAPACITY);
+}
 
-    /* And a rate-guaranteed tier is never granted out of it. */
-    for (unsigned int i = 0; i < GW_MAX_SEATS; i++)
-        if (c.seats[i].short_addr != 0 && i >= GW_N_CFP)
-            CHECK(c.seats[i].tier == GW_TIER_IDLE);
+/* The floor arithmetic itself, so the derived figures cannot drift silently. */
+static void test_capacity_split(void)
+{
+    CHECK(GW_SCHED_IDLE_FLOOR == GW_MAX_SEATS);
+    CHECK(GW_SCHED_IDLE_FLOOR + GW_SCHED_UPGRADE_POOL == GW_SCHED_CAPACITY);
+    CHECK(gw_core_tier_upgrade_cost(GW_TIER_IDLE) == 0u);
+    CHECK(gw_core_tier_upgrade_cost(GW_TIER_SLOW) == 4u);
+    CHECK(gw_core_tier_upgrade_cost(GW_TIER_FAST) == 24u);
+
+    /* Worst case must fit: every seat at IDLE plus a full upgrade pool. */
+    CHECK(GW_MAX_SEATS * 1u +
+          GW_SCHED_MAX_FAST * gw_core_tier_upgrade_cost(GW_TIER_FAST)
+          <= GW_SCHED_CAPACITY);
 }
 
 /* A keepalive must never evict the seat that sent it, even when the tier it
@@ -542,7 +572,9 @@ int main(void)
     test_find_eui_selectivity();
     test_tier_normalization();
     test_tier_cadence();
-    test_fast_saturation_degrades_rather_than_refuses();
+    test_capacity_split();
+    test_presence_is_guaranteed_rate_is_not();
+    test_movers_first_does_not_lock_out_later_tags();
     test_keepalive_upgrade_is_admission_controlled();
     test_hundred_tags_all_get_served();
     test_no_duplicate_in_one_superframe();

@@ -34,6 +34,14 @@ uint32_t gw_core_tier_cost(uint8_t tier)
     return GW_SCHED_WINDOW_SF / gw_core_tier_period(tier);
 }
 
+uint32_t gw_core_tier_upgrade_cost(uint8_t tier)
+{
+    /* What this tier costs ABOVE the IDLE floor the seat already holds. Zero
+     * for IDLE, which is what makes presence free -- see the admission policy
+     * in gw_core.h. */
+    return gw_core_tier_cost(tier) - gw_core_tier_cost(GW_TIER_IDLE);
+}
+
 /* ---- Seat lookup -------------------------------------------------------- */
 
 static int find_seat_by_addr(const struct gw_core_ctx *c, uint16_t addr)
@@ -77,47 +85,37 @@ uint32_t gw_core_cost_used(const struct gw_core_ctx *c)
     return cost;
 }
 
-/* Highest tier at or below `want` whose cost fits in `budget`, or -1 if not
- * even IDLE fits. Walks down from the request, so a tag asking for FAST in a
- * busy cell gets SLOW rather than a refusal. */
-static int best_tier_within(uint8_t want, uint32_t budget)
+uint32_t gw_core_upgrades_used(const struct gw_core_ctx *c)
 {
-    for (int t = (int)gw_core_normalize_tier(want); t >= 0; t--) {
-        if (gw_core_tier_cost((uint8_t)t) <= budget) return t;
-    }
-    return -1;
+    uint32_t up = 0;
+
+    for (unsigned int i = 0; i < GW_MAX_SEATS; i++)
+        if (c->seats[i].short_addr != 0)
+            up += gw_core_tier_upgrade_cost(c->seats[i].tier);
+    return up;
 }
 
-/* Slot-superframes this seat may claim, excluding whatever it already costs --
- * so a re-join or keepalive at an unchanged tier is always admissible, and an
- * upgrade is charged only the difference. `own` is 0 for a seat that does not
- * exist yet. */
-static uint32_t free_budget_for(const struct gw_core_ctx *c, uint32_t own)
+/* The tier to grant: the highest at or below `want` whose UPGRADE cost fits
+ * what is left of GW_SCHED_UPGRADE_POOL. `own_upgrade` is this seat's current
+ * upgrade cost, excluded from the accounting so a re-join or keepalive at an
+ * unchanged tier is always admissible and a genuine upgrade is charged only the
+ * difference; pass 0 for a seat that does not exist yet.
+ *
+ * Never returns -1. IDLE has an upgrade cost of zero, so it always fits -- that
+ * is the presence guarantee, and it is why admission can only fail on the seat
+ * table being full, never on airtime. */
+static uint8_t grant_tier(const struct gw_core_ctx *c, uint8_t want,
+                          uint32_t own_upgrade)
 {
-    uint32_t used = gw_core_cost_used(c) - own;
+    uint32_t spent = gw_core_upgrades_used(c) - own_upgrade;
+    uint32_t left  = (spent < GW_SCHED_UPGRADE_POOL)
+                             ? GW_SCHED_UPGRADE_POOL - spent
+                             : 0u;
 
-    return (used < GW_SCHED_CAPACITY) ? GW_SCHED_CAPACITY - used : 0u;
-}
-
-/* The tier to actually grant. Prefers the strict ladder; falls back to IDLE
- * under the bounded overshoot of GW_SCHED_OVERSUB_SF so a saturated cell
- * degrades a tag instead of making it invisible. Returns -1 only when even
- * that is unavailable. */
-static int grant_tier(const struct gw_core_ctx *c, uint8_t want, uint32_t own)
-{
-    int t = best_tier_within(want, free_budget_for(c, own));
-
-    if (t >= 0) return t;
-
-    if (GW_SCHED_OVERSUB_SF > 0u) {
-        uint32_t used = gw_core_cost_used(c) - own;
-
-        if (used + gw_core_tier_cost(GW_TIER_IDLE) <=
-            GW_SCHED_CAPACITY + GW_SCHED_OVERSUB_SF) {
-            return (int)GW_TIER_IDLE;
-        }
+    for (int t = (int)gw_core_normalize_tier(want); t > 0; t--) {
+        if (gw_core_tier_upgrade_cost((uint8_t)t) <= left) return (uint8_t)t;
     }
-    return -1;
+    return (uint8_t)GW_TIER_IDLE;
 }
 
 /* ---- Scheduling --------------------------------------------------------- */
@@ -131,14 +129,13 @@ static int grant_tier(const struct gw_core_ctx *c, uint8_t want, uint32_t own)
  * overdue, which is what makes the scheduler starvation-free without any
  * explicit fairness bookkeeping.
  *
- * Starvation-freedom depends on admission control, not on this function:
- * grant_tier() is what keeps the sum of demands at or below GW_N_CFP slots per
- * superframe on average, give or take the bounded GW_SCHED_OVERSUB_SF. Remove
- * that and this loop will happily let 11 FAST seats crowd out every IDLE seat
- * forever. The overshoot is safe here precisely because it is bounded and
- * IDLE-only: a few slot-superframes of excess make the most-overdue seats a
- * little later, which is the graceful direction, whereas an unbounded excess
- * would silently halve everyone's rate.
+ * Starvation-freedom depends on admission control, not on this function.
+ * grant_tier() is what keeps total demand at or below GW_SCHED_CAPACITY, by
+ * reserving the IDLE floor for every seat and rationing upgrades out of what
+ * is left. Remove that and this loop will happily let a handful of FAST seats
+ * crowd out every IDLE seat forever -- the lateness ordering distributes
+ * scarcity fairly, but it cannot create airtime that was over-promised at
+ * admission time.
  *
  * Cost is GW_N_CFP * GW_MAX_SEATS comparisons = 11 * 128, on a K_PRIO_COOP(0)
  * loop once per 200 ms superframe. Selection is by repeated max rather than a
@@ -270,16 +267,9 @@ bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
         if (idx < 0) return false;                   /* no seat left */
     }
 
-    uint32_t own  = fresh ? 0u : gw_core_tier_cost(c->seats[idx].tier);
-    int      tier = grant_tier(c, req_tier, own);
-
-    if (tier < 0) {
-        /* A fresh tag that cannot even be served at IDLE is refused outright.
-         * An existing seat keeps what it already had rather than being evicted
-         * by its own keepalive. */
-        if (fresh) return false;
-        tier = (int)c->seats[idx].tier;
-    }
+    uint32_t own  = fresh ? 0u
+                          : gw_core_tier_upgrade_cost(c->seats[idx].tier);
+    uint8_t  tier = grant_tier(c, req_tier, own);
 
     if (fresh) {
         c->seats[idx].short_addr = alloc_short_addr(c);
@@ -288,12 +278,12 @@ bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
          * than waiting out a full tier period after being granted. */
         c->seats[idx].next_due = c->frame_counter;
     }
-    c->seats[idx].tier            = (uint8_t)tier;
+    c->seats[idx].tier            = tier;
     c->seats[idx].lease_remaining = GW_LEASE_SF;
 
     out->short_addr = c->seats[idx].short_addr;
     out->seat_id    = (uint8_t)idx;
-    out->tier       = (uint8_t)tier;
+    out->tier       = tier;
     out->lease      = GW_LEASE_SF;
     return true;
 }
@@ -305,21 +295,16 @@ void gw_core_keepalive(struct gw_core_ctx *c, uint16_t short_addr,
 
     if (idx < 0) return;
 
-    uint32_t own  = gw_core_tier_cost(c->seats[idx].tier);
-    int      tier = grant_tier(c, req_tier, own);
+    uint32_t own  = gw_core_tier_upgrade_cost(c->seats[idx].tier);
+    uint8_t  tier = grant_tier(c, req_tier, own);
 
-    /* Never evict a seat on its own keepalive: if nothing fits, it keeps the
-     * tier it already had. `own` was excluded from the budget above, so this
-     * branch is only reachable for a genuine UPGRADE that does not fit. */
-    if (tier < 0) tier = (int)c->seats[idx].tier;
-
-    c->seats[idx].tier            = (uint8_t)tier;
+    c->seats[idx].tier            = tier;
     c->seats[idx].lease_remaining = GW_LEASE_SF;
 
     if (out) {
         out->short_addr = c->seats[idx].short_addr;
         out->seat_id    = (uint8_t)idx;
-        out->tier       = (uint8_t)tier;
+        out->tier       = tier;
         out->lease      = GW_LEASE_SF;
     }
 }
