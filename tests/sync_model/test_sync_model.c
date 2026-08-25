@@ -403,6 +403,95 @@ static void test_coasting_then_giving_up(void)
 	CHECK(sync_model_to_master(&m, s.l0, &out));
 }
 
+/* ---- 5. The Phase 2 gate itself ---------------------------------------- */
+
+/* The claim the whole hardware gate rests on: the RMS of the model's own
+ * prediction residuals equals the timestamp jitter feeding it. If that does
+ * not hold, reading `sync stats` on a bench anchor measures nothing and the
+ * gate needs external instrumentation after all.
+ *
+ * The simulated noise is uniform on [-A, +A], whose sigma is A/sqrt(3), so
+ * that -- not A -- is what the RMS must land on. */
+static void test_residual_rms_measures_the_jitter(void)
+{
+	const int32_t amps[] = { 6, 32, 64, 320, 640 };
+
+	printf("  residual RMS vs true jitter sigma:\n");
+	for (unsigned int i = 0; i < sizeof(amps) / sizeof(amps[0]); i++) {
+		struct sync_model m;
+		struct sim s;
+
+		rng_seed(500u + i);
+		sync_model_init(&m);
+		sim_init(&s, 0x1800000000ULL, 0x0200000000ULL, 40000, amps[i]);
+
+		for (unsigned int k = 0; k < 400u; k++) sim_step(&s, &m);
+
+		/* sigma of a uniform distribution on [-A, A]: A/sqrt(3). Kept in
+		 * thousandths as well as rounded, so comparisons below need not
+		 * truncate twice. 1000/sqrt(3) = 577. */
+		uint32_t sigma_x1000 = (uint32_t)((int64_t)amps[i] * 577);
+		uint32_t sigma       = sigma_x1000 / 1000u;
+		uint32_t rms   = sync_model_residual_rms_dtu(&m);
+
+		printf("      amp %4d -> sigma %4u, measured RMS %4u, max %5u\n",
+		       amps[i], sigma, rms,
+		       sync_model_residual_max_dtu(&m));
+
+		CHECK(sync_model_residual_count(&m) > 390u);
+
+		/* The RMS itself sits at SYNC_RESIDUAL_TO_JITTER x sigma, not at
+		 * sigma -- the residual differences two independent noisy
+		 * timestamps. Pinned so the factor cannot drift unnoticed. */
+		uint32_t est = sync_model_jitter_est_dtu(&m);
+
+		printf("                inferred jitter %4u (true sigma %4u)\n",
+		       est, sigma);
+
+		/* The RAW rms tracks SYNC_RESIDUAL_TO_JITTER x sigma. Compared in
+		 * thousandths, because truncating sigma to an integer and then
+		 * truncating the product again costs 25 % at the smallest
+		 * amplitude and fails a band the behaviour actually satisfies. */
+		uint32_t want_x1000 =
+			(sigma_x1000 * SYNC_RESIDUAL_TO_JITTER) / 1000u;
+
+		CHECK(rms * 1000u * 100u >= want_x1000 * 70u);
+		CHECK(rms * 1000u * 100u <= want_x1000 * 135u);
+
+		/* And the INFERRED jitter recovers sigma, which is the claim the
+		 * gate actually rests on. Widest at the smallest amplitude,
+		 * where integer truncation of sigma itself dominates. */
+		CHECK(est * 100u >= sigma * 70u);
+		CHECK(est * 100u <= sigma * 135u);
+	}
+}
+
+/* A reset clears the statistics without disturbing the sync itself -- the
+ * operator will want a fresh measurement without re-acquiring. */
+static void test_residual_reset_keeps_sync(void)
+{
+	struct sync_model m;
+	struct sim s;
+	uint64_t out;
+
+	rng_seed(77);
+	sync_model_init(&m);
+	sim_init(&s, 0x0300000000ULL, 0x0900000000ULL, 40000, SYNC_JITTER_DTU);
+	for (unsigned int k = 0; k < 60u; k++) sim_step(&s, &m);
+
+	CHECK(sync_model_residual_count(&m) > 50u);
+	int32_t drift_before = sync_model_drift_ppb(&m);
+
+	sync_model_residual_reset(&m);
+	CHECK(sync_model_residual_count(&m) == 0u);
+	CHECK(sync_model_residual_rms_dtu(&m) == 0u);
+	CHECK(sync_model_residual_max_dtu(&m) == 0u);
+
+	/* Still synced, still the same rate. */
+	CHECK(sync_model_to_master(&m, s.l0, &out));
+	CHECK(sync_model_drift_ppb(&m) == drift_before);
+}
+
 int main(void)
 {
 	printf("sync_model: 1 ns = %" PRId64 " DTU, CCP interval = %llu DTU\n",
@@ -418,6 +507,8 @@ int main(void)
 	test_survives_the_40_bit_wrap();
 	test_max_baseline_does_not_overflow();
 	test_coasting_then_giving_up();
+	test_residual_rms_measures_the_jitter();
+	test_residual_reset_keeps_sync();
 
 	if (failures) {
 		printf("\n%d CHECK(s) FAILED\n", failures);

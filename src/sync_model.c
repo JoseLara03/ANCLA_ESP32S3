@@ -59,6 +59,41 @@ void sync_model_init(struct sync_model *m)
     m->misses     = 0;
     m->have_raw   = false;
     m->valid      = false;
+    m->res_sq_sum = 0;
+    m->res_n      = 0;
+    m->res_max    = 0;
+}
+
+uint32_t sync_model_residual_rms_dtu(const struct sync_model *m)
+{
+    if (m->res_n == 0) return 0;
+    return isqrt32(m->res_sq_sum / m->res_n);
+}
+
+uint32_t sync_model_jitter_est_dtu(const struct sync_model *m)
+{
+    /* Divide out SYNC_RESIDUAL_TO_JITTER. The residual differences two noisy
+     * timestamps, so the raw RMS overstates the per-observation jitter by that
+     * factor -- taking the RMS for the jitter would reject hardware that
+     * actually passes the gate. */
+    return (sync_model_residual_rms_dtu(m) * 1000u) / SYNC_RESIDUAL_TO_JITTER;
+}
+
+uint32_t sync_model_residual_max_dtu(const struct sync_model *m)
+{
+    return m->res_max;
+}
+
+uint32_t sync_model_residual_count(const struct sync_model *m)
+{
+    return m->res_n;
+}
+
+void sync_model_residual_reset(struct sync_model *m)
+{
+    m->res_sq_sum = 0;
+    m->res_n      = 0;
+    m->res_max    = 0;
 }
 
 /* Roll the baseline forward onto its own midpoint, halving its span while
@@ -94,8 +129,18 @@ void sync_model_observe(struct sync_model *m, uint64_t m_dtu, uint64_t l_dtu)
 
         if (sync_model_to_master(m, l_dtu, &pred)) {
             int64_t residual = sdelta40(m_dtu, pred);
+            uint64_t mag = (uint64_t)(residual < 0 ? -residual : residual);
 
             m->phase_corr += residual >> SYNC_PHASE_EMA_SHIFT;
+
+            /* Accumulated BEFORE the correction is applied, so the statistic
+             * measures the model's open-loop prediction error rather than what
+             * is left after it has already corrected for it. The latter would
+             * report a number that shrinks with the EMA gain and says nothing
+             * about the hardware. */
+            m->res_sq_sum += mag * mag;
+            m->res_n++;
+            if (mag > m->res_max) m->res_max = (uint32_t)mag;
         }
     }
 

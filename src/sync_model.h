@@ -158,6 +158,12 @@ struct sync_model {
     uint32_t misses;         /* consecutive missed CCPs */
     bool     have_raw;       /* l_raw/m_raw usable for differencing */
     bool     valid;          /* a usable rate estimate exists */
+    /* Residual statistics. See sync_model_residual_rms_dtu() -- these are what
+     * turn the Phase 2 gate into a self-measurement rather than a bench setup
+     * with external equipment. Survive everything except an explicit reset. */
+    uint64_t res_sq_sum;
+    uint32_t res_n;
+    uint32_t res_max;
 };
 
 void sync_model_init(struct sync_model *m);
@@ -183,8 +189,52 @@ bool sync_model_to_master(const struct sync_model *m, uint64_t l_dtu,
 uint32_t sync_model_error_dtu(const struct sync_model *m, uint32_t ahead_dtu);
 
 /* Relative drift of the local clock against the master, in parts per billion,
- * signed. Diagnostics and the CFO cross-check; not used by the conversion,
- * which works in exact integer ratios instead. */
+ * signed. POSITIVE means the local clock runs fast. Diagnostics and the CFO
+ * cross-check; not used by the conversion, which works in exact integer ratios
+ * instead. */
 int32_t sync_model_drift_ppb(const struct sync_model *m);
+
+/* ---- Residual statistics: the Phase 2 gate, self-measured --------------
+ *
+ * Every observation is predicted before it is folded in, and the residual is
+ * (actual master time) - (predicted master time). The actual value is exact --
+ * it is the master's own declared transmit time -- so the residual is a
+ * measurement of the local RX timestamp noise. That makes the Phase 2 gate a
+ * self-measurement: flash two anchors, let them run, read one number. No
+ * reference instrument, no known distance, no external clock.
+ *
+ * But the residual is NOT equal to the jitter, and an earlier version of this
+ * comment claimed it was. The prediction consumes TWO noisy local timestamps --
+ * the new observation's, and the phase reference's, through the `d = l - l_raw`
+ * term -- so the residual differences two independent samples and its RMS sits
+ * at sqrt(2) * jitter as a floor, with the phase EMA and the rate term adding a
+ * little more. Measured across five noise amplitudes in tests/sync_model/ the
+ * factor is about 1.55.
+ *
+ * That factor matters at the gate in the direction that misleads: an operator
+ * reading 64 DTU of RMS and taking it for 1 ns of jitter would be looking at
+ * about 0.65 ns of real jitter and rejecting hardware that passes.
+ * sync_model_jitter_est_dtu() applies the conversion, and it is the value to
+ * compare against the sweep table -- not the raw RMS.
+ *
+ * SYNC_RESIDUAL_TO_JITTER is EMPIRICAL, from the simulation. It should be
+ * re-derived against hardware if the observed RMS and an independently measured
+ * jitter ever disagree; the tests pin the relation so a change is visible.
+ *
+ * All in DTU. rms returns 0 before there are any observations. */
+/* Ratio of residual RMS to true timestamp jitter, x1000. See above: sqrt(2) is
+ * the floor from differencing two independent samples, and 1.55 is what the
+ * simulation measures once the phase EMA and rate term are included. */
+#define SYNC_RESIDUAL_TO_JITTER  1550u
+
+uint32_t sync_model_residual_rms_dtu(const struct sync_model *m);
+uint32_t sync_model_residual_max_dtu(const struct sync_model *m);
+uint32_t sync_model_residual_count(const struct sync_model *m);
+void     sync_model_residual_reset(struct sync_model *m);
+
+/* Per-observation timestamp jitter inferred from the residuals. THIS is the
+ * number to compare against the sweep table at the top of this header, and the
+ * one the Phase 2 gate turns on. */
+uint32_t sync_model_jitter_est_dtu(const struct sync_model *m);
 
 #endif /* SYNC_MODEL_H */

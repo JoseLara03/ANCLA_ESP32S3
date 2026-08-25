@@ -303,6 +303,12 @@ thresholds.
   `T_GUARD_UUS` (488, the 0.5 ms superframe partition guard from the MAC
   contract §2) is **not** `BEACON_GUARD_UUS` (1500, the slave's TX-suppression
   window around the beacon). Confusing the two triples the charged overhead.
+- `src/ccp_frame.{c,h}` — the clock-calibration-packet wire format, function
+  code `0xEF`. Deliberately NOT in `uwb_frame_802_15_4z.c` (byte-identical with
+  the tag, which has no use for CCPs), same precedent `apos_frame.c` set. Pure
+  C, host-tested in `tests/ccp_frame/`. **`0xEF` is the LAST free code in the
+  `0xEx` range** — the allocation table is in its header, and anything after
+  this needs a subtype byte under an existing code rather than a new one.
 - `src/sync_model.{c,h}` — anchor clock synchronisation: converts a local
   DW3220 timestamp into a master anchor's time base from a stream of CCPs.
   Integer-only, pure C, host-tested in `tests/sync_model/`. **This is the Phase
@@ -432,6 +438,13 @@ thresholds.
   table for the open "a surveyed anchor stops answering DISCOVERY after a power
   cycle" fault: what each debug line means, and which candidate cause each log
   pattern confirms or kills.
+- `docs/anchor-sync-measurement.md` — the Phase 2 gate for the TDoA migration,
+  reduced to one measurement: per-observation timestamp jitter between two
+  anchors, read off `sync stats`. Under ~0.5 ns Phase 3 proceeds, over ~1 ns it
+  does not. Needs no reference instrument (the model measures its own input
+  noise) and **does not depend on antenna calibration** — that is a bias, this
+  is noise — so it runs in parallel with the calibration campaign. Also records
+  what is not yet implemented: the radio glue.
 - `docs/antenna-delay-calibration.md` — the operator procedure for the above:
   DWM3001CDK prerequisites, physical setup, `cal ref`, the `cal peer`
   cross-check and its acceptance threshold, troubleshooting.
@@ -1052,6 +1065,9 @@ gcc -Wall -Wextra -Isrc -o tests/mac_budget/test_mac_budget.exe tests/mac_budget
 
 gcc -Wall -Wextra -Isrc -o tests/sync_model/test_sync_model.exe tests/sync_model/test_sync_model.c src/sync_model.c
 ./tests/sync_model/test_sync_model.exe          # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/ccp_frame/test_ccp_frame.exe tests/ccp_frame/test_ccp_frame.c src/ccp_frame.c
+./tests/ccp_frame/test_ccp_frame.exe            # ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/mac_budget/test_uwb_mac_asserts.exe tests/mac_budget/test_uwb_mac_asserts.c src/mac_budget.c
 ./tests/mac_budget/test_uwb_mac_asserts.exe     # ALL TESTS PASSED, exits 0
