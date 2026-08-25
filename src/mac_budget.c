@@ -11,6 +11,11 @@
 
 #include "mac_budget.h"
 
+/* For NULL. mac_budget.h needs only <stdint.h> for its integer types, and host
+ * gcc happens to pull NULL in transitively -- the Zephyr toolchain does not, so
+ * this must be explicit or the target build fails where the host build passed. */
+#include <stddef.h>
+
 void mac_phy_frozen(struct mac_phy *out)
 {
 	if (out == NULL) {
