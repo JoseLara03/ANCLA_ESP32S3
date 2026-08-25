@@ -171,7 +171,7 @@ static void send_grant(const uint8_t eui[UWB_FRAME_EUI_LEN],
 	 * pointer -- another known frame-module defect left unfixed for
 	 * byte-identity with the tag -- which cannot fire on this path. */
 	int n = uwb_frame_grant_build(buf, sizeof(buf), eui, g->short_addr,
-				      g->slot_index, g->tier, g->lease);
+				      g->seat_id, g->tier, g->lease);
 	if (n < 0) {
 		LOG_WRN("grant build failed (%d)", n);
 		return;
@@ -213,18 +213,35 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 			return;
 		}
 		if (!gw_core_join(ctx, eui, req_tier, &g)) {
-			LOG_WRN("JOIN refused — all %u seats occupied", GW_N_CFP);
+			/* Two distinct causes, and the numbers separate them:
+			 * no free seat of GW_MAX_SEATS, or no slot-superframes
+			 * left of GW_SCHED_CAPACITY even at IDLE. */
+			LOG_WRN("JOIN refused — seats %u/%u, airtime %u/%u",
+				gw_core_seats_used(ctx),
+				(unsigned int)GW_MAX_SEATS,
+				gw_core_cost_used(ctx),
+				(unsigned int)GW_SCHED_CAPACITY);
 			return;
 		}
-		LOG_INF("GRANT addr=0x%04X slot=%u tier=%u lease=%u",
-			g.short_addr, g.slot_index, g.tier, g.lease);
+		/* `tier` is what was GRANTED, which may be below req_tier when
+		 * the cell is busy -- log both, so a degraded grant is visible
+		 * rather than looking like the tag asked for the slower rate. */
+		LOG_INF("GRANT addr=0x%04X seat=%u tier=%u(req %u) lease=%u "
+			"[seats %u/%u, airtime %u/%u]",
+			g.short_addr, g.seat_id, g.tier, req_tier, g.lease,
+			gw_core_seats_used(ctx), (unsigned int)GW_MAX_SEATS,
+			gw_core_cost_used(ctx),
+			(unsigned int)GW_SCHED_CAPACITY);
 		send_grant(eui, &g, rx_ts);
 	} else if (uwb_frame_is_keepalive(buf, len)) {
 		uint16_t sa = 0;
 		uint8_t rt = 0, si = 0;
 
 		if (uwb_frame_parse_keepalive(buf, len, &sa, &rt, &si) == 0) {
-			gw_core_keepalive(ctx, sa, rt);
+			/* NULL: the tag learns its granted tier from the
+			 * cadence of the beacon slot map, not from a
+			 * KEEPALIVE reply -- the contract has no such frame. */
+			gw_core_keepalive(ctx, sa, rt, NULL);
 		}
 	} else if (uwb_frame_is_release(buf, len)) {
 		uint16_t sa = uwb_frame_get_src_addr(buf);
@@ -302,8 +319,10 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 	apos_gw_init();
 
 	LOG_INF("{\"status\":\"gateway\",\"x\":%.2f,\"y\":%.2f,"
-		"\"superframe_ms\":200,\"slots\":%u}",
-		(double)cfg->x, (double)cfg->y, GW_N_CFP);
+		"\"superframe_ms\":200,\"slots\":%u,\"seats\":%u,"
+		"\"airtime_budget\":%u}",
+		(double)cfg->x, (double)cfg->y, GW_N_CFP,
+		(unsigned int)GW_MAX_SEATS, (unsigned int)GW_SCHED_CAPACITY);
 
 	uint64_t beacon_tx_ts = tx_beacon(&ctx, false, 0);
 
