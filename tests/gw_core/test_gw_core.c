@@ -554,6 +554,30 @@ static void test_tier_normalization(void)
     CHECK(GW_N_CFP * gw_core_tier_cost(GW_TIER_FAST) == GW_SCHED_CAPACITY);
 }
 
+
+/* The lease must sustain the slowest tier's period. A tag participates once per
+ * tier period and so sleeps about that long, and it renews at half the lease,
+ * so the cadence plus a margin for missed beacons has to fit inside that half.
+ *
+ * At the old GW_LEASE_SF of 50 this was FALSE for IDLE by a hair -- 25 + 4 is
+ * not below 25 -- which put the slowest tier exactly on its own renewal
+ * deadline. Pinned in both directions so the reason for 75 cannot be quietly
+ * reverted, and so a future tier period that the lease cannot sustain fails
+ * here rather than on a bench. */
+static void test_lease_sustains_every_tier_period(void)
+{
+    for (unsigned int t = 0; t < GW_TIER_COUNT; t++) {
+        uint32_t p = gw_core_tier_period((uint8_t)t);
+
+        CHECK(p + GW_LEASE_MARGIN_SF < GW_LEASE_SF / 2u);
+    }
+    CHECK(GW_TIER_PERIOD_MAX == gw_core_tier_period(GW_TIER_IDLE));
+    CHECK(!(GW_TIER_PERIOD_MAX + GW_LEASE_MARGIN_SF < 50u / 2u));
+
+    /* And the tag's copy of the lease must agree -- the GRANT carries it. */
+    CHECK(GW_LEASE_SF == 75u);
+}
+
 int main(void)
 {
     test_init();
@@ -573,6 +597,7 @@ int main(void)
     test_tier_normalization();
     test_tier_cadence();
     test_capacity_split();
+    test_lease_sustains_every_tier_period();
     test_presence_is_guaranteed_rate_is_not();
     test_movers_first_does_not_lock_out_later_tags();
     test_keepalive_upgrade_is_admission_controlled();

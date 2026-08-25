@@ -48,7 +48,34 @@
 #include "uwb_frame_802_15_4z.h"   /* UWB_FRAME_N_CFP / _EUI_LEN / _ADDR_BCAST */
 
 #define GW_N_CFP          UWB_FRAME_N_CFP   /* ranging slots per superframe */
-#define GW_LEASE_SF       50u               /* lease length, superframes */
+/* Lease length, superframes. Raised 50 -> 75 on 2026-08-25.
+ *
+ * The lease, the tier period and a tag's listen-skip are ONE parameter wearing
+ * three hats, and 50 made the slowest tier sit exactly on its own deadline. A
+ * tag participating every N superframes must sleep about N superframes, and it
+ * renews at half the lease, so the lease has to satisfy
+ *
+ *     GW_LEASE_SF / 2  >  N  +  margin
+ *
+ * for the slowest N in the table. At N = 25 (IDLE) and a lease of 50 that is
+ * 25 > 25, which is false by a hair: the tag wakes exactly on the renewal
+ * deadline every time and one missed beacon costs it the seat. The tag's own
+ * uwb_net.h has recorded that failure from the bench for months -- "a skip of
+ * exactly 25 lands every renewal on its own deadline", keepalives on the air
+ * and no position fixes.
+ *
+ * 75 puts the deadline at 37 against a 25-superframe skip: 12 superframes, 2.4
+ * seconds, of margin. GW_SCHED_WINDOW_SF is unchanged -- the accounting window
+ * and the lease are unrelated quantities that happened to share a number.
+ *
+ * The cost of a longer lease is that a dead tag's seat is held 15 s instead of
+ * 10 s, and A3 made that much cheaper than it used to be: a held IDLE seat now
+ * costs 1 slot-superframe of 275 rather than a whole CFP slot.
+ *
+ * This is a WIRE value -- the GRANT carries it -- so it must match the tag's
+ * UWB_NET_LEASE_SF, and changing it belongs to the proto_ver 3 flag day already
+ * in progress. */
+#define GW_LEASE_SF       75u
 #define GW_TAG_ADDR_BASE  0x0100u           /* tag short-addr pool base */
 
 /* Logical seats. Deliberately much larger than GW_N_CFP -- that inequality is
@@ -143,6 +170,14 @@ uint32_t gw_core_tier_upgrade_cost(uint8_t tier);
 #define GW_SCHED_SLOW_UPGRADE  ((GW_SCHED_WINDOW_SF / 5u) - 1u)  /* 4  */
 #define GW_SCHED_MAX_FAST  (GW_SCHED_UPGRADE_POOL / GW_SCHED_FAST_UPGRADE)
 #define GW_SCHED_MAX_SLOW  (GW_SCHED_UPGRADE_POOL / GW_SCHED_SLOW_UPGRADE)
+
+/* The slowest tier's period, which is the largest N the lease must sustain. */
+#define GW_TIER_PERIOD_MAX   GW_SCHED_WINDOW_SF
+
+/* Margin, in superframes, between a tag's wake cadence and its renewal
+ * deadline. One superframe would be arithmetically sufficient; this allows a
+ * few missed beacons, which is the realistic failure. */
+#define GW_LEASE_MARGIN_SF   4u
 
 /* Cost of one seat at `tier`, in slot-superframes per window. An unknown tier
  * is charged as IDLE, matching gw_core_normalize_tier(). */
