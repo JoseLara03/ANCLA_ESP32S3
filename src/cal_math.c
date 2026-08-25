@@ -58,6 +58,13 @@ uint16_t cal_solve_step(int32_t measured_mm, int32_t ref_mm, uint16_t cur_total_
     int32_t err_mm = measured_mm - ref_mm;
     int32_t delta_units = div_round_pos(err_mm * 1000, CAL_MM_PER_UNIT_X1000);
 
+    /* Bound a single iteration's correction -- see CAL_MAX_STEP_UNITS. */
+    if (delta_units > CAL_MAX_STEP_UNITS) {
+        delta_units = CAL_MAX_STEP_UNITS;
+    } else if (delta_units < -CAL_MAX_STEP_UNITS) {
+        delta_units = -CAL_MAX_STEP_UNITS;
+    }
+
     int32_t new_total = (int32_t)cur_total_dly + delta_units;
 
     if (new_total < 0) {
@@ -178,6 +185,15 @@ int cal_math_selftest(void)
     }
     /* Solver clamps at zero (cannot go negative). */
     if (cal_solve_step(0, 100000, 10) != 0) {
+        fails++;
+    }
+    /* Solver bounds a single correction to +/-CAL_MAX_STEP_UNITS: a 75000 mm
+     * error (~32051 raw units) must not swing the total by more than 2000
+     * units in one step, regardless of how far off the reading is. */
+    if (cal_solve_step(76000, 1000, 31844) != 31844 + CAL_MAX_STEP_UNITS) {
+        fails++;
+    }
+    if (cal_solve_step(1000, 76000, 31844) != 31844 - CAL_MAX_STEP_UNITS) {
         fails++;
     }
     /* Equal split: even and odd totals. */

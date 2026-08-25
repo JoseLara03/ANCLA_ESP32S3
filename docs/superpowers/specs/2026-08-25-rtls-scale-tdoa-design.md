@@ -504,10 +504,33 @@ lectura de ese retardo degenerado casualmente lee como convergida, **se persiste
 una calibración rota a NVS sin error en ningún lado.** `tests/cal_solve/` del
 ancla pasa hoy porque no contiene los dos asserts que el tag agregó.
 
-→ **A0 (bloqueante, antes de correr `cal ref` en cualquier ancla):** portar
-`CAL_MAX_STEP_UNITS` y su clamp de `tag_testting/src/cal_math.{c,h}` a ANCLA,
-copiar también los dos asserts nuevos a `tests/cal_solve/`, y confirmar `diff`
-vacío.
+→ **A0 — HECHO 2026-08-25.** `cal_math.{c,h}` copiado verbatim tag → ANCLA,
+`diff` vacío verificado, suite completa verde (14 suites).
+
+**Y A0 destapó algo que la copia sola habría empeorado.** El clamp del tag
+**desactiva el guardián de rango del ancla**. `cal_solve_tx_delay()` siempre
+rechazó con `-ERANGE` un retardo fuera de `CAL_TX_DLY_MIN..MAX`, y su contrato
+dice que el llamador no debe persistir ese valor. Con el clamp, un paso saturado
+ya no se pasa de la ventana: aterriza cómodamente dentro. En concreto
+`cal_solve_tx_delay(12000, 2000, 16385, 16385, &tx)` —10 m de error de medición—
+pasó de devolver `-ERANGE` a devolver **0 con `tx = 18385`**, un éxito cargando
+un retardo ~4.7 m equivocado que el procedimiento habría escrito a NVS.
+Verificado neutralizando el guardián y viendo fallar `CHECK(tx != 18385)`.
+
+Por eso los dos guardianes son **complementarios, no redundantes**: el clamp
+acota el daño, el rango reporta que se acotó. `cal_solve.c` ahora chequea
+`|measured_mm − ref_mm| > CAL_MAX_STEP_MM` (4680 mm, **derivado** de
+`CAL_MAX_STEP_UNITS * CAL_MM_PER_UNIT_X1000`, no reescrito, porque el tag puede
+cambiarlos) **antes** del test de rango. `cal_math` queda byte-idéntico: el
+guardián vive en la capa propia del ancla, así que no requiere coordinación
+entre repos. Cuatro tests nuevos en `tests/cal_solve/`, con control negativo.
+
+**Lección general, más valiosa que el fix:** una cota agregada en una dependencia
+copiada puede volver **inalcanzable** el chequeo de validez del llamador, y nada
+falla ruidosamente cuando pasa — `tests/cal_solve/` del ancla siguió pasando
+porque solo afirmaba los vectores del selftest del tag. Al re-copiar `cal_math`,
+re-verificar que `CAL_MAX_STEP_MM` siga acotando lo que el solver realmente
+satura.
 
 → **A0b (con el bump de `proto_ver` v3, Fase 1):** absorber ALERT en el codec
 del ancla y resolver la doble asignación de `0xEB` descrita en §4.4.

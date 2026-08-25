@@ -14,6 +14,18 @@
  * c * 0.5 * DWT_TIME_UNITS = ~2.34 mm. Stored x1000 for integer math. */
 #define CAL_MM_PER_UNIT_X1000   2340
 
+/* Largest per-iteration correction cal_solve_step() will apply, in delay
+ * units. A genuine per-unit factory variance on this hardware is tens to a
+ * few hundred units (e.g. 16371 nominal vs 15922 measured on one board --
+ * ~450 units); a correction demanding tens of thousands of units means the
+ * sample that produced it is corrupted, not that the antenna delay is
+ * wildly wrong. Without this bound, one bad measurement (whatever causes
+ * it) can swing the combined delay by ~32000 units in a single step,
+ * driving it to the 0 or CAL_MAX_TOTAL_DLY clamp -- and if that degenerate
+ * delay's own next measurement then happens to read as converged, a broken
+ * calibration gets persisted to NVS with no error anywhere. */
+#define CAL_MAX_STEP_UNITS      2000
+
 /* Clamp for the combined (TX+RX) antenna delay. */
 #define CAL_MAX_TOTAL_DLY       65000u
 

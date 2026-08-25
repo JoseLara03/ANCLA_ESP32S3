@@ -682,6 +682,29 @@ thresholds.
   since this failure looked exactly like a configuration bug from the console.
   A link budget measured before the rework is not valid — re-measure on a
   reworked board.
+- **`cal_solve.c` needs TWO guards, and the newer one exists because the other
+  one silently stopped working.** `cal_solve_tx_delay()` has always rejected a
+  solved delay outside `CAL_TX_DLY_MIN..MAX` with `-ERANGE`, and its header
+  contract says the caller must not persist such a value. Then `cal_math.c` --
+  which is a **verbatim copy owned by the tag** -- gained `CAL_MAX_STEP_UNITS`
+  (2000), bounding one iteration's correction so a corrupted sample cannot swing
+  the delay ~32000 units at once. Individually both are right. Together, the
+  clamp **defeated the range check**: a saturated step no longer overshoots the
+  window, it lands comfortably inside it. Concretely
+  `cal_solve_tx_delay(12000, 2000, 16385, 16385, &tx)` is a 10 m measurement
+  error that used to return `-ERANGE`; with the clamp it returned **0 with
+  tx = 18385**, a success carrying a delay ~4.7 m wrong, which the calling
+  procedure would have written to NVS. Verified by neutralising the guard and
+  watching `CHECK(tx != 18385)` fail. So `cal_solve.c` now checks
+  `|measured_mm - ref_mm| > CAL_MAX_STEP_MM` (4680 mm, **derived** from
+  `CAL_MAX_STEP_UNITS * CAL_MM_PER_UNIT_X1000` rather than restated, since the
+  tag may change those) **before** the range test, and reports the bound the
+  measurement was pushing toward. The general lesson, worth more than the fix: a
+  bound added in a copied dependency can make a caller's own validity check
+  unreachable, and nothing fails loudly when it does — the anchor's
+  `tests/cal_solve/` went on passing because it only asserted the tag's
+  selftest vectors. When re-copying `cal_math` from the tag, re-check that
+  `CAL_MAX_STEP_MM` still bounds what the solver actually saturates at.
 - **An SS-TWR exchange is NOT `poll_airtime + turnaround + resp_airtime` — that
   form double-counts both SHRs and inflates the span by ~1194 us per exchange
   at this PHY.** `POLL_RX_TO_RESP_TX_DLY_UUS` is measured **RMARKER to
