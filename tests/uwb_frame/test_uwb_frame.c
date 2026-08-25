@@ -1,5 +1,6 @@
 #include "uwb_frame_802_15_4z.h"
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -331,6 +332,99 @@ static void test_pos(void)
                               1.0f, 2.0f, 0.1f, 4, 50) == -EMSGSIZE);
 }
 
+static void test_alert(void)
+{
+    /* 0xEE since 2026-08-25. Was 0xEB, which collided exactly with the anchor
+     * survey's APOS_FRAME_TYPE -- same code, same 34-byte length, same
+     * discriminating offset. Pinned here because a function code is a wire
+     * value: changing it must be a deliberate edit to a test, not a silent
+     * consequence of editing a header. */
+    CHECK(UWB_FRAME_TYPE_ALERT == 0xEE);
+    CHECK(UWB_FRAME_LEN_ALERT == 34);
+    CHECK(UWB_FRAME_LEN_ALERT <= UWB_FRAME_MAX_LEN);
+    CHECK(UWB_ALERT_STATE_HELP == 0x01);
+    CHECK(UWB_ALERT_STATE_CANCEL == 0x00);
+    CHECK(UWB_ALERT_HOP_UNKNOWN == 0xFF);
+
+    struct uwb_alert a;
+    memset(&a, 0, sizeof(a));
+    a.state       = UWB_ALERT_STATE_HELP;
+    a.epoch       = 7;
+    a.repeat_seq  = 3;
+    a.sender_hop  = UWB_ALERT_HOP_UNKNOWN;
+    a.ttl         = UWB_ALERT_TTL_INIT;
+    memcpy(a.orig_eui, (uint8_t[8]){1,2,3,4,5,6,7,8}, 8);
+    a.orig_addr   = 0x1234;
+    a.batt_soc    = 87;
+    a.last_x      = -1.5f;
+    a.last_y      = 2.25f;
+
+    uint8_t buf[UWB_FRAME_MAX_LEN];
+    int n = uwb_frame_alert_build(buf, sizeof(buf), 0x0102, &a);
+    CHECK(n == UWB_FRAME_LEN_ALERT);
+    CHECK(uwb_frame_is_alert(buf, (size_t)n));
+    CHECK(uwb_frame_get_dest_addr(buf) == UWB_ADDR_GATEWAY);
+    CHECK(uwb_frame_get_src_addr(buf) == 0x0102);
+    CHECK(buf[9] == UWB_FRAME_TYPE_ALERT);
+
+    /* Round-trip: build -> parse returns every field bit-identical. Compare
+     * the whole struct via memcmp, not field-by-field ==, because last_x/
+     * last_y may be NaN below and NaN never compares equal to itself. */
+    struct uwb_alert b;
+    memset(&b, 0, sizeof(b));
+    CHECK(uwb_frame_parse_alert(buf, (size_t)n, &b) == 0);
+    CHECK(memcmp(&a, &b, sizeof(a)) == 0);
+
+    /* NaN coordinates round-trip too (raw-byte compare, not ==). */
+    struct uwb_alert nanA;
+    memset(&nanA, 0, sizeof(nanA));
+    nanA.state      = UWB_ALERT_STATE_CANCEL;
+    nanA.epoch      = 200;
+    nanA.sender_hop = 2;
+    nanA.ttl        = 3;
+    nanA.last_x     = NAN;
+    nanA.last_y     = NAN;
+    uint8_t nbuf[UWB_FRAME_MAX_LEN];
+    int nn = uwb_frame_alert_build(nbuf, sizeof(nbuf), 0x0007, &nanA);
+    CHECK(nn == UWB_FRAME_LEN_ALERT);
+    struct uwb_alert nanB;
+    memset(&nanB, 0, sizeof(nanB));
+    CHECK(uwb_frame_parse_alert(nbuf, (size_t)nn, &nanB) == 0);
+    CHECK(memcmp(&nanA, &nanB, sizeof(nanA)) == 0);
+
+    /* uwb_frame_is_alert rejects: wrong length, wrong type, bad PAN. */
+    CHECK(!uwb_frame_is_alert(buf, UWB_FRAME_LEN_ALERT - 1));  /* 33 */
+    CHECK(!uwb_frame_is_alert(buf, UWB_FRAME_LEN_ALERT + 1));  /* 35 */
+    {
+        uint8_t bt[UWB_FRAME_LEN_ALERT]; memcpy(bt, buf, UWB_FRAME_LEN_ALERT);
+        bt[9] = UWB_FRAME_TYPE_POS;
+        CHECK(!uwb_frame_is_alert(bt, UWB_FRAME_LEN_ALERT));
+    }
+    {
+        uint8_t bp[UWB_FRAME_LEN_ALERT]; memcpy(bp, buf, UWB_FRAME_LEN_ALERT);
+        bp[3] = 0xBE;   /* corrupt PAN */
+        CHECK(!uwb_frame_is_alert(bp, UWB_FRAME_LEN_ALERT));
+    }
+
+    /* uwb_frame_parse_alert rejects a frame with any reserved bit set. */
+    {
+        uint8_t br[UWB_FRAME_LEN_ALERT]; memcpy(br, buf, UWB_FRAME_LEN_ALERT);
+        br[10] |= 0x02;   /* state offset (byte 10); reserved bit1 */
+        struct uwb_alert out;
+        CHECK(uwb_frame_parse_alert(br, UWB_FRAME_LEN_ALERT, &out) == -EINVAL);
+    }
+
+    /* uwb_frame_alert_build errors. */
+    CHECK(uwb_frame_alert_build(buf, UWB_FRAME_LEN_ALERT - 1, 0x0102, &a) == -EMSGSIZE);
+    CHECK(uwb_frame_alert_build(NULL, sizeof(buf), 0x0102, &a) == -EINVAL);
+    CHECK(uwb_frame_alert_build(buf, sizeof(buf), 0x0102, NULL) == -EINVAL);
+
+    /* Same length as GRANT/POS is not enough to be confused -- only the type
+     * byte distinguishes them. */
+    CHECK(!uwb_frame_is_grant(buf, UWB_FRAME_LEN_GRANT));
+    CHECK(!uwb_frame_is_pos(buf, UWB_FRAME_LEN_POS));
+}
+
 int main(void)
 {
     test_scaffold();
@@ -344,6 +438,7 @@ int main(void)
     test_join_grant();
     test_keepalive_release();
     test_pos();
+    test_alert();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

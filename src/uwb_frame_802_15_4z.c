@@ -26,6 +26,16 @@
 #define OFF_POS_RES    18  /* bytes 18-21 */
 #define OFF_POS_NANCH  22
 #define OFF_POS_SOC    23
+#define OFF_AL_STATE   10
+#define OFF_AL_EPOCH   11
+#define OFF_AL_REP     12
+#define OFF_AL_HOP     13
+#define OFF_AL_TTL     14
+#define OFF_AL_EUI     15  /* bytes 15-22 */
+#define OFF_AL_ADDR    23  /* bytes 23-24 */
+#define OFF_AL_SOC     25
+#define OFF_AL_X       26  /* bytes 26-29 */
+#define OFF_AL_Y       30  /* bytes 30-33 */
 
 /* ---- Little-endian field helpers ---- */
 static void put_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
@@ -392,5 +402,52 @@ int uwb_frame_parse_pos(const uint8_t *buf, size_t len, uint16_t *src_addr,
     if (residual_m) *residual_m = get_f32(&buf[OFF_POS_RES]);
     if (n_anchors)  *n_anchors  = buf[OFF_POS_NANCH];
     if (batt_soc)   *batt_soc   = buf[OFF_POS_SOC];
+    return 0;
+}
+
+/* ---- ALERT frame support ---- */
+
+int uwb_frame_alert_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                          const struct uwb_alert *a)
+{
+    if (!a) return -EINVAL;
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_ALERT, UWB_ADDR_GATEWAY,
+                       src_addr, UWB_FRAME_TYPE_ALERT);
+    if (rc) return rc;
+    buf[OFF_AL_STATE] = a->state;
+    buf[OFF_AL_EPOCH] = a->epoch;
+    buf[OFF_AL_REP]   = a->repeat_seq;
+    buf[OFF_AL_HOP]   = a->sender_hop;
+    buf[OFF_AL_TTL]   = a->ttl;
+    memcpy(&buf[OFF_AL_EUI], a->orig_eui, UWB_FRAME_EUI_LEN);
+    put_u16(&buf[OFF_AL_ADDR], a->orig_addr);
+    buf[OFF_AL_SOC] = a->batt_soc;
+    put_f32(&buf[OFF_AL_X], a->last_x);
+    put_f32(&buf[OFF_AL_Y], a->last_y);
+    return UWB_FRAME_LEN_ALERT;
+}
+
+bool uwb_frame_is_alert(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_ALERT && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_ALERT;
+}
+
+int uwb_frame_parse_alert(const uint8_t *buf, size_t len, struct uwb_alert *a)
+{
+    if (!a) return -EINVAL;
+    if (!uwb_frame_is_alert(buf, len)) return -EINVAL;
+    if (buf[OFF_AL_STATE] & UWB_ALERT_STATE_RESERVED_MASK) return -EINVAL;
+
+    a->state       = buf[OFF_AL_STATE];
+    a->epoch       = buf[OFF_AL_EPOCH];
+    a->repeat_seq  = buf[OFF_AL_REP];
+    a->sender_hop  = buf[OFF_AL_HOP];
+    a->ttl         = buf[OFF_AL_TTL];
+    memcpy(a->orig_eui, &buf[OFF_AL_EUI], UWB_FRAME_EUI_LEN);
+    a->orig_addr   = get_u16(&buf[OFF_AL_ADDR]);
+    a->batt_soc    = buf[OFF_AL_SOC];
+    a->last_x      = get_f32(&buf[OFF_AL_X]);
+    a->last_y      = get_f32(&buf[OFF_AL_Y]);
     return 0;
 }

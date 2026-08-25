@@ -17,12 +17,45 @@
 #define UWB_FRAME_TYPE_KEEPALIVE 0xE8
 #define UWB_FRAME_TYPE_RELEASE   0xE9
 #define UWB_FRAME_TYPE_POS       0xEA
+/* Moved from 0xEB on 2026-08-25. 0xEB was DOUBLE-ALLOCATED: the anchor project
+ * had been using it as APOS_FRAME_TYPE for the auto-positioning survey since
+ * before ALERT existed, and the collision was exact rather than approximate --
+ * APOS_LEN_ENUM_RSP is 34 bytes, the same as UWB_FRAME_LEN_ALERT, with the
+ * discriminating byte at the same offset 10 (ALERT's `state`, apos's subtype).
+ *
+ * It had not bitten yet, but only via two single-point saves: an ENUM_RSP
+ * reaching a tag was rejected because subtype 0x02 trips
+ * UWB_ALERT_STATE_RESERVED_MASK by one bit, and a HELP alert reaching an anchor
+ * survived only because state 0x01 is exactly APOS_SUB_SURVEY_BEGIN and the two
+ * frames differ in length. Any new 34-byte apos subtype with bit 1 clear, or any
+ * change to UWB_FRAME_LEN_ALERT, turns that into silent cross-talk between two
+ * unrelated functions.
+ *
+ * ALERT moved rather than apos because apos already has seven subtypes, its own
+ * codec and its own host tests, whereas ALERT is a single type. 0xEC and 0xED
+ * are reserved for CONFIG_SET / CONFIG_ACK (design spec section 4.4). */
+#define UWB_FRAME_TYPE_ALERT     0xEE
 
 #define UWB_ADDR_GATEWAY  0x0000u
 #define UWB_ADDR_UNASSOC  0xFFFEu   /* tag src before it is granted a short addr */
 
-#define UWB_PROTO_VER     2
-#define UWB_FRAME_N_CFP   11        /* ranging slots per superframe (v2) */
+/* Bumped 2 -> 3 on 2026-08-25. Two changes ride on it, neither of which alters
+ * a frame LAYOUT -- which is why the version, not the length, is what protects
+ * them:
+ *
+ *   1. The beacon's slot map is now a SCHEDULE ("who transmits this
+ *      superframe") rather than an ownership table. A v2 tag reads absence from
+ *      the map as a reclaimed seat and tears down, so it would thrash against a
+ *      v3 gateway that time-multiplexes slots.
+ *   2. GRANT byte 20 carries a SEAT id rather than a CFP slot index, and seat
+ *      ids exceed N_CFP.
+ *
+ * A v2 tag against a v3 gateway therefore stays deaf in SCAN, which is the
+ * correct loud failure rather than a silent misbehaviour -- but it does make
+ * this a FLAG DAY: both firmwares are ours and both must be reflashed together.
+ * ALERT's move to 0xEE is grouped here for the same reason. */
+#define UWB_PROTO_VER     3
+#define UWB_FRAME_N_CFP   11        /* ranging slots per superframe */
 #define UWB_FRAME_N_CAP   4         /* CAP Aloha mini-slots (v1) */
 
 #define UWB_FRAME_PANID       0xCADE  /* written as literal bytes 0xCA,0xDE */
@@ -49,6 +82,29 @@
  * real 0 % reading. */
 #define UWB_FRAME_POS_SOC_UNKNOWN 0xFFu
 #define UWB_FRAME_LEN_POS        24
+
+/* ---- ALERT (0xEE): HELP/CANCEL, tag/anchor -> gateway --------------------
+ * See spec/2026-08-16-uwb-help-alert-design.md §2/§3 for the field
+ * semantics (epoch/repeat_seq/ttl/sender_hop ordering and the reserved
+ * `state` bits). UWB_FRAME_LEN_ALERT (34) <= UWB_FRAME_MAX_LEN (37). */
+#define UWB_ALERT_STATE_CANCEL 0x00u
+#define UWB_ALERT_STATE_HELP   0x01u
+#define UWB_ALERT_STATE_RESERVED_MASK 0xFEu   /* bits1-7, must be 0 */
+#define UWB_ALERT_HOP_UNKNOWN  0xFFu
+#define UWB_ALERT_TTL_INIT     6
+#define UWB_FRAME_LEN_ALERT    34
+
+struct uwb_alert {
+    uint8_t  state;        /* bit0 HELP/CANCEL; bits1-7 reserved, must be 0 */
+    uint8_t  epoch;
+    uint8_t  repeat_seq;
+    uint8_t  sender_hop;
+    uint8_t  ttl;
+    uint8_t  orig_eui[8];
+    uint16_t orig_addr;
+    uint8_t  batt_soc;
+    float    last_x, last_y;   /* NaN when the tag has no fix */
+};
 
 struct uwb_anchor_slot {
     uint16_t addr;      /* anchor short address */
@@ -114,6 +170,12 @@ bool uwb_frame_is_pos(const uint8_t *buf, size_t len);
 int  uwb_frame_parse_pos(const uint8_t *buf, size_t len, uint16_t *src_addr,
                          float *x, float *y, float *residual_m,
                          uint8_t *n_anchors, uint8_t *batt_soc);
+
+/* ---- ALERT (0xEE) builder / parser / validator ---- */
+int  uwb_frame_alert_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                           const struct uwb_alert *a);
+bool uwb_frame_is_alert(const uint8_t *buf, size_t len);
+int  uwb_frame_parse_alert(const uint8_t *buf, size_t len, struct uwb_alert *a);
 
 /* ---- Validators ---- */
 bool uwb_frame_is_valid(const uint8_t *buf, size_t len);

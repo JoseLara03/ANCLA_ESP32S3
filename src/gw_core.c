@@ -196,7 +196,29 @@ static uint16_t alloc_short_addr(struct gw_core_ctx *c)
     /* Monotonic pool from GW_TAG_ADDR_BASE, skipping any address held by a
      * live seat. The guard bound is GW_MAX_SEATS (not GW_N_CFP as it was while
      * the table was slot-indexed): with GW_MAX_SEATS live seats, that many
-     * collisions is the worst case before a free value must appear. */
+     * collisions is the worst case before a free value must appear.
+     *
+     * DO NOT "improve" this into prompt address reuse. The long wrap --
+     * 0x0100..0xFFFD is 65278 values, so a freed address is not handed out
+     * again for that many joins -- is an accidental but load-bearing
+     * QUARANTINE, and it is what protects the Tid fallback path:
+     *
+     * uwb_gateway.c's POS dispatch is deliberately not gated on seat state, so
+     * a fix can arrive just after its sender's lease expired. It then calls
+     * gw_core_find_eui(), which returns false, and the fix is published with
+     * tag_id = src_addr -- an uninformative one-record phantom, documented and
+     * accepted (see CLAUDE.md's Tid entry).
+     *
+     * Reuse an address promptly and that failure changes character. Tag A's
+     * seat expires, tag B joins and is given A's old address, then a straggler
+     * POS frame from A arrives: find_eui() now succeeds and returns B's EUI, so
+     * A's position is attributed to B -- a real, wrong, live device. That is
+     * the one path by which the fallback can be silently wrong about a real tag
+     * rather than merely uninformative, and the monotonic pool is what keeps it
+     * at the ~1.5e-5 coincidence bound instead of making it routine.
+     *
+     * The Tid fix (hashing the EUI) does not help here: the whole point of this
+     * path is that the EUI looked up is the WRONG tag's. */
     for (unsigned int guard = 0; guard <= GW_MAX_SEATS; guard++) {
         uint16_t a = c->next_short_addr++;
 
