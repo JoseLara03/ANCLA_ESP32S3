@@ -149,6 +149,7 @@ enum gw_crumb {
 	GW_CRUMB_SF_TICK,     /* 7: gw_core_superframe_tick() */
 	GW_CRUMB_TX_BEACON,   /* 8: inside tx_beacon() -- delayed TX + TXFRS */
 	GW_CRUMB_CCP_TX,      /* 9: inside ccp_master_after_beacon() */
+	GW_CRUMB_CCP_TXTEST,  /* 10: inside ccp_master_txtest_step() -- bench-only */
 };
 
 static volatile uint32_t gw_crumb;
@@ -186,7 +187,7 @@ static void gw_stall_expiry(struct k_timer *t)
 	LOG_ERR("{\"gw_stuck\":{\"crumb\":%u,\"for_ms\":%u,\"seq\":%u,"
 		"\"apos_busy\":%d,\"note\":\"1=loop_top 2=apos_step "
 		"3=rx_arm 4=rx_wait 5=rx_read 6=dispatch 7=sf_tick "
-		"8=tx_beacon 9=ccp_tx\"}}",
+		"8=tx_beacon 9=ccp_tx 10=ccp_txtest\"}}",
 		gw_crumb, CRUMB_STALL_MS, gw_crumb_seq,
 		(int)apos_gw_busy());
 }
@@ -666,6 +667,20 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 		if (ts != 0u) {
 			CRUMB(GW_CRUMB_CCP_TX);
 			ccp_master_after_beacon(next_beacon, &gw_seq);
+		}
+
+		/* D3 bench diagnostic ("sync txtest"): consumes at most one
+		 * pending request per superframe, here and nowhere else. This
+		 * is deliberately unconditional on `ts` -- unlike the real CCP
+		 * above, the test does not need a freshly-confirmed beacon
+		 * time to schedule from, since it transmits immediately rather
+		 * than at a computed hi32. Bounded: at most one immediate TX
+		 * and one bounded TXFRS wait, a no-op otherwise. See
+		 * ccp_master.h for why this must run from THIS loop and never
+		 * from the shell thread that requests it. */
+		if (ccp_master_txtest_pending()) {
+			CRUMB(GW_CRUMB_CCP_TXTEST);
+			ccp_master_txtest_step(&gw_seq);
 		}
 
 		/* On a miss, re-base on the current time rather than compounding

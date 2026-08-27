@@ -36,6 +36,7 @@
 
 #include <zephyr/shell/shell.h>
 
+#include <errno.h>
 #include <string.h>
 
 #ifdef CONFIG_ANCLA_CAL_MODE
@@ -155,17 +156,32 @@ static int cmd_master(const struct shell *sh, size_t argc, char **argv)
 
 	uint32_t sent = 0, dropped = 0, root = 0;
 	int32_t late_min = 0, late_max = 0, late_last = 0;
+	int32_t late_signed_last = 0, late_signed_min = 0;
+	uint32_t sys_status_lo = 0;
+	bool hpdwarn_seen = false;
+	bool tt_pending = false, tt_done = false, tt_tx_ok = false, tt_txfrs_ok = false;
 
 	ccp_master_stats(&sent, &dropped, &root, &late_min, &late_max,
 			 &late_last);
+	ccp_master_diag_stats(&late_signed_last, &late_signed_min,
+			      &sys_status_lo, &hpdwarn_seen);
+	ccp_master_txtest_stats(&tt_pending, &tt_done, &tt_tx_ok, &tt_txfrs_ok);
 
 	shell_print(sh,
 		    "{\"ccp_master\":{\"role\":\"%s\",\"root\":%u,"
 		    "\"sent\":%u,\"dropped\":%u,"
 		    "\"late_ns_min\":%d,\"late_ns_max\":%d,"
-		    "\"late_ns_last\":%d}}",
+		    "\"late_ns_last\":%d,"
+		    "\"late_ns_signed_last\":%d,\"late_ns_signed_min\":%d,"
+		    "\"sys_status_lo\":\"0x%08X\",\"hpdwarn_seen\":%d,"
+		    "\"txtest\":{\"pending\":%d,\"done\":%d,\"tx_ok\":%d,"
+		    "\"txfrs_ok\":%d}}}",
 		    board_role(), root, sent, dropped,
-		    (int)late_min, (int)late_max, (int)late_last);
+		    (int)late_min, (int)late_max, (int)late_last,
+		    (int)late_signed_last, (int)late_signed_min,
+		    (unsigned int)sys_status_lo, (int)hpdwarn_seen,
+		    (int)tt_pending, (int)tt_done, (int)tt_tx_ok,
+		    (int)tt_txfrs_ok);
 
 	if (strcmp(board_role(), "gateway") != 0) {
 		shell_warn(sh,
@@ -187,6 +203,42 @@ static int cmd_master(const struct shell *sh, size_t argc, char **argv)
 			   "suspecting the RF link.",
 			   dropped, sent + dropped);
 	}
+	return 0;
+}
+
+static int cmd_txtest(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	/* Gateway mode only -- the same refusal pattern as the apos tree.
+	 * ccp_master_after_beacon()'s per-superframe CCP only ever runs from
+	 * uwb_gateway_run()'s loop, and this test rides the exact same
+	 * mechanism (a flag consumed by that loop), so it means nothing
+	 * anywhere else. */
+	if (strcmp(board_role(), "gateway") != 0) {
+		shell_error(sh, "sync txtest: gateway mode only (this board is "
+				"\"%s\")", board_role());
+		return -ENOTSUP;
+	}
+
+	/* BENCH DIAGNOSTIC ONLY: an immediate TX lands at an arbitrary time
+	 * within the superframe, wherever the gateway loop happens to be when
+	 * it consumes this request -- it can collide with beacon, GRANT, or
+	 * ranging traffic on a live network. Never use this on a deployed
+	 * gateway.
+	 *
+	 * This only SETS A FLAG -- see ccp_master.h. The actual transmit runs
+	 * on the gateway loop, on its next iteration (i.e. after the current
+	 * superframe's beacon and CCP), never from this shell thread. Check
+	 * the result with `sync master` afterwards; \"pending\":1 means the
+	 * gateway loop has not consumed it yet. */
+	ccp_master_request_txtest();
+	shell_print(sh,
+		    "queued one immediate-TX CCP (BENCH DIAGNOSTIC — not for a "
+		    "live deployment). The gateway loop transmits it on its "
+		    "next iteration; run `sync master` afterwards for the "
+		    "result (see its \"txtest\" field).");
 	return 0;
 }
 
@@ -214,6 +266,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync,
 		      "master — CCP transmit stats as JSON (meaningful on a "
 		      "GATEWAY)",
 		      cmd_master, 1, 0),
+	SHELL_CMD_ARG(txtest, NULL,
+		      "txtest — BENCH DIAGNOSTIC: queue one immediate-TX CCP "
+		      "(GATEWAY only); read the result with `sync master`",
+		      cmd_txtest, 1, 0),
 	SHELL_SUBCMD_SET_END
 );
 

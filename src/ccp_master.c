@@ -93,6 +93,50 @@ static int32_t late_ns_last;
 static uint32_t n_nonpositive_late;
 static bool have_late_sample;
 
+/* D2: the SIGNED lateness, tracked unconditionally (including non-positive
+ * values), unlike late_ns_{min,max} above which deliberately exclude them.
+ * This is the decisive number for telling HPDWARN and TXERR apart: at the
+ * instant of the arm we expect to be roughly one CCP-SHR *before* the
+ * scheduled RMARKER, i.e. around -1.05 ms (~ -262000 hi32 ticks,
+ * late_ns ~= -1050000). A value near that confirms at_hi32 is sane and the
+ * failure has some other cause (consistent with TXERR); a wildly large
+ * magnitude -- anything approaching the ~8.6 s half-period this hi32
+ * arithmetic is valid within -- would mean at_hi32 itself is being computed
+ * or written wrongly, which would BE the cause of HPDWARN, not merely
+ * coincide with it. */
+static int32_t late_ns_signed_last;
+static int32_t late_ns_signed_min;
+static bool have_signed_late_sample;
+
+/* D1: the raw low system-status word and whether HPDWARN was set, read ONLY
+ * on the dwt_starttx() failure path, immediately after the failure. HPDWARN is
+ * explicitly cleared right before dwt_starttx() (see the call site) so that
+ * any HPDWARN observed here was necessarily set by THIS CMD_DTX and is not
+ * stale from an earlier transmission.
+ *
+ * This is suggestive, not proof: ull_starttx() (the vendored driver) issues
+ * CMD_TXRXOFF on BOTH of its failure branches -- HPDWARN and TXERR -- before
+ * we ever get to read anything, and that command may itself clear HPDWARN.
+ * So "HPDWARN reads clear" is consistent with TXERR having fired, but it does
+ * not rule out a HPDWARN that the TXRXOFF already cleared before this read.
+ * Read alongside late_ns_signed_last/min above, which is the stronger
+ * evidence. */
+static uint32_t last_sys_status_lo;
+static bool last_hpdwarn_seen;
+
+/* D3: the one-shot immediate-TX control experiment ("sync txtest"). Separate
+ * state from everything above so the bench probe can never be confused with,
+ * or perturb, the normal per-superframe CCP counters. txtest_pending is set
+ * by the shell thread (ccp_master_request_txtest()) and consumed ONLY by the
+ * gateway loop (ccp_master_txtest_step()), which is what makes this safe: see
+ * ccp_master.h for the full reasoning on why the radio itself must never be
+ * touched from the shell thread here. */
+static volatile bool txtest_pending;
+static bool txtest_done;
+static bool txtest_tx_ok;
+static bool txtest_txfrs_ok;
+static uint8_t txtest_buf[CCP_FRAME_LEN];
+
 void ccp_master_init(void)
 {
 	/* Zero-pad FIRST, mirroring apos_node.c's apos_node_init(): hwinfo may
@@ -135,6 +179,18 @@ void ccp_master_init(void)
 	n_nonpositive_late = 0;
 	have_late_sample = false;
 
+	late_ns_signed_last = 0;
+	late_ns_signed_min = 0;
+	have_signed_late_sample = false;
+
+	last_sys_status_lo = 0;
+	last_hpdwarn_seen = false;
+
+	txtest_pending = false;
+	txtest_done = false;
+	txtest_tx_ok = false;
+	txtest_txfrs_ok = false;
+
 	LOG_INF("{\"ccp_master\":{\"root_id\":%u,\"offset_uus\":%u}}",
 		root_id, (unsigned int)CCP_OFFSET_UUS);
 }
@@ -154,10 +210,17 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 			LOG_WRN("{\"ccp_master\":{\"sent\":%u,\"dropped\":%u,"
 				"\"late_ns_min\":%d,\"late_ns_max\":%d,"
 				"\"late_ns_last\":%d,"
-				"\"nonpositive_late\":%u}}",
+				"\"nonpositive_late\":%u,"
+				"\"late_ns_signed_last\":%d,"
+				"\"late_ns_signed_min\":%d,"
+				"\"sys_status_lo\":\"0x%08X\","
+				"\"hpdwarn_seen\":%d}}",
 				n_sent, n_dropped,
 				(int)late_ns_min, (int)late_ns_max,
-				(int)late_ns_last, n_nonpositive_late);
+				(int)late_ns_last, n_nonpositive_late,
+				(int)late_ns_signed_last, (int)late_ns_signed_min,
+				(unsigned int)last_sys_status_lo,
+				(int)last_hpdwarn_seen);
 			last_reported_dropped = n_dropped;
 		}
 	}
@@ -258,6 +321,14 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 	dwt_writetxdata((uint16_t)n, tx_buf, 0);
 	dwt_writetxfctrl((uint16_t)(n + FCS_LEN), 0, 0);
 
+	/* D1: clear HPDWARN immediately before arming, write-1-to-clear like
+	 * every other status bit on this part. Any HPDWARN read after this
+	 * point was necessarily set by THIS dwt_starttx()'s own CMD_DTX, not
+	 * left over from an earlier transmission -- without this clear, a
+	 * stale HPDWARN from a previous exchange would make the reading below
+	 * meaningless. */
+	dwt_writesysstatuslo(DWT_INT_HPDWARN_BIT_MASK);
+
 	if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
 		dwt_forcetrxoff();
 		n_dropped++;
@@ -293,6 +364,28 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 		/* 1 hi32 tick = 256 DTU ~= 4.006 ns. Integer ns, good enough
 		 * for a diagnostic. */
 		int32_t late_ns = (int32_t)(((int64_t)late_ticks * 4006) / 1000);
+
+		/* D1: read the raw status, HPDWARN clear or not. This is the
+		 * one extra register read Change 2's own comment above says
+		 * has no public way to distinguish the two ull_starttx()
+		 * failure branches -- this closes that gap as far as it CAN
+		 * be closed from outside the driver. See the static's own
+		 * comment for why a clear reading is suggestive, not proof. */
+		uint32_t status_lo = dwt_readsysstatuslo();
+
+		last_sys_status_lo = status_lo;
+		last_hpdwarn_seen = (status_lo & DWT_INT_HPDWARN_BIT_MASK) != 0u;
+
+		/* D2: track the SIGNED value unconditionally, independent of
+		 * the non-positive/positive split the pre-existing fields
+		 * below use. This is the number that separates the two
+		 * hypotheses -- see the static's comment for the expected
+		 * magnitude (~ -1.05 ms) and what a wild outlier would mean. */
+		late_ns_signed_last = late_ns;
+		if (!have_signed_late_sample || late_ns < late_ns_signed_min) {
+			late_ns_signed_min = late_ns;
+		}
+		have_signed_late_sample = true;
 
 		if (late_ns <= 0) {
 			/* NOT late by this measure -- the arm actually
@@ -383,5 +476,120 @@ void ccp_master_stats(uint32_t *sent, uint32_t *dropped, uint32_t *root,
 	}
 	if (late_last) {
 		*late_last = late_ns_last;
+	}
+}
+
+void ccp_master_diag_stats(int32_t *late_signed_last, int32_t *late_signed_min,
+			   uint32_t *sys_status_lo, bool *hpdwarn_seen)
+{
+	if (late_signed_last) {
+		*late_signed_last = late_ns_signed_last;
+	}
+	if (late_signed_min) {
+		*late_signed_min = late_ns_signed_min;
+	}
+	if (sys_status_lo) {
+		*sys_status_lo = last_sys_status_lo;
+	}
+	if (hpdwarn_seen) {
+		*hpdwarn_seen = last_hpdwarn_seen;
+	}
+}
+
+void ccp_master_request_txtest(void)
+{
+	/* Only a request flag is touched here -- this function runs on the
+	 * shell thread and must never reach the radio itself; see
+	 * ccp_master.h and the hazard analysis in uwb_gateway.c's call site
+	 * for why. txtest_pending is the sole field the shell thread writes;
+	 * everything else below is written only by ccp_master_txtest_step(),
+	 * which runs on the gateway loop. */
+	txtest_done = false;
+	txtest_tx_ok = false;
+	txtest_txfrs_ok = false;
+	txtest_pending = true;
+}
+
+bool ccp_master_txtest_pending(void)
+{
+	return txtest_pending;
+}
+
+void ccp_master_txtest_step(uint8_t *frame_seq)
+{
+	if (!txtest_pending) {
+		return;
+	}
+	/* Cleared FIRST: whatever happens below, this is a one-shot -- the
+	 * gateway loop must not retry it next superframe on its own. */
+	txtest_pending = false;
+
+	/* seq 0xFF marks this as the bench probe, not a real per-superframe
+	 * CCP, so a sniffer capture (or ccp_slave's own receive path, which
+	 * counts on ccp_seq being gapless) cannot mistake one for the other.
+	 * tx_dtu is meaningless for an immediate TX -- there is no scheduled
+	 * RMARKER to report -- so it is left 0 rather than invented. */
+	struct ccp_frame f = {
+		.seq = 0xFFu,
+		.hop = CCP_HOP_ROOT,
+		.tx_dtu = 0,
+		.root_id = root_id,
+	};
+
+	int n = ccp_frame_build(txtest_buf, sizeof(txtest_buf),
+				UWB_ADDR_GATEWAY_RESERVED, (*frame_seq)++, &f);
+
+	if (n < 0) {
+		LOG_ERR("txtest: CCP build failed (%d)", n);
+		txtest_done = true;
+		return;
+	}
+
+	/* Same TXERR precaution as the real per-superframe CCP: this probe
+	 * follows a beacon (and possibly a real CCP) TX, which per the
+	 * Change-3 comment above leaves the TSE in DW_SYS_STATE_TXERR until
+	 * CMD_TXRXOFF clears it. */
+	dwt_forcetrxoff();
+	dwt_writesysstatuslo(DWT_INT_HPDWARN_BIT_MASK);
+
+	dwt_writetxdata((uint16_t)n, txtest_buf, 0);
+	dwt_writetxfctrl((uint16_t)(n + FCS_LEN), 0, 0);
+
+	if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+		dwt_forcetrxoff();
+		txtest_tx_ok = false;
+		txtest_txfrs_ok = false;
+		txtest_done = true;
+		return;
+	}
+	txtest_tx_ok = true;
+
+	if (!uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK,
+				       CCP_MASTER_TX_TIMEOUT_MS)) {
+		dwt_forcetrxoff();
+		dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+		txtest_txfrs_ok = false;
+		txtest_done = true;
+		return;
+	}
+	dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+	txtest_txfrs_ok = true;
+	txtest_done = true;
+}
+
+void ccp_master_txtest_stats(bool *pending, bool *done, bool *tx_ok,
+			     bool *txfrs_ok)
+{
+	if (pending) {
+		*pending = txtest_pending;
+	}
+	if (done) {
+		*done = txtest_done;
+	}
+	if (tx_ok) {
+		*tx_ok = txtest_tx_ok;
+	}
+	if (txfrs_ok) {
+		*txfrs_ok = txtest_txfrs_ok;
 	}
 }
