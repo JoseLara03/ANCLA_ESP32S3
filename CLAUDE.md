@@ -1212,6 +1212,43 @@ sync master                    transmit half — CCP sent/dropped counts as
   `res.dim`; only the shell copy did not. Fixed by reading
   `apos_gw_result()->dim`. Worth generalising: `res.dim` now has three consumers
   that must agree, and the shell one is the easiest to forget.
+- **A delayed TX armed immediately after another TX fails `dwt_starttx()`
+  deterministically, and the fix is `dwt_forcetrxoff()` before arming, not a
+  timing change.** `ccp_master_after_beacon()` (`src/ccp_master.c`) arms the
+  clock-calibration-packet's delayed TX right after `tx_beacon()`'s beacon TX
+  completes, and on the bench `dwt_starttx(DWT_START_TX_DELAYED)` returned
+  `DWT_ERROR` for 100% of CCPs — `sent:0`, `dropped` climbing by one every
+  superframe, forever. The first hypothesis was a missed arm deadline; the
+  lateness instrumentation added specifically to test that (Change 2 in the
+  same function) refuted it outright: `nonpositive_late` equalled `dropped`
+  on all 249 samples with `late_ns_max:0`, meaning the arm completed at or
+  before the scheduled hi32 every single time. The real cause is in
+  `ull_starttx()` (`modules/dw3000-decadriver/dwt_uwb_driver/dw3000/dw3000_device.c`
+  ~line 5061), which has **two** distinct failure branches behind one
+  `DWT_ERROR` return: HPDWARN (a genuinely missed deadline, which the
+  lateness measurement ruled out), and — the one actually firing here —
+  `SYS_STATE_LO` reading `DW_SYS_STATE_TXERR` (`0xD0000`, documented in
+  `dw3000_deca_vals.h:154` as "TSE is in TX but TX is in IDLE in SYS_STATE_LO
+  register"). That is exactly the state the chip sits in immediately after a
+  transmission completes and before `CMD_TXRXOFF` has returned the Transmit
+  Sequencing Engine to IDLE. Every other delayed-TX site in this tree already
+  calls `dwt_forcetrxoff()` before arming (`src/anchor_respond.c:133`,
+  `src/apos_gw.c:207`, `src/apos_node.c:136`, `src/ss_initiator.c:99`) —
+  `tx_beacon()` in `src/uwb_gateway.c` is the only OTHER exception, and it is
+  safe only because a completed **RX**, not a TX, always precedes it, and RX
+  leaves the TSE in IDLE on its own. The CCP is the one delayed TX in the
+  whole tree armed directly after another TX, so it inherited TXERR every
+  time. Fixed by adding the same `dwt_forcetrxoff()` call the other sites
+  already have, immediately before `dwt_setdelayedtrxtime()`. It is cheap,
+  not a new wait: `ull_forcetrxoff()` only issues `CMD_TXRXOFF`, and skips
+  even that write when the part is already idle (documented at
+  `src/ss_initiator.c:99-101`). The general lesson: `ull_starttx()`'s two
+  failure paths are indistinguishable from the bare `DWT_ERROR` return —
+  there is no public accessor in `deca_device_api.h` that reports which one
+  fired or exposes `SYS_STATE_LO` directly — so a zero-lateness, nonzero-drop
+  signature is currently the only way from outside the driver to tell TXERR
+  apart from a real missed deadline; do not assume a `DWT_ERROR` on a
+  delayed TX is automatically a timing problem.
 
 ## System context
 

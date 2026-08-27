@@ -222,6 +222,38 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 		return;
 	}
 
+	/* Change 3, and the actual fix for the 100%-drop bug the Change-1/2
+	 * instrumentation above diagnosed. dwt_forcetrxoff() (ull_forcetrxoff()
+	 * in the driver) issues CMD_TXRXOFF and, per ss_initiator.c's own
+	 * comment on the identical call, skips even that write when the part is
+	 * already idle -- so this is cheap, not a new wait, and does not touch
+	 * the K_PRIO_COOP(0) bound.
+	 *
+	 * WHY it is required here specifically: this is the ONLY delayed TX in
+	 * the whole tree armed immediately after another TX rather than after
+	 * an RX or from a cold start. Every other delayed-TX site already calls
+	 * dwt_forcetrxoff() before arming (anchor_respond.c:133, apos_gw.c:207,
+	 * apos_node.c:136, ss_initiator.c:99); tx_beacon() in uwb_gateway.c is
+	 * the only OTHER exception, and it gets away with it only because a
+	 * completed RX -- not a TX -- always precedes it, and RX leaves the
+	 * Transmit Sequencing Engine in IDLE on its own. A completed TX does
+	 * not: ull_starttx() (dw3000_device.c ~line 5061) reads SYS_STATE_LO
+	 * and, absent HPDWARN, treats state DW_SYS_STATE_TXERR (0xD0000,
+	 * documented in dw3000_deca_vals.h:154 as "TSE is in TX but TX is in
+	 * IDLE in SYS_STATE_LO register") as a hard DWT_ERROR. That is exactly
+	 * the state the chip is left in right after the beacon's own TX
+	 * completes and before CMD_TXRXOFF has been issued to clear it -- which
+	 * is precisely the gap between tx_beacon() returning and this function
+	 * arming the CCP. The result was deterministic, not intermittent:
+	 * dwt_starttx() failed for 100% of CCPs on the bench (sent:0, dropped
+	 * climbing by one every superframe), while the lateness instrument just
+	 * below reported nonpositive_late == dropped on all 249 samples with
+	 * late_ns_max:0 -- proof the arm was NOT late and the HPDWARN branch was
+	 * NOT what fired, which is what pointed at TXERR instead. Do not remove
+	 * this call on the theory that the timing must be at fault; the
+	 * instrumentation already ruled that out once. */
+	dwt_forcetrxoff();
+
 	dwt_setdelayedtrxtime(at_hi32);
 	dwt_writetxdata((uint16_t)n, tx_buf, 0);
 	dwt_writetxfctrl((uint16_t)(n + FCS_LEN), 0, 0);
@@ -236,6 +268,18 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 		 * were -- the number that decides how much CCP_SCHED_ARM_-
 		 * BUDGET_NS needs to grow, or whether the arm cost isn't the
 		 * culprit at all.
+		 *
+		 * This does NOT distinguish ull_starttx()'s two failure
+		 * branches (HPDWARN vs. DW_SYS_STATE_TXERR, dw3000_device.c
+		 * ~line 5061) from each other -- both return plain DWT_ERROR
+		 * and neither dwt_starttx() nor any other function in the
+		 * public deca_device_api.h vtable hands back which one fired
+		 * or the SYS_STATE_LO value itself, so there is no public
+		 * accessor left to add here without reaching into driver
+		 * internals CLAUDE.md says not to touch. A zero lateness with
+		 * a nonzero drop count (as diagnosed above, for TXERR) is
+		 * currently the only way to tell them apart from outside the
+		 * driver.
 		 *
 		 * Signed difference, mandatory, not stylistic: hi32 wraps
 		 * every ~17.2 s (256 DTU/tick, ~4.006 ns/tick), and CLAUDE.md
