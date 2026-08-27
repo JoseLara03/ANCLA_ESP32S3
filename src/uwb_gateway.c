@@ -31,6 +31,8 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+/* log_panic() lives here, not in log.h -- it is log CONTROL, not log output. */
+#include <zephyr/logging/log_ctrl.h>
 
 #include <deca_device_api.h>
 
@@ -116,6 +118,78 @@ LOG_MODULE_REGISTER(uwb_gateway, ANCLA_LOG_LEVEL);
  * ranging traffic it does not, which is why a similar fault now presents as a
  * total freeze instead of a silent radio with a live console. */
 #define LOOP_STALL_MS 300u
+
+/* ---- Breadcrumb: where the loop is, readable from outside the loop -------
+ *
+ * The wall-clock watchdog above only runs where it sits, at the top of the
+ * inner loop. Anything that blocks INSIDE the loop body -- an SPI transfer that
+ * never completes, a callee that spins -- is invisible to it, because the check
+ * is never reached again. That is not a hypothetical gap: on the bench
+ * 2026-08-26 the gateway stopped mid-survey with the last pair unreported and
+ * NO gw_fault line, which is exactly what a body-blocking stall looks like.
+ * (The solver was the first suspect and is exonerated: replaying that run's
+ * exact edges through apos_geom_solve() on the host returns rc=0 instantly.)
+ *
+ * So the loop drops a crumb at every step and a k_timer reads it. The timer
+ * expiry runs in ISR context, which is the only context that can observe this
+ * thread while it is stuck inside a call -- an interrupt preempts a
+ * K_PRIO_COOP(0) busy-wait, a lower-priority thread never will.
+ *
+ * Numbering is deliberately stable and gapless so a capture can be read
+ * straight off the console without the source at hand. */
+enum gw_crumb {
+	GW_CRUMB_BOOT = 0,
+	GW_CRUMB_LOOP_TOP,    /* 1: top of the inner loop, clocks just read */
+	GW_CRUMB_APOS_STEP,   /* 2: inside apos_gw_step() -- may transmit */
+	GW_CRUMB_RX_ARM,      /* 3: dwt_setrxtimeout + dwt_rxenable */
+	GW_CRUMB_RX_WAIT,     /* 4: blocked on rx_sem (bounded, 400 ms) */
+	GW_CRUMB_RX_READ,     /* 5: dwt_readrxdata + RX timestamp */
+	GW_CRUMB_DISPATCH,    /* 6: inside dispatch() -- may send a GRANT */
+	GW_CRUMB_SF_TICK,     /* 7: gw_core_superframe_tick() */
+	GW_CRUMB_TX_BEACON,   /* 8: inside tx_beacon() -- delayed TX + TXFRS */
+};
+
+static volatile uint32_t gw_crumb;
+static volatile uint32_t gw_crumb_seq;
+
+#define CRUMB(c) do { gw_crumb = (uint32_t)(c); gw_crumb_seq++; } while (0)
+
+/* Long enough that a legitimate 400 ms rx_sem wait plus slack cannot trip it. */
+#define CRUMB_STALL_MS 900u
+
+static void gw_stall_expiry(struct k_timer *t)
+{
+	static uint32_t last_seq;
+	static bool reported;
+
+	ARG_UNUSED(t);
+
+	if (gw_crumb_seq != last_seq) {
+		last_seq = gw_crumb_seq;
+		reported = false;
+		return;
+	}
+	if (reported) {
+		return;
+	}
+	reported = true;
+
+	/* log_panic() switches the log subsystem to synchronous and flushes
+	 * what is queued. It is the ONLY way this line reaches the console once
+	 * the loop has starved the preemptible log thread -- and it is exactly
+	 * what Zephyr's own fatal handler does for the same reason. Timing is
+	 * wrecked afterwards, which costs nothing: the board is already stuck,
+	 * and this fires once per stall, not twice a second forever. */
+	log_panic();
+	LOG_ERR("{\"gw_stuck\":{\"crumb\":%u,\"for_ms\":%u,\"seq\":%u,"
+		"\"apos_busy\":%d,\"note\":\"1=loop_top 2=apos_step "
+		"3=rx_arm 4=rx_wait 5=rx_read 6=dispatch 7=sf_tick "
+		"8=tx_beacon\"}}",
+		gw_crumb, CRUMB_STALL_MS, gw_crumb_seq,
+		(int)apos_gw_busy());
+}
+
+static K_TIMER_DEFINE(gw_stall_timer, gw_stall_expiry, NULL);
 
 static K_SEM_DEFINE(rx_sem, 0, 1);
 
@@ -369,6 +443,12 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 		return;
 	}
 
+	/* Armed only now: before this point the radio bring-up legitimately
+	 * takes longer than CRUMB_STALL_MS and would report a stall that is
+	 * really just a slow boot. */
+	k_timer_start(&gw_stall_timer, K_MSEC(CRUMB_STALL_MS),
+		      K_MSEC(CRUMB_STALL_MS));
+
 	/* Liveness of the OUTER loop, one line per superframe. If these stop
 	 * while the board is still powered, the loop is trapped inside the inner
 	 * for(;;), and the stall watchdog below reports which clock is at fault.
@@ -387,6 +467,8 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 		uint32_t loop_entry_systime = dwt_readsystimestamphi32();
 
 		for (;;) {
+			CRUMB(GW_CRUMB_LOOP_TOP);
+
 			uint32_t now = dwt_readsystimestamphi32();
 			int32_t to_beacon = (int32_t)(next_beacon - now);
 
@@ -453,6 +535,7 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 					uint32_t avail_uus = (uint32_t)(
 						((uint64_t)span << 8) / UUS_TO_DWT_TIME);
 
+					CRUMB(GW_CRUMB_APOS_STEP);
 					apos_gw_step(avail_uus, &gw_seq);
 
 					now = dwt_readsystimestamphi32();
@@ -474,6 +557,7 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 			uint32_t rx_to_uus =
 				(uint32_t)(((uint64_t)span_hi32 << 8) / UUS_TO_DWT_TIME);
 
+			CRUMB(GW_CRUMB_RX_ARM);
 			dwt_setpreambledetecttimeout(0);
 			dwt_setrxtimeout(rx_to_uus);
 			dwt_setrxaftertxdelay(0);
@@ -483,6 +567,7 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 			 * timeout normally arrives, but a MAC loop that can wedge
 			 * takes the whole network down, not one range. One
 			 * superframe of slack past the window is ample. */
+			CRUMB(GW_CRUMB_RX_WAIT);
 			if (k_sem_take(&rx_sem, K_MSEC(400)) != 0) {
 				LOG_WRN("no RX event within the window — re-arming");
 				dwt_forcetrxoff();
@@ -500,15 +585,19 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 				continue;
 			}
 
+			CRUMB(GW_CRUMB_RX_READ);
 			dwt_readrxdata(rx_buf, flen, 0);
 
 			uint64_t rx_ts = uwb_get_rx_timestamp_u64();
 
+			CRUMB(GW_CRUMB_DISPATCH);
 			dispatch(&ctx, rx_buf, (uint16_t)(flen - FCS_LEN), rx_ts);
 		}
 
+		CRUMB(GW_CRUMB_SF_TICK);
 		gw_core_superframe_tick(&ctx);
 
+		CRUMB(GW_CRUMB_TX_BEACON);
 		uint64_t ts = tx_beacon(&ctx, true, next_beacon);
 
 		/* On a miss, re-base on the current time rather than compounding
