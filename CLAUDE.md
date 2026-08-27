@@ -354,6 +354,13 @@ thresholds.
   C, host-tested in `tests/ccp_frame/`. **`0xEF` is the LAST free code in the
   `0xEx` range** — the allocation table is in its header, and anything after
   this needs a subtype byte under an existing code rather than a new one.
+- `src/ccp_sched.h` — dónde cae el CCP en el superframe: `CCP_OFFSET_UUS`
+  (= `BEACON_OCCUPANCY_UUS`, es decir inmediatamente después de la ocupación
+  del beacon, dentro de la guarda que los slaves ya no pueden usar) y los dos
+  `BUILD_ASSERT` que prueban que el preámbulo no pisa el beacon y que la trama
+  termina antes de que cierre la guarda. Solo header, sin `.c`, mismo patrón
+  que `uwb_mac.h`; host-testeado en `tests/ccp_sched/` donde **incluir el
+  header es el test**.
 - `src/sync_model.{c,h}` — anchor clock synchronisation: converts a local
   DW3220 timestamp into a master anchor's time base from a stream of CCPs.
   Integer-only, pure C, host-tested in `tests/sync_model/`. **This is the Phase
@@ -1192,6 +1199,9 @@ gcc -Wall -Wextra -Isrc -o tests/ccp_frame/test_ccp_frame.exe tests/ccp_frame/te
 
 gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/mac_budget/test_uwb_mac_asserts.exe tests/mac_budget/test_uwb_mac_asserts.c src/mac_budget.c
 ./tests/mac_budget/test_uwb_mac_asserts.exe     # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/ccp_sched/test_ccp_sched.exe tests/ccp_sched/test_ccp_sched.c src/mac_budget.c
+./tests/ccp_sched/test_ccp_sched.exe            # ALL TESTS PASSED, exits 0
 ```
 
 `-lm` is required by the two suites that link `apos_geom.c` — the solver calls
@@ -1201,7 +1211,9 @@ gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/mac_budget/test_uwb_mac
 supplies a `zephyr/sys/util.h` defining `BUILD_ASSERT` as `_Static_assert`. That
 is the whole point of that test: **including `src/uwb_mac.h` is the test**, so a
 budget that no longer holds fails to *compile* under plain gcc instead of
-waiting for a Zephyr build. Same shim pattern as the tag's
+waiting for a Zephyr build. `tests/ccp_sched/` needs the same shim for the same
+reason: it includes `src/ccp_sched.h`, whose `BUILD_ASSERT`s check where the CCP
+sits against the beacon's own frame length. Same shim pattern as the tag's
 `tests/uwb_radio_owner/shim`.
 
 ## Repo
