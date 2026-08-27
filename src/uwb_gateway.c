@@ -425,7 +425,36 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 	 * out their full timeout on every single transmission. */
 	dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
 
-	struct gw_core_ctx ctx;
+	/* STATIC, not automatic, and this is not a style choice.
+	 *
+	 * sizeof(struct gw_core_ctx) is 2588 bytes against a
+	 * CONFIG_MAIN_STACK_SIZE of 4096. As an automatic it claimed 63% of this
+	 * thread's entire stack before a single callee got a frame, and
+	 * do_solve() -- which adds 344 bytes of its own locals and sits at the
+	 * bottom of the deepest call chain in the firmware
+	 * (uwb_gateway_run -> apos_gw_step -> step_range -> do_solve ->
+	 * apos_geom_solve -> apos_geom_refine -> cost) -- runs from exactly this
+	 * stack. Xtensa's windowed ABI spills register windows on deep chains on
+	 * top of every declared frame, so the real high-water mark is higher
+	 * than the sum of those frames, and neither CONFIG_STACK_SENTINEL nor
+	 * hardware stack protection is enabled in the production image: an
+	 * overflow here is silent and corrupts whatever lies below.
+	 *
+	 * It was ~236 bytes when the anchor survey was written and reviewed --
+	 * seats[] was indexed by CFP slot, so GW_N_CFP (11) of them. The
+	 * seat/schedule split for 100-tag capacity made it seats[GW_MAX_SEATS]
+	 * (128), growing this one automatic by ~2352 bytes. Nothing flagged it:
+	 * gw_core is host-tested where the stack is megabytes, the survey had
+	 * never been run on hardware, and the two changes were on different
+	 * branches.
+	 *
+	 * Static is correct rather than merely bigger-is-safer:
+	 * uwb_gateway_run() is called once from main() and never returns, so
+	 * there is exactly one instance for the life of the process either way.
+	 * Nothing else may take this address -- see apos_gw_result()'s note on
+	 * why unsynchronised reads of gateway-loop state are safe only from
+	 * strictly lower-priority threads. */
+	static struct gw_core_ctx ctx;
 
 	gw_core_init(&ctx);
 	apos_gw_init();
