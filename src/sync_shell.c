@@ -18,7 +18,6 @@
 #include "ccp_slave.h"
 #include "sync_model.h"
 
-#include <zephyr/kernel.h>
 #include <zephyr/shell/shell.h>
 
 /* Thresholds from docs/anchor-sync-measurement.md section 4. 64 DTU = 1 ns
@@ -54,7 +53,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 
-	struct sync_model *m = ccp_slave_model();
+	const struct sync_model *m = ccp_slave_model();
 	uint32_t rx = 0, gap = 0, reject = 0, root = 0;
 
 	ccp_slave_stats(&rx, &gap, &reject, &root);
@@ -116,7 +115,7 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 
-	sync_model_residual_reset(ccp_slave_model());
+	ccp_slave_residual_reset();
 	shell_print(sh, "residual statistics cleared — the rate estimate and "
 			"its baseline are NOT touched, so `count` restarts "
 			"while the lock is kept");

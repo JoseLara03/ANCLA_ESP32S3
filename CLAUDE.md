@@ -380,9 +380,21 @@ sync reset                     clear the residual statistics without
   production image.
 - `src/ccp_slave.{c,h}` — the CCP receiver on the SLAVE: owns the single
   `struct sync_model`, detects missed CCPs from gaps in `ccp_seq` and calls
-  `sync_model_miss()` for each one. No arithmetic of its own — everything that
-  could be wrong about the estimator lives in `sync_model.c`, which is pure C
-  and host-tested.
+  `sync_model_miss()` for each one — except a gap large enough to look like a
+  sequence number moving BACKWARDS (over 128; the ordinary trigger is a
+  gateway reboot, which re-seeds `ccp_seq` at 0 without changing `root_id`),
+  where it calls `sync_model_miss()` for none of them, re-baselines instead,
+  and counts the frame in `n_reject` rather than `n_gap` — the whole point
+  being that `n_gap` is the counter an operator reads as "the link is losing
+  CCPs", and a benign reboot must not make it lie. No arithmetic of its own —
+  everything that could be wrong about the estimator lives in `sync_model.c`,
+  which is pure C and host-tested. `ccp_slave_model()` returns a `const`
+  pointer: on a SLAVE, `main()` stays at the default preemptible priority (see
+  `main.c`), so the shell can be preempted by the loop's own writes at any
+  point, and read-only access through a const pointer is what makes that safe.
+  The one write reachable from the shell (`sync reset`'s residual clear) goes
+  through `ccp_slave_residual_reset()`, fenced with
+  `k_sched_lock()`/`k_sched_unlock()` instead.
 - `src/sync_shell.c` — the `sync` command tree. Prints the gate's verdict
   itself, because the natural mistake here (reading `rms` as if it were the
   jitter) rejects hardware that passes.

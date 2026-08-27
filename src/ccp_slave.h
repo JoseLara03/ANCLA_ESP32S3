@@ -34,18 +34,37 @@ void ccp_slave_init(void);
  * 255 DTU, ~4 ns, against a 1 ns gate. */
 bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts);
 
-/* The live model, for the `sync` shell command. Non-const because
- * sync_model_residual_reset() takes a mutable pointer.
+/* The live model, for the `sync` shell command. Read-only: on a SLAVE, main()
+ * is left at the default (preemptible) priority -- see main.c's comment on why
+ * only GATEWAY mode is promoted to K_PRIO_COOP(0) -- so the SLAVE loop can
+ * preempt the shell at any point, including mid-update of `model`. A const
+ * pointer is what makes that safe for a READER: the shell can only ever see a
+ * complete previous state or a complete next one, never a half-written one,
+ * because it has no way to write through this pointer at all. It does NOT make
+ * the model safe to mutate from the shell -- see ccp_slave_residual_reset()
+ * for the one write path reachable from there, and why it is fenced instead of
+ * exposed here. */
+const struct sync_model *ccp_slave_model(void);
+
+/* Clear the residual statistics (RMS/max/count), keeping the rate estimate and
+ * baseline untouched -- the `sync reset` command's write path.
  *
- * Unsynchronised, and safe today for one reason: the SLAVE loop is the only
- * writer and the shell is strictly lower priority, so a reader never observes a
- * half-updated model -- it sees the previous state or the next one. Same
- * reasoning, and the same fragility, as apos_gw_result(). */
-struct sync_model *ccp_slave_model(void);
+ * Fenced with k_sched_lock()/k_sched_unlock() because the SLAVE loop is a
+ * preemptible-priority writer that can interrupt the shell thread at any
+ * instruction boundary (see ccp_slave_model()'s comment). Without the fence,
+ * sync_model_residual_reset()'s three stores -- one of them a 64-bit
+ * res_sq_sum, two stores on this target -- can interleave with
+ * sync_model_observe()'s `res_sq_sum += mag*mag; res_n++` and leave a stale
+ * high half of a CUMULATIVE sum standing next to a restarted res_n, inflating
+ * rms_dtu/jitter_est_dtu until the next reset -- exactly the misreading this
+ * command exists to prevent, on hardware that actually passes. */
+void ccp_slave_residual_reset(void);
 
 /* Counters. `n_gap` is expected CCPs that never arrived, `n_reject` is frames
  * that were CCPs but were not usable -- a parse failure, a hop this node may
- * not adopt, or a duplicate sequence number. */
+ * not adopt, a duplicate sequence number, or a sequence number that moved
+ * BACKWARDS (see ccp_slave.c: the ordinary trigger is a gateway reboot,
+ * which re-seeds ccp_seq at 0 without changing root_id). */
 void ccp_slave_stats(uint32_t *n_rx, uint32_t *n_gap, uint32_t *n_reject,
 		     uint32_t *root_id);
 

@@ -9,6 +9,7 @@
 #include "ccp_frame.h"
 #include "uwb_debug.h"
 
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(ccp_slave, ANCLA_LOG_LEVEL);
@@ -80,7 +81,22 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts)
 		return true;
 	}
 
-	if (gap > (uint8_t)(SYNC_MISS_MAX + 1u)) {
+	if (gap > 128u) {
+		/* A "gap" this large is far more likely to be the sequence
+		 * number moving BACKWARDS than 129+ superframes of genuine
+		 * forward misses. The ordinary trigger is a gateway reboot:
+		 * ccp_master_init() re-seeds ccp_seq at 0 while root_id is
+		 * derived from the board and does NOT change, so the
+		 * root-change branch above never sees it either. Re-baselining
+		 * the model is still correct here -- the old baseline really
+		 * doesn't describe the new sequence -- but counting this as
+		 * n_gap would tell the operator the LINK is dropping CCPs
+		 * (Step 7 item 3's exact reading) when nothing was lost at
+		 * all. n_reject is what it actually is: a frame this node
+		 * could not fold into its running count. */
+		n_reject++;
+		sync_model_init(&model);
+	} else if (gap > (uint8_t)(SYNC_MISS_MAX + 1u)) {
 		/* Already coasted past the model's own limit, so its estimate
 		 * is invalid whatever we do. A fresh baseline beats feeding it
 		 * hundreds of misses one call at a time on the SLAVE loop. */
@@ -98,9 +114,25 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts)
 	return true;
 }
 
-struct sync_model *ccp_slave_model(void)
+const struct sync_model *ccp_slave_model(void)
 {
 	return &model;
+}
+
+void ccp_slave_residual_reset(void)
+{
+	/* k_sched_lock()/k_sched_unlock() around exactly the three stores
+	 * sync_model_residual_reset() makes -- res_sq_sum, res_n, res_max --
+	 * and nothing else. The fence is here, not in sync_model.c, because the
+	 * race is specific to THIS caller: the shell thread can be preempted by
+	 * the SLAVE loop's own sync_model_observe() mid-update (see
+	 * ccp_slave_model()'s comment on why a SLAVE runs main() at the default,
+	 * preemptible priority). k_sched_lock() is legal from any thread,
+	 * including the shell, and this region does no blocking call and no log
+	 * write, so it cannot hold the lock across either. */
+	k_sched_lock();
+	sync_model_residual_reset(&model);
+	k_sched_unlock();
 }
 
 void ccp_slave_stats(uint32_t *rx, uint32_t *gap, uint32_t *reject,
