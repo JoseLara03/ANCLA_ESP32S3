@@ -376,74 +376,117 @@ sync master                    transmit half — CCP sent/dropped counts as
   C, host-tested in `tests/ccp_frame/`. **`0xEF` is the LAST free code in the
   `0xEx` range** — the allocation table is in its header, and anything after
   this needs a subtype byte under an existing code rather than a new one.
-- `src/ccp_sched.h` — where the CCP falls in the superframe: `CCP_OFFSET_UUS`
-  (= `BEACON_OCCUPANCY_UUS`, i.e. immediately after the beacon's declared
-  occupancy, inside the guard the slaves already may not use) and the two
-  `BUILD_ASSERT`s that prove the preamble does not overlap the beacon and that
-  the frame is off the air before the first legitimate slave CAP preamble may
-  begin. Header-only, no `.c`, same pattern as `uwb_mac.h`; host-tested in
-  `tests/ccp_sched/` where **including the header is the test**. `CCP_OFFSET_UUS`'s
-  legal window is two-sided and both bounds are derived quantities, not tuned:
-  `CCP_SCHED_ARM_BUDGET_NS` (98856 ns, the lower bound) is the wall-clock budget
-  to ARM the CCP after the beacon's TXFRS — genuinely unmeasured on this path,
-  not comfortable headroom, see its own comment — and `CCP_SCHED_CAP_PREAMBLE_NS`
-  (2026728 ns) is the upper bound, a full SHR earlier than
-  `CCP_SCHED_GUARD_END_NS` because `beacon_guard_tx_allowed()` gates a slave's
-  RMARKER, not its preamble. Comparing assert (b) against `CCP_SCHED_GUARD_END_NS`
-  directly — an earlier version of this file did — over-claims the trailing
-  margin by that whole SHR (1299638 ns claimed vs. 249444 ns true).
+- `src/ccp_sched.h` — where the CCP falls in the superframe. Header-only, no
+  `.c`, same pattern as `uwb_mac.h`; host-tested in `tests/ccp_sched/` where
+  **including the header is the test**. Carries the design-history writeup for
+  why the original delayed-TX schedule (a fixed `CCP_OFFSET_UUS` after the
+  beacon's RMARKER, plus two `BUILD_ASSERT`s proving both edges of that
+  schedule cleared the guard window) was abandoned: it failed 100% on
+  hardware, because a delayed TX's arm deadline is measured against its
+  RMARKER while the physical constraint is against its PREAMBLE, a whole SHR
+  (1050194 ns) earlier — see the hard-won fact below for the general form of
+  that trap. The now-current design (immediate TX, deferred announced
+  timestamp — see `ccp_master.{c,h}`) has no scheduled RMARKER left to police
+  at compile time, so `CCP_OFFSET_UUS` and the two old asserts are GONE, not
+  merely unused — a live-looking constant nothing honours is worse than none.
+  What remains is `CCP_SCHED_MAX_ARM_NS` (348300 ns) — the whole post-beacon
+  guard window minus the CCP's own full airtime minus the beacon's own
+  airtime — and one `BUILD_ASSERT` that it is positive, i.e. that the guard
+  window is even wide enough to host the CCP's whole frame at all. That is a
+  genuine compile-time property of the PHY and the MAC contract's guard
+  sizing; whether any one arm sequence is fast enough to use the resulting
+  margin is now a measured, runtime question — see `ccp_master.c`'s
+  `arm_cost_ns_last`, checked against this same constant every superframe.
 - `src/ccp_master.{c,h}` — the CCP transmitter on the GATEWAY, root of the sync
   tree (hop 0). On the gateway deliberately: it already schedules one delayed
-  TX per superframe, and the clock it schedules from **is** the time base. A
-  master role on a slave would have added an unsolicited TX path to a
-  production image. Clears TXFRS explicitly on its own delayed-TX timeout
-  (write-1-to-clear; a late-but-real TX left it set once and the NEXT delayed
-  TX on this radio — the following beacon — read this CCP's stale timestamp
-  as its own), same as `uwb_gateway.c`'s `tx_beacon()`/`send_grant()` now do
-  on theirs. Per-event drop detail (`dwt_starttx()` failure, a TXFRS timeout)
-  logs at `LOG_DBG`; a rate-limited `LOG_WRN` summary of `sent`/`dropped`
-  every `CCP_MASTER_STATS_LOG_PERIOD_SF` superframes is what actually survives
-  `ANCLA_LOG_LEVEL == LOG_LEVEL_INF` in production, and only fires when the
-  drop count has moved — a healthy gateway stays silent. `ccp_master_stats()`
-  is also readable live from the console via `sync master`.
+  TX per superframe (the beacon), and the clock that beacon is scheduled from
+  **is** the time base. A master role on a slave would have added an
+  unsolicited TX path to a production image. Transmits each CCP with
+  `DWT_START_TX_IMMEDIATE` right after the beacon and reads back its ACTUAL TX
+  timestamp once TXFRS confirms it — the deferred-timestamp design: since a
+  transmitter cannot know its own TX timestamp before transmitting, that
+  timestamp travels in the FOLLOWING CCP instead, so a CCP with sequence S
+  announces sequence S-1's measured timestamp. `prev_tx_dtu`/`have_prev_tx` is
+  advanced ONLY on a confirmed transmit — a dropped CCP costs the announcement
+  it would have carried too, not just itself, so the next CCP re-announces the
+  same previous timestamp rather than one for a frame that never existed. The
+  first CCP after boot sends `tx_dtu = 0` as a sentinel meaning "nothing to
+  announce yet" (a genuine 40-bit timestamp landing on exactly 0 is a 2⁻⁴⁰
+  event costing at most one skipped observation); the "sync txtest" probe
+  reuses the same sentinel for the same reason, which is a happy accident: it
+  makes a probe frame automatically inert to a receiver with no special-casing
+  needed on either side. Still calls `dwt_forcetrxoff()` before every transmit
+  despite there being no delayed time to arm — this is the ONLY transmit site
+  in the tree that follows another TX (the beacon) rather than an RX or a cold
+  start, and a completed TX, unlike a completed RX, leaves the Transmit
+  Sequencing Engine in `DW_SYS_STATE_TXERR` until `CMD_TXRXOFF` clears it (see
+  the hard-won fact below). Tracks `offset_ns_{min,max,last}` — where the
+  CCP's ACTUAL RMARKER landed relative to the beacon's, a signed hi32
+  difference, replacing the old "lateness against a schedule" instrument that
+  stopped meaning anything once nothing is scheduled — and `arm_cost_ns_last`,
+  the same offset with the CCP's own SHR and the beacon's own post-RMARKER
+  airtime subtracted, checked against `ccp_sched.h`'s `CCP_SCHED_MAX_ARM_NS`
+  with a rate-limited `LOG_WRN` (not a `BUILD_ASSERT` — the quantity is
+  measured, not known at compile time) if a CCP's frame end reaches the
+  earliest legitimate slave CAP preamble. Per-event drop detail logs at
+  `LOG_DBG`; a rate-limited `LOG_WRN` summary of `sent`/`dropped`/the offset
+  figures every `CCP_MASTER_STATS_LOG_PERIOD_SF` superframes is what actually
+  survives `ANCLA_LOG_LEVEL == LOG_LEVEL_INF` in production, firing only when
+  the drop count has moved. Also readable live via `sync master`.
 - `src/ccp_slave.{c,h}` — the CCP receiver on the SLAVE: owns the single
-  `struct sync_model`, detects missed CCPs from gaps in `ccp_seq` and calls
-  `sync_model_miss()` for each one — except a gap large enough to look like a
-  sequence number moving BACKWARDS (over 128; the ordinary trigger is a
-  gateway reboot, which re-seeds `ccp_seq` at 0 without changing `root_id`),
-  where it calls `sync_model_miss()` for none of them, re-baselines instead,
-  and counts the frame in `n_reject` rather than `n_gap` — the whole point
-  being that `n_gap` is the counter an operator reads as "the link is losing
-  CCPs", and a benign reboot must not make it lie. A gateway reboot does not
-  always wrap `ccp_seq` above 128, though: a reboot that hits while the
-  slave's `last_seq` is itself large enough wraps the apparent gap back down
-  into the ordinary 1..128 range, indistinguishable from a genuine forward
-  gap or miss run **by sequence number alone**. So every gap in that range is
-  also checked against the SLAVE's own local DW3220 clock — a genuine gap of
-  `n` superframes must show roughly `n * SYNC_CCP_INTERVAL_DTU` of real
-  elapsed local time (`CCP_SLAVE_GAP_TOL_FACTOR`, a deliberately generous
-  4x band, orders of magnitude past what crystal drift alone could produce),
-  and a reboot's elapsed local time has no relationship to that arithmetic at
-  all. A mismatch re-baselines and counts in `n_reject` the same as the
-  large-gap case; this is what catches the case sequence-number checking
-  alone cannot, of which `gap == 1` with several REAL seconds elapsed is the
-  sharpest example. Every re-baseline path — this one, the large-gap one, and
-  a root change — calls `sync_model_init()`, which clears the residual
-  statistics along with the rate estimate: `count` restarts at 0 and the
-  verdict returns to `"insufficient"` even though `sync_model.h` documents
-  those statistics as surviving "everything except an explicit reset" — true
-  of `sync_model.c`'s own API, but `ccp_slave.c` is the first caller to invoke
-  `sync_model_init()` itself mid-life rather than only at `ccp_slave_init()`,
-  so a re-baseline is a second, implicit reset from this module's callers'
-  point of view. No arithmetic of its own beyond that discontinuity check —
-  everything that could be wrong about the estimator lives in `sync_model.c`,
-  which is pure C and host-tested. `ccp_slave_model()` returns a `const`
-  pointer: on a SLAVE, `main()` stays at the default preemptible priority (see
-  `main.c`), so the shell can be preempted by the loop's own writes at any
-  point, and read-only access through a const pointer is what makes that safe.
-  The one write reachable from the shell (`sync reset`'s residual clear) goes
-  through `ccp_slave_residual_reset()`, fenced with
-  `k_sched_lock()`/`k_sched_unlock()` instead.
+  `struct sync_model` and implements the deferred-timestamp pairing protocol.
+  Because a CCP with sequence S announces sequence S-1's measured timestamp,
+  an observation now LAGS the frame it describes by one superframe: this
+  module remembers the last frame it actually RECEIVED (`prev_seq`/
+  `prev_rx_ts`) and, on receiving sequence S, checks whether that remembered
+  frame IS sequence S-1 before pairing S's announcement with S-1's local RX
+  time into a `sync_model_observe()` call. A CCP lost in the air therefore
+  costs its receiver two things, not one: the missed frame itself, AND the
+  announcement that would have completed the PRIOR frame's observation (which
+  travelled only in the frame that was lost) — so `n_rx` (every CCP received)
+  and the paired-observation count (`sync_model_residual_count()`, surfaced
+  alongside `n_paired`/`n_no_announce` via `ccp_slave_stats_ex()`) can
+  legitimately diverge on a healthy link, not just a faulty one. `tx_dtu == 0`
+  is the reserved "no announcement" sentinel (boot, or a "sync txtest" probe)
+  and is handled identically: remembered as the new `prev`, nothing paired.
+  Detects missed CCPs from gaps between PAIRED observations (not between
+  receptions) and calls `sync_model_miss()` for each one — except an interval
+  large enough to look like a sequence number moving BACKWARDS (over 128; the
+  ordinary trigger is a gateway reboot, which re-seeds `ccp_seq` at 0 without
+  changing `root_id`), where it calls `sync_model_miss()` for none of them,
+  re-baselines instead, and counts the frame in `n_reject` rather than
+  `n_gap` — the whole point being that `n_gap` is the counter an operator
+  reads as "the link is losing CCPs", and a benign reboot must not make it
+  lie. A gateway reboot does not always wrap the interval above 128, though: a
+  reboot that hits while the slave's own sequence state is itself large enough
+  wraps the apparent interval back down into the ordinary 1..128 range,
+  indistinguishable from a genuine forward gap **by sequence number alone**.
+  So every interval in that range is also checked against the SLAVE's own
+  local DW3220 clock — a genuine gap of `n` intervals must show roughly
+  `n * SYNC_CCP_INTERVAL_DTU` of real elapsed local time
+  (`CCP_SLAVE_GAP_TOL_FACTOR`, a deliberately generous 4x band, orders of
+  magnitude past what crystal drift alone could produce), and a reboot's
+  elapsed local time has no relationship to that arithmetic at all. A mismatch
+  re-baselines and counts in `n_reject` the same as the large-gap case. Every
+  re-baseline path — this one, the large-interval one, and a root change —
+  calls `sync_model_init()`, which clears the residual statistics along with
+  the rate estimate: `count` restarts at 0 and the verdict returns to
+  `"insufficient"` even though `sync_model.h` documents those statistics as
+  surviving "everything except an explicit reset" — true of `sync_model.c`'s
+  own API, but `ccp_slave.c` is a caller that invokes `sync_model_init()`
+  itself mid-life rather than only at `ccp_slave_init()`, so a re-baseline is
+  a second, implicit reset from this module's callers' point of view. No
+  arithmetic of its own beyond that discontinuity check — everything that
+  could be wrong about the estimator lives in `sync_model.c`, which is pure C
+  and host-tested and was NOT modified for this redesign: only the sequencing
+  and pairing logic around it changed, never `sync_model_observe()`'s
+  contract. `ccp_slave_model()` returns a `const` pointer: on a SLAVE,
+  `main()` stays at the default preemptible priority (see `main.c`), so the
+  shell can be preempted by the loop's own writes at any point, and read-only
+  access through a const pointer is what makes that safe. The one write
+  reachable from the shell (`sync reset`'s residual clear) goes through
+  `ccp_slave_residual_reset()`, fenced with `k_sched_lock()`/
+  `k_sched_unlock()` instead.
 - `src/sync_shell.c` — the `sync` command tree. Prints the gate's verdict
   itself, because the natural mistake here (reading `rms` as if it were the
   jitter) rejects hardware that passes. Registered unconditionally, including
@@ -710,6 +753,40 @@ sync master                    transmit half — CCP sent/dropped counts as
   same name in `src/uwb_gateway.c` (currently 11) — the two are unrelated and
   must not be confused. See the next bullet for why 11 and not 5. Revisit
   either if the relevant delay budgets are tuned further.
+- **A delayed TX's arm deadline is `DX_TIME − SHR`, not `DX_TIME` — measuring
+  lateness against the RMARKER instead of the preamble start hid a 100%
+  CCP-drop bug for two bench cycles.** The clock-calibration-packet (CCP,
+  `0xEF`) master originally scheduled each frame with a DELAYED TX at a fixed
+  offset after the beacon's RMARKER, and `dwt_starttx()` returned `DWT_ERROR`
+  for every single one on the bench. The instrumentation that finally
+  explained it measured the arm sequence completing 614654-678485 ns after
+  the BEACON's RMARKER — comfortably inside the CCP's own ~1.538 ms offset, so
+  by that measure the arm was never late. It was late anyway, because a
+  frame's RMARKER sits at the END of its own SHR (1050194 ns at PLEN_1024, the
+  preamble+SFD this project runs), so the deadline that actually matters is
+  the PREAMBLE start, a whole SHR earlier than the RMARKER the old instrument
+  was comparing against. Against that true deadline the arm was routinely
+  ~190 us LATE, while simultaneously reading ~860 us EARLY against the
+  RMARKER — both true at once, because they are distances to two different
+  instants a full SHR apart. `ull_starttx()`'s two failure branches (the
+  HPDWARN deadline check, and `DW_SYS_STATE_TXERR` — the Transmit Sequencing
+  Engine left mid-TX-to-IDLE by whatever transmitted immediately before this
+  arm) both collapse to the same plain `DWT_ERROR` return; there is no public
+  accessor that says which one fired, and `sys_status_lo:0x00000000` /
+  `hpdwarn_seen:0` on every failure was the only way to infer TXERR rather
+  than HPDWARN from outside the driver. Raising the offset could not have
+  fixed this either way: solving both edges of the guard window for a legal
+  offset left a window narrower than the observed arm-completion jitter
+  alone. The eventual fix (`src/ccp_master.c`, `src/ccp_sched.h`) does not
+  raise the offset — it removes the deadline: `DWT_START_TX_IMMEDIATE` instead
+  of a scheduled time, with the frame's actual TX timestamp read back after
+  TXFRS and carried in the FOLLOWING frame (`src/ccp_slave.c` pairs them).
+  Immune to arm jitter by construction, since there is no longer a deadline
+  for jitter to miss. The general lesson: on this part, ANY reasoning about a
+  delayed TX's timing must be anchored to the PREAMBLE, not the RMARKER the
+  API itself schedules against — an SHR's worth of margin (over 1 ms at
+  PLEN_1024) can be silently spent or silently available depending on which
+  edge a given measurement is actually taken from.
 - **The gateway's `TX_COMPLETE_TIMEOUT_MS` is shared by two delayed-TX call
   sites with different worst cases — size it against the larger one.**
   `tx_beacon()`'s delayed beacon and `send_grant()`'s GRANT both wait on the

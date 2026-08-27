@@ -6,29 +6,58 @@
  * Where the CCP sits inside the superframe.
  *
  * Header only, no .c file, same as uwb_mac.h: everything here is compile-time
- * arithmetic, and the BUILD_ASSERTs at the bottom ARE the deliverable. There is
- * no runtime behaviour to test, only a budget that must hold.
+ * arithmetic, and the BUILD_ASSERT at the bottom IS the deliverable.
  *
- * The placement decision, and why it costs nothing:
+ * ---- Why the delayed-TX design this header used to police was abandoned ---
  *
- * A slave suppresses its own TX inside [T_b - BEACON_GUARD_UUS,
- * T_b + BEACON_OCCUPANCY_UUS + BEACON_GUARD_UUS], where T_b is the beacon's
- * RMARKER -- that is the value beacon_guard_beacon() is fed, since it comes
- * from the beacon's RX timestamp. That window is already reserved and already
- * empty, so a CCP transmitted inside it takes NO airtime away from the CAP or
- * the CFP. The alternative -- a slot of its own -- would have cost 0.645% of
- * every superframe and forced the capacity model in the design spec section 3.2
- * to be re-run.
+ * The original design scheduled the CCP with a DELAYED TX, CCP_OFFSET_UUS
+ * (BEACON_OCCUPANCY_UUS, 1500 UUS) after the beacon's RMARKER, and this header
+ * carried two BUILD_ASSERTs proving that a frame armed exactly on schedule
+ * would clear both the beacon on one side and the first legitimate slave CAP
+ * transmit on the other. That held at compile time and failed 100% on
+ * hardware: dwt_starttx() returned DWT_ERROR for every single CCP.
  *
- * The offset is BEACON_OCCUPANCY_UUS rather than a tuned number, and that is
- * the point: it reads as "immediately after the occupancy the beacon already
- * declares for itself". The two asserts below prove both edges hold.
+ * Instrumentation (see git history on src/ccp_master.c, commits c4a515b through
+ * 2efd93b) settled why. The arm sequence -- dwt_forcetrxoff(),
+ * dwt_setdelayedtrxtime(), dwt_writetxdata(), dwt_writetxfctrl(),
+ * dwt_starttx() -- completed 614654-678485 ns after the BEACON's RMARKER, i.e.
+ * 225243-289074 ns after the beacon's own frame ended
+ * (CCP_SCHED_BEACON_END_NS, 389411 ns). That is well inside the ~1.538 ms
+ * CCP_OFFSET_UUS gave the arm to complete in -- comfortably early against the
+ * CCP's own RMARKER. But a frame's RMARKER sits at the END of its own SHR
+ * (CCP_SCHED_SHR_NS, 1050194 ns at PLEN_1024): the CCP's PREAMBLE had to start
+ * at 1538461 - 1050194 = 488267 ns after the beacon's RMARKER, and the arm
+ * routinely finished 190218 ns (worst case) AFTER that. So the arm was late
+ * for the preamble it needed to schedule, by up to ~190 us, while being
+ * measured as ~860 us EARLY against the RMARKER -- both true at once, because
+ * they are distances to two different instants a full SHR apart. The old
+ * instrument measured lateness against the RMARKER and reported "not late";
+ * the reference point, not the measurement, was wrong. That is what hid this
+ * for two bench cycles.
  *
- * Everything is measured from the beacon's RMARKER, because that is what a
- * delayed TX is programmed against. Note the RMARKER sits at the END of its own
- * SHR, so a frame's preamble PRECEDES its scheduled time -- this is the same
- * trap that made an earlier SS-TWR span estimate double-count both SHRs; see
- * MAC_SSTWR_EXCHANGE_PS in mac_budget.h.
+ * hpdwarn_seen:0 and sys_status_lo:0x00000000 on every failure additionally
+ * showed the failing branch was DW_SYS_STATE_TXERR in ull_starttx(), not the
+ * HPDWARN deadline check -- TXERR being CAUSED by the late arm, not inherited
+ * from the beacon (dwt_forcetrxoff() before the arm, already present, changed
+ * nothing, because it cannot fix a preamble that starts too late).
+ *
+ * Raising CCP_OFFSET_UUS cannot fix this: solving both edges for the offset
+ * leaves a legal window of 1685.5-1743.2 UUS, 57.7 UUS (57700 ns) wide --
+ * narrower than the ~63831 ns of observed arm-completion jitter
+ * (678485 - 614654) alone, before any margin. There is no delayed-TX offset
+ * that reliably fits.
+ *
+ * The fix (docs/superpowers/plans/2026-08-26-fase2-ccp-sync.md, Option B):
+ * transmit the CCP with DWT_START_TX_IMMEDIATE right after the beacon, read
+ * back its ACTUAL TX timestamp once TXFRS is confirmed, and carry that
+ * timestamp in the FOLLOWING CCP rather than announcing a scheduled time for
+ * itself. This is immune to arm jitter by construction: there is no deadline
+ * to miss, because the announced timestamp is measured after the fact, not
+ * predicted before it. src/ccp_master.c and src/ccp_slave.c implement the
+ * pairing; this header now checks the one thing that is still compile-time
+ * checkable -- that an immediate CCP transmitted right after the beacon
+ * physically FITS in the post-beacon guard window at all, with margin to
+ * spare, before the first legitimate slave CAP preamble.
  */
 
 #ifndef CCP_SCHED_H
@@ -41,12 +70,7 @@
 
 #include <zephyr/sys/util.h>
 
-/* Offset from the beacon's RMARKER to the CCP's RMARKER, in UUS. The caller
- * multiplies by UUS_TO_DWT_TIME; this header stays free of radio headers so the
- * budget is checkable under plain gcc. */
-#define CCP_OFFSET_UUS  BEACON_OCCUPANCY_UUS
-
-/* ---- Derived quantities, for the asserts and for tests/ccp_sched ---- */
+/* ---- Derived quantities, for the assert and for tests/ccp_sched ---- */
 
 /* Preamble + SFD. A frame's RMARKER is at the end of this, so the SHR occupies
  * the air BEFORE the scheduled time. */
@@ -60,12 +84,12 @@
 		     MAC_BITS_PS(((uint64_t)(bytes) + MAC_FCS_BYTES) * 8ULL,    \
 				 MAC_PHY_BITRATE))
 
-/* The CCP's scheduled RMARKER, relative to the beacon's. */
-#define CCP_SCHED_AT_NS         MAC_UUS_TO_NS(CCP_OFFSET_UUS)
-
 /* Where the beacon's own frame stops occupying the air, relative to its
  * RMARKER. UWB_FRAME_MAX_LEN is the beacon length: it is the longest frame the
- * contract defines, and tx_beacon() builds exactly that. */
+ * contract defines, and tx_beacon() builds exactly that. This is also, now,
+ * the earliest instant the CCP's own arm sequence can even begin -- it cannot
+ * start before tx_beacon() has returned, which happens only once the beacon's
+ * TXFRS is confirmed. */
 #define CCP_SCHED_BEACON_END_NS                                                \
 	CCP_SCHED_POST_RMARKER_NS(UWB_FRAME_MAX_LEN)
 
@@ -73,47 +97,6 @@
  * RMARKER. */
 #define CCP_SCHED_GUARD_END_NS                                                 \
 	(MAC_UUS_TO_NS(BEACON_OCCUPANCY_UUS) + MAC_UUS_TO_NS(BEACON_GUARD_UUS))
-
-/* The wall-clock budget to ARM the CCP -- not merely an airtime margin, which
- * is how the comment on assert (a) used to read this number.
- *
- * tx_beacon() returns only once the BEACON's TXFRS has fired, i.e. at
- * CCP_SCHED_BEACON_END_NS after the beacon's RMARKER. The CCP's own PREAMBLE
- * must begin at CCP_SCHED_AT_NS - CCP_SCHED_SHR_NS (its RMARKER minus its own
- * SHR). Between those two instants, ccp_master_after_beacon() must run
- * dwt_writesysstatuslo() -> uwb_get_tx_timestamp_u64() ->
- * dwt_setdelayedtrxtime() -> dwt_writetxdata() -> dwt_writetxfctrl() ->
- * dwt_starttx() -- five SPI transactions -- and have the delayed TX ARMED
- * before this window closes. That is a real scheduling constraint on the
- * K_PRIO_COOP(0) gateway loop, not comfortable headroom: mac_budget.h's own
- * MAC_TURNAROUND_FLOOR_PS carries this project's MEASURED arm-cost figures for
- * a comparable path (cir=133-156 us, readdata=23-33 us, readts=20 us, "so
- * ~200000 ns is the honest planning figure") -- and that path includes a CIR
- * read this one does not, so ~200 us over-estimates the CCP's true cost by an
- * AMOUNT NOBODY HAS MEASURED, not by a known, comfortable margin. Whether
- * 98856 ns is enough is exactly the open question this comment refuses to
- * paper over.
- *
- * This is also HALF of a two-sided legal window for CCP_OFFSET_UUS: this is
- * the lower bound (unmeasured on this exact path), and CCP_SCHED_CAP_PREAMBLE_NS
- * below derives the upper bound (1743 UUS -- see its comment). CCP_OFFSET_UUS
- * must be re-derived from a MEASURED beacon-TXFRS-to-dwt_starttx()-return cost
- * on real hardware and checked against both bounds, never guessed and never
- * retuned as a knob -- CLAUDE.md already records a board wedged once by
- * treating a delayed-TX budget that way (the beacon's own
- * TX_COMPLETE_TIMEOUT_MS regression). */
-#define CCP_SCHED_ARM_BUDGET_NS                                                \
-	(CCP_SCHED_AT_NS - CCP_SCHED_SHR_NS - CCP_SCHED_BEACON_END_NS)
-
-/* (a) The CCP's PREAMBLE must not start before the beacon's frame has finished.
- * Checking the RMARKER alone would pass while the preamble sat on top of the
- * beacon's payload -- 1050 us of collision that a sniffer would show as a
- * corrupt beacon and nothing would attribute to the CCP.
- *
- * This margin IS CCP_SCHED_ARM_BUDGET_NS -- see its comment above for why that
- * number is a live risk, not a comfortable one. */
-BUILD_ASSERT(CCP_SCHED_AT_NS >= CCP_SCHED_BEACON_END_NS + CCP_SCHED_SHR_NS,
-	     "CCP preamble would start before the beacon frame ends");
 
 /* Earliest PREAMBLE of the first legitimate slave CAP transmit, relative to
  * the beacon's RMARKER.
@@ -129,27 +112,43 @@ BUILD_ASSERT(CCP_SCHED_AT_NS >= CCP_SCHED_BEACON_END_NS + CCP_SCHED_SHR_NS,
 #define CCP_SCHED_CAP_PREAMBLE_NS                                              \
 	(CCP_SCHED_GUARD_END_NS - CCP_SCHED_SHR_NS)
 
-/* (b) The CCP must be off the air before the first legitimate slave CAP
- * PREAMBLE, or it collides with it.
+/* The whole guard-window budget available to host one CCP frame, from the
+ * instant the beacon's frame ends to the instant the first legitimate slave
+ * CAP preamble may begin, MINUS the CCP's own full airtime (SHR through FCS).
+ * What is left over is headroom for the immediate-TX arm sequence itself
+ * (dwt_forcetrxoff() through dwt_starttx(), now with NO dwt_setdelayedtrxtime()
+ * call at all -- an immediate TX needs no scheduled time) to run and for the
+ * frame to clear the air before that preamble.
  *
- * Comparing against CCP_SCHED_GUARD_END_NS directly -- the RMARKER bound the
- * guard itself is written against -- over-claims the margin by a full SHR
- * (1050194 ns): it says nothing about when a slave's preamble can actually
- * appear, only about where its RMARKER may land. CCP_SCHED_CAP_PREAMBLE_NS
- * corrects for that, and is what this assert must compare against. */
-BUILD_ASSERT(CCP_SCHED_AT_NS + CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN) <=
-		     CCP_SCHED_CAP_PREAMBLE_NS,
-	     "CCP still transmitting when the first slave CAP preamble may begin");
+ * This is the honest replacement for the old CCP_SCHED_ARM_BUDGET_NS: that
+ * macro bounded a delayed TX's arm-before-a-deadline race, which no longer
+ * exists. This bounds something real instead -- that the guard window is even
+ * wide enough to fit the CCP's whole frame with the beacon's own airtime
+ * subtracted, a genuine compile-time property of the PHY parameters and the
+ * MAC contract's guard sizing, independent of how fast any one arm sequence
+ * happens to run.
+ *
+ * Evaluates to 2026728 - 1289017 - 389411 = 348300 today. */
+/* Computed in a SIGNED 64-bit type deliberately: every term above is a
+ * uint32_t, and an unsigned subtraction that goes negative WRAPS to a huge
+ * positive value rather than failing the assert below -- exactly the kind of
+ * silent-wraparound trap CLAUDE.md already warns about for hi32 arithmetic,
+ * just at compile time instead of on the wire. Widening to int64_t before
+ * subtracting is what makes a genuine shortfall show up as a negative number
+ * instead of vanishing. */
+#define CCP_SCHED_MAX_ARM_NS                                                   \
+	((int64_t)CCP_SCHED_CAP_PREAMBLE_NS -                                  \
+	 (int64_t)(CCP_SCHED_SHR_NS + CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN)) - \
+	 (int64_t)CCP_SCHED_BEACON_END_NS)
 
-/* The offset ceiling this leaves CCP_OFFSET_UUS: solving assert (b) for
- * CCP_SCHED_AT_NS gives AT_NS <= CCP_SCHED_CAP_PREAMBLE_NS -
- * CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN) = 2026728 - 238823 = 1787905 ns,
- * i.e. AT_NS/MAC_UUS_PS <= 1743 UUS (integer UUS, truncated). Paired with
- * CCP_SCHED_ARM_BUDGET_NS above, CCP_OFFSET_UUS's legal window is two-sided:
- * bounded below by an unmeasured arm cost and above by 1743 UUS. Not encoded
- * as a macro or a third BUILD_ASSERT because CCP_FRAME_LEN's contribution
- * (238823 ns) is specific to today's CCP payload size and would need
- * re-deriving if that ever changes -- the two asserts above already check the
- * one CCP_OFFSET_UUS value that matters. */
+/* The guard window must be wide enough to host one whole CCP frame after the
+ * beacon's own airtime, with something left over for the arm sequence to run
+ * in. A non-positive value here would mean the CCP frame plus the beacon's
+ * frame together do not even fit before the first legitimate slave CAP
+ * preamble -- a genuine compile-time property, checkable without any
+ * hardware measurement at all, unlike the arm-jitter question the old delayed
+ * design could not settle this way. */
+BUILD_ASSERT(CCP_SCHED_MAX_ARM_NS > 0,
+	     "no room left in the post-beacon guard window for the CCP frame");
 
 #endif /* CCP_SCHED_H */

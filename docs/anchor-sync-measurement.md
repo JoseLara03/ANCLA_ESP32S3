@@ -114,12 +114,30 @@ recorded in §4.1, this document describes a gate that is executable but not
 yet passed, failed, or even attempted.
 
 The CCP goes in the **post-beacon guard window**, where slaves already may not
-transmit, so it costs **no** airtime from the CAP or the CFP —
-`CCP_OFFSET_UUS` is `BEACON_OCCUPANCY_UUS` and two `BUILD_ASSERT`s in
-`src/ccp_sched.h` prove the preamble does not overlap the beacon and the frame
-is off the air before the guard closes. Its airtime is **1.289 ms, 0.645 % of a
+transmit, so it costs **no** airtime from the CAP or the CFP. It is sent with
+`DWT_START_TX_IMMEDIATE` right after the beacon's own TXFRS confirms, not on a
+scheduled offset — an earlier design scheduled it with a DELAYED TX at a fixed
+offset (`CCP_OFFSET_UUS`) after the beacon's RMARKER, and it failed 100% on
+the bench: the arm sequence could not reliably finish before the CCP's own
+PREAMBLE needed to start, a whole SHR (1050194 ns at PLEN_1024) earlier than
+the RMARKER the old design scheduled against — see CLAUDE.md's hard-won fact
+on this for the full diagnosis. The immediate-TX design removes the deadline
+entirely rather than re-tuning it: there is nothing left to arm against, so
+there is nothing for arm jitter to be late for. Since a transmitter cannot
+know its own TX timestamp before transmitting, each CCP announces the
+PREVIOUS CCP's measured timestamp instead of its own — `src/ccp_master.c`
+reads the actual TX timestamp back once TXFRS confirms and carries it in the
+following frame; `src/ccp_slave.c` pairs a CCP's announcement with the local
+RX timestamp of the frame it describes. `src/ccp_sched.h` keeps one
+`BUILD_ASSERT` — `CCP_SCHED_MAX_ARM_NS` (348300 ns) is positive, i.e. the
+post-beacon guard window is wide enough to host the CCP's whole frame at all
+after the beacon's own airtime — and reports the rest (where the CCP actually
+lands, and the implied arm cost) as a runtime measurement instead, since
+whether any one arm sequence is fast enough is no longer something a header
+can know at compile time. Its airtime is still **1.289 ms, 0.645 % of a
 200 ms superframe** — pinned in `tests/ccp_frame/test_airtime_is_recorded` and
-again in `tests/ccp_sched/`.
+again in `tests/ccp_sched/` — unchanged by any of this: the frame did not
+change size, only when it transmits and what it carries.
 
 **Role selection is deliberately not runtime-configurable.** The master is the
 gateway, because putting an unsolicited transmit path in a production SLAVE
@@ -149,22 +167,34 @@ repeat the measurement with the roles swapped (§3), swap the **boards**:
 3. **On the gateway console, before reading anything on the slave**: confirm
    there is no `"beacon started but TXFRS never completed"` line anywhere in
    the log, then run `sync master` (or wait for its own rate-limited
-   `{"ccp_master":{"sent":...,"dropped":...}}` `LOG_WRN` summary — it only
-   prints when the drop count has actually moved). This step exists because
-   the TRANSMIT half of this measurement has its own, quieter failure mode:
-   the CCP's wall-clock budget to arm after the beacon
-   (`src/ccp_sched.h`'s `CCP_SCHED_ARM_BUDGET_NS`) is a derived figure, not a
-   measured one, on this exact path. **If `dropped` is climbing — worst case,
-   `sent` stays near 0 and the slave never sees a single CCP — this is a
-   SCHEDULING problem, not an RF one.** The fix is to measure the real
-   beacon-TXFRS-to-`dwt_starttx()`-return cost on this hardware and re-derive
-   `CCP_OFFSET_UUS` within its 1743 UUS ceiling (see `src/ccp_sched.h`'s
-   comments on `CCP_SCHED_ARM_BUDGET_NS` and `CCP_SCHED_CAP_PREAMBLE_NS`) —
-   not to move the boards, swap antennas, or otherwise chase an RF cause that
-   was never there.
+   `{"ccp_master":{"sent":...,"dropped":...,"offset_ns_min":...,
+   "offset_ns_max":...,"arm_cost_ns_last":...}}` `LOG_WRN` summary — it only
+   prints when the drop count has actually moved). Under the immediate-TX
+   design there is no scheduled deadline left to miss, so a dropped CCP here
+   means something different than it used to: either `dwt_starttx()` itself
+   failed (check for a `DW_SYS_STATE_TXERR`-class fault — CLAUDE.md's hard-won
+   fact on the arm-deadline trap covers why a completed TX, unlike a completed
+   RX, can leave the radio needing an explicit `dwt_forcetrxoff()` before the
+   next transmit), or TXFRS never arrived within `CCP_MASTER_TX_TIMEOUT_MS`
+   (8 ms) of a successful `dwt_starttx()`. **If `dropped` is climbing —
+   worst case, `sent` stays near 0 and the slave never sees a single CCP —
+   suspect the radio state left over from the beacon's own TX, or a genuine
+   TXFRS timeout, not a scheduling budget: there is no schedule left to be
+   too tight.** Also watch for a `{"ccp_master":{"cap_overlap":1,...}}`
+   `LOG_WRN`: that means a CCP's frame end reached the earliest legitimate
+   slave CAP preamble (`arm_cost_ns_last` approaching or exceeding
+   `CCP_SCHED_MAX_ARM_NS`, 348300 ns) — the CCP is still being sent and
+   confirmed, but it is colliding with real ranging traffic, which is a
+   different problem from a drop and needs the arm sequence itself
+   shortened, not a timeout raised.
 4. On the slave, `sync stats`. Confirm `rx` climbing by ~5 per second, `root`
    equal to the gateway's `root_id`, and `valid:1` within a couple of seconds.
-   `gaps` and `rejected` should both stay at or near 0.
+   `gaps` and `rejected` should both stay at or near 0. Under the
+   deferred-timestamp design an observation lags its frame by one superframe,
+   so also check `paired` is climbing roughly in step with `rx` (allowing for
+   one `no_announce` — the master's first CCP after its own boot never carries
+   an announcement) — `rx` climbing while `paired`/`count` stay flat points at
+   the pairing logic or a `root`/sequence discontinuity, not at the RF link.
 5. `sync reset`, then leave it alone for **at least 90 seconds** — the verdict
    is withheld below 400 observations on purpose, and at ~5 per second that is
    ~80 s.
@@ -179,7 +209,7 @@ repeat the measurement with the roles swapped (§3), swap the **boards**:
    which turns on `CONFIG_THREAD_ANALYZER`) and read the gateway's `main`
    thread peak stack usage. Compare it against the 1748/4096-byte figure
    CLAUDE.md already recorded for the anchor survey's `do_solve()` path — this
-   loop now does one more delayed TX and one more bounded TXFRS wait per
+   loop now does one more immediate TX and one more bounded TXFRS wait per
    superframe than that measurement covered, and nothing has confirmed yet
    that the extra call depth does not move the peak.
 
@@ -239,12 +269,20 @@ Before any of the remedies below: `rx:0` on the slave, or a `verdict` stuck at
 jitter number, and the remedies below do not apply to it. Check the
 **transmit** side first, not the link: `sync master` on the gateway (or its
 own periodic `LOG_WRN` summary). If `dropped` is climbing while `sent` stays
-low or zero, the gateway is not getting CCPs onto the air at all — most likely
-the arm-deadline risk in `src/ccp_sched.h` (`CCP_SCHED_ARM_BUDGET_NS`, see §3
-step 3) — and no amount of moving boards, checking line of sight, or reading
-`max`/`rms` on the slave will fix a CCP that never transmitted. Only once
-`sync master` shows `sent` climbing and `dropped` flat does an `rx:0` on the
-slave become an RF question rather than a scheduling one.
+low or zero, the gateway is not getting CCPs onto the air at all — under the
+immediate-TX design (§2, §3 step 3) that means either `dwt_starttx()` itself
+is failing (check for the `DW_SYS_STATE_TXERR` radio-state trap CLAUDE.md's
+hard-won fact describes, left over from the beacon's own TX) or TXFRS is
+timing out — and no amount of moving boards, checking line of sight, or
+reading `max`/`rms` on the slave will fix a CCP that never transmitted. If
+instead `sent` is climbing normally but the slave's `rx` stays flat, that
+points at the RF link as expected; but if `rx` climbs while `paired`/`count`
+stay flat, check `no_announce` and a possible `root`/sequence discontinuity
+before suspecting the link (§3 step 4) — that is the deferred-timestamp
+design's own failure mode, not an RF one either. Only once `sync master`
+shows `sent` climbing and `dropped` flat, AND `sync stats` shows `paired`
+tracking `rx`, does a stuck `verdict` become a genuine jitter question rather
+than a transmit or pairing one.
 
 In rough order of cost:
 

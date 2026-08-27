@@ -1,11 +1,16 @@
 /* Including ccp_sched.h IS the test: under tests/mac_budget/shim its
- * BUILD_ASSERTs are _Static_assert, so a budget that stops holding fails to
+ * BUILD_ASSERT is _Static_assert, so a budget that stops holding fails to
  * COMPILE under plain gcc instead of waiting for a Zephyr build. Same pattern
  * as tests/mac_budget/test_uwb_mac_asserts.c.
  *
  * The printed figures are not decoration: they are the numbers the design
  * decision in docs/superpowers/plans/2026-08-26-fase2-ccp-sync.md D2 was made
- * from, so a reader can confirm the table rather than trust it. */
+ * from, so a reader can confirm the table rather than trust it. Rewritten for
+ * the immediate-TX design (Option B): the old asserts checked a delayed TX's
+ * scheduled RMARKER against both edges of the guard window, which no longer
+ * exists as a scheduled quantity. What is still checkable at compile time is
+ * that the guard window is wide enough to host one whole CCP frame at all,
+ * after the beacon's own airtime -- CCP_SCHED_MAX_ARM_NS. */
 #include "ccp_sched.h"
 
 #include <stdio.h>
@@ -20,57 +25,38 @@ static int failures;
 		}                                                              \
 	} while (0)
 
-/* The offset is BEACON_OCCUPANCY_UUS by DERIVATION, not by coincidence. If
- * someone retunes it to a literal, this fails and says why. */
-static void test_offset_is_the_beacon_occupancy(void)
+/* The airtime figures themselves, pinned so nothing here silently drifts.
+ * These are constant arithmetic over frozen PHY parameters and the MAC
+ * contract's guard sizing -- unrelated to how any one arm sequence performs
+ * on hardware. Measured 2026-08-26 (unchanged by the Option B redesign: the
+ * PHY and the guard geometry did not move, only how the CCP is scheduled). */
+static void test_derived_quantities_are_pinned(void)
 {
-	CHECK(CCP_OFFSET_UUS == BEACON_OCCUPANCY_UUS);
-	CHECK(CCP_OFFSET_UUS == 1500u);
-}
-
-/* Both edges, with their margins pinned. A change that leaves the asserts
- * holding but eats the margin is worth seeing. */
-static void test_ccp_fits_the_post_beacon_guard(void)
-{
-	uint32_t earliest = CCP_SCHED_BEACON_END_NS + CCP_SCHED_SHR_NS;
-	uint32_t ends_at = CCP_SCHED_AT_NS +
-			   CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN);
-
-	CHECK(CCP_SCHED_AT_NS >= earliest);
-	/* The trailing edge is checked against CCP_SCHED_CAP_PREAMBLE_NS, NOT
-	 * CCP_SCHED_GUARD_END_NS -- the latter is the guard's RMARKER bound,
-	 * a full SHR later than the earliest colliding PREAMBLE. Comparing
-	 * against it directly is the exact over-claim F2 fixed. */
-	CHECK(ends_at <= CCP_SCHED_CAP_PREAMBLE_NS);
-
-	/* Measured 2026-08-26. Exact values, not bounds: these are constant
-	 * arithmetic over frozen PHY parameters, so anything that moves them
-	 * moves the airtime model and should be read, not silently absorbed. */
 	CHECK(CCP_SCHED_SHR_NS == 1050194u);
 	CHECK(CCP_SCHED_BEACON_END_NS == 389411u);
-	CHECK(earliest == 1439605u);
-	CHECK(CCP_SCHED_AT_NS == 1538461u);
-	CHECK(ends_at == 1777284u);
 	CHECK(CCP_SCHED_GUARD_END_NS == 3076922u);
 	CHECK(CCP_SCHED_CAP_PREAMBLE_NS == 2026728u);
+}
 
-	/* CCP_SCHED_ARM_BUDGET_NS is the wall-clock budget to ARM the CCP after
-	 * the beacon's TXFRS -- five SPI calls must complete inside this many
-	 * nanoseconds. Pinned so it cannot silently drift, but NOT asserted
-	 * sufficient: nobody has measured this path's actual arm cost on
-	 * hardware, so whether 98856 ns is enough is still an open question. */
-	CHECK(CCP_SCHED_ARM_BUDGET_NS == 98856u);
-	CHECK(CCP_SCHED_AT_NS - earliest == 98856u);
+/* The number this whole redesign turns on: how much of the post-beacon guard
+ * window is left over for the CCP's own frame plus the immediate-TX arm
+ * sequence, after subtracting the beacon's own airtime and the CCP's whole
+ * SHR-through-FCS airtime. Pinned at 348300 ns per the approved design. */
+static void test_max_arm_ns_is_348300(void)
+{
+	CHECK(CCP_SCHED_MAX_ARM_NS == 348300u);
 
-	/* The TRUE trailing margin, against the corrected (b) edge -- 249444 ns,
-	 * not the 1299638 ns the old (wrong) comparison against
-	 * CCP_SCHED_GUARD_END_NS implied. */
-	CHECK(CCP_SCHED_CAP_PREAMBLE_NS - ends_at == 249444u);
+	uint32_t full_ccp = CCP_SCHED_SHR_NS +
+			    CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN);
+
+	CHECK(CCP_SCHED_CAP_PREAMBLE_NS - CCP_SCHED_BEACON_END_NS - full_ccp ==
+	      CCP_SCHED_MAX_ARM_NS);
 }
 
 /* The CCP's total airtime and its share of a superframe. Quoted in
  * docs/anchor-sync-measurement.md section 2, so pin it here rather than letting
- * the doc drift. */
+ * the doc drift. Unchanged by Option B -- the frame itself did not change
+ * size, only when it is transmitted and what it carries. */
 static void test_airtime_share_is_recorded(void)
 {
 	uint32_t full = CCP_SCHED_SHR_NS +
@@ -84,8 +70,8 @@ static void test_airtime_share_is_recorded(void)
 
 int main(void)
 {
-	test_offset_is_the_beacon_occupancy();
-	test_ccp_fits_the_post_beacon_guard();
+	test_derived_quantities_are_pinned();
+	test_max_arm_ns_is_348300();
 	test_airtime_share_is_recorded();
 
 	if (failures) {

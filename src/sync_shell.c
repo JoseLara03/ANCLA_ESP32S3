@@ -90,8 +90,10 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 
 	const struct sync_model *m = ccp_slave_model();
 	uint32_t rx = 0, gap = 0, reject = 0, root = 0;
+	uint32_t paired = 0, no_announce = 0;
 
 	ccp_slave_stats(&rx, &gap, &reject, &root);
+	ccp_slave_stats_ex(&paired, &no_announce);
 
 	/* sync_model_error_dtu() returns UINT32_MAX when the model has no rate
 	 * estimate. That is the documented public way to ask, rather than
@@ -105,12 +107,14 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	uint32_t jit_ps = (uint32_t)(((uint64_t)jit * 1565u) / 100u);
 
 	shell_print(sh,
-		    "{\"sync\":{\"role\":\"%s\",\"root\":%u,\"rx\":%u,\"gaps\":%u,"
+		    "{\"sync\":{\"role\":\"%s\",\"root\":%u,\"rx\":%u,"
+		    "\"paired\":%u,\"no_announce\":%u,\"gaps\":%u,"
 		    "\"rejected\":%u,\"count\":%u,\"valid\":%u,"
 		    "\"jitter_est_dtu\":%u,\"jitter_est_ps\":%u,"
 		    "\"rms_dtu\":%u,\"max_dtu\":%u,\"drift_ppb\":%d,"
 		    "\"verdict\":\"%s\"}}",
-		    board_role(), root, rx, gap, reject, cnt, valid ? 1u : 0u,
+		    board_role(), root, rx, paired, no_announce, gap, reject,
+		    cnt, valid ? 1u : 0u,
 		    jit, jit_ps,
 		    sync_model_residual_rms_dtu(m),
 		    sync_model_residual_max_dtu(m),
@@ -141,10 +145,14 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		    "read jitter_est, NOT rms: the residual differences two "
 		    "noisy timestamps and its RMS is ~1.55x the real jitter. "
 		    "Thresholds: <%u DTU pass, <=%u marginal, above that fail. "
-		    "rx/gaps/rejected/valid are only meaningful on a SLAVE -- "
-		    "a GATEWAY or the cal image never feed this model, so "
-		    "root:0 rx:0 valid:0 \"no-lock\" there means \"not a "
-		    "slave\", not \"dead link\". See \"role\" above.",
+		    "rx/paired/no_announce/gaps/rejected/valid are only "
+		    "meaningful on a SLAVE -- a GATEWAY or the cal image never "
+		    "feed this model, so root:0 rx:0 valid:0 \"no-lock\" there "
+		    "means \"not a slave\", not \"dead link\". See \"role\" "
+		    "above. rx climbing while count stays 0: check "
+		    "no_announce first (a freshly-rebooted or "
+		    "txtest-only master looks exactly like this by design, "
+		    "not a fault) before suspecting the pairing logic.",
 		    SYNC_GATE_PASS_DTU, SYNC_GATE_FAIL_DTU);
 	return 0;
 }
@@ -155,31 +163,24 @@ static int cmd_master(const struct shell *sh, size_t argc, char **argv)
 	ARG_UNUSED(argv);
 
 	uint32_t sent = 0, dropped = 0, root = 0;
-	int32_t late_min = 0, late_max = 0, late_last = 0;
-	int32_t late_signed_last = 0, late_signed_min = 0;
-	uint32_t sys_status_lo = 0;
-	bool hpdwarn_seen = false;
+	int32_t offset_min = 0, offset_max = 0, offset_last = 0;
+	int32_t arm_cost_last = 0;
 	bool tt_pending = false, tt_done = false, tt_tx_ok = false, tt_txfrs_ok = false;
 
-	ccp_master_stats(&sent, &dropped, &root, &late_min, &late_max,
-			 &late_last);
-	ccp_master_diag_stats(&late_signed_last, &late_signed_min,
-			      &sys_status_lo, &hpdwarn_seen);
+	ccp_master_stats(&sent, &dropped, &root, &offset_min, &offset_max,
+			 &offset_last, &arm_cost_last);
 	ccp_master_txtest_stats(&tt_pending, &tt_done, &tt_tx_ok, &tt_txfrs_ok);
 
 	shell_print(sh,
 		    "{\"ccp_master\":{\"role\":\"%s\",\"root\":%u,"
 		    "\"sent\":%u,\"dropped\":%u,"
-		    "\"late_ns_min\":%d,\"late_ns_max\":%d,"
-		    "\"late_ns_last\":%d,"
-		    "\"late_ns_signed_last\":%d,\"late_ns_signed_min\":%d,"
-		    "\"sys_status_lo\":\"0x%08X\",\"hpdwarn_seen\":%d,"
+		    "\"offset_ns_min\":%d,\"offset_ns_max\":%d,"
+		    "\"offset_ns_last\":%d,\"arm_cost_ns_last\":%d,"
 		    "\"txtest\":{\"pending\":%d,\"done\":%d,\"tx_ok\":%d,"
 		    "\"txfrs_ok\":%d}}}",
 		    board_role(), root, sent, dropped,
-		    (int)late_min, (int)late_max, (int)late_last,
-		    (int)late_signed_last, (int)late_signed_min,
-		    (unsigned int)sys_status_lo, (int)hpdwarn_seen,
+		    (int)offset_min, (int)offset_max, (int)offset_last,
+		    (int)arm_cost_last,
 		    (int)tt_pending, (int)tt_done, (int)tt_tx_ok,
 		    (int)tt_txfrs_ok);
 
@@ -190,12 +191,13 @@ static int cmd_master(const struct shell *sh, size_t argc, char **argv)
 			   "else, so sent:0 dropped:0 here means \"not a "
 			   "gateway\", not \"the link is fine\".");
 	} else if (dropped != 0u) {
-		/* Makes a real risk readable rather than silent: if the CCP's
-		 * arm budget (ccp_sched.h's CCP_SCHED_ARM_BUDGET_NS, unmeasured
-		 * on this exact path) is too tight on this hardware, every CCP
-		 * is dropped and `sync stats` on the peer just sits at `rx:0`
-		 * forever, with nothing there to say why. This is the first
-		 * place that does. */
+		/* Makes a real risk readable rather than silent: a dropped CCP
+		 * costs the receiver both an observation AND the following
+		 * CCP's ability to make one (the deferred-timestamp design
+		 * only announces a CONFIRMED transmit's timestamp), so
+		 * `sync stats` on the peer can sit well short of `rx` even
+		 * on a mostly-healthy link. This is the first place that says
+		 * why. */
 		shell_warn(sh,
 			   "%u of %u CCPs dropped. If this keeps climbing, "
 			   "check docs/anchor-sync-measurement.md section 5 "
