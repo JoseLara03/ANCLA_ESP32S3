@@ -715,6 +715,19 @@ static void on_range_rsp(const uint8_t *buf, uint16_t plen)
 	} else if (from >= 0 && to >= 0) {
 		apos_table_add_meas(&tbl, (uint8_t)from, (uint8_t)to, mean, sd,
 				    n_ok);
+		/* One line per accepted pair. Until this existed the ranging
+		 * phase logged ONLY failures, so a run in progress and a run
+		 * that had died were indistinguishable from the console: 12
+		 * pairs at up to APOS_GW_RANGE_TIMEOUT_MS * (1 +
+		 * APOS_GW_RANGE_RETRIES) each is over a minute of silence.
+		 * That is what sent the first hardware investigation of this
+		 * phase looking for a hang that had not happened yet. */
+		LOG_INF("{\"apos_pair\":{\"i\":%u,\"of\":%u,\"from\":"
+			"\"0x%04X\",\"to\":\"0x%04X\",\"mean_mm\":%d,"
+			"\"sd_mm\":%u,\"n_ok\":%u}}",
+			(unsigned int)pair_idx + 1u,
+			(unsigned int)pair_total, await_from_addr,
+			await_peer_addr, mean, sd, n_ok);
 	}
 
 	awaiting_rsp = false;

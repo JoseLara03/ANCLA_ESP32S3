@@ -24,6 +24,7 @@
 #include "gw_core.h"
 #include "pos_sink.h"
 #include "tag_id.h"
+#include "uwb_debug.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_mac.h"
@@ -33,7 +34,7 @@
 
 #include <deca_device_api.h>
 
-LOG_MODULE_REGISTER(uwb_gateway, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(uwb_gateway, ANCLA_LOG_LEVEL);
 
 /* T_SUPERFRAME_UUS comes from uwb_mac.h — the slaves predict the beacon from
  * the same definition, and a local copy here would drift against theirs. */
@@ -78,6 +79,36 @@ LOG_MODULE_REGISTER(uwb_gateway, LOG_LEVEL_INF);
 
 /* Longest frame the contract defines is a 39-byte beacon; +FCS, rounded up. */
 #define RX_BUF_LEN 64
+
+/* How long the DW3220's own clock may fail to advance before this loop calls it
+ * wedged.
+ *
+ * This exists because a stopped chip clock is the ONE failure this loop cannot
+ * notice or report, and its silence is total. The beacon is scheduled from
+ * dwt_readsystimestamphi32(), so if that value stops advancing, `to_beacon`
+ * never crosses BEACON_ARM_MARGIN_UUS, the inner loop never breaks, and
+ * tx_beacon() is never reached again -- the network's time base simply stops.
+ *
+ * What makes it undiagnosable rather than merely broken is the priority layout.
+ * This loop runs at K_PRIO_COOP(0) = -16 and dwt_isr() runs on the system
+ * workqueue at -1; the shell and the log-processing thread are both PREEMPTIBLE
+ * (the log thread at K_LOWEST_APPLICATION_THREAD_PRIO). While a wedged chip
+ * keeps re-asserting its IRQ, this loop and the workqueue hand the rx_sem back
+ * and forth with neither ever idle, so nothing preemptible is ever scheduled:
+ * the console goes dead, the log thread never drains, and with
+ * CONFIG_LOG_MODE_DEFERRED the queued records are then OVERWRITTEN. The board
+ * stops beaconing and says nothing at all -- no warning, no fatal dump.
+ *
+ * CLAUDE.md records this chip wedging before, diagnosed the long way. That
+ * instance left the shell ALIVE (an idle network gave the loop nothing to
+ * service, so it sat in k_sem_take and yielded). Under the anchor survey's
+ * sustained ranging traffic it does not, which is why the same hardware fault
+ * now presents as a total freeze.
+ *
+ * 60 ms is a third of a superframe: long enough that no legitimate quiet spell
+ * trips it (the clock advances every 4.006 ns), short enough to be caught
+ * inside the superframe it happened in. */
+#define CLOCK_STALL_MS 60u
 
 static K_SEM_DEFINE(rx_sem, 0, 1);
 
@@ -331,13 +362,52 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 		return;
 	}
 
+	/* Liveness of the OUTER loop, one line per superframe. If these stop
+	 * while the board is still powered, the loop is trapped inside the inner
+	 * for(;;) and the stall check below says whether the chip clock is why.
+	 * Debug image only -- five lines a second is not a production log. */
+	uint32_t stall_ref = 0;
+	int64_t stall_since_ms = k_uptime_get();
+
 	while (1) {
 		uint32_t next_beacon = (uint32_t)((beacon_tx_ts +
 			((uint64_t)T_SUPERFRAME_UUS * UUS_TO_DWT_TIME)) >> 8);
 
+		LOG_DBG("{\"gw_sf\":{\"systime\":%u,\"next_beacon\":%u,"
+			"\"fc\":%u,\"apos_busy\":%d}}",
+			dwt_readsystimestamphi32(), next_beacon,
+			ctx.frame_counter, (int)apos_gw_busy());
+
 		for (;;) {
 			uint32_t now = dwt_readsystimestamphi32();
 			int32_t to_beacon = (int32_t)(next_beacon - now);
+
+			/* Wedged-chip check, BEFORE the break test that depends
+			 * on `now` advancing. Bounded in wall-clock time, which
+			 * the radio cannot stop, rather than in iterations,
+			 * which say nothing about how long they took. */
+			if (now != stall_ref) {
+				stall_ref = now;
+				stall_since_ms = k_uptime_get();
+			} else if (k_uptime_get() - stall_since_ms >
+				   (int64_t)CLOCK_STALL_MS) {
+				LOG_ERR("{\"gw_fault\":{\"why\":\"DW3220 "
+					"system clock has not advanced in %u ms "
+					"— the chip is wedged, this is not a "
+					"firmware stall\",\"systime\":%u,"
+					"\"apos_busy\":%d}}",
+					CLOCK_STALL_MS, now,
+					(int)apos_gw_busy());
+				/* Sleep, not k_yield(): yielding only reaches
+				 * threads at this priority or above, and every
+				 * thread that could report this or accept a
+				 * console command is BELOW it. One millisecond
+				 * is what buys the shell back, and without it
+				 * the operator has no way in. */
+				stall_since_ms = k_uptime_get();
+				k_msleep(1);
+				continue;
+			}
 
 			if (to_beacon <= (int32_t)UUS_TO_HI32(BEACON_ARM_MARGIN_UUS)) {
 				break;
