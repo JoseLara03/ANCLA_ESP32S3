@@ -20,6 +20,7 @@ target_sources(app PRIVATE
 	src/beacon_guard.c
 	src/ccp_frame.c
 	src/ccp_master.c
+	src/ccp_slave.c
 	src/disc_schedule.c
 	src/gw_core.c
 	src/mac_budget.c
@@ -32,6 +33,7 @@ target_sources(app PRIVATE
 	src/pos_sink.c
 	src/ss_initiator.c
 	src/sync_model.c
+	src/sync_shell.c
 	src/tag_id.c
 	src/uwb_config.c
 	src/uwb_dwtime.c

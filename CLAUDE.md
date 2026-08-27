@@ -313,6 +313,18 @@ cal peer <id> <mm>              range anchor <id> at a known distance;
 See `docs/antenna-delay-calibration.md` for the full procedure and acceptance
 thresholds.
 
+The CCP receiver adds a `sync` tree, in the **production** image. It only
+reports; it transmits nothing and has no configuration commands.
+
+```
+sync stats                     the Phase 2 gate as JSON, with a verdict.
+                               Read `jitter_est`, NOT `rms` — the residual
+                               differences two noisy timestamps and its RMS
+                               is ~1.55x the real jitter
+sync reset                     clear the residual statistics without
+                               touching the lock or the baseline
+```
+
 ## Layout
 
 - `boards/innovaforce/ancla_esp32s3/` — out-of-tree board definition, added to
@@ -354,13 +366,26 @@ thresholds.
   C, host-tested in `tests/ccp_frame/`. **`0xEF` is the LAST free code in the
   `0xEx` range** — the allocation table is in its header, and anything after
   this needs a subtype byte under an existing code rather than a new one.
-- `src/ccp_sched.h` — dónde cae el CCP en el superframe: `CCP_OFFSET_UUS`
-  (= `BEACON_OCCUPANCY_UUS`, es decir inmediatamente después de la ocupación
-  del beacon, dentro de la guarda que los slaves ya no pueden usar) y los dos
-  `BUILD_ASSERT` que prueban que el preámbulo no pisa el beacon y que la trama
-  termina antes de que cierre la guarda. Solo header, sin `.c`, mismo patrón
-  que `uwb_mac.h`; host-testeado en `tests/ccp_sched/` donde **incluir el
-  header es el test**.
+- `src/ccp_sched.h` — where the CCP falls in the superframe: `CCP_OFFSET_UUS`
+  (= `BEACON_OCCUPANCY_UUS`, i.e. immediately after the beacon's declared
+  occupancy, inside the guard the slaves already may not use) and the two
+  `BUILD_ASSERT`s that prove the preamble does not overlap the beacon and that
+  the frame is off the air before the guard closes. Header-only, no `.c`, same
+  pattern as `uwb_mac.h`; host-tested in `tests/ccp_sched/` where **including
+  the header is the test**.
+- `src/ccp_master.{c,h}` — the CCP transmitter on the GATEWAY, root of the sync
+  tree (hop 0). On the gateway deliberately: it already schedules one delayed
+  TX per superframe, and the clock it schedules from **is** the time base. A
+  master role on a slave would have added an unsolicited TX path to a
+  production image.
+- `src/ccp_slave.{c,h}` — the CCP receiver on the SLAVE: owns the single
+  `struct sync_model`, detects missed CCPs from gaps in `ccp_seq` and calls
+  `sync_model_miss()` for each one. No arithmetic of its own — everything that
+  could be wrong about the estimator lives in `sync_model.c`, which is pure C
+  and host-tested.
+- `src/sync_shell.c` — the `sync` command tree. Prints the gate's verdict
+  itself, because the natural mistake here (reading `rms` as if it were the
+  jitter) rejects hardware that passes.
 - `src/sync_model.{c,h}` — anchor clock synchronisation: converts a local
   DW3220 timestamp into a master anchor's time base from a stream of CCPs.
   Integer-only, pure C, host-tested in `tests/sync_model/`. **This is the Phase

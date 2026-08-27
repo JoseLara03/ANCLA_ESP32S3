@@ -18,6 +18,7 @@
 #include "anchor_respond.h"
 #include "apos_node.h"
 #include "beacon_guard.h"
+#include "ccp_slave.h"
 #include "uwb_debug.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
@@ -281,6 +282,7 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		cfg->anchor_id, uwb_config_short_addr(cfg));
 
 	apos_node_init();
+	ccp_slave_init();
 
 	beacon_guard_init(&bguard, UUS_TO_HI32(T_SUPERFRAME_UUS),
 			  UUS_TO_HI32(BEACON_GUARD_UUS),
@@ -350,6 +352,15 @@ void uwb_slave_run(const uwb_config_t *cfg)
 #ifdef CONFIG_ANCLA_RANGING_DEBUG
 		dbg_count(rx_buf, plen);
 #endif
+
+		/* First in the chain, and cheap to reject: ccp_frame_is_ccp()
+		 * is a type-and-length test. A CCP arrives once per superframe
+		 * and is for nobody else, so there is no reason to walk it past
+		 * the survey and ranging responders. */
+		if (ccp_slave_on_rx(rx_buf, plen, rx_ts)) {
+			rx_arm();
+			continue;
+		}
 
 		/* Offered to each in turn; each ignores what is not its
 		 * own. APOS goes first and short-circuits: a survey
