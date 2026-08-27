@@ -651,10 +651,21 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 		/* Only on a CONFIRMED beacon. ts == 0 means the beacon did not
 		 * go out, and a CCP scheduled from a beacon that never
 		 * transmitted would be scheduled from a time that does not
-		 * exist. Bounded: one delayed TX, one bounded TXFRS wait. */
+		 * exist. Bounded: one delayed TX, one bounded TXFRS wait.
+		 *
+		 * Passes next_beacon -- the PROGRAMMED hi32 this loop already
+		 * armed the beacon against -- not ts (tx_beacon()'s measured
+		 * TX timestamp). next_beacon has not been re-based yet at
+		 * this point (that happens below, into beacon_tx_ts for the
+		 * NEXT iteration), so it is still exactly what this beacon was
+		 * scheduled from. ts != 0 remains the right guard: it is still
+		 * the only signal that this specific beacon actually
+		 * transmitted, which is what makes next_beacon meaningful
+		 * here at all. See ccp_master.h for why the programmed value
+		 * is used instead of the measured one. */
 		if (ts != 0u) {
 			CRUMB(GW_CRUMB_CCP_TX);
-			ccp_master_after_beacon(ts, &gw_seq);
+			ccp_master_after_beacon(next_beacon, &gw_seq);
 		}
 
 		/* On a miss, re-base on the current time rather than compounding

@@ -20,6 +20,7 @@
 
 #include <deca_device_api.h>
 
+#include <stdbool.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(ccp_master, ANCLA_LOG_LEVEL);
@@ -74,6 +75,24 @@ static uint32_t n_dropped;
 static uint32_t sf_since_report;
 static uint32_t last_reported_dropped;
 
+/* How late dwt_starttx() found the radio clock, on the failure path only --
+ * see the BUILD_ASSERT-adjacent comment in ccp_master_after_beacon() for how
+ * this is computed. Tracked only across OBSERVED positive latenesses; a
+ * non-positive reading is counted separately (n_nonpositive_late) rather than
+ * folded into min/max, because a negative "lateness" means the arm was NOT
+ * late and the failure has some other cause -- reporting it as e.g.
+ * late_ns_min would tell an operator the arm budget is fine when the data
+ * says nothing of the kind. 0 (no positive observation yet) is the printed
+ * default for all three; that is indistinguishable from "measured exactly
+ * zero" only in principle, since a genuine zero-ns miss is not physically
+ * distinguishable from "not yet observed" anyway and both are equally
+ * uninteresting for sizing the budget. */
+static int32_t late_ns_min;
+static int32_t late_ns_max;
+static int32_t late_ns_last;
+static uint32_t n_nonpositive_late;
+static bool have_late_sample;
+
 void ccp_master_init(void)
 {
 	/* Zero-pad FIRST, mirroring apos_node.c's apos_node_init(): hwinfo may
@@ -110,12 +129,17 @@ void ccp_master_init(void)
 	n_dropped = 0;
 	sf_since_report = 0;
 	last_reported_dropped = 0;
+	late_ns_min = 0;
+	late_ns_max = 0;
+	late_ns_last = 0;
+	n_nonpositive_late = 0;
+	have_late_sample = false;
 
 	LOG_INF("{\"ccp_master\":{\"root_id\":%u,\"offset_uus\":%u}}",
 		root_id, (unsigned int)CCP_OFFSET_UUS);
 }
 
-void ccp_master_after_beacon(uint64_t beacon_tx_dtu, uint8_t *frame_seq)
+void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 {
 	/* The production-visible drop summary. Deliberately at the TOP of the
 	 * function, before this superframe's own CCP is even built: it reports
@@ -127,33 +151,50 @@ void ccp_master_after_beacon(uint64_t beacon_tx_dtu, uint8_t *frame_seq)
 	if (++sf_since_report >= CCP_MASTER_STATS_LOG_PERIOD_SF) {
 		sf_since_report = 0;
 		if (n_dropped != last_reported_dropped) {
-			LOG_WRN("{\"ccp_master\":{\"sent\":%u,\"dropped\":%u}}",
-				n_sent, n_dropped);
+			LOG_WRN("{\"ccp_master\":{\"sent\":%u,\"dropped\":%u,"
+				"\"late_ns_min\":%d,\"late_ns_max\":%d,"
+				"\"late_ns_last\":%d,"
+				"\"nonpositive_late\":%u}}",
+				n_sent, n_dropped,
+				(int)late_ns_min, (int)late_ns_max,
+				(int)late_ns_last, n_nonpositive_late);
 			last_reported_dropped = n_dropped;
 		}
 	}
 
-	/* The delayed-TX register is programmed in hi32 units, so the hardware
-	 * rounds the RMARKER DOWN to a 256-DTU boundary. The payload MUST carry
-	 * the rounded value.
+	/* Scheduled entirely in hi32 -- no SPI read, no 40-bit round trip. This
+	 * is Change 1 of the arm-latency fix: the previous version took
+	 * tx_beacon()'s MEASURED TX timestamp (uwb_get_tx_timestamp_u64(), a
+	 * ~20 us SPI read) as its base. beacon_hi32 here is the PROGRAMMED hi32
+	 * the gateway already computed to arm the beacon itself
+	 * (uwb_gateway.c's `next_beacon`, passed by the caller before it is
+	 * re-based) -- the gateway already knows this value for free, so
+	 * deriving the CCP's time from it removes that read from a budget
+	 * (CCP_SCHED_ARM_BUDGET_NS, ccp_sched.h) hardware has now shown is too
+	 * tight: 100% of CCPs dropped on the bench with the old computation.
 	 *
-	 * This is the single most destructive mistake available in this file.
-	 * Carrying the unrounded value puts up to 255 DTU -- ~4 ns -- of error
-	 * into every observation, and the gate this whole phase exists to
-	 * measure has a threshold of 1 ns. The measurement would fail, and it
-	 * would fail in the direction that looks like a hardware verdict.
+	 * CCP_OFFSET_UUS * UUS_TO_DWT_TIME is a compile-time constant, and the
+	 * `>> 8` of it is EXACT for today's values: CCP_OFFSET_UUS is 1500
+	 * (BEACON_OCCUPANCY_UUS) and UUS_TO_DWT_TIME is 65536, so the product
+	 * is 98304000 = 384000 * 256 -- a multiple of 256 with a zero low
+	 * byte, so the shift drops no bits. If either constant ever changes
+	 * such that the product stops being a multiple of 256, this comment's
+	 * claim needs re-checking; nothing here catches that automatically.
 	 *
-	 * What this payload does NOT carry, deliberately: ant_delay_tx. The
-	 * hardware's actual TX timestamp differs from this programmed RMARKER
-	 * by that fixed antenna delay, but it is a CONSTANT bias, absorbed
-	 * whole by the receiver's phase reference on the very first
-	 * observation. This gate measures jitter, not absolute time-of-flight,
-	 * so adding it here would not improve the measurement -- it would just
-	 * move a bias sync_model already cancels. Do not "fix" this. */
-	uint64_t want = (beacon_tx_dtu +
-			 (uint64_t)CCP_OFFSET_UUS * UUS_TO_DWT_TIME) &
-			SYNC_DTU_MASK;
-	uint32_t at_hi32 = (uint32_t)(want >> 8);
+	 * Unsigned 32-bit wraparound of the addition below is correct and
+	 * intended, not a bug: the hi32 counter itself wraps every ~17.2 s
+	 * (CLAUDE.md), and dwt_setdelayedtrxtime() / dwt_readsystimestamphi32()
+	 * both operate in that same wrapping 32-bit space, so arithmetic that
+	 * wraps identically is what stays consistent with the hardware.
+	 *
+	 * What this does NOT carry, deliberately: ant_delay_tx. The hardware's
+	 * actual TX timestamp differs from this programmed RMARKER by that
+	 * fixed antenna delay, but it is a CONSTANT bias, absorbed whole by the
+	 * receiver's phase reference on the very first observation. This gate
+	 * measures jitter, not absolute time-of-flight, so adding it here would
+	 * not improve the measurement -- it would just move a bias sync_model
+	 * already cancels. Do not "fix" this. */
+	uint32_t at_hi32 = beacon_hi32 + UUS_TO_HI32(CCP_OFFSET_UUS);
 	uint64_t rmarker = ((uint64_t)at_hi32) << 8;
 
 	struct ccp_frame f = {
@@ -188,6 +229,56 @@ void ccp_master_after_beacon(uint64_t beacon_tx_dtu, uint8_t *frame_seq)
 	if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
 		dwt_forcetrxoff();
 		n_dropped++;
+
+		/* This is Change 2: on the already-failed path only, one more
+		 * register read costs nothing (the CCP is dropped either way)
+		 * and tells us how far past the scheduled arm we actually
+		 * were -- the number that decides how much CCP_SCHED_ARM_-
+		 * BUDGET_NS needs to grow, or whether the arm cost isn't the
+		 * culprit at all.
+		 *
+		 * Signed difference, mandatory, not stylistic: hi32 wraps
+		 * every ~17.2 s (256 DTU/tick, ~4.006 ns/tick), and CLAUDE.md
+		 * records that a plain unsigned compare of two hi32 values is
+		 * wrong across that wrap and looks like a radio fault instead
+		 * of a timing one. (int32_t) casts of the raw subtraction give
+		 * the correct signed delta on either side of a wrap. */
+		uint32_t now_hi32 = dwt_readsystimestamphi32();
+		int32_t late_ticks = (int32_t)(now_hi32 - at_hi32);
+
+		/* 1 hi32 tick = 256 DTU ~= 4.006 ns. Integer ns, good enough
+		 * for a diagnostic. */
+		int32_t late_ns = (int32_t)(((int64_t)late_ticks * 4006) / 1000);
+
+		if (late_ns <= 0) {
+			/* NOT late by this measure -- the arm actually
+			 * completed at or before the scheduled hi32, so the
+			 * arm-budget theory does not explain THIS failure.
+			 * Folding this into late_ns_min would tell an operator
+			 * the arm budget is fine when the data says nothing of
+			 * the kind (a negative min reads as "up to Nns early",
+			 * not "no evidence of lateness") -- so it is counted
+			 * separately instead. */
+			n_nonpositive_late++;
+		} else if (!have_late_sample) {
+			/* First-ever positive-lateness observation: seed
+			 * min/max rather than comparing against the reset
+			 * default of 0, which would otherwise clamp
+			 * late_ns_min at 0 forever. */
+			late_ns_min = late_ns;
+			late_ns_max = late_ns;
+			late_ns_last = late_ns;
+			have_late_sample = true;
+		} else {
+			if (late_ns < late_ns_min) {
+				late_ns_min = late_ns;
+			}
+			if (late_ns > late_ns_max) {
+				late_ns_max = late_ns;
+			}
+			late_ns_last = late_ns;
+		}
+
 		LOG_DBG("CCP missed its slot");
 		return;
 	}
@@ -228,7 +319,8 @@ void ccp_master_after_beacon(uint64_t beacon_tx_dtu, uint8_t *frame_seq)
 	n_sent++;
 }
 
-void ccp_master_stats(uint32_t *sent, uint32_t *dropped, uint32_t *root)
+void ccp_master_stats(uint32_t *sent, uint32_t *dropped, uint32_t *root,
+		      int32_t *late_min, int32_t *late_max, int32_t *late_last)
 {
 	if (sent) {
 		*sent = n_sent;
@@ -238,5 +330,14 @@ void ccp_master_stats(uint32_t *sent, uint32_t *dropped, uint32_t *root)
 	}
 	if (root) {
 		*root = root_id;
+	}
+	if (late_min) {
+		*late_min = late_ns_min;
+	}
+	if (late_max) {
+		*late_max = late_ns_max;
+	}
+	if (late_last) {
+		*late_last = late_ns_last;
 	}
 }

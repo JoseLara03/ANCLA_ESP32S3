@@ -154,13 +154,18 @@ static int cmd_master(const struct shell *sh, size_t argc, char **argv)
 	ARG_UNUSED(argv);
 
 	uint32_t sent = 0, dropped = 0, root = 0;
+	int32_t late_min = 0, late_max = 0, late_last = 0;
 
-	ccp_master_stats(&sent, &dropped, &root);
+	ccp_master_stats(&sent, &dropped, &root, &late_min, &late_max,
+			 &late_last);
 
 	shell_print(sh,
 		    "{\"ccp_master\":{\"role\":\"%s\",\"root\":%u,"
-		    "\"sent\":%u,\"dropped\":%u}}",
-		    board_role(), root, sent, dropped);
+		    "\"sent\":%u,\"dropped\":%u,"
+		    "\"late_ns_min\":%d,\"late_ns_max\":%d,"
+		    "\"late_ns_last\":%d}}",
+		    board_role(), root, sent, dropped,
+		    (int)late_min, (int)late_max, (int)late_last);
 
 	if (strcmp(board_role(), "gateway") != 0) {
 		shell_warn(sh,
