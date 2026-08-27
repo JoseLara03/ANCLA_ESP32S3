@@ -94,41 +94,59 @@ five noise amplitudes, so the factor cannot drift unnoticed.
 |---|---|
 | The sync arithmetic, error budget, residual statistics | `src/sync_model.{c,h}`, `tests/sync_model/` |
 | The CCP wire format | `src/ccp_frame.{c,h}`, `tests/ccp_frame/` |
+| Where the CCP sits in the superframe | `src/ccp_sched.h`, `tests/ccp_sched/` |
 
-**Not implemented.** The radio glue is the remaining work and it is what this
-document cannot yet be executed without:
+**Implemented and building clean; hardware verification PENDING:**
 
-- A master role that schedules a delayed CCP transmission once per superframe,
-  puts the **scheduled** RMARKER time in the payload, waits for TXFRS, and
-  **discards the CCP if TXFRS never arrives**. That last clause is not optional:
-  `CLAUDE.md` records that `dwt_starttx()` can report success for a delayed
-  transmission that never happens, and a phantom CCP injects a fabricated
-  observation into the one estimator the migration depends on.
-- A slave role that receives CCPs, reads `dwt_readrxtimestamp()`, and feeds
-  `sync_model_observe()` — calling `sync_model_miss()` on a gap in `ccp_seq`.
-- A `sync` shell command reporting `jitter_est`, `rms`, `max`, `count`,
-  `drift_ppb` and validity, so the gate is read off a console rather than
-  inferred.
-- Role selection. Two boards can be hardcoded for the measurement; the
-  production tree (root → masters at hop 1 → leaves at hop 2, `CCP_HOP_MAX`)
-  is coordinated over the WiFi backhaul out of band, which is what the backhaul
-  decision bought.
+| Piece | Where |
+|---|---|
+| Master role (gateway, hop 0) | `src/ccp_master.{c,h}` |
+| Slave role, gap detection, model ownership | `src/ccp_slave.{c,h}` |
+| `sync stats` / `sync reset` | `src/sync_shell.c` |
 
-The CCP airtime is **~1.29 ms, 0.64 % of a 200 ms superframe** — cheap, but it
-is one more frame competing with the beacon, and Phase 3's superframe layout has
-to budget it. Pinned in `tests/ccp_frame/test_airtime_is_recorded`.
+**No board has run this path yet.** The three pieces above compile and link
+into their images, and their host-testable logic is covered by the suites
+above them — but nothing in this second table has been observed transmitting,
+receiving, or reporting a verdict on real hardware. Every number in §0 and §4
+is a simulation result or a host-test result, not a measurement. §3 below is
+the procedure that closes that gap, and until it has been run and its output
+recorded in §4.1, this document describes a gate that is executable but not
+yet passed, failed, or even attempted.
 
-## 3. Procedure, once the glue above exists
+The CCP goes in the **post-beacon guard window**, where slaves already may not
+transmit, so it costs **no** airtime from the CAP or the CFP —
+`CCP_OFFSET_UUS` is `BEACON_OCCUPANCY_UUS` and two `BUILD_ASSERT`s in
+`src/ccp_sched.h` prove the preamble does not overlap the beacon and the frame
+is off the air before the guard closes. Its airtime is **1.289 ms, 0.645 % of a
+200 ms superframe** — pinned in `tests/ccp_frame/test_airtime_is_recorded` and
+again in `tests/ccp_sched/`.
 
-1. Flash both anchors. Designate one master (`hop = 0`), one slave.
-2. Confirm the slave is receiving: `count` climbing by ~5 per second, `valid`
-   true within a couple of seconds.
-3. Let it run **at least 400 observations** (~80 s). The statistic is an RMS and
-   a short sample is a noisy one; the simulation uses 400 for the same reason.
-4. `sync stats`, and read **`jitter_est`**.
-5. Convert if you like: 64 DTU = 1 ns, 1 DTU = 15.65 ps.
+**Role selection is deliberately not runtime-configurable.** The master is the
+gateway, because putting an unsolicited transmit path in a production SLAVE
+image is the collision hazard `apos_node.c`'s two gates exist to prevent. To
+repeat the measurement with the roles swapped (§3), swap the **boards**:
+`anchor mode gateway` on the other one, then `kernel reboot cold`.
 
-Repeat with the roles swapped. A large asymmetry between the two directions
+## 3. Procedure
+
+1. Flash **production** on both boards. One is `anchor mode gateway` (the CCP
+   master, hop 0), the other `anchor mode slave` (the receiver).
+2. On the gateway, confirm `{"ccp_master":{"root_id":N,...}}` at boot and note
+   `root_id`.
+3. On the slave, `sync stats`. Confirm `rx` climbing by ~5 per second, `root`
+   equal to the gateway's `root_id`, and `valid:1` within a couple of seconds.
+   `gaps` and `rejected` should both stay at or near 0.
+4. `sync reset`, then leave it alone for **at least 90 seconds** — the verdict
+   is withheld below 400 observations on purpose, and at ~5 per second that is
+   ~80 s.
+5. `sync stats`. **Read `verdict` and `jitter_est_ps`.** Do **not** read
+   `rms_dtu` as the jitter — §0.2 explains why that misleads in the confident
+   direction: the residual RMS runs about 1.55× the real jitter because the
+   prediction consumes two noisy timestamps, so 64 DTU of RMS read as 1 ns is
+   actually about 0.65 ns, and an operator making that substitution would
+   reject hardware that passes.
+
+Repeat with the boards swapped. A large asymmetry between the two directions
 points at one board, not at the technology — the same logic as swapping
 `anchor id` to separate a firmware fault from a board fault.
 
@@ -154,6 +172,26 @@ Cross-checks worth taking at the same time, because they cost nothing extra:
   has a tail rather than being Gaussian noise, which usually means multipath or
   an intermittent obstruction, not clock noise. Fix the setup and re-measure
   before believing the number.
+
+### 4.1 Recording the result
+
+_Not yet run._ Nothing below has been filled in.
+
+**Direction 1** — master: `___` (board), slave: `___` (board) — date: `___`
+
+```
+_not yet run_
+```
+
+**Direction 2** — master: `___` (board), slave: `___` (board) — date: `___`
+
+```
+_not yet run_
+```
+
+Until both blocks above are filled in with real `sync stats` output, the
+Phase 2 gate is **unmeasured** and the A7 row in
+`docs/superpowers/specs/2026-08-25-rtls-scale-tdoa-design.md` stays `parcial`.
 
 ## 5. If the number is too high
 
