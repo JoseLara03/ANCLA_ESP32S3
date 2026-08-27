@@ -21,6 +21,7 @@
 
 #include "apos_frame.h"
 #include "apos_gw.h"
+#include "ccp_master.h"
 #include "gw_core.h"
 #include "pos_sink.h"
 #include "tag_id.h"
@@ -147,6 +148,7 @@ enum gw_crumb {
 	GW_CRUMB_DISPATCH,    /* 6: inside dispatch() -- may send a GRANT */
 	GW_CRUMB_SF_TICK,     /* 7: gw_core_superframe_tick() */
 	GW_CRUMB_TX_BEACON,   /* 8: inside tx_beacon() -- delayed TX + TXFRS */
+	GW_CRUMB_CCP_TX,      /* 9: inside ccp_master_after_beacon() */
 };
 
 static volatile uint32_t gw_crumb;
@@ -184,7 +186,7 @@ static void gw_stall_expiry(struct k_timer *t)
 	LOG_ERR("{\"gw_stuck\":{\"crumb\":%u,\"for_ms\":%u,\"seq\":%u,"
 		"\"apos_busy\":%d,\"note\":\"1=loop_top 2=apos_step "
 		"3=rx_arm 4=rx_wait 5=rx_read 6=dispatch 7=sf_tick "
-		"8=tx_beacon\"}}",
+		"8=tx_beacon 9=ccp_tx\"}}",
 		gw_crumb, CRUMB_STALL_MS, gw_crumb_seq,
 		(int)apos_gw_busy());
 }
@@ -457,6 +459,7 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 	static struct gw_core_ctx ctx;
 
 	gw_core_init(&ctx);
+	ccp_master_init();
 	apos_gw_init();
 
 	LOG_INF("{\"status\":\"gateway\",\"x\":%.2f,\"y\":%.2f,"
@@ -628,6 +631,15 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 
 		CRUMB(GW_CRUMB_TX_BEACON);
 		uint64_t ts = tx_beacon(&ctx, true, next_beacon);
+
+		/* Only on a CONFIRMED beacon. ts == 0 means the beacon did not
+		 * go out, and a CCP scheduled from a beacon that never
+		 * transmitted would be scheduled from a time that does not
+		 * exist. Bounded: one delayed TX, one bounded TXFRS wait. */
+		if (ts != 0u) {
+			CRUMB(GW_CRUMB_CCP_TX);
+			ccp_master_after_beacon(ts, &gw_seq);
+		}
 
 		/* On a miss, re-base on the current time rather than compounding
 		 * the error into every following superframe. */

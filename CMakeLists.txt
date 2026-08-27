@@ -19,6 +19,7 @@ target_sources(app PRIVATE
 	src/apos_table.c
 	src/beacon_guard.c
 	src/ccp_frame.c
+	src/ccp_master.c
 	src/disc_schedule.c
 	src/gw_core.c
 	src/mac_budget.c
