@@ -62,9 +62,25 @@ void ccp_slave_residual_reset(void);
 
 /* Counters. `n_gap` is expected CCPs that never arrived, `n_reject` is frames
  * that were CCPs but were not usable -- a parse failure, a hop this node may
- * not adopt, a duplicate sequence number, or a sequence number that moved
- * BACKWARDS (see ccp_slave.c: the ordinary trigger is a gateway reboot,
- * which re-seeds ccp_seq at 0 without changing root_id). */
+ * not adopt, a duplicate sequence number, a sequence number that moved
+ * BACKWARDS by more than 128 (see ccp_slave.c: the ordinary trigger is a
+ * gateway reboot, which re-seeds ccp_seq at 0 without changing root_id), OR a
+ * sequence number that looks like an ordinary small forward gap but whose
+ * LOCAL elapsed time disagrees with it -- the other half of that same
+ * gateway-reboot trigger, wrapped down instead of up, which the sequence
+ * number alone cannot distinguish from a genuine gap and the local DW3220
+ * clock can (see ccp_slave.c's CCP_SLAVE_GAP_TOL_FACTOR).
+ *
+ * Every one of these rejection paths re-baselines via sync_model_init(),
+ * which also clears the residual statistics (res_sq_sum/res_n/res_max) along
+ * with the rate estimate -- sync_model.h documents those as surviving
+ * "everything except an explicit reset", and that is still true of
+ * sync_model.c's own API; ccp_slave.c is simply the first caller to invoke
+ * sync_model_init() itself mid-life rather than only at ccp_slave_init(), so
+ * from this module's own callers' point of view a re-baseline IS a second,
+ * implicit reset. A `sync stats` read straight after one of these will show
+ * `count` restarted and the verdict back at "insufficient", with no other
+ * symptom -- expected, not a bug. */
 void ccp_slave_stats(uint32_t *n_rx, uint32_t *n_gap, uint32_t *n_reject,
 		     uint32_t *root_id);
 

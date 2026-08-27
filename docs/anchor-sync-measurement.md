@@ -129,22 +129,59 @@ repeat the measurement with the roles swapped (§3), swap the **boards**:
 
 ## 3. Procedure
 
+0. **Sniffer check, before touching either console.** Everything below assumes
+   the CCP is actually reaching the air, and a sniffer settles that
+   independently of anything either board self-reports. Capture a few seconds
+   with a DWM3001CDK sniffer and confirm: a 21-byte `0xEF` frame follows
+   **each** `0xE5` beacon, `src = 0x0000` (the gateway's reserved address), the
+   byte at offset 10 (`ccp_seq`) incrementing with no gaps across consecutive
+   CCPs, and the byte at offset 11 (`hop`) equal to `0x00` (`CCP_HOP_ROOT` —
+   there is exactly one root in this Phase 2 setup). Note in passing: `gw_seq`,
+   the ordinary 802.15.4 sequence field, now advances **twice** per superframe
+   on the gateway — once building the beacon, once building the CCP that
+   follows it — so an operator checking the BEACON's own sequence continuity
+   on the same sniffer trace will correctly see it jump by 2 each superframe,
+   not 1. That is expected, not a dropped frame.
 1. Flash **production** on both boards. One is `anchor mode gateway` (the CCP
    master, hop 0), the other `anchor mode slave` (the receiver).
 2. On the gateway, confirm `{"ccp_master":{"root_id":N,...}}` at boot and note
    `root_id`.
-3. On the slave, `sync stats`. Confirm `rx` climbing by ~5 per second, `root`
+3. **On the gateway console, before reading anything on the slave**: confirm
+   there is no `"beacon started but TXFRS never completed"` line anywhere in
+   the log, then run `sync master` (or wait for its own rate-limited
+   `{"ccp_master":{"sent":...,"dropped":...}}` `LOG_WRN` summary — it only
+   prints when the drop count has actually moved). This step exists because
+   the TRANSMIT half of this measurement has its own, quieter failure mode:
+   the CCP's wall-clock budget to arm after the beacon
+   (`src/ccp_sched.h`'s `CCP_SCHED_ARM_BUDGET_NS`) is a derived figure, not a
+   measured one, on this exact path. **If `dropped` is climbing — worst case,
+   `sent` stays near 0 and the slave never sees a single CCP — this is a
+   SCHEDULING problem, not an RF one.** The fix is to measure the real
+   beacon-TXFRS-to-`dwt_starttx()`-return cost on this hardware and re-derive
+   `CCP_OFFSET_UUS` within its 1743 UUS ceiling (see `src/ccp_sched.h`'s
+   comments on `CCP_SCHED_ARM_BUDGET_NS` and `CCP_SCHED_CAP_PREAMBLE_NS`) —
+   not to move the boards, swap antennas, or otherwise chase an RF cause that
+   was never there.
+4. On the slave, `sync stats`. Confirm `rx` climbing by ~5 per second, `root`
    equal to the gateway's `root_id`, and `valid:1` within a couple of seconds.
    `gaps` and `rejected` should both stay at or near 0.
-4. `sync reset`, then leave it alone for **at least 90 seconds** — the verdict
+5. `sync reset`, then leave it alone for **at least 90 seconds** — the verdict
    is withheld below 400 observations on purpose, and at ~5 per second that is
    ~80 s.
-5. `sync stats`. **Read `verdict` and `jitter_est_ps`.** Do **not** read
+6. `sync stats`. **Read `verdict` and `jitter_est_ps`.** Do **not** read
    `rms_dtu` as the jitter — §0.2 explains why that misleads in the confident
    direction: the residual RMS runs about 1.55× the real jitter because the
    prediction consumes two noisy timestamps, so 64 DTU of RMS read as 1 ns is
    actually about 0.65 ns, and an operator making that substitution would
    reject hardware that passes.
+7. Once the number itself looks right, run the whole procedure **one more
+   time** with the debug image (`west build ... -- -DEXTRA_CONF_FILE=debug.conf`,
+   which turns on `CONFIG_THREAD_ANALYZER`) and read the gateway's `main`
+   thread peak stack usage. Compare it against the 1748/4096-byte figure
+   CLAUDE.md already recorded for the anchor survey's `do_solve()` path — this
+   loop now does one more delayed TX and one more bounded TXFRS wait per
+   superframe than that measurement covered, and nothing has confirmed yet
+   that the extra call depth does not move the peak.
 
 Repeat with the boards swapped. A large asymmetry between the two directions
 points at one board, not at the technology — the same logic as swapping
@@ -194,6 +231,20 @@ Phase 2 gate is **unmeasured** and the A7 row in
 `docs/superpowers/specs/2026-08-25-rtls-scale-tdoa-design.md` stays `parcial`.
 
 ## 5. If the number is too high
+
+### 5.0 If there is no number at all
+
+Before any of the remedies below: `rx:0` on the slave, or a `verdict` stuck at
+`"no-lock"` no matter how long it runs, is a **different** failure from a high
+jitter number, and the remedies below do not apply to it. Check the
+**transmit** side first, not the link: `sync master` on the gateway (or its
+own periodic `LOG_WRN` summary). If `dropped` is climbing while `sent` stays
+low or zero, the gateway is not getting CCPs onto the air at all — most likely
+the arm-deadline risk in `src/ccp_sched.h` (`CCP_SCHED_ARM_BUDGET_NS`, see §3
+step 3) — and no amount of moving boards, checking line of sight, or reading
+`max`/`rms` on the slave will fix a CCP that never transmitted. Only once
+`sync master` shows `sent` climbing and `dropped` flat does an `rx:0` on the
+slave become an RF question rather than a scheduling one.
 
 In rough order of cost:
 

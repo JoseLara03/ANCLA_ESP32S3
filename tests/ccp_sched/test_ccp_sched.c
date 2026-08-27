@@ -37,7 +37,11 @@ static void test_ccp_fits_the_post_beacon_guard(void)
 			   CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN);
 
 	CHECK(CCP_SCHED_AT_NS >= earliest);
-	CHECK(ends_at <= CCP_SCHED_GUARD_END_NS);
+	/* The trailing edge is checked against CCP_SCHED_CAP_PREAMBLE_NS, NOT
+	 * CCP_SCHED_GUARD_END_NS -- the latter is the guard's RMARKER bound,
+	 * a full SHR later than the earliest colliding PREAMBLE. Comparing
+	 * against it directly is the exact over-claim F2 fixed. */
+	CHECK(ends_at <= CCP_SCHED_CAP_PREAMBLE_NS);
 
 	/* Measured 2026-08-26. Exact values, not bounds: these are constant
 	 * arithmetic over frozen PHY parameters, so anything that moves them
@@ -48,9 +52,20 @@ static void test_ccp_fits_the_post_beacon_guard(void)
 	CHECK(CCP_SCHED_AT_NS == 1538461u);
 	CHECK(ends_at == 1777284u);
 	CHECK(CCP_SCHED_GUARD_END_NS == 3076922u);
+	CHECK(CCP_SCHED_CAP_PREAMBLE_NS == 2026728u);
 
+	/* CCP_SCHED_ARM_BUDGET_NS is the wall-clock budget to ARM the CCP after
+	 * the beacon's TXFRS -- five SPI calls must complete inside this many
+	 * nanoseconds. Pinned so it cannot silently drift, but NOT asserted
+	 * sufficient: nobody has measured this path's actual arm cost on
+	 * hardware, so whether 98856 ns is enough is still an open question. */
+	CHECK(CCP_SCHED_ARM_BUDGET_NS == 98856u);
 	CHECK(CCP_SCHED_AT_NS - earliest == 98856u);
-	CHECK(CCP_SCHED_GUARD_END_NS - ends_at == 1299638u);
+
+	/* The TRUE trailing margin, against the corrected (b) edge -- 249444 ns,
+	 * not the 1299638 ns the old (wrong) comparison against
+	 * CCP_SCHED_GUARD_END_NS implied. */
+	CHECK(CCP_SCHED_CAP_PREAMBLE_NS - ends_at == 249444u);
 }
 
 /* The CCP's total airtime and its share of a superframe. Quoted in

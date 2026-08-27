@@ -313,16 +313,26 @@ cal peer <id> <mm>              range anchor <id> at a known distance;
 See `docs/antenna-delay-calibration.md` for the full procedure and acceptance
 thresholds.
 
-The CCP receiver adds a `sync` tree, in the **production** image. It only
-reports; it transmits nothing and has no configuration commands.
+The `sync` tree reports the CCP sync gate. It is registered unconditionally —
+in the **production** image on every role, AND in the **calibration** image
+too (`ccp_slave.c`/`ccp_master.c` compile into both; only `cal_run.c`'s own
+loop never drives either). It only reports; it transmits nothing and has no
+configuration commands. `stats` and `master` each print a `role` field for
+exactly this reason: on a role that does not exercise them (a GATEWAY reading
+`stats`, a SLAVE reading `master`, or either command on the cal image) the
+underlying counters simply never moved, so a static "no-lock" or `sent:0,
+dropped:0` reads exactly like a dead link unless the role is checked first.
 
 ```
-sync stats                     the Phase 2 gate as JSON, with a verdict.
-                               Read `jitter_est`, NOT `rms` — the residual
+sync stats                     receive half — the Phase 2 gate as JSON, with a
+                               verdict; meaningful on a SLAVE. Read
+                               `jitter_est`, NOT `rms` — the residual
                                differences two noisy timestamps and its RMS
                                is ~1.55x the real jitter
 sync reset                     clear the residual statistics without
                                touching the lock or the baseline
+sync master                    transmit half — CCP sent/dropped counts as
+                               JSON; meaningful on a GATEWAY
 ```
 
 ## Layout
@@ -370,14 +380,32 @@ sync reset                     clear the residual statistics without
   (= `BEACON_OCCUPANCY_UUS`, i.e. immediately after the beacon's declared
   occupancy, inside the guard the slaves already may not use) and the two
   `BUILD_ASSERT`s that prove the preamble does not overlap the beacon and that
-  the frame is off the air before the guard closes. Header-only, no `.c`, same
-  pattern as `uwb_mac.h`; host-tested in `tests/ccp_sched/` where **including
-  the header is the test**.
+  the frame is off the air before the first legitimate slave CAP preamble may
+  begin. Header-only, no `.c`, same pattern as `uwb_mac.h`; host-tested in
+  `tests/ccp_sched/` where **including the header is the test**. `CCP_OFFSET_UUS`'s
+  legal window is two-sided and both bounds are derived quantities, not tuned:
+  `CCP_SCHED_ARM_BUDGET_NS` (98856 ns, the lower bound) is the wall-clock budget
+  to ARM the CCP after the beacon's TXFRS — genuinely unmeasured on this path,
+  not comfortable headroom, see its own comment — and `CCP_SCHED_CAP_PREAMBLE_NS`
+  (2026728 ns) is the upper bound, a full SHR earlier than
+  `CCP_SCHED_GUARD_END_NS` because `beacon_guard_tx_allowed()` gates a slave's
+  RMARKER, not its preamble. Comparing assert (b) against `CCP_SCHED_GUARD_END_NS`
+  directly — an earlier version of this file did — over-claims the trailing
+  margin by that whole SHR (1299638 ns claimed vs. 249444 ns true).
 - `src/ccp_master.{c,h}` — the CCP transmitter on the GATEWAY, root of the sync
   tree (hop 0). On the gateway deliberately: it already schedules one delayed
   TX per superframe, and the clock it schedules from **is** the time base. A
   master role on a slave would have added an unsolicited TX path to a
-  production image.
+  production image. Clears TXFRS explicitly on its own delayed-TX timeout
+  (write-1-to-clear; a late-but-real TX left it set once and the NEXT delayed
+  TX on this radio — the following beacon — read this CCP's stale timestamp
+  as its own), same as `uwb_gateway.c`'s `tx_beacon()`/`send_grant()` now do
+  on theirs. Per-event drop detail (`dwt_starttx()` failure, a TXFRS timeout)
+  logs at `LOG_DBG`; a rate-limited `LOG_WRN` summary of `sent`/`dropped`
+  every `CCP_MASTER_STATS_LOG_PERIOD_SF` superframes is what actually survives
+  `ANCLA_LOG_LEVEL == LOG_LEVEL_INF` in production, and only fires when the
+  drop count has moved — a healthy gateway stays silent. `ccp_master_stats()`
+  is also readable live from the console via `sync master`.
 - `src/ccp_slave.{c,h}` — the CCP receiver on the SLAVE: owns the single
   `struct sync_model`, detects missed CCPs from gaps in `ccp_seq` and calls
   `sync_model_miss()` for each one — except a gap large enough to look like a
@@ -386,7 +414,28 @@ sync reset                     clear the residual statistics without
   where it calls `sync_model_miss()` for none of them, re-baselines instead,
   and counts the frame in `n_reject` rather than `n_gap` — the whole point
   being that `n_gap` is the counter an operator reads as "the link is losing
-  CCPs", and a benign reboot must not make it lie. No arithmetic of its own —
+  CCPs", and a benign reboot must not make it lie. A gateway reboot does not
+  always wrap `ccp_seq` above 128, though: a reboot that hits while the
+  slave's `last_seq` is itself large enough wraps the apparent gap back down
+  into the ordinary 1..128 range, indistinguishable from a genuine forward
+  gap or miss run **by sequence number alone**. So every gap in that range is
+  also checked against the SLAVE's own local DW3220 clock — a genuine gap of
+  `n` superframes must show roughly `n * SYNC_CCP_INTERVAL_DTU` of real
+  elapsed local time (`CCP_SLAVE_GAP_TOL_FACTOR`, a deliberately generous
+  4x band, orders of magnitude past what crystal drift alone could produce),
+  and a reboot's elapsed local time has no relationship to that arithmetic at
+  all. A mismatch re-baselines and counts in `n_reject` the same as the
+  large-gap case; this is what catches the case sequence-number checking
+  alone cannot, of which `gap == 1` with several REAL seconds elapsed is the
+  sharpest example. Every re-baseline path — this one, the large-gap one, and
+  a root change — calls `sync_model_init()`, which clears the residual
+  statistics along with the rate estimate: `count` restarts at 0 and the
+  verdict returns to `"insufficient"` even though `sync_model.h` documents
+  those statistics as surviving "everything except an explicit reset" — true
+  of `sync_model.c`'s own API, but `ccp_slave.c` is the first caller to invoke
+  `sync_model_init()` itself mid-life rather than only at `ccp_slave_init()`,
+  so a re-baseline is a second, implicit reset from this module's callers'
+  point of view. No arithmetic of its own beyond that discontinuity check —
   everything that could be wrong about the estimator lives in `sync_model.c`,
   which is pure C and host-tested. `ccp_slave_model()` returns a `const`
   pointer: on a SLAVE, `main()` stays at the default preemptible priority (see
@@ -397,7 +446,15 @@ sync reset                     clear the residual statistics without
   `k_sched_lock()`/`k_sched_unlock()` instead.
 - `src/sync_shell.c` — the `sync` command tree. Prints the gate's verdict
   itself, because the natural mistake here (reading `rms` as if it were the
-  jitter) rejects hardware that passes.
+  jitter) rejects hardware that passes. Registered unconditionally, including
+  in the **calibration image** — `ccp_slave.c`/`ccp_master.c` compile into
+  every image regardless of `CONFIG_ANCLA_CAL_MODE`, only `cal_run.c`'s loop
+  never calls either module's init or per-superframe entry point — so both
+  `sync stats` (the receive half, meaningful on a SLAVE) and `sync master`
+  (the transmit half, meaningful on a GATEWAY) print a `role` field: on any
+  other role the underlying counters simply never moved, and a static
+  `"no-lock"` / `sent:0, dropped:0` is otherwise indistinguishable from a dead
+  link.
 - `src/sync_model.{c,h}` — anchor clock synchronisation: converts a local
   DW3220 timestamp into a master anchor's time base from a stream of CCPs.
   Integer-only, pure C, host-tested in `tests/sync_model/`. **This is the Phase

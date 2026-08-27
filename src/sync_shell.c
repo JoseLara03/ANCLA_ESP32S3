@@ -13,12 +13,46 @@
  * REJECTING hardware that passes, killing the TDoA migration on a
  * misinterpretation. So this command prints jitter_est first, prints the
  * verdict itself, and prints rms only as a diagnostic beside it.
+ *
+ * This tree is registered UNCONDITIONALLY -- in the production image on
+ * every role, AND in the calibration image (CONFIG_ANCLA_CAL_MODE; see
+ * CLAUDE.md's Build & flash section -- ccp_slave.c/ccp_master.c compile into
+ * every image regardless of that config, only cal_run.c's loop never calls
+ * either module's init or per-superframe entry point). `sync stats` reads the
+ * receive half, meaningful only on a SLAVE; `sync master` below reads the
+ * transmit half, meaningful only on a GATEWAY. On every OTHER role -- a
+ * GATEWAY reading `sync stats`, a SLAVE reading `sync master`, or the cal
+ * image reading either -- the underlying counters simply never moved, and
+ * `root:0, rx:0, valid:0, verdict:"no-lock"` / `sent:0, dropped:0` is
+ * indistinguishable on its own from a dead link. Both commands print a `role`
+ * field for exactly that reason: read it before concluding anything about the
+ * number next to it.
  */
 
+#include "ccp_master.h"
 #include "ccp_slave.h"
 #include "sync_model.h"
+#include "uwb_config.h"
 
 #include <zephyr/shell/shell.h>
+
+#include <string.h>
+
+#ifdef CONFIG_ANCLA_CAL_MODE
+/* The cal image runs cal_run()'s own loop, never uwb_slave_run() or
+ * uwb_gateway_run() -- so cfg->mode (persisted NVS state, unrelated to what
+ * actually executes here) would be actively misleading if reported as this
+ * board's role. Say what it really is instead. */
+static const char *board_role(void)
+{
+	return "cal";
+}
+#else
+static const char *board_role(void)
+{
+	return uwb_config_mode_name(uwb_config_get()->mode);
+}
+#endif
 
 /* Thresholds from docs/anchor-sync-measurement.md section 4. 64 DTU = 1 ns
  * (SYNC_DTU_PER_NS), 32 DTU = 0.5 ns. */
@@ -70,12 +104,12 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	uint32_t jit_ps = (uint32_t)(((uint64_t)jit * 1565u) / 100u);
 
 	shell_print(sh,
-		    "{\"sync\":{\"root\":%u,\"rx\":%u,\"gaps\":%u,"
+		    "{\"sync\":{\"role\":\"%s\",\"root\":%u,\"rx\":%u,\"gaps\":%u,"
 		    "\"rejected\":%u,\"count\":%u,\"valid\":%u,"
 		    "\"jitter_est_dtu\":%u,\"jitter_est_ps\":%u,"
 		    "\"rms_dtu\":%u,\"max_dtu\":%u,\"drift_ppb\":%d,"
 		    "\"verdict\":\"%s\"}}",
-		    root, rx, gap, reject, cnt, valid ? 1u : 0u,
+		    board_role(), root, rx, gap, reject, cnt, valid ? 1u : 0u,
 		    jit, jit_ps,
 		    sync_model_residual_rms_dtu(m),
 		    sync_model_residual_max_dtu(m),
@@ -105,8 +139,49 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh,
 		    "read jitter_est, NOT rms: the residual differences two "
 		    "noisy timestamps and its RMS is ~1.55x the real jitter. "
-		    "Thresholds: <%u DTU pass, <=%u marginal, above that fail.",
+		    "Thresholds: <%u DTU pass, <=%u marginal, above that fail. "
+		    "rx/gaps/rejected/valid are only meaningful on a SLAVE -- "
+		    "a GATEWAY or the cal image never feed this model, so "
+		    "root:0 rx:0 valid:0 \"no-lock\" there means \"not a "
+		    "slave\", not \"dead link\". See \"role\" above.",
 		    SYNC_GATE_PASS_DTU, SYNC_GATE_FAIL_DTU);
+	return 0;
+}
+
+static int cmd_master(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	uint32_t sent = 0, dropped = 0, root = 0;
+
+	ccp_master_stats(&sent, &dropped, &root);
+
+	shell_print(sh,
+		    "{\"ccp_master\":{\"role\":\"%s\",\"root\":%u,"
+		    "\"sent\":%u,\"dropped\":%u}}",
+		    board_role(), root, sent, dropped);
+
+	if (strcmp(board_role(), "gateway") != 0) {
+		shell_warn(sh,
+			   "sent/dropped are only meaningful on a GATEWAY -- "
+			   "ccp_master_after_beacon() is called from nowhere "
+			   "else, so sent:0 dropped:0 here means \"not a "
+			   "gateway\", not \"the link is fine\".");
+	} else if (dropped != 0u) {
+		/* Makes a real risk readable rather than silent: if the CCP's
+		 * arm budget (ccp_sched.h's CCP_SCHED_ARM_BUDGET_NS, unmeasured
+		 * on this exact path) is too tight on this hardware, every CCP
+		 * is dropped and `sync stats` on the peer just sits at `rx:0`
+		 * forever, with nothing there to say why. This is the first
+		 * place that does. */
+		shell_warn(sh,
+			   "%u of %u CCPs dropped. If this keeps climbing, "
+			   "check docs/anchor-sync-measurement.md section 5 "
+			   "item \"there is no number at all\" before "
+			   "suspecting the RF link.",
+			   dropped, sent + dropped);
+	}
 	return 0;
 }
 
@@ -124,11 +199,16 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync,
 	SHELL_CMD_ARG(stats, NULL,
-		      "stats — the Phase 2 gate as JSON, with a verdict",
+		      "stats — the Phase 2 gate as JSON, with a verdict "
+		      "(receive half; meaningful on a SLAVE)",
 		      cmd_stats, 1, 0),
 	SHELL_CMD_ARG(reset, NULL,
 		      "reset — clear the residual statistics, keeping the lock",
 		      cmd_reset, 1, 0),
+	SHELL_CMD_ARG(master, NULL,
+		      "master — CCP transmit stats as JSON (meaningful on a "
+		      "GATEWAY)",
+		      cmd_master, 1, 0),
 	SHELL_SUBCMD_SET_END
 );
 

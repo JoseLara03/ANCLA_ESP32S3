@@ -267,6 +267,17 @@ static uint64_t tx_beacon(struct gw_core_ctx *ctx, bool delayed, uint32_t tx_at)
 	if (!uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK,
 				       TX_COMPLETE_TIMEOUT_MS)) {
 		dwt_forcetrxoff();
+		/* Explicit TXFRS clear on a timeout, not just on success below.
+		 * See ccp_master.c's own TXFRS-timeout branch for the full
+		 * failure scenario this prevents (the third TXFRS
+		 * write-1-to-clear bug on this board, after the two CLAUDE.md
+		 * already records): left set, the NEXT delayed TX on this radio
+		 * finds TXFRS already up and its bounded wait returns
+		 * immediately against a stale, wrong timestamp. Here that next
+		 * delayed TX is ccp_master_after_beacon()'s CCP, so an
+		 * uncleared beacon TXFRS would corrupt the very measurement
+		 * this whole branch exists to protect. */
+		dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
 		LOG_WRN("beacon started but TXFRS never completed — forced off");
 		return 0;
 	}
@@ -307,6 +318,11 @@ static void send_grant(const uint8_t eui[UWB_FRAME_EUI_LEN],
 	if (!uwb_wait_for_sysstatus_lo(DWT_INT_TXFRS_BIT_MASK,
 				       TX_COMPLETE_TIMEOUT_MS)) {
 		dwt_forcetrxoff();
+		/* Explicit TXFRS clear -- see ccp_master.c's TXFRS-timeout branch
+		 * for the failure scenario this prevents: a late-but-real TX
+		 * leaving TXFRS set for the NEXT delayed TX on this radio (the
+		 * following beacon, or its CCP) to misread as its own. */
+		dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
 		LOG_WRN("grant started but TXFRS never completed — forced off");
 		return;
 	}
