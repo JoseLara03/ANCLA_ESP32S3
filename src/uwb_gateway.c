@@ -80,35 +80,42 @@ LOG_MODULE_REGISTER(uwb_gateway, ANCLA_LOG_LEVEL);
 /* Longest frame the contract defines is a 39-byte beacon; +FCS, rounded up. */
 #define RX_BUF_LEN 64
 
-/* How long the DW3220's own clock may fail to advance before this loop calls it
- * wedged.
+/* How long the inner RX-servicing loop may run WITHOUT reaching the beacon
+ * before it declares itself stalled.
  *
- * This exists because a stopped chip clock is the ONE failure this loop cannot
- * notice or report, and its silence is total. The beacon is scheduled from
- * dwt_readsystimestamphi32(), so if that value stops advancing, `to_beacon`
- * never crosses BEACON_ARM_MARGIN_UUS, the inner loop never breaks, and
- * tx_beacon() is never reached again -- the network's time base simply stops.
+ * This exists because a loop that stops breaking out is the one failure this
+ * gateway cannot notice or report, and its silence is total. Two things follow
+ * from the priority layout: this loop is K_PRIO_COOP(0) = -16 and dwt_isr()
+ * runs on the system workqueue at -1, while the shell and the log-processing
+ * thread are both PREEMPTIBLE (the log thread at
+ * K_LOWEST_APPLICATION_THREAD_PRIO). If those two stop going idle, nothing
+ * preemptible is ever scheduled: the console dies, the log thread never drains,
+ * and CONFIG_LOG_MODE_OVERFLOW then overwrites the queued records. The board
+ * stops beaconing and says nothing -- no warning, no fatal dump. Observed on
+ * the bench during an `apos run` ranging phase.
  *
- * What makes it undiagnosable rather than merely broken is the priority layout.
- * This loop runs at K_PRIO_COOP(0) = -16 and dwt_isr() runs on the system
- * workqueue at -1; the shell and the log-processing thread are both PREEMPTIBLE
- * (the log thread at K_LOWEST_APPLICATION_THREAD_PRIO). While a wedged chip
- * keeps re-asserting its IRQ, this loop and the workqueue hand the rx_sem back
- * and forth with neither ever idle, so nothing preemptible is ever scheduled:
- * the console goes dead, the log thread never drains, and with
- * CONFIG_LOG_MODE_DEFERRED the queued records are then OVERWRITTEN. The board
- * stops beaconing and says nothing at all -- no warning, no fatal dump.
+ * Deliberately a WALL-CLOCK bound on the whole loop rather than a check that
+ * the radio clock advanced. A frozen radio clock was the first hypothesis --
+ * the beacon is scheduled from dwt_readsystimestamphi32(), so a stopped clock
+ * traps the loop by construction -- and the heartbeat below REFUTED it: over
+ * the runs captured, systime advanced dead-regularly (210.7 / 210.5 / 210.3 /
+ * 211.5 / 210.8 ms). A clock-only check would therefore have reported nothing
+ * for the fault actually seen. k_uptime_get() is driven by the SoC timer, which
+ * no DW3220 state can stop, so it bounds the loop whatever the cause: frozen
+ * radio clock, an IRQ storm the loop cannot drain, or arithmetic that never
+ * satisfies the break test. The report prints both clocks so the next capture
+ * says WHICH.
+ *
+ * 300 ms is 1.5 superframes: past any legitimate iteration (the loop must reach
+ * the beacon every 200 ms by construction) and short enough to be caught in the
+ * superframe it happened in.
  *
  * CLAUDE.md records this chip wedging before, diagnosed the long way. That
- * instance left the shell ALIVE (an idle network gave the loop nothing to
- * service, so it sat in k_sem_take and yielded). Under the anchor survey's
- * sustained ranging traffic it does not, which is why the same hardware fault
- * now presents as a total freeze.
- *
- * 60 ms is a third of a superframe: long enough that no legitimate quiet spell
- * trips it (the clock advances every 4.006 ns), short enough to be caught
- * inside the superframe it happened in. */
-#define CLOCK_STALL_MS 60u
+ * instance left the shell ALIVE -- an idle network gave the loop nothing to
+ * service, so it sat in k_sem_take and yielded. Under the survey's sustained
+ * ranging traffic it does not, which is why a similar fault now presents as a
+ * total freeze instead of a silent radio with a live console. */
+#define LOOP_STALL_MS 300u
 
 static K_SEM_DEFINE(rx_sem, 0, 1);
 
@@ -364,11 +371,9 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 
 	/* Liveness of the OUTER loop, one line per superframe. If these stop
 	 * while the board is still powered, the loop is trapped inside the inner
-	 * for(;;) and the stall check below says whether the chip clock is why.
-	 * Debug image only -- five lines a second is not a production log. */
-	uint32_t stall_ref = 0;
-	int64_t stall_since_ms = k_uptime_get();
-
+	 * for(;;), and the stall watchdog below reports which clock is at fault.
+	 * Debug image only -- five lines a second is not a production log, and
+	 * under CONFIG_LOG_MODE_DEFERRED it costs only the enqueue. */
 	while (1) {
 		uint32_t next_beacon = (uint32_t)((beacon_tx_ts +
 			((uint64_t)T_SUPERFRAME_UUS * UUS_TO_DWT_TIME)) >> 8);
@@ -378,33 +383,40 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 			dwt_readsystimestamphi32(), next_beacon,
 			ctx.frame_counter, (int)apos_gw_busy());
 
+		int64_t loop_entry_ms = k_uptime_get();
+		uint32_t loop_entry_systime = dwt_readsystimestamphi32();
+
 		for (;;) {
 			uint32_t now = dwt_readsystimestamphi32();
 			int32_t to_beacon = (int32_t)(next_beacon - now);
 
-			/* Wedged-chip check, BEFORE the break test that depends
-			 * on `now` advancing. Bounded in wall-clock time, which
-			 * the radio cannot stop, rather than in iterations,
-			 * which say nothing about how long they took. */
-			if (now != stall_ref) {
-				stall_ref = now;
-				stall_since_ms = k_uptime_get();
-			} else if (k_uptime_get() - stall_since_ms >
-				   (int64_t)CLOCK_STALL_MS) {
-				LOG_ERR("{\"gw_fault\":{\"why\":\"DW3220 "
-					"system clock has not advanced in %u ms "
-					"— the chip is wedged, this is not a "
-					"firmware stall\",\"systime\":%u,"
+			/* Stall watchdog, BEFORE the break test it exists to
+			 * catch failing. */
+			if (k_uptime_get() - loop_entry_ms >
+			    (int64_t)LOOP_STALL_MS) {
+				LOG_ERR("{\"gw_fault\":{\"why\":\"inner "
+					"loop has not reached the beacon in "
+					"%u ms\",\"systime\":%u,"
+					"\"systime_at_entry\":%u,"
+					"\"radio_clock_moved\":%d,"
+					"\"next_beacon\":%u,"
+					"\"to_beacon\":%d,"
 					"\"apos_busy\":%d}}",
-					CLOCK_STALL_MS, now,
+					LOOP_STALL_MS, now, loop_entry_systime,
+					(int)(now != loop_entry_systime),
+					next_beacon, (int)to_beacon,
 					(int)apos_gw_busy());
 				/* Sleep, not k_yield(): yielding only reaches
 				 * threads at this priority or above, and every
-				 * thread that could report this or accept a
-				 * console command is BELOW it. One millisecond
-				 * is what buys the shell back, and without it
-				 * the operator has no way in. */
-				stall_since_ms = k_uptime_get();
+				 * thread that could print the line just
+				 * enqueued -- or accept a console command to
+				 * ask about it -- is BELOW this one. This
+				 * millisecond is the whole reason DEFERRED
+				 * logging can report a scheduler-starving
+				 * fault at all, and it is why debug.conf does
+				 * NOT need immediate mode. */
+				loop_entry_ms = k_uptime_get();
+				loop_entry_systime = now;
 				k_msleep(1);
 				continue;
 			}
