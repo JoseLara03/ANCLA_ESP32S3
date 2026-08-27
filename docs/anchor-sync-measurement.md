@@ -104,14 +104,23 @@ five noise amplitudes, so the factor cannot drift unnoticed.
 | Slave role, gap detection, model ownership | `src/ccp_slave.{c,h}` |
 | `sync stats` / `sync reset` | `src/sync_shell.c` |
 
-**No board has run this path yet.** The three pieces above compile and link
-into their images, and their host-testable logic is covered by the suites
-above them — but nothing in this second table has been observed transmitting,
-receiving, or reporting a verdict on real hardware. Every number in §0 and §4
-is a simulation result or a host-test result, not a measurement. §3 below is
-the procedure that closes that gap, and until it has been run and its output
-recorded in §4.1, this document describes a gate that is executable but not
-yet passed, failed, or even attempted.
+**This path has now run on hardware (2026-08-26), on USB-C power.** The three
+pieces above compile and link into their images, and their host-testable
+logic is covered by the suites above them — and, per the procedure in §3, all
+three have also been observed transmitting, receiving, pairing observations,
+and rendering a verdict on real boards: CCPs went out, the slave paired them,
+and `sync stats` reported `jitter_est`. That happened on USB-C specifically —
+CLAUDE.md's hard-won fact on the battery/CCP finding records that on LiPo
+power the master demonstrably does **not** transmit a second frame per
+superframe, so this table's hardware status should be read as USB-C-only
+until that is also verified on battery. Every number in **§0** is still a
+simulation result or a host-test result, not a measurement, and that
+distinction still matters — those figures bound what the arithmetic can do,
+not what this hardware has done. **§4.1 now carries the real measurements**;
+read it for the actual numbers and the verdicts they produced. What remains
+outstanding is narrower than "the whole gate": the **roles-swapped second
+direction** (§3, final paragraph) has not been run, and neither has the
+CCP-interval experiment noted in §4.1.
 
 The CCP goes in the **post-beacon guard window**, where slaves already may not
 transmit, so it costs **no** airtime from the CAP or the CFP. It is sent with
