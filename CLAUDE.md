@@ -370,6 +370,14 @@ sync master                    transmit half — CCP sent/dropped counts as
   `T_GUARD_UUS` (488, the 0.5 ms superframe partition guard from the MAC
   contract §2) is **not** `BEACON_GUARD_UUS` (1500, the slave's TX-suppression
   window around the beacon). Confusing the two triples the charged overhead.
+- `src/blink_frame.{c,h}` — the BLINK wire format for Phase 3 TDoA: a tag
+  emits this instead of running a ranging sweep, every anchor that hears it
+  timestamps it, and the gateway solves. Function code `0xF0`, the first code
+  outside the now-full `0xEx` range (see the allocation table in
+  `src/ccp_frame.h`). Deliberately NOT in `uwb_frame_802_15_4z.c`, same
+  byte-identity rule as `ccp_frame.c`/`apos_frame.c` — the tag carries a
+  byte-identical copy, this repo is the source of truth for it. Pure C,
+  host-tested in `tests/blink_frame/`.
 - `src/ccp_frame.{c,h}` — the clock-calibration-packet wire format, function
   code `0xEF`. Deliberately NOT in `uwb_frame_802_15_4z.c` (byte-identical with
   the tag, which has no use for CCPs), same precedent `apos_frame.c` set. Pure
@@ -1466,6 +1474,9 @@ gcc -Wall -Wextra -Isrc -o tests/sync_model/test_sync_model.exe tests/sync_model
 
 gcc -Wall -Wextra -Isrc -o tests/ccp_frame/test_ccp_frame.exe tests/ccp_frame/test_ccp_frame.c src/ccp_frame.c
 ./tests/ccp_frame/test_ccp_frame.exe            # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/blink_frame/test_blink_frame.exe tests/blink_frame/test_blink_frame.c src/blink_frame.c
+./tests/blink_frame/test_blink_frame.exe        # blink_frame: ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/mac_budget/test_uwb_mac_asserts.exe tests/mac_budget/test_uwb_mac_asserts.c src/mac_budget.c
 ./tests/mac_budget/test_uwb_mac_asserts.exe     # ALL TESTS PASSED, exits 0

@@ -23,6 +23,7 @@
  *   0xEC, 0xED  reserved: CONFIG_SET / CONFIG_ACK (design spec section 4.4)
  *   0xEE        ALERT
  *   0xEF        CCP  <- this, and the 0xEx range is now FULL
+ *   0xF0        BLINK_FRAME_TYPE (src/blink_frame.h) -- first code past 0xEx
  *
  * Anything after this needs a different range or a subtype byte under an
  * existing code. Prefer a subtype: apos already demonstrates that seven
