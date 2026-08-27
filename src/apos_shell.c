@@ -325,11 +325,19 @@ static void warn_unverified(const struct shell *sh)
 
 	apos_gw_result_quality(&recip, &sd);
 
+	/* The free-parameter formula is 2N-3 in 2D and 3N-6 in 3D. This message
+	 * hardcoded 3N-6, so the first real 2D survey (2026-08-26) printed the
+	 * wrong one -- in the single warning an operator is most likely to
+	 * check the arithmetic of. apos_gw.c's two JSON warnings already
+	 * selected on res.dim; only the shell copy did not. */
+	const struct apos_result *r = apos_gw_result();
+
 	shell_warn(sh, "WARNING: this survey is UNVERIFIED. The mesh has %d "
-		       "spare edge(s) (usable edges minus 3N-6), so the fit "
+		       "spare edge(s) (usable edges minus %s), so the fit "
 		       "reproduced the ranges exactly and rms/worst came back "
 		       "at ~0 however bad the ranging was.",
-		   apos_gw_result_redundancy());
+		   apos_gw_result_redundancy(),
+		   (r && r->dim == APOS_GEOM_2D) ? "2N-3" : "3N-6");
 	/* Deliberately NOT "add a fifth anchor". UWB_MAX_ANCHORS is 4 and
 	 * `anchor id` is bounded 0..3, so there is no fifth anchor an operator
 	 * can add -- see apos_gw_result_unverified(). Point them at numbers

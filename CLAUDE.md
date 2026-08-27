@@ -65,7 +65,23 @@ order a human would hit them running `docs/antenna-delay-calibration.md`:
   from the 0.48–2.0 m recorded above to under ~0.1 m, with `(x, y)` stable
   between consecutive fixes.
 
-None of these have been run. `docs/antenna-delay-calibration.md` is the
+**Partially run.** On 2026-08-25 one anchor was taken through `cal ref` at a
+2 m reference distance and reached **-8 mm**, inside the `|error_mm| < 15` gate.
+Everything else in the list above is still open on every board, including the
+repeat run, `kernel reboot cold` survival, and the whole `cal peer` cross-check.
+Treat the remaining two anchors as uncalibrated until a console reading says
+otherwise — `anchor show` reports the live values.
+
+A separate observation that is NOT calibration evidence, recorded so it is not
+mistaken for it: the first successful `apos run` (2026-08-26, §2 below) reported
+`max_reciprocal_mm: 5` across the whole mesh. That is the largest
+|d(A->B) - d(B->A)| and it bounds the antenna-delay **asymmetry** only.
+Averaging both directions is exactly what cancels asymmetry, so a small figure
+here says nothing about the common-mode bias every anchor shares — which is the
+part calibration fixes and the part that moves an absolute distance. A perfectly
+reciprocal mesh can be uniformly wrong by metres.
+
+`docs/antenna-delay-calibration.md` is the
 document to execute them from; until they are done, the residuals recorded at
 the top of this section are still the current, unresolved measurement.
 
@@ -124,33 +140,62 @@ responder path and four new frame types for that. See
 `docs/superpowers/specs/2026-08-14-anchor-auto-positioning-design.md` §4 — do
 not silently re-litigate this.
 
-**What has not happened yet: any hardware run at all.** Not one survey has been
-executed on a board. The outstanding hardware gates, in the order a human would
-hit them running `docs/anchor-auto-positioning.md`:
+### The survey has now RUN on hardware (2026-08-26), with THREE anchors in 2D
 
-- Anchors are antenna-delay calibrated first (§1 above). A survey run before
-  calibration produces confidently wrong geometry that nothing will flag.
-- `apos enum` on a gateway lists exactly four peers with distinct EUI-64s and
-  distinct short addresses `0x0001`–`0x0004`.
-- `apos run` completes with `missing_pairs:0`, all nodes placed, none
-  ambiguous, and the beacon stays on time throughout — no
-  `"beacon started but TXFRS never completed"` during the ranging phase, the
-  solve, or the persist. `APOS_GW_SOLVE_BUDGET_UUS` (150000) and the
-  survey-persist gate that reuses it have **never been timed on hardware**.
-- The solved node-to-node distances match a **tape measure**. On a four-anchor
-  array this is the only real check on the GEOMETRY — see the hard-won fact
-  below on why `rms_mm` cannot be one, and read `max_reciprocal_mm` /
-  `max_sd_mm` for the ranging.
-- `apos apply` reports `ok:4, failed:0, skipped:0, persisted:1`; every anchor
-  reports its new coordinates immediately and they survive `kernel reboot cold`.
-- `apos ref` set and the retained anchors payload carrying the surveyed
+First successful end-to-end `apos run` + `apos apply`, on a gateway plus three
+anchors (`0x0001`, `0x0002`, `0x0004`; `0x0003` was powered off). It took four
+attempts and a silent stack overflow to get there — see the hard-won fact on
+`struct gw_core_ctx` below, which is the single most expensive thing this
+project has learned about the survey path.
+
+**Met, and not to be re-run to prove:**
+
+- `apos enum` → 3 peers with distinct EUI-64s and short addresses.
+- `apos run` → `missing_pairs:0`, `placed:3/3`, `ambiguous:0`, `iters:15`.
+- **The beacon stayed on time throughout**, including the ranging phase, the
+  solve and the NVS persist: the `gw_sf` heartbeat came out at exactly 200.0 ms
+  (systime delta 49 923 544 hi32 x 4.006 ns) with not one `"beacon started but
+  TXFRS never completed"`. So `APOS_GW_SOLVE_BUDGET_UUS` (150000) and the
+  survey-persist gate that reuses it are now **timed on hardware** and hold.
+- `apos apply` → `ok:3, failed:0, skipped:0, persisted:1`, every anchor
+  acknowledging its coordinates.
+- The ranging quality numbers that are real on this array:
+  `max_reciprocal_mm: 5` (largest |A→B − B→A| across the whole mesh) and
+  `max_sd_mm: 40`. Reciprocity of 5 mm means the antenna-delay ASYMMETRY is
+  negligible — it says nothing about the common-mode bias, see below.
+- `gauge_collinearity` came back at **1.831** against the "thin" threshold of
+  `APOS_ACCEPT_GAUGE_COLLINEARITY` (0.10), i.e. 18x clear. Higher is better
+  here (the ratio is |plane.y| / |xaxis.x|); the gauge triangle was
+  well-conditioned, not marginal.
+
+**Still outstanding, and the first two are the ones that matter:**
+
+- **Tape measure.** The solved geometry was
+  `0x0001 (0.000, 0.000)`, `0x0002 (1.263, 0.000)`, `0x0004 (0.914, 2.312)`,
+  i.e. edges 1.263 / 2.486 / 2.338 m. The `anchor pos` values the same boards
+  were carrying implied 2.020 / 2.388 / 1.301 — up to **1037 mm** different,
+  and suspiciously like a PERMUTATION of the same three lengths, which is the
+  `anchor id` / coordinate mismatch this branch exists to remove. Either the
+  boards moved since those values were typed, or one of the two is badly wrong.
+  Nothing in the survey report can settle it: `rms_mm` was 0 by construction
+  (3 edges against 3 free parameters) and reciprocity cancels asymmetry, not
+  the common-mode antenna-delay bias every anchor shares. **Measure it.**
+- **Antenna-delay calibration** (§1 above). One anchor has a -8 mm `cal ref`
+  result; the other two have no recorded result, and no board has been through
+  the repeat run or the `cal peer` cross-check. So the absolute scale of those
+  three edges is unverified — and `max_reciprocal_mm: 5` does not verify it, for
+  the reason spelled out at the end of §1.
+- Survival of `kernel reboot cold`.
+- A FOUR-anchor run. With three anchors in 2D the mesh is isostatic and
+  `rms_mm` is identically zero; with four it is 6 edges against 5 free
+  parameters and `rms_mm` becomes a real (if weak) signal. `0x0003` did not
+  answer enumeration in three consecutive attempts and needs looking at.
+- `apos ref` set, and the retained anchors payload carrying the surveyed
   COORDINATES. The anchor names stay `ANC-LOBBY-00N` on purpose — the customer
   platform may key its records on `name`, so a survey changes coordinates only
   (`src/pos_json.c`).
 - The point of the branch: a tag ranging four surveyed anchors, with `0xEA`
   `residual` under ~0.1 m and `(x, y)` stable between fixes.
-
-None of these have been run.
 
 ## Build & flash
 
@@ -990,6 +1035,82 @@ thresholds.
   its FNV-1a reference vectors are written as `<published value> &
   0x7FFFFFFF` so they still check the hash itself rather than only the
   masking layered on top.
+
+- **A 2588-byte `struct gw_core_ctx` as a stack AUTOMATIC overflowed the
+  4096-byte main stack, silently, and only while `do_solve()` ran.** This cost
+  four bench sessions and three wrong instruments, so the whole shape is worth
+  keeping. `uwb_gateway_run()` declared `struct gw_core_ctx ctx;` as an
+  ordinary local. That was ~236 bytes when the anchor survey was written and
+  reviewed — `seats[]` was indexed by CFP slot, so `GW_N_CFP` (11) of them.
+  The seat/schedule split for 100-tag capacity made it `seats[GW_MAX_SEATS]`
+  (128) and `sizeof` went to **2588**. Measured afterwards with
+  `CONFIG_THREAD_ANALYZER`: `main` peaks at 1220 B idle and **1748 B** once
+  `do_solve()` → `apos_geom_solve()` → `apos_geom_refine()` has run. So with
+  `ctx` on the stack the real figures were 3808/4096 at rest — **fits, 288 B
+  spare** — and **4336/4096 during the solve, an overflow of 240 bytes.** That
+  is exactly the observed behaviour: the board ran for a minute and died the
+  instant the last ranging pair completed, because that is when `do_solve()`
+  runs at all. Fixed by making it `static`, which is *correct* and not merely
+  roomier: `uwb_gateway_run()` is called once from `main()` and never returns,
+  so there is one instance either way (confirmed at the link: production dram
+  259440 → 262032 B, +2592, the struct moving to `.bss`). Three lessons that
+  generalise past this bug:
+  **(a) The absence of a `k_timer` ISR report is evidence AGAINST scheduler
+  starvation, not a gap in the instrument.** Three instruments were spent
+  chasing the theory that the `K_PRIO_COOP(0)` loop was starving the
+  preemptible shell and log threads. An ISR preempts a busy-wait at any
+  priority, so an ISR that stops reporting means corrupted kernel state or a
+  halt — never starvation. That datum was in hand and was read as a hole in the
+  tooling.
+  **(b) In deferred logging, an absent line is NOT an absent step.** `LOG_INF`
+  enqueues and returns; if the thread dies before its next yield, the record
+  sits in a pool the preemptible log thread never drains, and
+  `CONFIG_LOG_MODE_OVERFLOW` then overwrites it. The console showed pair 5 of 6
+  as the last event when the firmware had gone considerably further. Do not
+  count missing lines as steps that did not execute.
+  **(c) Host tests cannot see this class of bug and neither can a code review
+  of either change.** `gw_core` is host-tested where stacks are megabytes, the
+  survey had never been run on hardware, and the two changes lived on different
+  branches. `CONFIG_THREAD_ANALYZER` (in `debug.conf`) is the only thing that
+  answers it, because arithmetic cannot: Xtensa's windowed ABI spills register
+  windows on deep call chains on top of every declared frame, so the true
+  high-water mark is always above what `-fstack-usage` can show.
+- **`CONFIG_LOG_MODE_IMMEDIATE` is unusable on this build — do not re-add it.**
+  Tried in `debug.conf` to get the last line out before a freeze. It failed
+  twice, each worse than the problem: (1) a synchronous console write from the
+  `K_PRIO_COOP(0)` loop costs milliseconds against a 5 ms
+  `BEACON_ARM_MARGIN_UUS`, so **every** delayed beacon missed its slot and the
+  re-base dragged the cadence to ~210.7 ms against a 200 ms
+  `T_SUPERFRAME_UUS`; (2) it crashed the board ~1.8 s into boot as WiFi
+  associated — `EXCCAUSE 20`, `PC 0x640`, current thread `idle` — a garbage PC
+  from a corrupted stack, most likely immediate mode's inline `cbprintf`
+  running in a context borrowing the 1024-byte `CONFIG_IDLE_STACK_SIZE` while
+  the WiFi blob logged heavily. Deferred mode only memcpys from the caller,
+  which is why production never sees it. The thing immediate mode was reached
+  for is served instead by the stall watchdog's deliberate `k_msleep(1)`: it
+  enqueues its report and then sleeps, which is what lets the preemptible log
+  thread drain. Note `k_msleep`, **not** `k_yield()` — yielding only reaches
+  threads at this priority or above, and every thread that could print the line
+  or take a console command is below it.
+  `log_panic()` is declared in `zephyr/logging/log_ctrl.h`, not `log.h`.
+- **`sysworkq` peaked at 948 of the default 1024 bytes (92 %) with `dwt_isr()`
+  on it.** Measured on the gateway under an `apos run`. `br101` runs the DW3000
+  interrupt handler from the system workqueue rather than the GPIO callback, and
+  `dwt_isr()` reads CIA diagnostics over SPI, so this is the radio path's stack.
+  76 bytes spare is not a margin, and it is the same failure class as the
+  `gw_core_ctx` overflow above. `CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE` is now 2048
+  in `prj.conf`. Neither `CONFIG_STACK_SENTINEL` nor hardware stack protection
+  is on in production (Xtensa has no `ARCH_HAS_STACK_PROTECTION` here), so an
+  overflow anywhere in this firmware is silent — `debug.conf` turns the software
+  sentinel on for exactly that reason.
+- **A user-facing warning that hardcodes a formula will be wrong the first time
+  the other mode runs.** `apos apply`'s unverified-survey warning said "usable
+  edges minus **3N-6**" unconditionally, so the first real 2D survey printed the
+  3D free-parameter formula — in the single warning an operator is most likely to
+  check the arithmetic of. `apos_gw.c`'s two JSON warnings already selected on
+  `res.dim`; only the shell copy did not. Fixed by reading
+  `apos_gw_result()->dim`. Worth generalising: `res.dim` now has three consumers
+  that must agree, and the shell one is the easiest to forget.
 
 ## System context
 
