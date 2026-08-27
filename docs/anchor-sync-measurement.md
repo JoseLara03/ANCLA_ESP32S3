@@ -242,23 +242,97 @@ Cross-checks worth taking at the same time, because they cost nothing extra:
 
 ### 4.1 Recording the result
 
-_Not yet run._ Nothing below has been filled in.
+**Direction 1** — master: gateway, slave: anchor — date: 2026-08-26 — power:
+**USB-C on both boards** — `sync reset` run before each reading (see §3 step 5;
+skipping it inflates the number, see below).
 
-**Direction 1** — master: `___` (board), slave: `___` (board) — date: `___`
+**30 cm:**
+
+```
+jitter_est: 50 DTU = 782 ps        verdict: marginal
+count (paired observations): 436
+gaps: 0    rejected: 0
+max/rms ratio: 3.47 (expected ~3.1 for a clean Gaussian at n=436 — no tail)
+```
+
+**3 m:**
+
+```
+jitter_est: 92-98 DTU = 1.44-1.53 ns   verdict: fail
+counts: 221 and 357 (two runs)
+gaps: 0    rejected: 0
+drift_ppb: 7.2-7.9 ppm (well inside the ±40 ppm two-crystal budget)
+one outlier: max 1968 DTU = 30.8 ns, 15.1x rms, seen once in 895 samples
+  and not repeated in the following 357 — a rare real event, not the
+  distribution; correctly fired the tail warning in §4.
+```
+
+`gaps:0` and `rejected:0` across ~2000 receptions total confirm the link and
+the deferred-timestamp pairing both work correctly; the numbers above are a
+genuine jitter measurement, not an artifact of dropped or misordered frames.
+
+**`sync reset` is worth 3.7x.** An un-reset reading at 30 cm gave 188 DTU,
+because the residual sum still contained observations taken while the rate
+estimate was converging (`SYNC_BASELINE_USEFUL` is 10). Skipping §3 step 5
+would have an operator conclude the hardware fails by a wide margin when it
+does not — this is why that step exists and is stated plainly here rather
+than left implicit.
+
+**Decomposition.** 30 cm to 3 m is 10x the distance and 20 dB of path loss; a
+purely SNR-limited (link-budget-limited) jitter would rise roughly 10x. It
+rose **1.9x**. Fitting `sigma^2 = floor^2 + (k*d)^2` to the two points:
+
+- floor ~= 49 DTU = 772 ps
+- link term ~= 8 DTU at 30 cm, ~= 81 DTU at 3 m
+- so at 30 cm, **~97% of the variance is floor, not link**
+
+This is a **two-point fit** — two points cannot discriminate between models,
+so treat this as a working hypothesis, not a proven decomposition. But the
+conclusion it supports is hard to avoid either way: the limit here is not
+link budget, and the floor alone (49 DTU) already exceeds the 32 DTU pass
+threshold, so even a perfect link at any distance would not have passed as
+designed.
+
+**Next lever, not yet run.** The residual measures prediction error over one
+CCP interval (200 ms). If the floor is crystal wander over that interval,
+lengthening the interval should raise it proportionally and shortening it
+should lower it (§5 remedy 2). The experiment is to send the CCP every 2
+superframes instead of every 1 and re-measure at 30 cm — deliberately
+lengthening, not shortening: shortening would need a second TX per
+superframe, and CLAUDE.md's hard-won fact on the battery/CCP finding records
+that the supply on this hardware already cannot sustain the one it has. If
+the floor does not move with the interval, it is per-observation timestamp
+noise and a hardware limit, not wander. **This experiment has not been run.**
+
+Also unconfirmed: whether both boards used for this measurement had the
+QM14070 PA rework CLAUDE.md records (the ~25 dB TX deficit fix). An
+unreworked board would inflate the link term measured above.
+
+**Product decision.** The 1 ns gate threshold targeted 10-30 cm TDoA accuracy
+(1 ns ~= 30 cm of range error). The gate **failed** against that target — do
+not read the numbers above as a pass. At the measured ~1.5 ns, range error is
+roughly **45 cm**. The target has been consciously re-derived rather than the
+hardware found adequate: **~45 cm is accepted for now, and Phase 3 proceeds
+at that accuracy**, with the two levers above (CCP-interval experiment; link
+term via TX power/antennas/anchor spacing) identified as the path to improve
+it later. This is §5 remedy 4 ("Accept worse than sub-ns and re-derive the
+accuracy target ... a product conversation, not a firmware one") being
+exercised deliberately, not the pass path in the §4 table above.
+
+**Direction 2** — master/slave roles swapped — **not yet run.**
 
 ```
 _not yet run_
 ```
 
-**Direction 2** — master: `___` (board), slave: `___` (board) — date: `___`
+A large asymmetry between the two directions would point at one board rather
+than the technology (§3, final paragraph); until direction 2 runs, that
+cross-check is still outstanding.
 
-```
-_not yet run_
-```
-
-Until both blocks above are filled in with real `sync stats` output, the
-Phase 2 gate is **unmeasured** and the A7 row in
-`docs/superpowers/specs/2026-08-25-rtls-scale-tdoa-design.md` stays `parcial`.
+The A7 row in `docs/superpowers/specs/2026-08-25-rtls-scale-tdoa-design.md`
+is now `sí` — the gate has been measured — but measured is not the same as
+passed at the original target; see that spec's "Gate de Fase 2" line for the
+outcome recorded there.
 
 ## 5. If the number is too high
 
@@ -266,8 +340,12 @@ Phase 2 gate is **unmeasured** and the A7 row in
 
 Before any of the remedies below: `rx:0` on the slave, or a `verdict` stuck at
 `"no-lock"` no matter how long it runs, is a **different** failure from a high
-jitter number, and the remedies below do not apply to it. Check the
-**transmit** side first, not the link: `sync master` on the gateway (or its
+jitter number, and the remedies below do not apply to it. First, check what
+the gateway is powered from — a LiPo cannot sustain the CCP's second PA-driven
+TX per superframe and presents exactly as `sent:0` with `dropped` climbing,
+indistinguishable at the console from the firmware faults below (see
+CLAUDE.md's hard-won fact on the battery/CCP finding). Only once USB-C power
+is confirmed should the **transmit** side be checked next, not the link: `sync master` on the gateway (or its
 own periodic `LOG_WRN` summary). If `dropped` is climbing while `sent` stays
 low or zero, the gateway is not getting CCPs onto the air at all — under the
 immediate-TX design (§2, §3 step 3) that means either `dwt_starttx()` itself

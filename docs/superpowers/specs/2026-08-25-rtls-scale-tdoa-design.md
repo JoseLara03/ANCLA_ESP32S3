@@ -577,7 +577,7 @@ Dueño del MAC, del gateway, del formato de aire y de la sincronía.
 | A4 | `UWB_PROTO_VER` 2 → 3 en `uwb_frame_802_15_4z.h` + nota de día-bandera. Avisar al Agente-TAG para que copie. | 1 | sí |
 | A5 | ~~Reuso de direcciones cortas~~ — **DESCARTADA 2026-08-25, haría daño.** El contador monotónico no es un defecto: su wrap largo (0x0100..0xFFFD = 65 278 valores) es una **cuarentena** que protege la ruta de fallback de `Tid`. Un POS rezagado de un tag cuyo asiento expiró se publica hoy con `tag_id = src_addr`, un fantasma de un registro, documentado y aceptado. Con reuso pronto, la dirección liberada la toma otro tag y `gw_core_find_eui()` devuelve el EUI **equivocado**: el fix se atribuye a un dispositivo real distinto. Esa es la única vía por la que el fallback puede estar silenciosamente mal sobre un tag real, y el pool monotónico la mantiene en la cota de coincidencia de ~1.5e-5 en vez de volverla rutina. El fix de `Tid` no ayuda aquí — el punto es que el EUI consultado es el del tag equivocado. Razón documentada en `alloc_short_addr()` para que no se "arregle" después. | — | — |
 | A6 | `src/sync_model.{c,h}` + `tests/sync_model/` — estimador de offset y deriva en Q16.16 sin float, copiando la forma de `tag_testting/src/beacon_sched_core.c`. Observable: timestamps CCP consecutivos (78 ppt). CFO como adquisición rápida. Cubrir coasteo y el wrap de 17.2 s de hi32 con aritmética de diferencia firmada. | 2 | sí |
-| A7 | Frame CCP + emisión/recepción entre anclas; plan de medición en hardware para el gate de Fase 2. | 2 | parcial |
+| A7 | Frame CCP + emisión/recepción entre anclas; plan de medición en hardware para el gate de Fase 2. | 2 | sí |
 | A8 | Blink TDoA en el codec + backhaul de timestamps por MQTT desde las anclas (compilar `net_uplink` en modo slave). | 3 | parcial |
 | A9 | Portar `pos_solver` / `pos_residual` / `pos_ekf` al gateway con modelo de diferencia de rangos. Host tests propios. | 3 | sí |
 | A10 | Frames `0xEC` CONFIG_SET / `0xED` CONFIG_ACK + bit de config pendiente en el beacon. | 4 | sí |
@@ -604,7 +604,7 @@ Dueño de la FSM del tag, del ahorro de energía y del consumo del downlink.
 |---|---|
 | Tras A4 | El Agente-TAG copia el codec (T4). Nada del lado del tag compila contra v3 antes. |
 | Antes de flashear Fase 1 | Ambos firmwares al mismo `proto_ver`. Un tag v2 contra gateway v3 queda **sordo en SCAN**, no degradado. |
-| Gate de Fase 2 | A7 mide en hardware. Si falla, la Fase 3 no procede y T7/T8 no se ejecutan. |
+| Gate de Fase 2 | A7 mide en hardware. Si falla, la Fase 3 no procede y T7/T8 no se ejecutan. **Medido 2026-08-26** (`docs/anchor-sync-measurement.md` §4.1): 30 cm → 782 ps (marginal), 3 m → 1.44-1.53 ns (fail) — el gate **falló** contra el objetivo original de 1 ns, no lo pasó. Decisión de producto tomada en respuesta, no un hallazgo de que el hardware fuera adecuado: el objetivo de precisión se re-derivó de 10-30 cm a **~45 cm** (remedio §5.4), y con eso **la Fase 3 procede**, a ~45 cm en vez de 10-30 cm. Dos palancas identificadas para mejorarlo después, ninguna corrida todavía: el experimento de intervalo de CCP (¿el piso de 49 DTU es *wander* de cristal o ruido de hardware?) y el término de enlace (potencia TX / antenas / espaciamiento de anclas). Ver también el hallazgo de la batería en CLAUDE.md: un gateway alimentado por LiPo no sostiene la segunda TX del CCP, así que toda medición del gate depende de la fuente de poder usada. |
 
 ---
 

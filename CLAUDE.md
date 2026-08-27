@@ -1326,6 +1326,68 @@ sync master                    transmit half — CCP sent/dropped counts as
   signature is currently the only way from outside the driver to tell TXERR
   apart from a real missed deadline; do not assume a `DWT_ERROR` on a
   delayed TX is automatically a timing problem.
+- **A battery-powered gateway cannot sustain the CCP's second PA-driven TX per
+  superframe — this is a deployment constraint, not a bug, and it finally
+  isolates a mechanism an older entry here only suspected.** Controlled
+  bench comparison, same firmware and same board, only the supply changed:
+  on a 3.6 V LiPo the gateway emits beacons only and no CCPs ever go out; on
+  USB-C both transmit normally. The CCP (`0xEF`) is a second PA-driven
+  transmission ~289 us after the beacon's own — see the "arm deadline"
+  entries just above for why it is armed immediately after the beacon TX —
+  and that back-to-back double-TX burst is exactly the case the older
+  hard-won fact "A board that transmits exactly one frame per boot and then
+  goes silent is a wedged DW3220" (above, under "This project's own GATEWAY
+  mode") flagged as its prime suspect ("the supply sagging under the PA's
+  draw at the first TX") without ever isolating it — that episode was closed
+  by swapping the board, not by measuring the rail. This experiment isolates
+  it: same board, same code, only the power source differs, and only the
+  second TX is missing. **Every Phase 2 sync measurement is therefore
+  supply-dependent** — a `jitter_est` or a `sent`/`dropped` count means
+  nothing unless the power source is recorded alongside it (see
+  `docs/anchor-sync-measurement.md` §4.1). The fix is hardware — bulk
+  capacitance, LiPo ESR, regulator droop under the ~289 us double-TX burst —
+  not firmware; the diagnostic is a scope on the supply rail across the
+  beacon-then-CCP pair, not a log line. **The operator trap: on battery this
+  presents as `sync master`'s `sent:0` with `dropped` climbing every
+  superframe**, which is indistinguishable at the console from the TXERR /
+  missed-arm-deadline failures the entries above describe — check the power
+  source before chasing either of those as a firmware fault.
+- **The Phase 2 sync gate was run on hardware (2026-08-26) and FAILED against
+  its original 1 ns target; the target was consciously re-derived rather than
+  the hardware being called adequate.** Both readings on USB-C power, after
+  `sync reset`: 30 cm gave `jitter_est` 50 DTU = 782 ps (`marginal`, n=436);
+  3 m gave 92-98 DTU = 1.44-1.53 ns (`fail`, n=221 and n=357). `gaps:0` and
+  `rejected:0` across ~2000 receptions throughout. Fitting
+  `sigma^2 = floor^2 + (k*d)^2` to the two points gives a floor of ~49 DTU
+  (~772 ps) — already above the 32 DTU pass threshold on its own — with the
+  link term only ~8 DTU at 30 cm rising to ~81 DTU at 3 m, i.e. **97% of the
+  30 cm variance is a floor, not the link budget**; a purely SNR-limited
+  jitter would have risen ~10x for the 10x distance change and it only rose
+  1.9x. This is a two-point fit, not a proven decomposition. `sync reset`
+  matters: an un-reset reading came back 188 DTU (3.7x too high) because the
+  residual sum still carried observations from before the rate estimate
+  converged (`SYNC_BASELINE_USEFUL` is 10) — skipping it would read as a
+  hardware failure well beyond the one actually measured. Decision (see
+  `docs/anchor-sync-measurement.md` §4.1 for the full readout): the 1 ns
+  target targeted 10-30 cm TDoA accuracy; at ~1.5 ns the honest range error
+  is ~45 cm (1 ns ~= 30 cm). Product decision: **~45 cm is accepted for now,
+  Phase 3 proceeds at that accuracy, and it is intended to improve.** Two
+  levers are identified and neither has been run: (1) send the CCP every 2
+  superframes instead of every 1 and re-measure at 30 cm — if the floor moves
+  proportionally with the interval it is crystal wander over that interval
+  (§5 remedy 2), if it does not move it is per-observation timestamp noise
+  and a hardware limit; deliberately lengthening rather than shortening,
+  because shortening needs a second TX per superframe and the entry above
+  says the supply already cannot sustain the one it has; (2) the link term
+  above matters at deployment range and is addressable through TX power,
+  antennas and anchor spacing — CLAUDE.md's own "~25 dB TX deficit" entry
+  above records that both these boards' PA rework status has not been
+  confirmed, and an unreworked board would inflate this term. §5 remedy 3
+  (raising `SYNC_PHASE_EMA_SHIFT`) has its own trap: `SYNC_RESIDUAL_TO_JITTER`
+  (1550) is empirical for shift = 3, so raising the shift lowers RMS while
+  making the reported `jitter_est` wrong unless the constant is re-derived —
+  `tests/sync_model/` pins the relation. The roles-swapped second direction
+  in `docs/anchor-sync-measurement.md` §3 has **not** been run.
 
 ## System context
 
