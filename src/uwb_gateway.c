@@ -25,6 +25,7 @@
 #include "gw_core.h"
 #include "pos_sink.h"
 #include "tag_id.h"
+#include "tdoa_gw.h"
 #include "uwb_debug.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
@@ -478,6 +479,7 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 	gw_core_init(&ctx);
 	ccp_master_init();
 	apos_gw_init();
+	tdoa_gw_init();
 
 	LOG_INF("{\"status\":\"gateway\",\"x\":%.2f,\"y\":%.2f,"
 		"\"superframe_ms\":200,\"slots\":%u,\"seats\":%u,"
@@ -511,6 +513,19 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 			"\"fc\":%u,\"apos_busy\":%d}}",
 			dwt_readsystimestamphi32(), next_beacon,
 			ctx.frame_counter, (int)apos_gw_busy());
+
+		/* Once per superframe, and here on purpose: the beacon has just
+		 * gone out, so nearly the whole superframe of margin remains
+		 * before the next arm. Bounded twice over (TDOA_GW_INGEST_MAX /
+		 * TDOA_GW_SOLVE_MAX), never blocking, never transmitting and
+		 * never writing flash -- the four requirements of anything that
+		 * runs on this loop at K_PRIO_COOP(0).
+		 *
+		 * NOT in the inner for(;;): observations arrive on the uplink
+		 * thread's cadence (POLL_TIMEOUT_MS, 50 ms) and not on RX events,
+		 * so running it per RX event would be hundreds of calls per
+		 * superframe for no gain. */
+		tdoa_gw_step(&ctx, k_uptime_get_32());
 
 		int64_t loop_entry_ms = k_uptime_get();
 		uint32_t loop_entry_systime = dwt_readsystimestamphi32();

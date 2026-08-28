@@ -492,6 +492,36 @@ sync master                    transmit half — CCP sent/dropped counts as
   construction at 3 anchors. Tightening it to, say, 20 m would make it an
   underived sync-quality gate in disguise. Pure C, host-tested in
   `tests/tdoa_dtu/`, including that an UNREBASED wrapped group is rejected.
+- `src/tdoa_gw.{c,h}` — the GATEWAY consumer of the observation topic, and the
+  point where Phase 3 first produces a coordinate: drain `net_uplink_get_obs()`,
+  position each observation from the applied survey, group it with
+  `tdoa_collect`, rebase and bound it with `tdoa_dtu`, solve with `tdoa_solve()`
+  and hand a `struct pos_fix` to `pos_sink_publish()`. **Nothing downstream
+  changes** — same `struct pos_fix`, same `Tid` derivation
+  (`gw_core_find_eui()` + `tag_id_from_eui()`, fallback and phantom-record cost
+  included), same `pos_json_fix()` payload, same frozen platform contract; the
+  measurement model changed, the telemetry did not. `tdoa_gw_step()` runs **once
+  per superframe** from the top of the gateway's OUTER loop, just after a beacon
+  went out, and is bounded twice over (`TDOA_GW_INGEST_MAX` 8,
+  `TDOA_GW_SOLVE_MAX` 2): it never blocks (`net_uplink_get_obs()` is
+  `K_NO_WAIT`), never transmits and never writes flash — the four requirements
+  of anything on that `K_PRIO_COOP(0)` loop. Deliberately NOT in the inner RX
+  loop: observations arrive on the uplink thread's 50 ms cadence, not on RX
+  events. All module state is `static` (`struct tdoa_collect` alone is 1792 B
+  against a 4096 B main stack that already peaks at 1748 B in apos's
+  `do_solve()`) — the same reason `gw_core_ctx` is. **`tdoa_collect_add()`
+  returning false is counted APART into `reject_dup` and `reject_shed`**: a
+  duplicate anchor report is harmless, whereas load shedding (every slot already
+  holding a releasable group) means this module is not draining fast enough and
+  otherwise looks at the console exactly like anchors going quiet. Honours
+  `tdoa_solve.h`'s caller contract by **zeroing `residual_m` at
+  `TDOA_MIN_ANCHORS`** rather than forwarding a number that is zero by
+  construction, with one warning per boot saying so. A GATEWAY contributes no
+  observation of its own (`blink_rx_init()` is called only from `uwb_slave.c`) —
+  correct, not a gap: it holds reserved address `0x0000`, is not in the survey,
+  and its observation could not be positioned. No host suite: its arithmetic all
+  lives in `tdoa_dtu`, `tdoa_collect` and `tdoa_solve`, which have theirs.
+  Counters read from the console with `blink stats` (second JSON line).
 - `src/tdoa_solve.{c,h}` — the Phase 3 position solver: hyperbolic 2D
   multilateration by Gauss-Newton over range DIFFERENCES (`r_i - r_0`) rather
   than ranges, with anchor 0 as the reference — same closed-form 2x2 normal

@@ -42,6 +42,7 @@ target_sources(app PRIVATE
 	src/tag_id.c
 	src/tdoa_collect.c
 	src/tdoa_dtu.c
+	src/tdoa_gw.c
 	src/tdoa_solve.c
 	src/uwb_config.c
 	src/uwb_dwtime.c
