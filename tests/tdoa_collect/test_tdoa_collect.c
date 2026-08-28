@@ -158,6 +158,41 @@ static void test_window_expiry_drops_the_group(void)
 	CHECK(n_out == 3);
 }
 
+/* tdoa_collect.c:109 branches on age_ms(...) >= TDOA_COLLECT_WINDOW_MS, so
+ * the boundary the code actually tests is the EXACT edge, not one past it.
+ * Below the minimum at exactly the window age must still discard; at or
+ * above TDOA_MIN_ANCHORS at exactly the window age must still release. */
+static void test_window_expiry_at_exact_boundary(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_obs o;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+
+	tdoa_collect_init(&c);
+
+	/* Below minimum, exactly at the boundary: must discard. */
+	o = obs(0x0D00, 5, 0, 0.0f, 0.0f, 100);
+	CHECK(tdoa_collect_add(&c, &o, 0));
+	o = obs(0x0D00, 5, 1, 10.0f, 0.0f, 110);
+	CHECK(tdoa_collect_add(&c, &o, 0));
+	CHECK(!tdoa_collect_take_ready(&c, TDOA_COLLECT_WINDOW_MS, out, &n_out,
+				       &tag_out));
+
+	/* At minimum, exactly at the boundary: must release. */
+	o = obs(0x0D01, 6, 0, 0.0f, 0.0f, 200);
+	CHECK(tdoa_collect_add(&c, &o, 0));
+	o = obs(0x0D01, 6, 1, 10.0f, 0.0f, 210);
+	CHECK(tdoa_collect_add(&c, &o, 0));
+	o = obs(0x0D01, 6, 2, 10.0f, 10.0f, 220);
+	CHECK(tdoa_collect_add(&c, &o, 0));
+	CHECK(tdoa_collect_take_ready(&c, TDOA_COLLECT_WINDOW_MS, out, &n_out,
+				      &tag_out));
+	CHECK(n_out == 3);
+	CHECK(tag_out == 0x0D01);
+}
+
 /* TDOA_COLLECT_SLOTS + 1 blinks open at once: the oldest is evicted so the
  * newest arrival always has somewhere to go. */
 static void test_slot_exhaustion_drops_oldest(void)
@@ -201,6 +236,97 @@ static void test_slot_exhaustion_drops_oldest(void)
 	CHECK(tdoa_collect_take_ready(&c, now + 2, out, &n_out, &tag_out));
 	CHECK(n_out == 4);
 	CHECK(tag_out == (uint16_t)(0x0400 + TDOA_COLLECT_SLOTS));
+}
+
+/* Slot exhaustion must not destroy an already-releasable group. Fill one
+ * slot to n == TDOA_MIN_ANCHORS (oldest, and therefore the group the OLD
+ * "evict oldest" policy would have picked), fill the rest with barely-formed
+ * n == 1 groups, then force a 17th distinct blink to arrive. The victim must
+ * be one of the incomplete groups, never the releasable oldest one -- and
+ * the releasable group must still be retrievable afterwards. */
+static void test_slot_exhaustion_protects_a_complete_group(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_obs o;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+
+	tdoa_collect_init(&c);
+
+	/* Slot 0: the oldest group, and already releasable (n == 3). */
+	uint16_t complete_tag = 0x0800;
+
+	for (uint8_t a = 0; a < TDOA_MIN_ANCHORS; a++) {
+		o = obs(complete_tag, 0, a, (float)a, 0.0f, 1000 + a);
+		CHECK(tdoa_collect_add(&c, &o, 0));
+	}
+
+	/* Slots 1..15: younger, single-observation groups. */
+	for (unsigned int i = 1; i < TDOA_COLLECT_SLOTS; i++) {
+		o = obs((uint16_t)(0x0900 + i), 0, 0, 0.0f, 0.0f, 1000);
+		CHECK(tdoa_collect_add(&c, &o, i));
+	}
+
+	/* The 17th distinct blink: every slot is full. The victim must be one of
+	 * the n == 1 groups, not the releasable oldest one. */
+	uint16_t newcomer = 0x0A00;
+	uint32_t now = TDOA_COLLECT_SLOTS;
+
+	CHECK(tdoa_collect_add(&c, &(struct tdoa_obs){
+		.tag_addr = newcomer, .blink_seq = 0, .anchor_id = 0,
+		.meas = fake_meas(0.0f, 0.0f, 1000),
+	}, now));
+
+	/* The complete group survived: at n == TDOA_MIN_ANCHORS (not
+	 * POS_MAX_ANCHORS) it still needs its window to expire before
+	 * take_ready() will hand it over -- protection means it was not
+	 * evicted, not that it jumps the release queue. */
+	uint32_t deadline = now + TDOA_COLLECT_WINDOW_MS + 1;
+
+	CHECK(tdoa_collect_take_ready(&c, deadline, out, &n_out, &tag_out));
+	CHECK(n_out == TDOA_MIN_ANCHORS);
+	CHECK(tag_out == complete_tag);
+}
+
+/* When every slot already holds a releasable group, the new observation is
+ * rejected outright rather than displacing any of them -- all
+ * TDOA_COLLECT_SLOTS pending fixes are about to be drained anyway. */
+static void test_slot_exhaustion_all_releasable_rejects_newcomer(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+
+	tdoa_collect_init(&c);
+
+	for (unsigned int i = 0; i < TDOA_COLLECT_SLOTS; i++) {
+		uint16_t tag = (uint16_t)(0x0B00 + i);
+
+		for (uint8_t a = 0; a < TDOA_MIN_ANCHORS; a++) {
+			struct tdoa_obs o = obs(tag, 0, a, (float)a, 0.0f, 1000 + a);
+
+			CHECK(tdoa_collect_add(&c, &o, i));
+		}
+	}
+
+	/* Every slot is full and releasable: rejected, not evicted-into. */
+	struct tdoa_obs newcomer = obs(0x0C00, 0, 0, 0.0f, 0.0f, 1000);
+
+	CHECK(!tdoa_collect_add(&c, &newcomer, TDOA_COLLECT_SLOTS));
+
+	/* All 16 original groups are untouched and releasable, once their
+	 * windows expire (n == TDOA_MIN_ANCHORS still waits on the window,
+	 * unlike n == POS_MAX_ANCHORS). */
+	uint32_t deadline = TDOA_COLLECT_SLOTS + TDOA_COLLECT_WINDOW_MS + 1;
+
+	for (unsigned int i = 0; i < TDOA_COLLECT_SLOTS; i++) {
+		CHECK(tdoa_collect_take_ready(&c, deadline, out, &n_out,
+					      &tag_out));
+		CHECK(n_out == TDOA_MIN_ANCHORS);
+	}
+	CHECK(!tdoa_collect_take_ready(&c, deadline, out, &n_out, &tag_out));
 }
 
 /* The same anchor_id reporting twice for one blink counts once. A duplicate
@@ -326,7 +452,10 @@ int main(void)
 	test_two_tags_do_not_mix();
 	test_below_minimum_is_not_ready();
 	test_window_expiry_drops_the_group();
+	test_window_expiry_at_exact_boundary();
 	test_slot_exhaustion_drops_oldest();
+	test_slot_exhaustion_protects_a_complete_group();
+	test_slot_exhaustion_all_releasable_rejects_newcomer();
 	test_duplicate_anchor_is_ignored();
 	test_ms_clock_wrap();
 	test_collector_feeds_solver();

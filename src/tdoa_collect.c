@@ -42,22 +42,33 @@ static struct tdoa_group *find_free(struct tdoa_collect *c)
 	return NULL;
 }
 
-/* Oldest by first_ms, measured as the largest signed age against `now_ms`.
- * Only called when every slot is in use, so it always finds one. */
-static struct tdoa_group *find_oldest(struct tdoa_collect *c, uint32_t now_ms)
+/* The least-complete group, ties broken by oldest first_ms -- the eviction
+ * victim on slot exhaustion. Never returns a group that is already
+ * RELEASABLE (n >= TDOA_MIN_ANCHORS) while a less-complete one exists,
+ * because that would destroy an already-resolvable fix to make room for a
+ * blink that may never complete. Returns NULL when every slot already holds
+ * a releasable group -- see tdoa_collect.h's slot-exhaustion note for what
+ * the caller does with that. Only called when every slot is in use. */
+static struct tdoa_group *find_eviction_victim(struct tdoa_collect *c,
+					       uint32_t now_ms)
 {
-	struct tdoa_group *oldest = &c->slot[0];
-	int32_t oldest_age = age_ms(now_ms, oldest->first_ms);
+	struct tdoa_group *victim = NULL;
+	int32_t victim_age = 0;
 
-	for (unsigned int i = 1; i < TDOA_COLLECT_SLOTS; i++) {
-		int32_t a = age_ms(now_ms, c->slot[i].first_ms);
+	for (unsigned int i = 0; i < TDOA_COLLECT_SLOTS; i++) {
+		struct tdoa_group *g = &c->slot[i];
 
-		if (a > oldest_age) {
-			oldest = &c->slot[i];
-			oldest_age = a;
+		if (g->n >= TDOA_MIN_ANCHORS) continue;   /* protected: releasable */
+
+		int32_t a = age_ms(now_ms, g->first_ms);
+
+		if (victim == NULL || g->n < victim->n ||
+		    (g->n == victim->n && a > victim_age)) {
+			victim = g;
+			victim_age = a;
 		}
 	}
-	return oldest;
+	return victim;
 }
 
 bool tdoa_collect_add(struct tdoa_collect *c, const struct tdoa_obs *o,
@@ -70,8 +81,12 @@ bool tdoa_collect_add(struct tdoa_collect *c, const struct tdoa_obs *o,
 
 	if (g == NULL) {
 		g = find_free(c);
-		if (g == NULL)
-			g = find_oldest(c, now_ms);   /* slot exhaustion: evict oldest */
+		if (g == NULL) {
+			g = find_eviction_victim(c, now_ms);
+			/* Every slot already holds a releasable group: reject rather
+			 * than destroy an already-resolvable fix. */
+			if (g == NULL) return false;
+		}
 
 		g->tag_addr    = o->tag_addr;
 		g->blink_seq   = o->blink_seq;

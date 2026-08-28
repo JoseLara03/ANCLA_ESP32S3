@@ -394,16 +394,32 @@ sync master                    transmit half — CCP sent/dropped counts as
   silently discarded. A duplicate report from the same `anchor_id` for the
   same blink (an MQTT redelivery, a retry) is rejected, not folded in twice —
   doing so would hand the solver a zero-difference equation against itself
-  and make its normal matrix singular. **Slot exhaustion (a 17th distinct
-  blink while all `TDOA_COLLECT_SLOTS` (16) are open) evicts the OLDEST
-  group, not the newest arrival** — the oldest is furthest from completion
-  and closest to its own timeout anyway, so it would likely be discarded on
-  the very next call regardless; same policy `net_uplink_submit()` uses for
-  its bounded queue, and for the same reason. `O(TDOA_COLLECT_SLOTS)` linear
-  search per call, bounded and allocation-free, safe to call from the
-  `K_PRIO_COOP(0)` gateway loop. Host-tested in `tests/tdoa_collect/`,
-  including an end-to-end test that feeds a collected group straight into
-  `tdoa_solve()`.
+  and make its normal matrix singular. **Slot exhaustion (a 17th distinct blink
+  while all `TDOA_COLLECT_SLOTS` (16) are open) evicts the LEAST COMPLETE
+  group, ties broken by oldest — never the newest arrival, and never a
+  group that has already reached `TDOA_MIN_ANCHORS`.** A first revision of
+  this module evicted strictly by age on the theory that the oldest group
+  was "furthest from completion" — backwards: the oldest group has had the
+  MOST time to fill, so it is the group MOST LIKELY to already be
+  releasable, and evicting it can silently destroy a fix the gateway could
+  already have produced while making room for a blink that may never
+  complete. Fixed in code review before this ever shipped. A group already
+  RELEASABLE (`n >= TDOA_MIN_ANCHORS`) is therefore protected from eviction
+  while any less-complete group exists; if every slot already holds a
+  releasable group, the new observation is REJECTED rather than displacing
+  one of them, since all of them are about to be drained by the next
+  `tdoa_collect_take_ready()` call regardless. The `net_uplink_submit()`
+  precedent for "evict to make room" is real but only partially transfers:
+  that queue holds exclusively already-completed fixes, so its worst case
+  is losing one finished reading, whereas this module's groups range from
+  zero observations to fully resolvable — which is exactly why
+  completeness, not age, has to be the primary eviction key here.
+  `O(TDOA_COLLECT_SLOTS)` linear search per call, bounded and
+  allocation-free, safe to call from the `K_PRIO_COOP(0)` gateway loop.
+  Host-tested in `tests/tdoa_collect/`, including an end-to-end test that
+  feeds a collected group straight into `tdoa_solve()`, and a dedicated
+  test that proves a releasable group survives slot exhaustion that would
+  have evicted it under the old, age-only policy.
 - `src/tdoa_solve.{c,h}` — the Phase 3 position solver: hyperbolic 2D
   multilateration by Gauss-Newton over range DIFFERENCES (`r_i - r_0`) rather
   than ranges, with anchor 0 as the reference — same closed-form 2x2 normal

@@ -18,16 +18,39 @@
  * out long before its seq value could recur. No extra disambiguator is
  * needed.
  *
- * ---- Slot exhaustion: drop the OLDEST group, not the new one -------------
+ * ---- Slot exhaustion: drop the LEAST COMPLETE group, not the oldest -------
  *
  * TDOA_COLLECT_SLOTS (16) open groups is already generous for one BLINK
  * period, so this only fires under packet loss or backhaul jitter piling up
- * stale groups. The oldest group is furthest from completion and closest to
- * its own window timeout anyway -- it would very likely be discarded on the
- * next tdoa_collect_take_ready() regardless. Evicting it to make room for a
- * fresh blink is the same call net_uplink_submit() makes for its bounded
- * queue, and for the same reason: an old, probably-dead item is worth less
- * than telemetry that just arrived.
+ * stale groups. An earlier revision of this module evicted the OLDEST group
+ * outright, on the theory that it was "furthest from completion and closest
+ * to its own timeout anyway" -- that reasoning is backwards. The oldest
+ * group has had the MOST time to fill, so it is the group MOST likely to
+ * already be complete, not least. Evicting strictly by age can therefore
+ * destroy an already-resolvable fix -- one sitting complete, merely waiting
+ * for the next tdoa_collect_take_ready() drain -- to make room for a blink
+ * that has not gathered a single observation yet and may never complete.
+ * That is a materially worse loss than dropping a still-forming group, and
+ * with take_ready() drained only once per superframe (200 ms) against a
+ * 150 ms window, a complete group can genuinely sit waiting when the 17th
+ * distinct blink arrives.
+ *
+ * So the victim is chosen by COMPLETENESS first, age second: the group with
+ * the fewest observations gathered, ties broken by oldest first_ms. Any
+ * group already RELEASABLE (n >= TDOA_MIN_ANCHORS -- a fix the gateway can
+ * actually produce) is never evicted while a less-complete group exists to
+ * take its place instead. If every slot already holds a releasable group,
+ * the new observation is REJECTED rather than destroying one of them: all
+ * TDOA_COLLECT_SLOTS pending fixes are about to be drained by the next
+ * take_ready() call regardless, so refusing one more inbound observation
+ * costs less than discarding a fix that is already resolvable.
+ *
+ * The net_uplink_submit() precedent for "evict to make room" is real but
+ * does not transfer whole: that queue only ever holds ALREADY-COMPLETED
+ * fixes, so its worst case is dropping one finished reading. This module's
+ * groups span the full range from zero observations to fully resolvable, so
+ * an eviction policy here has to protect completeness explicitly rather than
+ * relying on age as a proxy for it.
  *
  * ---- Release rule ---------------------------------------------------------
  *
@@ -96,11 +119,14 @@ void tdoa_collect_init(struct tdoa_collect *c);
  * for a (tag_addr, blink_seq) pair not currently held.
  *
  * Returns false, and changes nothing, when the observation cannot be used:
- * anchor_id >= POS_MAX_ANCHORS, or the anchor has already reported for this
+ * anchor_id >= POS_MAX_ANCHORS, the anchor has already reported for this
  * exact blink (a duplicate -- an MQTT redelivery or a retry -- which would
  * otherwise feed tdoa_solve() the same range difference twice and make its
- * normal matrix singular against itself). Returns true once the observation
- * is stored, whether or not the group is ready yet.
+ * normal matrix singular against itself), or every slot is full AND already
+ * holds a releasable group (n >= TDOA_MIN_ANCHORS) -- see the slot-exhaustion
+ * note above for why a new, unformed blink loses that contest rather than
+ * displacing a fix that already exists. Returns true once the observation is
+ * stored, whether or not the group is ready yet.
  *
  * O(TDOA_COLLECT_SLOTS) linear search, bounded and allocation-free -- safe to
  * call from the K_PRIO_COOP(0) gateway loop.
