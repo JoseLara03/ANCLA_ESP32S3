@@ -378,6 +378,32 @@ sync master                    transmit half — CCP sent/dropped counts as
   byte-identity rule as `ccp_frame.c`/`apos_frame.c` — the tag carries a
   byte-identical copy, this repo is the source of truth for it. Pure C,
   host-tested in `tests/blink_frame/`.
+- `src/tdoa_collect.{c,h}` — groups the observations different anchors make of
+  the SAME tag BLINK before `tdoa_solve()` ever sees them, keyed on
+  `(tag_addr, blink_seq)`. Pure C, no radio and no clock of its own —
+  `now_ms` is supplied by the caller on every call, and every comparison
+  against it is a signed difference, so a wrapping or repeated millisecond
+  counter cannot corrupt state. `blink_seq` wraps at 256, which even at 5 Hz
+  is 51.2 s between two blinks sharing a value — far longer than
+  `TDOA_COLLECT_WINDOW_MS` (150 ms, deliberately under one 200 ms
+  superframe), so a group always closes or times out long before its `seq`
+  could recur; no extra disambiguator is needed. A group releases as soon as
+  it is COMPLETE (`POS_MAX_ANCHORS` distinct anchors reported) or, short of
+  that, once its window has expired with at least `TDOA_MIN_ANCHORS`
+  gathered — fewer than that is not resolvable in 2D and the group is
+  silently discarded. A duplicate report from the same `anchor_id` for the
+  same blink (an MQTT redelivery, a retry) is rejected, not folded in twice —
+  doing so would hand the solver a zero-difference equation against itself
+  and make its normal matrix singular. **Slot exhaustion (a 17th distinct
+  blink while all `TDOA_COLLECT_SLOTS` (16) are open) evicts the OLDEST
+  group, not the newest arrival** — the oldest is furthest from completion
+  and closest to its own timeout anyway, so it would likely be discarded on
+  the very next call regardless; same policy `net_uplink_submit()` uses for
+  its bounded queue, and for the same reason. `O(TDOA_COLLECT_SLOTS)` linear
+  search per call, bounded and allocation-free, safe to call from the
+  `K_PRIO_COOP(0)` gateway loop. Host-tested in `tests/tdoa_collect/`,
+  including an end-to-end test that feeds a collected group straight into
+  `tdoa_solve()`.
 - `src/tdoa_solve.{c,h}` — the Phase 3 position solver: hyperbolic 2D
   multilateration by Gauss-Newton over range DIFFERENCES (`r_i - r_0`) rather
   than ranges, with anchor 0 as the reference — same closed-form 2x2 normal
@@ -1535,6 +1561,9 @@ gcc -Wall -Wextra -Isrc -o tests/pos_residual/test_pos_residual.exe tests/pos_re
 
 gcc -Wall -Wextra -Isrc -o tests/pos_solver/test_pos_solver.exe tests/pos_solver/test_pos_solver.c src/pos_solver.c src/pos_residual.c -lm
 ./tests/pos_solver/test_pos_solver.exe          # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/tdoa_collect/test_tdoa_collect.exe tests/tdoa_collect/test_tdoa_collect.c src/tdoa_collect.c src/tdoa_solve.c src/pos_residual.c -lm
+./tests/tdoa_collect/test_tdoa_collect.exe      # tdoa_collect: ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -o tests/tdoa_solve/test_tdoa_solve.exe tests/tdoa_solve/test_tdoa_solve.c src/tdoa_solve.c src/pos_residual.c -lm
 ./tests/tdoa_solve/test_tdoa_solve.exe          # tdoa_solve: ALL TESTS PASSED, exits 0
