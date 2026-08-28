@@ -1694,6 +1694,55 @@ sync master                    transmit half — CCP sent/dropped counts as
   and the fit's own residual (24 mm) is a floor on what the method can resolve,
   not a proven accuracy.
 
+## Reporting progress on multi-task work
+
+The operator asked (2026-08-28) to be given, for any task being worked on, its
+**percentage complete, its elapsed duration, and an estimated finish** — and for
+those estimates to be grounded rather than invented. Convention, so the numbers
+mean the same thing every time:
+
+- **Percent** is stages finished out of the stages a task actually has, not a
+  feeling. A task under the SDD loop has four: implement, review, fix round,
+  scoped re-review. A task with a clean first review has three and skips
+  straight from review to done. Say which denominator is in use, because a task
+  at "2 of 3" and one at "2 of 4" are not equally far along.
+- **Duration** is wall-clock agent time, taken from the actual run, never
+  estimated after the fact.
+- **Estimated finish** is the per-stage medians below multiplied by the stages
+  remaining. Label it an estimate every time. It is a median of a sample of two
+  tasks, so treat it as an order of magnitude, not a commitment.
+- **Report the estimate again when it moves**, not only at the start. An
+  estimate quietly left stale is worse than none.
+
+Measured on this plan (Phase 3, Tasks 5 and 6, one agent per stage):
+
+| stage             | T5     | T6     | median |
+|-------------------|--------|--------|--------|
+| implement         | 17.7 m | 16.8 m | 17.3 m |
+| review            | 11.7 m | 11.3 m | 11.5 m |
+| fix round         | died   |  7.9 m |  7.9 m |
+| scoped re-review  |  5.9 m |  6.8 m |  6.3 m |
+| **full cycle**    | —      | **42.8 m** | **~43 m** |
+
+Three things that distort those figures and should be said out loud rather than
+buried in a margin:
+
+- **Orchestration between stages is not counted.** Building the review package,
+  ruling on findings, verifying claims independently and writing the ledger all
+  happen between agents and add materially to wall clock.
+- **Agents die.** Three subagent deaths on the org monthly spend limit happened
+  during this plan alone, one of them mid-fix-round. A dead agent is not lost
+  work — it had already committed, and the recovery is to VERIFY and resume,
+  never to restart — but it does add an unpredictable stage.
+- **A task that needs no fix round finishes in about 35 minutes, not 43.** The
+  fix round is the variance, and whether a task needs one is not knowable in
+  advance.
+
+Above all: these are estimates of when the CODE is written and reviewed. They
+say nothing about when it WORKS, because nothing here is verified on hardware
+until a board runs it. Do not let a schedule figure be read as a completion
+figure.
+
 ## System context
 
 Ranging is Two-Way Ranging (TWR); distance is computed on the tag, not the
