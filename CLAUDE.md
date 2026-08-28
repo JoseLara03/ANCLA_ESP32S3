@@ -370,6 +370,29 @@ sync master                    transmit half — CCP sent/dropped counts as
   `T_GUARD_UUS` (488, the 0.5 ms superframe partition guard from the MAC
   contract §2) is **not** `BEACON_GUARD_UUS` (1500, the slave's TX-suppression
   window around the beacon). Confusing the two triples the charged overhead.
+- `src/blink_rx.{c,h}` — the anchor side of TDoA: stamp a tag's BLINK and hand
+  the observation to the uplink. **Receive-only — it adds no UWB transmission
+  to any node**, which is what makes Phase 3 survivable on hardware whose PA
+  supply cannot sustain a second frame per superframe (see the battery/CCP
+  entry under Hard-won facts). It holds no arithmetic of its own, the same
+  split `ccp_slave.c` makes: the conversion into the master's time base is
+  `sync_model_to_master()`, host-tested, and what lives here is the part a
+  host test cannot reach — a real RX timestamp from a real DW3220 and the
+  decision to **DISCARD** when the local clock cannot be expressed in the
+  master's base. **Discarding is the correct outcome, not a failure**: an
+  observation with no common time base is noise, and fed to `tdoa_solve()` it
+  would move the reported position by however far the two anchors' clocks
+  happen to be apart, indistinguishable from a real path difference. It is
+  dropped and counted (`blink_rx_stats()`'s `n_no_sync`), never published with
+  a local or guessed timestamp. `n_rx > 0` with `n_no_sync == n_rx` and
+  `n_sent` flat is a board hearing tags fine while its CCP link is down —
+  read `sync stats` (and check the gateway is on USB-C) before suspecting the
+  radio. Dispatched from `uwb_slave.c` immediately after `ccp_slave_on_rx()`
+  and before the responder chain: the CCP is what makes a BLINK convertible,
+  and nothing between the timestamp read and its conversion should be allowed
+  to spend time. No host suite on purpose — everything it calls is already
+  host-tested and the only thing a test could reach is the counters; its
+  verification is on hardware.
 - `src/blink_frame.{c,h}` — the BLINK wire format for Phase 3 TDoA: a tag
   emits this instead of running a ranging sweep, every anchor that hears it
   timestamps it, and the gateway solves. Function code `0xF0`, the first code
@@ -669,7 +692,25 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `src/net_store.{c,h}` — the above persisted under the `net/` settings subtree.
 - `src/net_shell.c` — the `net` console command tree.
 - `src/net_uplink.{c,h}` — the WiFi + MQTT uplink thread and the bounded fix
-  queue. GATEWAY mode only.
+  queue. **No longer GATEWAY-only: since Phase 3 it starts in BOTH modes**, and
+  the header's old "a slave has nothing to publish" claim is rewritten rather
+  than left standing — an anchor's BLINK observations ARE the TDoA measurement
+  and there is no UWB backhaul for them. Two directions, gated on one
+  `is_gateway` flag read once at thread start: a GATEWAY publishes fixes, keeps
+  publishing the retained anchor map, and SUBSCRIBES to
+  `POS_JSON_TOPIC_BLINK` (`net_uplink_get_obs()` drains what arrives, from the
+  gateway loop); a SLAVE publishes observations (`net_uplink_submit_blink()`)
+  and deliberately does NOT publish the retained map — four anchors
+  overwriting one retained document would be a real fault, not redundancy.
+  The subscribe lives at the end of `mqtt_bring_up()` on purpose: every
+  reconnect passes through it, so re-subscribing is automatic instead of a
+  forgettable special case, and a missing SUBACK aborts the connection rather
+  than leaving a gateway that publishes but is silently **deaf**. Both queues
+  drop the OLDEST entry when full, counted in `net_uplink_obs_stats()`.
+  Note this file is in the UNCONDITIONAL `target_sources` block, so it also
+  compiles into the CALIBRATION image where `CONFIG_NETWORKING=n`: every
+  public symbol needs a stub in the `#else` half or the cal image fails to
+  LINK.
 - `src/cal_math.{c,h}` — the pure-C antenna-delay solver, copied verbatim from
   the tag (`tag_testting/src/`), same rule as `uwb_frame_802_15_4z.c`: keep it
   byte-identical so this stays a copy the tag and the anchor share rather than

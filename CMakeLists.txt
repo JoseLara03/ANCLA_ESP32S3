@@ -19,6 +19,7 @@ target_sources(app PRIVATE
 	src/apos_table.c
 	src/beacon_guard.c
 	src/blink_frame.c
+	src/blink_rx.c
 	src/ccp_frame.c
 	src/ccp_master.c
 	src/ccp_slave.c

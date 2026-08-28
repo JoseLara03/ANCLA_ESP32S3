@@ -18,6 +18,7 @@
 #include "anchor_respond.h"
 #include "apos_node.h"
 #include "beacon_guard.h"
+#include "blink_rx.h"
 #include "ccp_slave.h"
 #include "uwb_debug.h"
 #include "uwb_dwtime.h"
@@ -282,6 +283,7 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		cfg->anchor_id, uwb_config_short_addr(cfg));
 
 	apos_node_init();
+	blink_rx_init(cfg);
 	ccp_slave_init();
 
 	beacon_guard_init(&bguard, UUS_TO_HI32(T_SUPERFRAME_UUS),
@@ -358,6 +360,19 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		 * and is for nobody else, so there is no reason to walk it past
 		 * the survey and ranging responders. */
 		if (ccp_slave_on_rx(rx_buf, plen, rx_ts)) {
+			rx_arm();
+			continue;
+		}
+
+		/* A BLINK is nobody else's either, and its timestamp IS the
+		 * datum: it is handled before the responder chain so no branch
+		 * of that chain can spend time between reading the timestamp
+		 * and converting it. It transmits nothing, so it does not
+		 * interact with the beacon guard. Deliberately AFTER the CCP:
+		 * the CCP is what makes a BLINK convertible at all, so if both
+		 * ever land in one turn of the loop, the frame that sustains
+		 * the clock model goes first. */
+		if (blink_rx_on_rx(rx_buf, plen, rx_ts, cir_quality)) {
 			rx_arm();
 			continue;
 		}
