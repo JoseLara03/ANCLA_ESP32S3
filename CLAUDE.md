@@ -378,6 +378,34 @@ sync master                    transmit half — CCP sent/dropped counts as
   byte-identity rule as `ccp_frame.c`/`apos_frame.c` — the tag carries a
   byte-identical copy, this repo is the source of truth for it. Pure C,
   host-tested in `tests/blink_frame/`.
+- `src/tdoa_solve.{c,h}` — the Phase 3 position solver: hyperbolic 2D
+  multilateration by Gauss-Newton over range DIFFERENCES (`r_i - r_0`) rather
+  than ranges, with anchor 0 as the reference — same closed-form 2x2 normal
+  equations and determinant test as `src/pos_solver.c`, whose iteration
+  constants (`POS_GN_MAX_ITERS`, `POS_GN_CONVERGE_M`, `POS_GN_DET_EPS`) it
+  copies rather than re-picks. Consumes `struct tdoa_meas` (anchor position,
+  `dz`, and a timestamp already converted into the common time base by
+  `sync_model_to_master()`) and produces the same `struct pos_result`
+  `pos_solver.h` defines. **`n` anchors give `n-1` range-difference equations
+  against 2 unknowns** — the same isostatic trap `CLAUDE.md` already documents
+  for the anchor survey. At `n == TDOA_MIN_ANCHORS` (3) that is exactly
+  determined, so Gauss-Newton re-fits any timestamps exactly and
+  `out->residual_m` reads (numerically) zero regardless of how wrong the
+  input is; `out->residual_m` only becomes a real (if weak) quality signal
+  from `n_used == 4`, where there is one spare equation. There is no field to
+  flag this — `struct pos_result` is the tag's own copy and this task must
+  not touch it — so the rule is stated as a hard caller contract in
+  `tdoa_solve.h` instead: never read `out->residual_m` as evidence of fit
+  quality when `out->n_used == TDOA_MIN_ANCHORS`.
+  `tests/tdoa_solve/test_three_anchor_residual_is_structurally_zero()`
+  demonstrates it directly: a 2 m timestamp error moves the fix 2.4 m off the
+  true position while `residual_m` stays under a millimetre. Also computes
+  `d_i = (t_i - t_0) * TDOA_M_PER_DTU` with the `int64_t` subtraction done
+  BEFORE any float conversion — these are raw DW3220 device times up to
+  ~2^40, and a float32's 24-bit mantissa only resolves ~65536 DTU (307 m) at
+  that magnitude, so subtracting after converting to float would silently
+  destroy the measurement while still returning a plausible-looking answer.
+  Pure C, no CMSIS-DSP, host-tested in `tests/tdoa_solve/`.
 - `src/ccp_frame.{c,h}` — the clock-calibration-packet wire format, function
   code `0xEF`. Deliberately NOT in `uwb_frame_802_15_4z.c` (byte-identical with
   the tag, which has no use for CCPs), same precedent `apos_frame.c` set. Pure
@@ -1507,10 +1535,17 @@ gcc -Wall -Wextra -Isrc -o tests/pos_residual/test_pos_residual.exe tests/pos_re
 
 gcc -Wall -Wextra -Isrc -o tests/pos_solver/test_pos_solver.exe tests/pos_solver/test_pos_solver.c src/pos_solver.c src/pos_residual.c -lm
 ./tests/pos_solver/test_pos_solver.exe          # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/tdoa_solve/test_tdoa_solve.exe tests/tdoa_solve/test_tdoa_solve.c src/tdoa_solve.c src/pos_residual.c -lm
+./tests/tdoa_solve/test_tdoa_solve.exe          # tdoa_solve: ALL TESTS PASSED, exits 0
 ```
 
-`-lm` is required by the suites that link `apos_geom.c`, `pos_solver.c` or
-`pos_residual.c` — they call `sqrtf`/`fabsf`. The others do not need it.
+`-lm` is required by the suites that link `apos_geom.c`, `pos_solver.c`,
+`pos_residual.c` or `tdoa_solve.c` — they call `sqrtf`/`fabsf`. The others do
+not need it. `tests/tdoa_solve/` links `pos_residual.c` only because its build
+line matches the sibling `pos_solver` suite's shape for consistency; the
+solver itself does not call into it — see the entry on `src/tdoa_solve.c`
+above for why it computes its own range-DIFFERENCE residual instead.
 
 `tests/mac_budget/test_uwb_mac_asserts.c` needs `-Itests/mac_budget/shim`, which
 supplies a `zephyr/sys/util.h` defining `BUILD_ASSERT` as `_Static_assert`. That

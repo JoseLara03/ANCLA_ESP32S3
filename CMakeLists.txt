@@ -38,6 +38,7 @@ target_sources(app PRIVATE
 	src/sync_model.c
 	src/sync_shell.c
 	src/tag_id.c
+	src/tdoa_solve.c
 	src/uwb_config.c
 	src/uwb_dwtime.c
 	src/uwb_frame_802_15_4z.c
