@@ -44,17 +44,65 @@
 
 #include "gw_core.h"
 
-/* Per-call bounds. INGEST_MAX x (one k_msgq_get + one linear scan of
- * TDOA_COLLECT_SLOTS) and SOLVE_MAX x (one Gauss-Newton solve over <= 4
- * anchors) are both tens of microseconds against BEACON_ARM_MARGIN_UUS
- * (5000 uus) -- and this runs a whole superframe away from the next arm, not
- * next to it. At 4 anchors x 5 Hz x 8 movers, 8 observations per superframe is
- * the steady-state arrival rate, so the bound throttles a burst rather than
- * the normal case. Raising either without re-reading the beacon heartbeat on
- * hardware is exactly the mistake CLAUDE.md's TX_COMPLETE_TIMEOUT_MS entries
- * document. */
-#define TDOA_GW_INGEST_MAX  8u
-#define TDOA_GW_SOLVE_MAX   2u
+/* ---- Per-call bounds, and the tag capacity they buy -----------------------
+ *
+ * THE ARRIVAL RATE. Re-derive this for your own site rather than trusting the
+ * numbers below; every term is a deployment parameter:
+ *
+ *   observations per superframe = anchors x blink_rate_hz x tags x 0.2
+ *   groups       per superframe =           blink_rate_hz x tags x 0.2
+ *
+ * (0.2 because T_SUPERFRAME_UUS is 200 ms, i.e. five superframes a second.)
+ * At this project's deployment -- 4 surveyed anchors, 5 Hz BLINK -- that is
+ * 4 observations and 1 group per superframe PER TAG. An earlier revision of
+ * this comment said 8 observations per superframe at "4 anchors x 5 Hz x 8
+ * movers"; that is the arithmetic for TWO tags, wrong by 4x, and it made a
+ * hard 2-tag ceiling look like generous burst headroom.
+ *
+ * WHAT tdoa_gw_step() MUST SUSTAIN, then, is INGEST_MAX >= 4 x tags and --
+ * because tdoa_collect_take_ready() releases AT MOST ONE group per call --
+ * SOLVE_MAX >= tags. Under either bound the shortfall does not queue up
+ * politely: it accumulates in net_uplink's obs_q (OBS_QUEUE_DEPTH, 32) which
+ * EVICTS THE OLDEST when full, so the loss lands upstream of this module and
+ * shows on `blink stats` as rx_drop_evict, not as anything here.
+ *
+ * THE BUDGET. The binding constraint is NOT BEACON_ARM_MARGIN_UUS: this runs
+ * at the TOP of the outer loop, immediately after a beacon went out, so the
+ * next arm is a whole T_SUPERFRAME_UUS (200 ms) away rather than 5 ms. What is
+ * actually at stake is the CAP service window -- every microsecond spent here
+ * is a microsecond the inner loop is not servicing JOIN/GRANT/POS RX -- so the
+ * self-imposed budget is 1 % of a superframe, 2 ms. Against that:
+ *
+ *   ingest: one k_msgq_get + a <= APOS_MAX_NODES survey scan + two bounded
+ *           TDOA_COLLECT_SLOTS scans, all integer  --  order 10 us, call it
+ *           32 x 10 us = 320 us
+ *   solve:  one Gauss-Newton fit over <= 4 anchors, POS_GN_MAX_ITERS of
+ *           single-precision sqrtf on the S3's FPU  --  conservatively 100 us,
+ *           call it 8 x 100 us = 800 us
+ *
+ * ~1.1 ms of the 2 ms budget, and both figures are ESTIMATES: they have never
+ * been measured on hardware. The instrument that settles it is the gw_sf
+ * heartbeat staying at exactly 200.0 ms with no "beacon started but TXFRS
+ * never completed", which is what turned APOS_GW_SOLVE_BUDGET_UUS from an
+ * estimate into a measured number. Raising either constant without re-reading
+ * that heartbeat is exactly the mistake CLAUDE.md's TX_COMPLETE_TIMEOUT_MS
+ * entries document.
+ *
+ * THE VALUES, AND THE CEILING THEY DOCUMENT. INGEST_MAX is set equal to
+ * OBS_QUEUE_DEPTH so that one step can always drain a full queue -- this
+ * module can then never be the reason the queue evicts. SOLVE_MAX follows from
+ * the same tag count:
+ *
+ *   4 anchors, 5 Hz  ->  32 / 4 = 8 TAGS, and 8 groups per superframe = 8 tags
+ *
+ * So this gateway sustains EIGHT tags at 5 Hz, and that is the ceiling to
+ * check against a site, not a burst allowance. It is also where obs_q's own
+ * depth of 32 puts the ceiling, so raising these two alone would buy nothing.
+ * At more than 8 tags, or a faster BLINK rate, the honest fix is to raise
+ * OBS_QUEUE_DEPTH and both of these together, and then re-read the heartbeat.
+ * The previous values (8 / 2) capped the system at TWO tags. */
+#define TDOA_GW_INGEST_MAX  32u
+#define TDOA_GW_SOLVE_MAX   8u
 
 /* Clear the collector and every cache. Call once, before the gateway loop. */
 void tdoa_gw_init(void);

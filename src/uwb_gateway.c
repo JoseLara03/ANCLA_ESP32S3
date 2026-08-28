@@ -524,7 +524,20 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 		 * NOT in the inner for(;;): observations arrive on the uplink
 		 * thread's cadence (POLL_TIMEOUT_MS, 50 ms) and not on RX events,
 		 * so running it per RX event would be hundreds of calls per
-		 * superframe for no gain. */
+		 * superframe for no gain.
+		 *
+		 * NOTE, and it is a gap in the instrument rather than a hazard
+		 * today: this runs BEFORE loop_entry_ms is sampled, so the stall
+		 * watchdog below -- which measures the INNER loop -- cannot see
+		 * the time this call takes. The work is bounded by
+		 * TDOA_GW_INGEST_MAX / TDOA_GW_SOLVE_MAX and neither bound is
+		 * derived from anything an anchor or a broker controls, so a slow
+		 * step is not a way this can fail today; but a step that ever DID
+		 * become slow would not be reported by the instrument built for
+		 * exactly that. The gw_sf heartbeat above is what would show it,
+		 * one superframe later. Placement right after the beacon is
+		 * deliberate (see above) -- do not move this call to satisfy the
+		 * watchdog without a reason. */
 		tdoa_gw_step(&ctx, k_uptime_get_32());
 
 		int64_t loop_entry_ms = k_uptime_get();

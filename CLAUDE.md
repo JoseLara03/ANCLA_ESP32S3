@@ -521,6 +521,32 @@ sync master                    transmit half — CCP sent/dropped counts as
   correct, not a gap: it holds reserved address `0x0000`, is not in the survey,
   and its observation could not be positioned. No host suite: its arithmetic all
   lives in `tdoa_dtu`, `tdoa_collect` and `tdoa_solve`, which have theirs.
+  Carries the one piece of new POLICY in Phase 3 that can silently DISCARD a
+  valid fix, recorded here rather than left in the source: a per-tag seed memo
+  (`TDOA_GW_SEED_SLOTS`, 16, LRU) remembers each tag's last fix and battery
+  reading, and a fix landing more than **`TDOA_GW_MAX_JUMP_M` (10 m)** from a
+  seed younger than `TDOA_GW_SEED_AGE_MS` (1000 ms) is REJECTED and counted in
+  `jump`. 10 m in 1 s is 36 km/h; the gate exists because `tdoa_solve.h` warns
+  that a tag outside the anchor hull can converge on the MIRROR branch and
+  still report `valid`, with a residual that cannot say so. The memo therefore
+  has TWO timestamps: `pos_ms` (written only with x/y, and what seed freshness
+  is judged on) and `last_ms` (touched by every observation, and what LRU
+  eviction uses), plus a `has_pos` flag. A single shared timestamp — which is
+  what this task's brief specified — makes a tag's FIRST observation look like
+  a fresh previous fix at **(0, 0)**, so that tag's first real fix is measured
+  against the origin and, more than 10 m away, rejected forever with nothing in
+  the log but "jumps more than 10.0 m". Caught in review before it shipped, and
+  the reason this policy is documented here at all.
+  `TDOA_GW_INGEST_MAX` (32) and `TDOA_GW_SOLVE_MAX` (8) sustain **8 tags at
+  5 Hz over 4 anchors** — observations per superframe = anchors x blink_rate x
+  tags x 0.2, groups per superframe = blink_rate x tags x 0.2, and
+  `tdoa_collect_take_ready()` releases at most ONE group per call. That is the
+  same ceiling `OBS_QUEUE_DEPTH` (32) imposes, so all three move together or
+  not at all; past it the loss lands UPSTREAM as `rx_drop_evict`, never as
+  `reject_shed`. Every per-observation and per-fix `LOG_WRN` here is **once per
+  boot** (counters carry the magnitudes): this runs on the `K_PRIO_COOP(0)`
+  loop, where `CONFIG_LOG_MODE_OVERFLOW` lets a steady condition destroy the
+  very records an operator is reading.
   Counters read from the console with `blink stats` (second JSON line).
 - `src/tdoa_solve.{c,h}` — the Phase 3 position solver: hyperbolic 2D
   multilateration by Gauss-Newton over range DIFFERENCES (`r_i - r_0`) rather

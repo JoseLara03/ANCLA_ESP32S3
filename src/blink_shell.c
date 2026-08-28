@@ -117,13 +117,35 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 			   "unsurveyed gateway solves nothing at all.",
 			   s_no_anchor);
 	}
+	/* Overload shows up UPSTREAM of tdoa_gw, so this verdict reads the
+	 * evict counter on the line above, not `reject_shed`. tdoa_gw_step()
+	 * ingests at most TDOA_GW_INGEST_MAX per superframe; anything beyond
+	 * that never leaves net_uplink's obs_q, which drops the OLDEST when
+	 * full. So the collector's slots stay comfortable and `reject_shed`
+	 * can sit at zero through a total overload -- the loss is already
+	 * counted, as rx_drop_evict, before this module ever sees it. */
+	if (d_evict > 0u) {
+		shell_warn(sh,
+			   "%u observation(s) were EVICTED from the receive "
+			   "queue before the gateway could ingest them: this "
+			   "board is not draining fast enough for the tag "
+			   "count. observations/superframe = anchors x "
+			   "blink_rate x tags x 0.2; TDOA_GW_INGEST_MAX (%u) "
+			   "and TDOA_GW_SOLVE_MAX (%u) sustain 8 tags at 5 Hz "
+			   "over 4 anchors, and OBS_QUEUE_DEPTH caps it there "
+			   "too. Re-read the gw_sf heartbeat after raising "
+			   "any of them.",
+			   d_evict, (unsigned int)TDOA_GW_INGEST_MAX,
+			   (unsigned int)TDOA_GW_SOLVE_MAX);
+	}
 	if (s_shed > 0u) {
 		shell_warn(sh,
-			   "%u observation(s) were SHED, not duplicated: every "
-			   "collector slot already held a releasable group, so "
-			   "this gateway is not draining fast enough. "
-			   "TDOA_GW_SOLVE_MAX is the knob, and the gw_sf "
-			   "heartbeat must be re-read after touching it.",
+			   "%u observation(s) were SHED by the collector (NOT "
+			   "duplicates): every slot already held a releasable "
+			   "group. Rarer than the evict case above and it "
+			   "means the same thing - TDOA_GW_SOLVE_MAX is the "
+			   "knob, and the gw_sf heartbeat must be re-read "
+			   "after touching it.",
 			   s_shed);
 	}
 	if (s_implaus > 0u) {

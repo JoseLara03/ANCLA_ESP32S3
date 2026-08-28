@@ -81,9 +81,27 @@ static uint32_t n_implausible;
 static uint32_t n_solve_fail;
 static uint32_t n_jump;
 
-/* One warning per boot, not one per fix: a three-anchor deployment produces
- * this condition on EVERY fix, and five lines a second is not a log. */
+/* Warn ONCE PER BOOT for each of these, and let the counters carry the rest.
+ * All three conditions are per-observation or per-fix and all three persist for
+ * as long as their cause does, so an unconditional LOG_WRN is 4 x 5 x tags
+ * records a second enqueued from the K_PRIO_COOP(0) beacon loop, forever. The
+ * enqueue itself is cheap under deferred logging, but CONFIG_LOG_MODE_OVERFLOW
+ * then OVERWRITES older records -- including the very lines an operator would
+ * be reading to work out why the gateway is unsurveyed. Same instinct as the
+ * apos/ccp rate-limited summaries; `blink stats` is where the magnitudes live.
+ *
+ * THE GAP, stated rather than left to be discovered: once per BOOT, not once
+ * per episode. A 4-anchor deployment that DEGRADES to 3 anchors mid-session
+ * warns once and then stays quiet even though the condition is new, and a
+ * survey applied while the gateway runs silences nothing that already fired.
+ * Accepted: the counters (`blink stats`) are the live signal, and a warning
+ * that can re-arm needs an episode notion this module has no reason to own. */
 static bool warned_blind_residual;
+static bool warned_no_anchor;
+static bool warned_shed;
+static bool warned_implausible;
+static bool warned_solve_fail;
+static bool warned_jump;
 
 void tdoa_gw_init(void)
 {
@@ -98,6 +116,11 @@ void tdoa_gw_init(void)
 	n_solve_fail  = 0u;
 	n_jump        = 0u;
 	warned_blind_residual = false;
+	warned_no_anchor = false;
+	warned_shed = false;
+	warned_implausible = false;
+	warned_solve_fail = false;
+	warned_jump = false;
 }
 
 /* Where anchor `anchor_id` is, from the applied survey.
@@ -238,8 +261,14 @@ static bool ingest_one(uint32_t now_ms)
 
 	if (!anchor_xyz(obs.anchor_id, &t.meas.x, &t.meas.y, &z)) {
 		n_no_anchor++;
-		LOG_WRN("observation from anchor %u: not in the applied survey "
-			"- dropped", obs.anchor_id);
+		if (!warned_no_anchor) {
+			warned_no_anchor = true;
+			LOG_WRN("observation from anchor %u: not in the applied "
+				"survey - dropped. Warned ONCE; `blink stats` "
+				"carries the count. On an unsurveyed gateway "
+				"EVERY observation lands here",
+				obs.anchor_id);
+		}
 		return true;
 	}
 
@@ -269,10 +298,15 @@ static bool ingest_one(uint32_t now_ms)
 		 * load this way otherwise looks identical to anchors that
 		 * stopped publishing. */
 		n_shed++;
-		LOG_WRN("observation from anchor %u shed: all %u collector "
-			"slots hold releasable groups - tdoa_gw_step() is not "
-			"draining fast enough",
-			obs.anchor_id, (unsigned int)TDOA_COLLECT_SLOTS);
+		if (!warned_shed) {
+			warned_shed = true;
+			LOG_WRN("observation from anchor %u shed: all %u "
+				"collector slots hold releasable groups - "
+				"tdoa_gw_step() is not draining fast enough. "
+				"Warned ONCE; `blink stats` carries the count",
+				obs.anchor_id,
+				(unsigned int)TDOA_COLLECT_SLOTS);
+		}
 	} else {
 		n_dup++;
 	}
@@ -303,9 +337,13 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 
 	if (!tdoa_dtu_plausible(m, n)) {
 		n_implausible++;
-		LOG_WRN("blink from 0x%04X: implausible spread - dropped "
-			"(broken sync, or a wrap this rebase did not fix)",
-			tag_addr);
+		if (!warned_implausible) {
+			warned_implausible = true;
+			LOG_WRN("blink from 0x%04X: implausible spread - "
+				"dropped (broken sync, or a wrap this rebase "
+				"did not fix). Warned ONCE; `blink stats` "
+				"carries the count", tag_addr);
+		}
 		return true;
 	}
 
@@ -322,8 +360,12 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 
 	if (!tdoa_solve(m, n, seed, &res) || !res.valid) {
 		n_solve_fail++;
-		LOG_WRN("blink from 0x%04X: solve failed over %u anchors",
-			tag_addr, (unsigned int)n);
+		if (!warned_solve_fail) {
+			warned_solve_fail = true;
+			LOG_WRN("blink from 0x%04X: solve failed over %u "
+				"anchors. Warned ONCE; `blink stats` carries "
+				"the count", tag_addr, (unsigned int)n);
+		}
 		return true;
 	}
 
@@ -338,10 +380,15 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 
 		if (sqrtf(dx * dx + dy * dy) > TDOA_GW_MAX_JUMP_M) {
 			n_jump++;
-			LOG_WRN("blink from 0x%04X: fix (%.2f, %.2f) jumps "
-				"more than %.1f m from the last one - dropped",
-				tag_addr, (double)res.x, (double)res.y,
-				(double)TDOA_GW_MAX_JUMP_M);
+			if (!warned_jump) {
+				warned_jump = true;
+				LOG_WRN("blink from 0x%04X: fix (%.2f, %.2f) "
+					"jumps more than %.1f m from the last "
+					"one - dropped. Warned ONCE; `blink "
+					"stats` carries the count",
+					tag_addr, (double)res.x, (double)res.y,
+					(double)TDOA_GW_MAX_JUMP_M);
+			}
 			return true;
 		}
 	}
@@ -386,6 +433,12 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	 * device. Documented and accepted there; unchanged here on purpose --
 	 * two different derivations of Tid would be a worse bug than the
 	 * phantom. */
+	/* The one LOG_WRN in this module left UNRATE-LIMITED, deliberately: it
+	 * is the same line, for the same event, that the 0xEA path in
+	 * uwb_gateway.c already logs on every straggler, and it has no counter
+	 * of its own -- rate-limiting it here would make the two paths disagree
+	 * and leave the event invisible. It is also self-limiting: a tag with no
+	 * seat is a tag whose lease expired, not a steady state. */
 	if (gw_core_find_eui(ctx, tag_addr, eui)) {
 		fix.tag_id = tag_id_from_eui(eui, UWB_FRAME_EUI_LEN);
 	} else {
