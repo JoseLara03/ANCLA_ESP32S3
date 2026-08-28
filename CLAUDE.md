@@ -502,8 +502,11 @@ sync master                    transmit half — CCP sent/dropped counts as
   included), same `pos_json_fix()` payload, same frozen platform contract; the
   measurement model changed, the telemetry did not. `tdoa_gw_step()` runs **once
   per superframe** from the top of the gateway's OUTER loop, just after a beacon
-  went out, and is bounded twice over (`TDOA_GW_INGEST_MAX` 8,
-  `TDOA_GW_SOLVE_MAX` 2): it never blocks (`net_uplink_get_obs()` is
+  went out, and is bounded twice over (`TDOA_GW_INGEST_MAX` and
+  `TDOA_GW_SOLVE_MAX`, whose values and the tag capacity they buy are below —
+  named here rather than restated, so the two halves of this entry cannot
+  disagree the way they did once already): it never blocks
+  (`net_uplink_get_obs()` is
   `K_NO_WAIT`), never transmits and never writes flash — the four requirements
   of anything on that `K_PRIO_COOP(0)` loop. Deliberately NOT in the inner RX
   loop: observations arrive on the uplink thread's 50 ms cadence, not on RX
