@@ -87,13 +87,20 @@ int main(void)
 		 * again. Every spin here must be bounded (see
 		 * uwb_wait_for_sysstatus_lo).
 		 *
-		 * SLAVE mode is deliberately left at the default priority: it
-		 * runs no network thread, so the change would buy nothing and
-		 * would perturb a bench-confirmed path. */
+		 * SLAVE mode is deliberately left at the default priority --
+		 * see the else branch below, which since Phase 3 DOES start a
+		 * network thread. */
 		k_thread_priority_set(k_current_get(), K_PRIO_COOP(0));
 		net_uplink_start();
 		uwb_gateway_run(cfg);
 	} else {
+		/* Since Phase 3 an anchor publishes its BLINK observations, so
+		 * the uplink runs here too. SLAVE mode is still deliberately
+		 * left at the DEFAULT (preemptible) priority: the loop blocks
+		 * in k_sem_take() and therefore yields to the WiFi driver's
+		 * threads (<= 7) on its own, and promoting it would perturb a
+		 * bench-confirmed path for nothing. */
+		net_uplink_start();
 		uwb_slave_run(cfg);
 	}
 #endif

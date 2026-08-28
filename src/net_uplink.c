@@ -96,6 +96,7 @@ static char    payload_buf[POS_JSON_MAX_LEN];
 static uint16_t next_msg_id = 1u;
 static bool    mqtt_connected;
 static bool    connack_seen;
+static bool    suback_seen;
 
 /* ~1.5 superframes at GW_N_CFP (11) seats: enough to absorb a publish stalling
  * behind one TCP retransmit, small enough that a real outage discards rather
@@ -103,6 +104,31 @@ static bool    connack_seen;
 #define FIX_QUEUE_DEPTH 16
 
 K_MSGQ_DEFINE(fix_q, sizeof(struct pos_fix), FIX_QUEUE_DEPTH, 4);
+
+/* Two queues, not one: the directions are different and live in different
+ * modes. 32 observations are ~4 tags x 4 anchors x 2 superframes of slack on
+ * the anchor, and on the gateway ~8 complete 4-anchor blinks -- above
+ * TDOA_COLLECT_SLOTS (16 groups), so the queue is never the bottleneck before
+ * the collector is. DRAM cost: 32 x 24 B = 768 B each. */
+#define OBS_QUEUE_DEPTH 32
+
+K_MSGQ_DEFINE(blink_q, sizeof(struct pos_blink_obs), OBS_QUEUE_DEPTH, 4);
+K_MSGQ_DEFINE(obs_q,   sizeof(struct pos_blink_obs), OBS_QUEUE_DEPTH, 4);
+
+static uint32_t n_obs_pub;
+static uint32_t n_obs_pub_drop;
+static uint32_t n_obs_rx;
+static uint32_t n_obs_rx_drop;
+static uint32_t n_obs_sub_fail;
+
+/* Receive buffer for one PUBLISH. static, not an automatic: the uplink thread
+ * has 4096 B of stack and pos_json_blink_parse() already puts 96 B of its own
+ * there. */
+static uint8_t obs_payload[POS_JSON_BLINK_MAX_LEN];
+
+/* true in GATEWAY mode. Read once when the thread starts and never changes:
+ * the mode comes from NVS and only changes with a reboot. */
+static bool is_gateway;
 
 static uint32_t dropped_fixes;
 static int64_t  last_drop_warn_ms;
@@ -220,6 +246,43 @@ void net_uplink_submit(const struct pos_fix *fix)
 	}
 }
 
+void net_uplink_submit_blink(const struct pos_blink_obs *o)
+{
+	struct pos_blink_obs discarded;
+
+	if (o == NULL) {
+		return;
+	}
+	if (k_msgq_put(&blink_q, o, K_NO_WAIT) == 0) {
+		return;
+	}
+
+	/* Full: drop the OLDEST, same rule as net_uplink_submit(). */
+	(void)k_msgq_get(&blink_q, &discarded, K_NO_WAIT);
+	n_obs_pub_drop++;
+	if (k_msgq_put(&blink_q, o, K_NO_WAIT) != 0) {
+		n_obs_pub_drop++;
+	}
+}
+
+bool net_uplink_get_obs(struct pos_blink_obs *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	return k_msgq_get(&obs_q, out, K_NO_WAIT) == 0;
+}
+
+void net_uplink_obs_stats(uint32_t *n_pub, uint32_t *n_pub_drop, uint32_t *n_rx,
+			  uint32_t *n_rx_drop, uint32_t *n_sub_fail)
+{
+	if (n_pub != NULL)      { *n_pub = n_obs_pub; }
+	if (n_pub_drop != NULL) { *n_pub_drop = n_obs_pub_drop; }
+	if (n_rx != NULL)       { *n_rx = n_obs_rx; }
+	if (n_rx_drop != NULL)  { *n_rx_drop = n_obs_rx_drop; }
+	if (n_sub_fail != NULL) { *n_sub_fail = n_obs_sub_fail; }
+}
+
 /* Associate and wait for DHCP. Returns true once an IPv4 address is assigned. */
 static bool wifi_connect(const net_config_t *cfg)
 {
@@ -277,10 +340,58 @@ static bool wifi_connect(const net_config_t *cfg)
 	return true;
 }
 
+/* Fold one received observation PUBLISH into obs_q. GATEWAY side. */
+static void handle_publish(struct mqtt_client *c,
+			   const struct mqtt_publish_param *p)
+{
+	struct pos_blink_obs obs;
+	struct pos_blink_obs discarded;
+	uint32_t len = p->message.payload.len;
+
+	/* The payload is ALWAYS drained from the socket, whether it fits or
+	 * not: leaving bytes unread desynchronises the MQTT stream and takes
+	 * down the whole connection, not just this message. */
+	if (len == 0u || len >= sizeof(obs_payload)) {
+		while (len > 0u) {
+			uint32_t chunk = MIN(len, (uint32_t)sizeof(obs_payload));
+
+			if (mqtt_readall_publish_payload(c, obs_payload,
+							 chunk) < 0) {
+				mqtt_connected = false;
+				return;
+			}
+			len -= chunk;
+		}
+		n_obs_rx_drop++;
+		return;
+	}
+
+	if (mqtt_readall_publish_payload(c, obs_payload, len) < 0) {
+		mqtt_connected = false;
+		return;
+	}
+
+	/* QoS 0 on the subscription, so there is no PUBACK to return here. */
+	if (pos_json_blink_parse((const char *)obs_payload, (size_t)len,
+				 &obs) != 0) {
+		n_obs_rx_drop++;
+		return;
+	}
+
+	n_obs_rx++;
+
+	if (k_msgq_put(&obs_q, &obs, K_NO_WAIT) == 0) {
+		return;
+	}
+	(void)k_msgq_get(&obs_q, &discarded, K_NO_WAIT);
+	n_obs_rx_drop++;
+	if (k_msgq_put(&obs_q, &obs, K_NO_WAIT) != 0) {
+		n_obs_rx_drop++;
+	}
+}
+
 static void mqtt_evt_handler(struct mqtt_client *c, const struct mqtt_evt *evt)
 {
-	ARG_UNUSED(c);
-
 	switch (evt->type) {
 	case MQTT_EVT_CONNACK:
 		if (evt->result != 0) {
@@ -296,6 +407,16 @@ static void mqtt_evt_handler(struct mqtt_client *c, const struct mqtt_evt *evt)
 		mqtt_connected = false;
 		break;
 	case MQTT_EVT_PUBACK:
+		break;
+	case MQTT_EVT_SUBACK:
+		if (evt->result != 0) {
+			LOG_WRN("SUBACK refused (%d)", evt->result);
+			break;
+		}
+		suback_seen = true;
+		break;
+	case MQTT_EVT_PUBLISH:
+		handle_publish(c, &evt->param.publish);
 		break;
 	default:
 		break;
@@ -351,6 +472,71 @@ static int publish(const char *topic, const char *msg, enum mqtt_qos qos,
 	}
 
 	return mqtt_publish(&client, &p);
+}
+
+/* Subscribe to the observation topic. GATEWAY only.
+ *
+ * Called from mqtt_bring_up(), which is what makes RE-subscribing after a
+ * reconnect automatic instead of a forgettable special case: every reconnect
+ * goes through here. A gateway that reconnects without re-subscribing is
+ * silently DEAF -- it keeps publishing fixes it can no longer compute, and
+ * nothing in the log says so.
+ *
+ * A missing or refused SUBACK returns false, which mqtt_bring_up() turns into
+ * an mqtt_abort() and a backoff retry. Deliberately NOT carrying on without a
+ * subscription: a connection that publishes but never receives is exactly the
+ * undetectable state this gate exists to prevent. */
+static bool subscribe_observations(void)
+{
+	struct mqtt_topic topic = {
+		.topic = {
+			.utf8 = (uint8_t *)POS_JSON_TOPIC_BLINK,
+			.size = sizeof(POS_JSON_TOPIC_BLINK) - 1u,
+		},
+		.qos = MQTT_QOS_0_AT_MOST_ONCE,
+	};
+	struct mqtt_subscription_list list = {
+		.list        = &topic,
+		.list_count  = 1u,
+		.message_id  = next_msg_id++,
+	};
+	int ret;
+
+	if (next_msg_id == 0u) {
+		next_msg_id = 1u;
+	}
+
+	suback_seen = false;
+	ret = mqtt_subscribe(&client, &list);
+	if (ret != 0) {
+		LOG_WRN("mqtt_subscribe failed (%d)", ret);
+		n_obs_sub_fail++;
+		return false;
+	}
+
+	/* Up to 10 s, the same scale as the CONNACK wait. Bounded: this thread
+	 * is preemptible, but an unbounded loop here would leave the uplink
+	 * hung forever without saying why. */
+	for (int i = 0; i < 100 && !suback_seen && mqtt_connected; i++) {
+		struct zsock_pollfd fds = {
+			.fd     = client.transport.tls.sock,
+			.events = ZSOCK_POLLIN,
+		};
+
+		if (zsock_poll(&fds, 1, 100) > 0 && mqtt_input(&client) != 0) {
+			break;
+		}
+	}
+
+	if (!suback_seen) {
+		LOG_WRN("no SUBACK for %s within 10 s - the gateway would be "
+			"deaf; reconnecting", POS_JSON_TOPIC_BLINK);
+		n_obs_sub_fail++;
+		return false;
+	}
+
+	LOG_INF("subscribed to %s", POS_JSON_TOPIC_BLINK);
+	return true;
 }
 
 /* Connect and wait for CONNACK. Returns true with mqtt_connected set. */
@@ -445,6 +631,13 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 	}
 
 	g_state = ST_CONNECTED;
+
+	if (is_gateway && !subscribe_observations()) {
+		mqtt_abort(&client);
+		mqtt_connected = false;
+		return false;
+	}
+
 	return true;
 }
 
@@ -496,6 +689,36 @@ static bool drain_fix_queue(void)
 	return true;
 }
 
+/* Publish every queued observation. QoS 0 and not retained, for the same
+ * reasons as a fix: the topic is flat, and an observation that needs a
+ * retransmit is already past TDOA_COLLECT_WINDOW_MS by the time it lands.
+ * Returns false if the connection died. */
+static bool drain_blink_queue(void)
+{
+	struct pos_blink_obs obs;
+
+	while (k_msgq_get(&blink_q, &obs, K_NO_WAIT) == 0) {
+		int n = pos_json_blink(payload_buf, sizeof(payload_buf), &obs);
+
+		if (n < 0) {
+			/* A formatting bug, not a network problem. Never
+			 * publish truncated JSON. */
+			LOG_ERR("observation payload truncated - dropping blink "
+				"from 0x%04X", obs.tag_addr);
+			n_obs_pub_drop++;
+			continue;
+		}
+
+		if (publish(POS_JSON_TOPIC_BLINK, payload_buf,
+			    MQTT_QOS_0_AT_MOST_ONCE, false) != 0) {
+			LOG_WRN("observation publish failed - reconnecting");
+			return false;
+		}
+		n_obs_pub++;
+	}
+	return true;
+}
+
 static void uplink_thread(void *a, void *b, void *c)
 {
 	const net_config_t *cfg = net_config_get();
@@ -505,6 +728,8 @@ static void uplink_thread(void *a, void *b, void *c)
 	ARG_UNUSED(a);
 	ARG_UNUSED(b);
 	ARG_UNUSED(c);
+
+	is_gateway = (uwb_config_get()->mode == UWB_MODE_GATEWAY);
 
 	if (!net_config_is_provisioned(cfg)) {
 		/* Logged exactly once. An unprovisioned gateway is a normal
@@ -563,7 +788,14 @@ static void uplink_thread(void *a, void *b, void *c)
 			}
 
 			mqtt_backoff_s = BACKOFF_START_S;
-			publish_anchor_map();
+
+			/* Only the gateway publishes the retained map. Four
+			 * anchors overwriting the same retained document would
+			 * be a real defect, not redundancy: an anchor does not
+			 * know the whole survey. */
+			if (is_gateway) {
+				publish_anchor_map();
+			}
 
 			while (mqtt_connected && wifi_associated) {
 				struct zsock_pollfd fds = {
@@ -590,7 +822,11 @@ static void uplink_thread(void *a, void *b, void *c)
 					break;
 				}
 
-				if (!drain_fix_queue()) {
+				if (is_gateway) {
+					if (!drain_fix_queue()) {
+						break;
+					}
+				} else if (!drain_blink_queue()) {
 					break;
 				}
 			}
@@ -636,6 +872,32 @@ void net_uplink_start(void)
 void net_uplink_submit(const struct pos_fix *fix)
 {
 	ARG_UNUSED(fix);
+}
+
+/* The observation path is stubbed here for the same reason as the rest of this
+ * block: net_uplink.c is in the UNCONDITIONAL target_sources list, so the
+ * calibration image (CONFIG_NETWORKING=n) compiles it too, and blink_rx.c --
+ * also unconditional -- calls net_uplink_submit_blink(). Without these the cal
+ * image fails to LINK, not to compile. */
+void net_uplink_submit_blink(const struct pos_blink_obs *o)
+{
+	ARG_UNUSED(o);
+}
+
+bool net_uplink_get_obs(struct pos_blink_obs *out)
+{
+	ARG_UNUSED(out);
+	return false;
+}
+
+void net_uplink_obs_stats(uint32_t *n_pub, uint32_t *n_pub_drop, uint32_t *n_rx,
+			  uint32_t *n_rx_drop, uint32_t *n_sub_fail)
+{
+	if (n_pub != NULL)      { *n_pub = 0u; }
+	if (n_pub_drop != NULL) { *n_pub_drop = 0u; }
+	if (n_rx != NULL)       { *n_rx = 0u; }
+	if (n_rx_drop != NULL)  { *n_rx_drop = 0u; }
+	if (n_sub_fail != NULL) { *n_sub_fail = 0u; }
 }
 
 const char *net_uplink_state_str(void)
