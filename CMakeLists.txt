@@ -31,7 +31,9 @@ target_sources(app PRIVATE
 	src/net_store.c
 	src/net_uplink.c
 	src/pos_json.c
+	src/pos_residual.c
 	src/pos_sink.c
+	src/pos_solver.c
 	src/ss_initiator.c
 	src/sync_model.c
 	src/sync_shell.c

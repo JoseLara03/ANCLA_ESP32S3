@@ -544,6 +544,24 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `src/pos_sink.{c,h}` — consumes decoded tag position fixes. Logs one JSON line
   per fix (the only place `residual`/`batt` stay visible) and hands the fix to
   `net_uplink` through a bounded queue.
+- `src/pos_solver.{c,h}` and `src/pos_residual.{c,h}` — the tag's own
+  range-based position solver (`pos_solve()`) and RMS residual helper
+  (`pos_residual_rms()`), copied verbatim from `tag_testting/src/` for Phase 3
+  TDoA work: the gateway needs the same `struct pos_result` and
+  `pos_residual_rms()` the tag already uses, so the tag's copy owns the
+  algorithm and this one must not drift from it — same rule as
+  `uwb_frame_802_15_4z.c` and `cal_math.{c,h}`. The `cal_math.c` drift incident
+  above is the reason this rule exists and not a formality: the tag's own copy
+  later grew `CAL_MAX_STEP_UNITS`, and that one-sided change silently made this
+  project's `-ERANGE` guard in `cal_solve.c` unreachable, returning a "success"
+  antenna delay ~4.7 m wrong with nothing failing loudly. Whoever re-copies
+  `pos_solver.c`/`pos_residual.c` from the tag later must diff both files
+  first and treat any divergence as a decision, not a paste. The tag owns
+  these files while it still solves its own fix; ownership moves to this repo
+  once the gateway takes over solving (Phase 3, later task). Pure C
+  (`<math.h>`, `sqrtf`/`fabsf` — the deliberate float exception to the "no
+  float on time/scheduling paths" rule, since this is geometry, not a clock),
+  host-tested in `tests/pos_solver/` and `tests/pos_residual/`.
 - `src/tag_id.{c,h}` — FNV-1a 32-bit hash used to derive a tag's stable
   platform identity (`Tid`) from its EUI. Pure C, host-tested in
   `tests/tag_id/`.
@@ -1483,10 +1501,16 @@ gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/mac_budget/test_uwb_mac
 
 gcc -Wall -Wextra -Isrc -Itests/mac_budget/shim -o tests/ccp_sched/test_ccp_sched.exe tests/ccp_sched/test_ccp_sched.c src/mac_budget.c
 ./tests/ccp_sched/test_ccp_sched.exe            # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/pos_residual/test_pos_residual.exe tests/pos_residual/test_pos_residual.c src/pos_residual.c -lm
+./tests/pos_residual/test_pos_residual.exe      # ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/pos_solver/test_pos_solver.exe tests/pos_solver/test_pos_solver.c src/pos_solver.c src/pos_residual.c -lm
+./tests/pos_solver/test_pos_solver.exe          # ALL TESTS PASSED, exits 0
 ```
 
-`-lm` is required by the two suites that link `apos_geom.c` — the solver calls
-`sqrtf`/`fabsf`. The others do not need it.
+`-lm` is required by the suites that link `apos_geom.c`, `pos_solver.c` or
+`pos_residual.c` — they call `sqrtf`/`fabsf`. The others do not need it.
 
 `tests/mac_budget/test_uwb_mac_asserts.c` needs `-Itests/mac_budget/shim`, which
 supplies a `zephyr/sys/util.h` defining `BUILD_ASSERT` as `_Static_assert`. That
