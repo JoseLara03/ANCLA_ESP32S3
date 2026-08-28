@@ -20,6 +20,7 @@ target_sources(app PRIVATE
 	src/beacon_guard.c
 	src/blink_frame.c
 	src/blink_rx.c
+	src/blink_shell.c
 	src/ccp_frame.c
 	src/ccp_master.c
 	src/ccp_slave.c

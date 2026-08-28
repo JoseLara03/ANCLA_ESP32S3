@@ -6,6 +6,7 @@
 
 #include "pos_json.h"
 
+#include <errno.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -197,6 +198,7 @@ static bool scan_u32(const char *json, const char *key, uint32_t *out)
 static bool scan_i64(const char *json, const char *key, int64_t *out)
 {
 	const char *p = scan_value(json, key);
+	long long v;
 
 	if (p == NULL) {
 		return false;
@@ -204,7 +206,18 @@ static bool scan_i64(const char *json, const char *key, int64_t *out)
 	if (*p != '-' && (*p < '0' || *p > '9')) {
 		return false;
 	}
-	*out = (int64_t)strtoll(p, NULL, 10);
+
+	/* errno is checked, not ignored: strtoll() SATURATES on overflow and
+	 * still returns a perfectly plausible-looking number, so without this
+	 * a 20-digit ts parses as LLONG_MAX and reports success. errno must be
+	 * cleared first -- strtoll() only ever sets it, never clears it. */
+	errno = 0;
+	v = strtoll(p, NULL, 10);
+	if (errno == ERANGE) {
+		return false;
+	}
+
+	*out = (int64_t)v;
 	return true;
 }
 
@@ -254,9 +267,15 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 	if (a > 0xFFu || t > 0xFFFFu || s > 0xFFu || q > 0xFFFFu || b > 0xFFu) {
 		return -1;
 	}
-	/* t_dtu is a time, never negative. A negative here means a broken
-	 * publisher or a corrupt payload, not usable data. */
-	if (ts < 0) {
+	/* t_dtu is a DW3220 device time, so it is bounded on BOTH sides: never
+	 * negative, and never past the counter's 40-bit domain. Every other
+	 * field here is already bounded; leaving this one open would be the
+	 * hole, since it is the only field the solver actually consumes. An
+	 * out-of-domain value is a broken publisher or a corrupt payload, and
+	 * accepting it would hand Task 6 a difference against a real timestamp
+	 * that yields a confidently wrong position -- or a NaN -- from a call
+	 * that returned success. */
+	if (ts < 0 || ts > POS_JSON_BLINK_TS_MAX) {
 		return -1;
 	}
 

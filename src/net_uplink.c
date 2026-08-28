@@ -118,7 +118,16 @@ K_MSGQ_DEFINE(obs_q,   sizeof(struct pos_blink_obs), OBS_QUEUE_DEPTH, 4);
 static uint32_t n_obs_pub;
 static uint32_t n_obs_pub_drop;
 static uint32_t n_obs_rx;
-static uint32_t n_obs_rx_drop;
+/* Three reasons a received observation is dropped, counted separately: an
+ * oversized payload (a publisher newer than this gateway), a parse failure (a
+ * broken or foreign publisher) and a queue eviction (the gateway loop is not
+ * draining fast enough) call for completely different responses, and one
+ * conflated number cannot tell a format incompatibility from saturation.
+ * net_uplink_obs_stats() still reports their SUM, so its contract is
+ * unchanged. */
+static uint32_t n_obs_rx_drop_oversize;
+static uint32_t n_obs_rx_drop_parse;
+static uint32_t n_obs_rx_drop_evict;
 static uint32_t n_obs_sub_fail;
 
 /* Receive buffer for one PUBLISH. static, not an automatic: the uplink thread
@@ -279,8 +288,19 @@ void net_uplink_obs_stats(uint32_t *n_pub, uint32_t *n_pub_drop, uint32_t *n_rx,
 	if (n_pub != NULL)      { *n_pub = n_obs_pub; }
 	if (n_pub_drop != NULL) { *n_pub_drop = n_obs_pub_drop; }
 	if (n_rx != NULL)       { *n_rx = n_obs_rx; }
-	if (n_rx_drop != NULL)  { *n_rx_drop = n_obs_rx_drop; }
+	if (n_rx_drop != NULL)  {
+		*n_rx_drop = n_obs_rx_drop_oversize + n_obs_rx_drop_parse +
+			     n_obs_rx_drop_evict;
+	}
 	if (n_sub_fail != NULL) { *n_sub_fail = n_obs_sub_fail; }
+}
+
+void net_uplink_obs_rx_drops(uint32_t *oversize, uint32_t *parse,
+			     uint32_t *evict)
+{
+	if (oversize != NULL) { *oversize = n_obs_rx_drop_oversize; }
+	if (parse != NULL)    { *parse = n_obs_rx_drop_parse; }
+	if (evict != NULL)    { *evict = n_obs_rx_drop_evict; }
 }
 
 /* Associate and wait for DHCP. Returns true once an IPv4 address is assigned. */
@@ -340,6 +360,29 @@ static bool wifi_connect(const net_config_t *cfg)
 	return true;
 }
 
+/* True when every per-topic code in a SUBACK granted the subscription. An
+ * empty return_codes list is treated as a REFUSAL: a SUBACK that acknowledges
+ * no topic has not granted ours, and accepting it silently would reopen the
+ * deaf-gateway hole this check closes. */
+static bool suback_codes_ok(const struct mqtt_suback_param *p)
+{
+	if (p->return_codes.data == NULL || p->return_codes.len == 0u) {
+		LOG_WRN("SUBACK carried no return code for %s - treating it as "
+			"refused", POS_JSON_TOPIC_BLINK);
+		return false;
+	}
+
+	for (uint32_t i = 0; i < p->return_codes.len; i++) {
+		if (p->return_codes.data[i] >= 0x80u) {
+			LOG_WRN("broker REFUSED %s (SUBACK code 0x%02X) - check "
+				"the broker ACL", POS_JSON_TOPIC_BLINK,
+				p->return_codes.data[i]);
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Fold one received observation PUBLISH into obs_q. GATEWAY side. */
 static void handle_publish(struct mqtt_client *c,
 			   const struct mqtt_publish_param *p)
@@ -362,7 +405,7 @@ static void handle_publish(struct mqtt_client *c,
 			}
 			len -= chunk;
 		}
-		n_obs_rx_drop++;
+		n_obs_rx_drop_oversize++;
 		return;
 	}
 
@@ -374,7 +417,7 @@ static void handle_publish(struct mqtt_client *c,
 	/* QoS 0 on the subscription, so there is no PUBACK to return here. */
 	if (pos_json_blink_parse((const char *)obs_payload, (size_t)len,
 				 &obs) != 0) {
-		n_obs_rx_drop++;
+		n_obs_rx_drop_parse++;
 		return;
 	}
 
@@ -384,9 +427,9 @@ static void handle_publish(struct mqtt_client *c,
 		return;
 	}
 	(void)k_msgq_get(&obs_q, &discarded, K_NO_WAIT);
-	n_obs_rx_drop++;
+	n_obs_rx_drop_evict++;
 	if (k_msgq_put(&obs_q, &obs, K_NO_WAIT) != 0) {
-		n_obs_rx_drop++;
+		n_obs_rx_drop_evict++;
 	}
 }
 
@@ -409,8 +452,27 @@ static void mqtt_evt_handler(struct mqtt_client *c, const struct mqtt_evt *evt)
 	case MQTT_EVT_PUBACK:
 		break;
 	case MQTT_EVT_SUBACK:
+		/* TWO independent things can be wrong here, and only checking
+		 * both makes this gate real.
+		 *
+		 * evt->result is the DECODE status, not the broker's answer:
+		 * subsys/net/lib/mqtt/mqtt_rx.c sets it from
+		 * subscribe_ack_decode(). A broker whose ACL denies this topic
+		 * replies with a well-formed SUBACK carrying 0x80 per topic --
+		 * decode succeeds, evt->result is 0, and taking that as success
+		 * left the gateway running forever hearing nothing with
+		 * n_obs_sub_fail stuck at 0, which is exactly the state
+		 * subscribe_observations() exists to prevent. So the per-topic
+		 * codes in evt->param.suback.return_codes are read too: >= 0x80
+		 * is failure in both MQTT 3.1.1 (return code) and 5.0 (reason
+		 * code). Anything below it is the granted maximum QoS, which we
+		 * do not constrain -- we subscribe at QoS 0 and a broker cannot
+		 * grant less than that. */
 		if (evt->result != 0) {
-			LOG_WRN("SUBACK refused (%d)", evt->result);
+			LOG_WRN("SUBACK decode failed (%d)", evt->result);
+			break;
+		}
+		if (!suback_codes_ok(&evt->param.suback)) {
 			break;
 		}
 		suback_seen = true;
@@ -630,14 +692,20 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 		return false;
 	}
 
-	g_state = ST_CONNECTED;
-
+	/* ST_CONNECTED is claimed only once BOTH halves of the connection are
+	 * up. Setting it before the subscribe made `net show` report
+	 * "connected" for the whole backoff sleep after a refused
+	 * subscription -- i.e. the one console surface an operator would check
+	 * agreed with the deaf gateway that everything was fine. The CONNACK
+	 * failure path above is honest for the same reason (it returns before
+	 * touching g_state); this path now matches its discipline. */
 	if (is_gateway && !subscribe_observations()) {
 		mqtt_abort(&client);
 		mqtt_connected = false;
 		return false;
 	}
 
+	g_state = ST_CONNECTED;
 	return true;
 }
 
@@ -898,6 +966,14 @@ void net_uplink_obs_stats(uint32_t *n_pub, uint32_t *n_pub_drop, uint32_t *n_rx,
 	if (n_rx != NULL)       { *n_rx = 0u; }
 	if (n_rx_drop != NULL)  { *n_rx_drop = 0u; }
 	if (n_sub_fail != NULL) { *n_sub_fail = 0u; }
+}
+
+void net_uplink_obs_rx_drops(uint32_t *oversize, uint32_t *parse,
+			     uint32_t *evict)
+{
+	if (oversize != NULL) { *oversize = 0u; }
+	if (parse != NULL)    { *parse = 0u; }
+	if (evict != NULL)    { *evict = 0u; }
 }
 
 const char *net_uplink_state_str(void)

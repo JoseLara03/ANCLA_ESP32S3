@@ -114,6 +114,35 @@ static void test_parse_handles_unterminated_and_extra_fields(void)
     CHECK(pos_json_blink_parse(json, POS_JSON_BLINK_MAX_LEN, &out) == -1);
 }
 
+/* ts is the only field the solver consumes, so it is the only one whose range
+ * check can turn a "success" into a wrong position. Both ends of the 40-bit
+ * domain are pinned here, plus strtoll()'s saturating overflow -- which is the
+ * nasty one: without an errno check it returns LLONG_MAX and looks like a
+ * perfectly ordinary large number. */
+static void test_ts_out_of_domain_and_overflow_are_rejected(void)
+{
+    struct pos_blink_obs out;
+    const char *base = "{\"a\":1,\"t\":2,\"s\":3,\"q\":4,\"b\":5,\"ts\":";
+    char buf[POS_JSON_BLINK_MAX_LEN];
+    const char *bad_ts[] = {
+        "\"1099511627776\"",           /* 2^40, one past the domain */
+        "\"99999999999999999999\"",    /* strtoll() ERANGE saturation */
+        "\"9223372036854775807\"",     /* LLONG_MAX itself, no ERANGE */
+    };
+
+    for (unsigned int i = 0; i < sizeof(bad_ts) / sizeof(bad_ts[0]); i++) {
+        snprintf(buf, sizeof(buf), "%s%s}", base, bad_ts[i]);
+        CHECK(pos_json_blink_parse(buf, strlen(buf), &out) == -1);
+    }
+
+    /* The largest legal value is still accepted: the bound rejects what is
+     * outside the domain, not what is merely big. */
+    snprintf(buf, sizeof(buf), "%s\"1099511627775\"}", base);
+    CHECK(pos_json_blink_parse(buf, strlen(buf), &out) == 0);
+    CHECK(out.t_dtu == 1099511627775LL);
+    CHECK(POS_JSON_BLINK_TS_MAX == 1099511627775LL);
+}
+
 int main(void)
 {
     test_topic_is_zone_scoped();
@@ -122,6 +151,7 @@ int main(void)
     test_worst_case_fits_and_short_buffer_refuses();
     test_parse_rejects_garbage();
     test_parse_handles_unterminated_and_extra_fields();
+    test_ts_out_of_domain_and_overflow_are_rejected();
     if (failures) { printf("\n%d CHECK(s) FAILED\n", failures); return EXIT_FAILURE; }
     printf("pos_json_blink: ALL TESTS PASSED\n");
     return EXIT_SUCCESS;

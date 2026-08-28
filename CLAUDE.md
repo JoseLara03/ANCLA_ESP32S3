@@ -313,6 +313,24 @@ cal peer <id> <mm>              range anchor <id> at a known distance;
 See `docs/antenna-delay-calibration.md` for the full procedure and acceptance
 thresholds.
 
+The `blink` tree reports the Phase 3 observation path. Registered
+unconditionally on every role and in the calibration image too, and it prints a
+`role` field for the same reason `sync` does: on a role that never exercises a
+counter, a static zero reads exactly like a dead link.
+
+```
+blink stats                    the TDoA observation path as JSON — the
+                               anchor's stamping counters (`rx`, `no_sync`,
+                               `bad`, `stamped`) and the uplink's
+                               publish/subscribe counters (`published`,
+                               `pub_drop`, `received`, `rx_drop` plus its
+                               three-way breakdown, `sub_fail`). `no_sync ==
+                               rx` is the CCP link, not the BLINK path —
+                               read `sync stats` and check the gateway is on
+                               USB-C. `sub_fail` climbing means the gateway
+                               is DEAF: check the broker ACL.
+```
+
 The `sync` tree reports the CCP sync gate. It is registered unconditionally —
 in the **production** image on every role, AND in the **calibration** image
 too (`ccp_slave.c`/`ccp_master.c` compile into both; only `cal_run.c`'s own
@@ -393,6 +411,18 @@ sync master                    transmit half — CCP sent/dropped counts as
   to spend time. No host suite on purpose — everything it calls is already
   host-tested and the only thing a test could reach is the counters; its
   verification is on hardware.
+- `src/blink_shell.c` — the `blink` command tree (`blink stats`), the ONLY
+  console surface on the observation path. Registered unconditionally and
+  prints a `role` field, same precedent and same reason as `src/sync_shell.c`.
+  It exists because every failure on that path is otherwise invisible and
+  reads as "no tags": an anchor whose CCP link is down (`no_sync == rx`), a
+  gateway whose broker ACL refused the subscription (`sub_fail`, i.e. DEAF),
+  a publisher too new for this gateway's `POS_JSON_BLINK_MAX_LEN`
+  (`rx_drop_oversize`), and a gateway loop too slow to drain `obs_q`
+  (`rx_drop_evict`). The receive drops are split three ways on purpose —
+  conflated, a format incompatibility is indistinguishable from saturation,
+  and the two need opposite responses. It prints the two verdicts worth
+  stating rather than leaving them to be spotted.
 - `src/blink_frame.{c,h}` — the BLINK wire format for Phase 3 TDoA: a tag
   emits this instead of running a ranging sweep, every anchor that hears it
   timestamps it, and the gateway solves. Function code `0xF0`, the first code

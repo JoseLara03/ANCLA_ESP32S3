@@ -14,6 +14,7 @@
 #define POS_JSON_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "apos_store.h"
 #include "pos_sink.h"
@@ -56,8 +57,28 @@ struct pos_blink_obs {
 /* Buffer big enough for pos_json_blink()'s worst case plus its NUL. The worst
  * case is 66 bytes (every field at maximum, a 13-digit ts -- measured by
  * tests/pos_json_blink/, which prints it); 96 leaves room for one more field
- * without re-sizing every caller. */
+ * without re-sizing every caller.
+ *
+ * ---- This constant is ALSO the parser's hard rejection ceiling ---------
+ *
+ * pos_json_blink_parse() refuses any payload of 96 bytes or more outright, so
+ * the "tolerates unknown fields" promise below is NOT unconditional: it holds
+ * only while the whole document stays at 95 bytes or less, i.e. 29 bytes past
+ * today's 66-byte worst case. A newer publisher that adds two modest fields
+ * would push a maximal payload past that and make an OLDER gateway reject
+ * EVERY observation rather than ignore the extras -- a silent, total loss of
+ * the TDoA input, not a graceful degradation. So this is a VERSIONING
+ * CONSTRAINT, not just a buffer size: adding a field to the observation
+ * document means checking the new worst case against 95 first, and raising
+ * this constant (on gateways BEFORE anchors) if it no longer fits.
+ * tests/pos_json_blink/ pins the 96-byte rejection deliberately. */
 #define POS_JSON_BLINK_MAX_LEN 96
+
+/* Upper bound on t_dtu: the DW3220's system counter is 40 bits, so anything
+ * above this is not a timestamp this network can have produced. Named here
+ * rather than written inline in the parser so the wire contract and the check
+ * that enforces it cannot drift apart. */
+#define POS_JSON_BLINK_TS_MAX 0xFFFFFFFFFFLL
 
 /* Format one observation:
  *   {"a":2,"t":257,"s":90,"ts":"123456789012","q":1234,"b":77}
@@ -76,7 +97,16 @@ int pos_json_blink(char *buf, size_t len, const struct pos_blink_obs *o);
 
 /* Parse what pos_json_blink() produces. `buf` need NOT be NUL-terminated (it
  * arrives that way from MQTT) and `len` is its real length. Tolerates unknown
- * fields, so a newer publisher cannot break an older gateway.
+ * fields, so a newer publisher cannot break an older gateway -- subject to the
+ * length ceiling documented on POS_JSON_BLINK_MAX_LEN above, which is a real
+ * limit on that promise and not a formality.
+ *
+ * EVERY field is range-checked, `ts` included: it is rejected below 0, above
+ * the DW3220's 40-bit domain (0xFFFFFFFFFF), and on strtoll() overflow. That
+ * bound is the last line of defence for the datum this whole path exists to
+ * carry -- an out-of-domain value reaching tdoa_solve() would be differenced
+ * against a real timestamp and produce a confidently wrong position (or a NaN)
+ * from a call that reported success.
  *
  * Returns 0 and fills `*out`, or -1 if a field is missing, one is out of range,
  * or `len` does not fit the internal buffer (POS_JSON_BLINK_MAX_LEN). */

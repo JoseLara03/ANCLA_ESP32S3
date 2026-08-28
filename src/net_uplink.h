@@ -77,6 +77,23 @@ bool net_uplink_get_obs(struct pos_blink_obs *out);
 void net_uplink_obs_stats(uint32_t *n_pub, uint32_t *n_pub_drop, uint32_t *n_rx,
 			  uint32_t *n_rx_drop, uint32_t *n_sub_fail);
 
+/* Why the gateway dropped received observations, broken out. `n_rx_drop` above
+ * stays the SUM of these three so its meaning does not change, but the sum on
+ * its own cannot tell apart two failures that need opposite responses:
+ *
+ *   oversize -- a payload at or above POS_JSON_BLINK_MAX_LEN. A publisher this
+ *               gateway is too old to understand (see that constant's
+ *               versioning note). A firmware problem; no tuning helps.
+ *   parse    -- it fitted, but a field was missing or out of range. A broken or
+ *               corrupt publisher, or a foreign publisher on our topic.
+ *   evict    -- it parsed fine and was thrown away to make room. The gateway
+ *               loop is not draining obs_q fast enough: a LOAD problem, and the
+ *               only one of the three that capacity or tuning can fix.
+ *
+ * Any out-pointer may be NULL. */
+void net_uplink_obs_rx_drops(uint32_t *oversize, uint32_t *parse,
+			     uint32_t *evict);
+
 /* Human-readable connection state for `net show`. Never NULL. */
 const char *net_uplink_state_str(void);
 
