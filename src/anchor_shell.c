@@ -165,9 +165,24 @@ static int cmd_ant(const struct shell *sh, size_t argc, char **argv)
 
 	ARG_UNUSED(argc);
 
-	if (!parse_ul(argv[1], &tx) || !parse_ul(argv[2], &rx) ||
-	    !uwb_config_set_ant(cfg, (uint32_t)tx, (uint32_t)rx)) {
-		shell_error(sh, "error: antenna delays must be 0..65535");
+	/* Say WHICH of the two things is wrong. Both arguments are bare
+	 * positional numbers, and the natural mistake is to type the field
+	 * names -- `anchor ant tx 16356` -- which used to be answered with a
+	 * range complaint about a value the operator never supplied, sending
+	 * them to check arithmetic that was already correct. Note both delays
+	 * must be given every time, even when only one is being changed. */
+	if (!parse_ul(argv[1], &tx) || !parse_ul(argv[2], &rx)) {
+		shell_error(sh,
+			    "error: expected two numbers, got \"%s\" and \"%s\"."
+			    " Usage: anchor ant <tx> <rx> — both values, no "
+			    "field names (e.g. anchor ant 16356 16385)",
+			    argv[1], argv[2]);
+		return -EINVAL;
+	}
+
+	if (!uwb_config_set_ant(cfg, (uint32_t)tx, (uint32_t)rx)) {
+		shell_error(sh, "error: antenna delays must be 0..65535 "
+				"(got tx=%lu rx=%lu)", tx, rx);
 		return -EINVAL;
 	}
 
