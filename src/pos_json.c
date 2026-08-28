@@ -10,6 +10,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix)
 {
@@ -154,4 +156,115 @@ int pos_json_anchors(char *buf, size_t len, const struct apos_survey *s)
 		return -1;
 	}
 	return (int)(off + (size_t)n);
+}
+
+/* A minimal scanner, not a JSON parser. Justified because the producer is
+ * pos_json_blink() in this same file and the format is pinned by
+ * tests/pos_json_blink/: pulling cJSON into the firmware for six scalar fields
+ * would cost flash and a dependency for nothing. Finds "key": and returns the
+ * first character of the value, skipping an opening quote if there is one. */
+static const char *scan_value(const char *json, const char *key)
+{
+	char pat[16];
+	const char *p;
+	int n = snprintf(pat, sizeof(pat), "\"%s\":", key);
+
+	if (n < 0 || (size_t)n >= sizeof(pat)) {
+		return NULL;
+	}
+	p = strstr(json, pat);
+	if (p == NULL) {
+		return NULL;
+	}
+	p += (size_t)n;
+	if (*p == '"') {
+		p++;
+	}
+	return p;
+}
+
+static bool scan_u32(const char *json, const char *key, uint32_t *out)
+{
+	const char *p = scan_value(json, key);
+
+	if (p == NULL || *p < '0' || *p > '9') {
+		return false;
+	}
+	*out = (uint32_t)strtoul(p, NULL, 10);
+	return true;
+}
+
+static bool scan_i64(const char *json, const char *key, int64_t *out)
+{
+	const char *p = scan_value(json, key);
+
+	if (p == NULL) {
+		return false;
+	}
+	if (*p != '-' && (*p < '0' || *p > '9')) {
+		return false;
+	}
+	*out = (int64_t)strtoll(p, NULL, 10);
+	return true;
+}
+
+int pos_json_blink(char *buf, size_t len, const struct pos_blink_obs *o)
+{
+	int n;
+
+	if (buf == NULL || o == NULL) {
+		return -1;
+	}
+
+	n = snprintf(buf, len,
+		     "{\"a\":%u,\"t\":%u,\"s\":%u,\"ts\":\"%lld\",\"q\":%u,\"b\":%u}",
+		     (unsigned int)o->anchor_id, (unsigned int)o->tag_addr,
+		     (unsigned int)o->blink_seq, (long long)o->t_dtu,
+		     (unsigned int)o->quality, (unsigned int)o->batt_soc);
+
+	if (n < 0 || (size_t)n >= len) {
+		return -1;
+	}
+	return n;
+}
+
+int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
+{
+	/* NUL-terminate a bounded copy: an MQTT payload does not arrive
+	 * terminated, and strstr() over unterminated memory would read out of
+	 * bounds. */
+	char scratch[POS_JSON_BLINK_MAX_LEN];
+	uint32_t a, t, s, q, b;
+	int64_t ts;
+
+	if (buf == NULL || out == NULL) {
+		return -1;
+	}
+	if (len == 0u || len >= sizeof(scratch)) {
+		return -1;
+	}
+	memcpy(scratch, buf, len);
+	scratch[len] = '\0';
+
+	if (!scan_u32(scratch, "a", &a) || !scan_u32(scratch, "t", &t) ||
+	    !scan_u32(scratch, "s", &s) || !scan_u32(scratch, "q", &q) ||
+	    !scan_u32(scratch, "b", &b) || !scan_i64(scratch, "ts", &ts)) {
+		return -1;
+	}
+	if (a > 0xFFu || t > 0xFFFFu || s > 0xFFu || q > 0xFFFFu || b > 0xFFu) {
+		return -1;
+	}
+	/* t_dtu is a time, never negative. A negative here means a broken
+	 * publisher or a corrupt payload, not usable data. */
+	if (ts < 0) {
+		return -1;
+	}
+
+	out->anchor_id = (uint8_t)a;
+	out->blink_seq = (uint8_t)s;
+	out->batt_soc  = (uint8_t)b;
+	out->tag_addr  = (uint16_t)t;
+	out->quality   = (uint16_t)q;
+	out->t_dtu     = ts;
+	return 0;
 }

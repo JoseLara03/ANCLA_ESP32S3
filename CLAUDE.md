@@ -653,6 +653,16 @@ sync master                    transmit half — CCP sent/dropped counts as
   (`ANC-LOBBY-001..004` at the corners of a 2 m × 2 m square) so an unsurveyed
   gateway still publishes a schema-valid document. The stub's coordinates are
   placeholders; its schema is the contract.
+  Since Phase 3 it also carries the **TDoA observation payload** —
+  `POS_JSON_TOPIC_BLINK`, `struct pos_blink_obs`, `pos_json_blink()` and
+  `pos_json_blink_parse()`, host-tested separately in `tests/pos_json_blink/`
+  because its consumer is our own gateway, not the customer platform. Its `ts`
+  field (the 40-bit RX timestamp in the master's time base) is emitted as a
+  **quoted decimal string on purpose**: the `Tid`-to-`int32` truncation above is
+  what an unquoted large integer invites from a consumer, and a `t_dtu` reaches
+  ~512x `INT32_MAX`. The parser is a minimal `"key":` scanner, not a JSON
+  parser, and it tolerates unknown fields so a newer publisher cannot break an
+  older gateway.
 - `src/net_config.{c,h}` — WiFi and MQTT settings. Pure C, host-tested in
   `tests/net_config/`. Explicitly initialised from `main()`, **not** lazily like
   `uwb_config_get()`, because `net_uplink` is a second thread.
@@ -1535,6 +1545,9 @@ gcc -Wall -Wextra -Isrc -o tests/beacon_guard/test_beacon_guard.exe tests/beacon
 
 gcc -Wall -Wextra -Isrc -o tests/pos_json/test_pos_json.exe tests/pos_json/test_pos_json.c src/pos_json.c
 ./tests/pos_json/test_pos_json.exe              # PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/pos_json_blink/test_pos_json_blink.exe tests/pos_json_blink/test_pos_json_blink.c src/pos_json.c -lm
+./tests/pos_json_blink/test_pos_json_blink.exe  # pos_json_blink: ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -o tests/net_config/test_net_config.exe tests/net_config/test_net_config.c src/net_config.c
 ./tests/net_config/test_net_config.exe          # PASSED, exits 0

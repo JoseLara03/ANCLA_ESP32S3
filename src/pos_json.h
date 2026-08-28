@@ -32,6 +32,56 @@
  * in whichever file happens to add the subscription. */
 #define POS_JSON_TOPIC_SURVEY "uwb/anchor/survey/" POS_JSON_ZONE_NAME
 
+/* TDoA observation topic: every anchor publishes one per BLINK it hears, and
+ * the gateway subscribes. Zone-scoped and composed from POS_JSON_ZONE_NAME like
+ * its siblings, so the topic can never disagree with the zone of the payload
+ * published on it.
+ *
+ * UNLIKE POS_JSON_TOPIC_SURVEY, this one IS subscribed -- net_uplink.c gained a
+ * subscribe path in Phase 3 Task 5. */
+#define POS_JSON_TOPIC_BLINK "uwb/anchor/blink/" POS_JSON_ZONE_NAME
+
+/* One observation: which anchor heard which BLINK and when, already in the
+ * master's time base. Produced by blink_rx.c on the anchor and consumed by the
+ * gateway (Task 6). */
+struct pos_blink_obs {
+	uint8_t  anchor_id;   /* 0..UWB_MAX_ANCHORS-1, the anchor that heard it */
+	uint8_t  blink_seq;   /* from the frame; with tag_addr it is the group key */
+	uint8_t  batt_soc;    /* 0-100, or UWB_FRAME_POS_SOC_UNKNOWN */
+	uint16_t tag_addr;    /* short address of the emitting tag */
+	uint16_t quality;     /* CIR quality, diagnostics -- the solver ignores it */
+	int64_t  t_dtu;       /* RX in the master's base, sync_model_to_master() */
+};
+
+/* Buffer big enough for pos_json_blink()'s worst case plus its NUL. The worst
+ * case is 66 bytes (every field at maximum, a 13-digit ts -- measured by
+ * tests/pos_json_blink/, which prints it); 96 leaves room for one more field
+ * without re-sizing every caller. */
+#define POS_JSON_BLINK_MAX_LEN 96
+
+/* Format one observation:
+ *   {"a":2,"t":257,"s":90,"ts":"123456789012","q":1234,"b":77}
+ *
+ * `ts` goes out as a QUOTED decimal string, not as a JSON number, and that is
+ * deliberate: it is a 40-bit value (up to 1099511627775) and the Tid lesson (the
+ * platform's int32 column, which SILENTLY dropped everything above INT32_MAX --
+ * see CLAUDE.md) is that a large unquoted integer invites some consumer to
+ * narrow it without saying so. The consumer of THIS topic is our own gateway, so
+ * the encoding is ours to choose.
+ *
+ * Returns bytes written excluding the NUL, or -1 if it does not fit. On -1 the
+ * caller MUST drop: publishing truncated JSON is worse than publishing
+ * nothing. */
+int pos_json_blink(char *buf, size_t len, const struct pos_blink_obs *o);
+
+/* Parse what pos_json_blink() produces. `buf` need NOT be NUL-terminated (it
+ * arrives that way from MQTT) and `len` is its real length. Tolerates unknown
+ * fields, so a newer publisher cannot break an older gateway.
+ *
+ * Returns 0 and fills `*out`, or -1 if a field is missing, one is out of range,
+ * or `len` does not fit the internal buffer (POS_JSON_BLINK_MAX_LEN). */
+int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out);
+
 /* Buffer size that fits either document plus its NUL. Sized on the LARGER of the
  * two: a full APOS_MAX_NODES surveyed document (~150 bytes per anchor at the
  * widest coordinate and lat/long values), not the four-anchor stub it used to be
