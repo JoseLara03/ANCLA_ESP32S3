@@ -209,10 +209,20 @@ static void test_dtu_scale(void)
 
 /* Sync noise at gate level: 0.5 ns = 32 DTU on each timestamp. The resulting
  * position error is what decides whether the product meets 10-30 cm, and this
- * test PRINTS it rather than asserting it -- the number is the deliverable. */
+ * test PRINTS it rather than asserting it -- the number is the deliverable.
+ *
+ * `solved` is counted and asserted separately from `worst`, deliberately: a
+ * solver that fails every trial leaves `worst` at its initial 0.0f, which
+ * looks exactly like a perfect result on the printed line and would let this
+ * test pass vacuously while reporting a fabricated "worst error 0.000 m" --
+ * this is not hypothetical, see the negative-control transcript in
+ * task-3-report.md. 190/200 is not a tuned tolerance for failure rate, only a
+ * floor that catches "the solver stopped solving"; at this noise level 200
+ * trials solve essentially every time in practice (see the printed count). */
 static void test_error_under_gate_level_noise(void)
 {
 	float worst = 0.0f;
+	unsigned int solved = 0;
 	uint32_t rng = 12345u;
 
 	for (unsigned int trial = 0; trial < 200u; trial++) {
@@ -225,12 +235,14 @@ static void test_error_under_gate_level_noise(void)
 			m[i].t_dtu += (int64_t)((rng >> 8) % 65u) - 32;   /* +/-32 DTU */
 		}
 		if (!tdoa_solve(m, 4, NULL, &r) || !r.valid) continue;
+		solved++;
 		float e = sqrtf((r.x - 5.0f) * (r.x - 5.0f) +
 				(r.y - 5.0f) * (r.y - 5.0f));
 		if (e > worst) worst = e;
 	}
-	printf("  with +/-32 DTU (0.5 ns) noise: worst error %.3f m\n",
-	       (double)worst);
+	printf("  with +/-32 DTU (0.5 ns) noise: worst error %.3f m (%u/200 solved)\n",
+	       (double)worst, solved);
+	CHECK(solved > 190u);
 	CHECK(worst < 1.0f);
 }
 

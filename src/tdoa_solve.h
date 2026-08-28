@@ -65,6 +65,23 @@ struct tdoa_meas {
  * out->n_used before treating out->residual_m as a quality signal: at
  * n_used == TDOA_MIN_ANCHORS it is not one.
  *
+ * KNOWN LIMITATION -- "converged" is not always "correct": convergence here
+ * is judged purely by step size (the iteration stops once |dx|,|dy| fall
+ * under CONV_EPS_M), unlike pos_solve(), which additionally rejects a
+ * converged point whose cost-function GRADIENT is still large -- see
+ * gn_solve()'s final gate in pos_solver.c. A hyperbolic TDoA system
+ * genuinely has a second branch (the mirror solution on the far side of the
+ * reference anchor's hyperbola), and for a tag well outside the anchor hull
+ * Gauss-Newton can settle there and still report valid = true. At n == 4
+ * (one spare equation) out->residual_m is too weak a signal to reliably
+ * discriminate the wrong branch from the right one. This is deliberately
+ * NOT fixed by adding a gradient gate in this revision -- that would be a
+ * change to the convergence criterion itself, which needs its own
+ * validation rather than being folded into a review fix. A caller feeding
+ * this solver a bad or unbounded seed should treat a "valid" result as
+ * provisional until it is corroborated (e.g. against a previous fix, or
+ * plausibility-checked against the deployment's known geometry).
+ *
  * Returns false (and sets out->valid = false) if n < TDOA_MIN_ANCHORS, if
  * n > POS_MAX_ANCHORS, if the geometry is degenerate (singular normal
  * matrix, e.g. collinear anchors, or the estimate exactly on anchor 0), or if

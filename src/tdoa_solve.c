@@ -12,9 +12,12 @@
 #define CONV_EPS_M   1e-4f
 #define DET_EPS      1e-6f
 
-/* Division-by-zero guard on r_i = sqrt(...). Matches POS_H_MIN_M in
- * pos_solver.c: only reachable if the estimate lands exactly on an anchor's
- * horizontal position AND dz is (mis-)configured as 0. */
+/* Division-by-zero guard on r_i = sqrt(...). Same VALUE as POS_H_MIN_M in
+ * pos_solver.c, but a different BEHAVIOUR: pos_solver.c clamps h to that
+ * floor and continues (max_abs_residual()/gn_solve()), whereas here the
+ * solve is refused outright rather than clamped. Only reachable if the
+ * estimate lands exactly on an anchor's horizontal position AND dz is
+ * (mis-)configured as 0. */
 #define R_MIN_M      1e-3f
 
 /* Slant distance from (x, y) to anchor a's horizontal position, with dz
