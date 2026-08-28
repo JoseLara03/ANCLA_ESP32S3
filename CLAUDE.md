@@ -1644,6 +1644,56 @@ sync master                    transmit half — CCP sent/dropped counts as
   `tests/sync_model/` pins the relation. The roles-swapped second direction
   in `docs/anchor-sync-measurement.md` §3 has **not** been run.
 
+- **A four-anchor survey plus a laser distance meter calibrates antenna delay
+  BETTER than `cal ref` does, and it is the only method here that is
+  falsifiable.** Measured 2026-08-28 on the four-anchor array, in full LOS,
+  after every board had already been through `cal ref` and passed a `cal peer`
+  cross-check. `apos run` still returned `accepted:0` with `rms_mm` 65 and
+  edges disagreeing with a laser by -130 to +519 mm. Fitting the per-node model
+  `error_ij = b_i + b_j` to the six laser-referenced edges is **6 equations
+  against 4 unknowns — overdetermined, so it can fail**. It did not: the RMS
+  collapsed from **312.5 mm to 24.1 mm** (13x), every residual inside +/-33 mm,
+  which is the level of the per-edge `sd` (16-68 mm) already being reported.
+  So the error was per-BOARD antenna delay, not geometry, not NLOS (the array
+  was in clear line of sight), and not clock offset (`max_reciprocal_mm` 24
+  bounds the residual CFO at ~0.04 ppm against a +/-20 ppm crystal). The solved
+  biases were `0x0001` +321 mm, `0x0003` +231 mm, `0x0002` +67 mm, `0x0004`
+  -164 mm -- and `0x0001`/`0x0003` were exactly the two boards the operator had
+  independently noticed "always differ", which is what turned a hunch into a
+  number. **Conversion: 2.3459 mm of range per unit of antenna delay**
+  (`c * 15.65 ps / 2`; one DTU is 4.69 mm of path but only half of it lands in
+  an SS-TWR range -- the same "half a tick per unit" the antenna-delay bullet
+  in "URGENT next work" derives). Reading LONG means the configured delay is
+  too SMALL, so the correction ADDS.
+  **Why `cal ref` cannot reach this answer, structurally**: it drives
+  `(b_anchor + b_ref)` to zero and can never observe `b_ref` alone, so the
+  reference node's own delay error transfers into every board it calibrates,
+  invisibly and identically. Two consequences worth keeping. (1) Every anchor
+  calibrated against ONE reference should end up at `b = -b_ref`, i.e. all
+  EQUAL, and pairwise errors should then be a CONSTANT on every pair. A
+  measured SPREAD between boards -- 485 mm here -- therefore proves the
+  persisted `ant_delay_tx` values are not what calibration should have
+  produced, whatever the console said at the time; check the live values with
+  `anchor show` before re-deriving anything. (2) A laser gives ABSOLUTE
+  distances, so the per-node fit is gauge-free and needs no reference node at
+  all: `e_ij = b_i + b_j` over K4 has no null space (adding `c` to every `b`
+  moves every edge by `2c`), so the four biases come out absolutely, not
+  relatively.
+  **This calibrates only the SUM `ant_tx + ant_rx`, which is all SS-TWR can
+  observe and all TWR ranging needs. It constrains the TX/RX SPLIT not at
+  all** -- and the split is exactly what Phase 3 TDoA depends on, since an
+  anchor there only ever receives and nothing cancels: the observable carries
+  `(dR_i - dR_0)`, the DIFFERENCE in RX-delay error between anchors, at
+  **4.69 mm per DTU with nothing to cancel it**. Every board here still has
+  `ant_delay_rx` pinned at the factory 16385 while the whole correction went
+  into TX, so that difference is raw uncalibrated manufacturing spread. No TWR
+  measurement of any kind can constrain it. Recorded here because the TDoA
+  plan does not yet account for it.
+  Two things this does NOT establish, stated so they are not assumed: the
+  corrected delays had not been applied or re-surveyed when this was written,
+  and the fit's own residual (24 mm) is a floor on what the method can resolve,
+  not a proven accuracy.
+
 ## System context
 
 Ranging is Two-Way Ranging (TWR); distance is computed on the tag, not the
