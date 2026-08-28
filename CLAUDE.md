@@ -473,6 +473,25 @@ sync master                    transmit half — CCP sent/dropped counts as
   feeds a collected group straight into `tdoa_solve()`, and a dedicated
   test that proves a releasable group survives slot exhaustion that would
   have evicted it under the old, age-only policy.
+- `src/tdoa_dtu.{c,h}` — turns a blink group's ABSOLUTE 40-bit master-base
+  timestamps into signed differences, and bounds them. `struct tdoa_meas.t_dtu`
+  as it leaves `blink_rx.c` wraps every ~17.2 s, and `tdoa_solve()` consumes
+  only `t_i - t_0`, so two observations of the SAME blink on opposite sides of
+  that wrap differ by ~2^40 DTU — about **5.16 million km** of path difference —
+  which the solver cannot tell from a measurement. Neither `tdoa_collect` (which
+  only groups) nor `tdoa_solve` (delivered and tested against rebased inputs) may
+  fix it, so `tdoa_gw` calls `tdoa_dtu_rebase()` between
+  `tdoa_collect_take_ready()` and `tdoa_solve()`: the project's global
+  "every timestamp comparison is a signed difference" rule at modulo 2^40
+  instead of 2^32. `tdoa_dtu_plausible()` then bounds every rebased `|t_dtu|` by
+  `TDOA_DTU_MAX_SPREAD` (32768 DTU = 153.7 m of path difference) — a
+  deliberately generous PHYSICAL bound from the deployment (apos edges measured
+  1.2–2.5 m), **not** a sync-quality filter: it catches the gross case (an
+  uncorrected wrap, a corrupt `t_dtu`, a clock model re-baselined mid-group) and
+  is the only sanity check in front of a solver whose own residual is zero by
+  construction at 3 anchors. Tightening it to, say, 20 m would make it an
+  underived sync-quality gate in disguise. Pure C, host-tested in
+  `tests/tdoa_dtu/`, including that an UNREBASED wrapped group is rejected.
 - `src/tdoa_solve.{c,h}` — the Phase 3 position solver: hyperbolic 2D
   multilateration by Gauss-Newton over range DIFFERENCES (`r_i - r_0`) rather
   than ranges, with anchor 0 as the reference — same closed-form 2x2 normal
@@ -1664,6 +1683,9 @@ gcc -Wall -Wextra -Isrc -o tests/pos_solver/test_pos_solver.exe tests/pos_solver
 
 gcc -Wall -Wextra -Isrc -o tests/tdoa_collect/test_tdoa_collect.exe tests/tdoa_collect/test_tdoa_collect.c src/tdoa_collect.c src/tdoa_solve.c src/pos_residual.c -lm
 ./tests/tdoa_collect/test_tdoa_collect.exe      # tdoa_collect: ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/tdoa_dtu/test_tdoa_dtu.exe tests/tdoa_dtu/test_tdoa_dtu.c src/tdoa_dtu.c -lm
+./tests/tdoa_dtu/test_tdoa_dtu.exe              # tdoa_dtu: ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -o tests/tdoa_solve/test_tdoa_solve.exe tests/tdoa_solve/test_tdoa_solve.c src/tdoa_solve.c src/pos_residual.c -lm
 ./tests/tdoa_solve/test_tdoa_solve.exe          # tdoa_solve: ALL TESTS PASSED, exits 0
