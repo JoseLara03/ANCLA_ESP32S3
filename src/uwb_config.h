@@ -72,9 +72,12 @@ bool uwb_config_mode_from_name(const char *name, uint8_t *out);
 /* "slave", "gateway", or "unknown" for an out-of-range value. Never NULL. */
 const char *uwb_config_mode_name(uint8_t mode);
 
-/* This anchor's 16-bit short address: UWB_ANCHOR_ADDR_BASE + anchor_id.
- * The single place the console id maps to the on-air address. Its low byte is
- * also the id the tag echoes in the legacy WAVE poll. */
+/* This board's 16-bit short address. In SLAVE mode: UWB_ANCHOR_ADDR_BASE +
+ * anchor_id, the single place the console id maps to the on-air address (its
+ * low byte is also the id the tag echoes in the legacy WAVE poll). In GATEWAY
+ * mode: always UWB_ADDR_GATEWAY_RESERVED, regardless of anchor_id -- that
+ * field is meaningless on a gateway and defaults to 0, which used to alias
+ * onto anchor id 0's real address. */
 uint16_t uwb_config_short_addr(const uwb_config_t *c);
 
 #endif /* UWB_CONFIG_H */

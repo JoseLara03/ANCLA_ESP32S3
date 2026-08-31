@@ -141,6 +141,16 @@ static void test_short_addr(void)
     /* The low byte is what the tag echoes in the WAVE poll's byte 10. */
     CHECK(uwb_config_set_id(&c, 3));
     CHECK((uint8_t)(uwb_config_short_addr(&c) & 0xFFu) == 4);
+
+    /* GATEWAY mode always reports the reserved address, regardless of
+     * anchor_id -- a fresh/never-touched gateway defaults to id 0, which
+     * must NOT alias onto a genuine anchor id 0's address (this collided
+     * two boards' MQTT client ids on the same broker before this fix). */
+    for (uint8_t id = 0; id < UWB_MAX_ANCHORS; id++) {
+        CHECK(uwb_config_set_id(&c, id));
+        CHECK(uwb_config_set_mode(&c, UWB_MODE_GATEWAY));
+        CHECK(uwb_config_short_addr(&c) == UWB_ADDR_GATEWAY_RESERVED);
+    }
 }
 
 int main(void)

@@ -98,5 +98,15 @@ const char *uwb_config_mode_name(uint8_t mode)
 
 uint16_t uwb_config_short_addr(const uwb_config_t *c)
 {
+	/* A gateway's real address is the reserved 0x0000, not base+anchor_id --
+	 * anchor_id on a gateway config is meaningless (never set from the
+	 * console) and defaults to 0, which previously mapped to the SAME
+	 * address as a genuine anchor id 0. Every caller of this function
+	 * (net_uplink.c's MQTT client id, `anchor show`, ...) needs the real
+	 * address regardless of role, so the branch belongs here once rather
+	 * than being duplicated at each call site. */
+	if (c->mode == UWB_MODE_GATEWAY) {
+		return UWB_ADDR_GATEWAY_RESERVED;
+	}
 	return (uint16_t)(UWB_ANCHOR_ADDR_BASE + c->anchor_id);
 }
