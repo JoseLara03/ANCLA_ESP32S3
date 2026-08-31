@@ -197,6 +197,72 @@ project has learned about the survey path.
 - The point of the branch: a tag ranging four surveyed anchors, with `0xEA`
   `residual` under ~0.1 m and `(x, y)` stable between fixes.
 
+### 3. TDoA migration (Phase 2/3): the measurement chain works, capacity does not yet
+
+Separate track from §1/§2 above, and the reason the two must not be
+conflated: this is about **how many tags the network can serve**, not
+whether any one tag's coordinate is trustworthy. Full history in
+`docs/superpowers/plans/2026-08-25-fase3-tdoa.md` and
+`docs/superpowers/specs/2026-08-25-rtls-scale-tdoa-design.md`; this is the
+short version.
+
+**Phase 2 gate: ran, and failed against its own original threshold — Phase 3
+proceeded anyway, by a deliberate product decision, not because the hardware
+met the bar it was asked to meet.** Anchor-to-anchor timestamp jitter over CCP
+measured **782 ps at 30 cm** (`marginal`) and **1.44–1.53 ns at 3 m**
+(**`fail`**) against the 1 ns target (`docs/anchor-sync-measurement.md`
+§4.1). That converts to ~0.43–0.46 m of implied position error at the 3 m
+figure. The accuracy target was consciously re-derived from 10–30 cm to
+**~45 cm**, and the worst measured case lands right at that number — proceed
+at that accuracy, not at the original one, and do not cite a 10–30 cm figure
+for this system without re-checking that decision first.
+
+**Phase 3, Task 7 (the tag emits BLINK instead of ranging): ran on hardware
+2026-08-30.** The whole observation chain — tag emits `0xF0` BLINK, every
+anchor that hears it stamps and converts the timestamp via
+`sync_model_to_master()`, the gateway groups (`tdoa_collect`), rebases and
+bounds the 40-bit timestamps (`tdoa_dtu`), solves (`tdoa_solve`), and
+publishes through the same `pos_sink_publish()`/MQTT path as before — is
+verified producing real fixes, including **surviving a `kernel reboot cold`**
+after the survey was re-applied. **Read this precisely: what was measured is
+precision (repeatability between consecutive fixes), not accuracy.** No
+ground-truth position has been taken, so the ~45 cm target above is still a
+target, not yet a verified number. `out->residual_m` from `tdoa_solve()` is
+zero by construction at `TDOA_MIN_ANCHORS` (3) — it is not evidence of fit
+quality here and must not be cited as such (see `src/tdoa_solve.h`'s own
+caller contract).
+
+**Task 8 (cleanup) is done, in `tag_testting`, 2026-08-30.** `pos_dbg.c` (the
+temporary raw-range BLE log used to tune the tag's own EKF) is retired per
+its removal checklist in `tag_testting/spec/2026-08-22-position-filtering-design.md`
+— its capture campaign never ran; it is gone because Phase 3 moved
+position-solving off the tag entirely, not because the log finished its job.
+`pos_solver`/`pos_residual` ownership has NOT yet moved from `tag_testting`'s
+`CLAUDE.md` to this one — that transfer is still open and belongs to whoever
+next edits both files together, so a diff between the two copies can be
+checked at the same time as the ownership note changes.
+
+**What is NOT done, and is the actual blocker on the 100-tags-at-5Hz
+objective: Task 4B, capacity.** The BLINK as shipped by Task 7 occupies the
+*same* 13.32 ms slot a full TWR exchange used — a 1.223 ms frame sitting in a
+slot sized for something 10.9x longer. The tag saves battery; **the network
+gains zero capacity** and still serves the same ~11 tags TWR always did. This
+is now fully designed — `docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md`
+resolves all five open questions the original Task 4B stub left (slot
+assignment is `slot_index(seat_id) = seat_id`, the CFP is repartitioned
+rather than extended so `T_SUPERFRAME_UUS` stays untouched, a cell runs
+TWR-mode or blink-mode but never both) — and planned,
+`docs/superpowers/plans/2026-08-30-blink-slotted-mac.md`, six tasks across
+both repos. **None of the six tasks in that plan have been implemented yet.**
+The first is the tag's first-ever use of `DWT_START_TX_DELAYED` on this radio
+port — flagged in the design as a genuinely new risk, not a copy-paste from
+the anchor side's existing delayed-TX code.
+
+**In one sentence, for whoever picks this up next:** the TDoA measurement
+path is real and hardware-verified; the accuracy number is a target, not yet
+checked against ground truth; and the capacity number the whole migration was
+for (100 tags) has a finished design and zero lines of implementation.
+
 ## Build & flash
 
 ```powershell
@@ -361,7 +427,12 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `modules/dw3000-decadriver/` — **vendored third-party** Zephyr module
   (br101/zephyr-dw3000-decadriver @ `6208d99`, containing Qorvo dwt_uwb_driver
   08.02.02), registered via `ZEPHYR_EXTRA_MODULES`. Carries three deliberate
-  local deltas; a naive upstream re-pull will silently drop them.
+  local deltas plus a fourth found 2026-08-30: `platform/dw3000_spi.c`
+  included `"version.h"` directly, which Zephyr moved to
+  `include/generated/zephyr/version.h`; only surfaced building against a
+  newer Zephyr than the one this module was last touched under. Fixed by
+  including `<zephyr/version.h>`. A naive upstream re-pull will silently
+  drop all four.
 - `src/main.c` — boot: load config from NVS, bring the DW3220 up, dispatch on
   mode to `uwb_slave_run()` / `uwb_gateway_run()`.
 - `src/uwb_config.{c,h}` — per-anchor config (mode, id, antenna delays,
@@ -1867,5 +1938,7 @@ sits against the beacon's own frame length. Same shim pattern as the tag's
 
 ## Repo
 
-Local git only, on `master`, **no remote configured** — nothing is pushed
-anywhere.
+`origin` is `https://github.com/JoseLara03/ANCLA_ESP32S3.git`. Work happens on
+feature branches (`feat/rtls-scale-tdoa` as of 2026-08-31), pushed to `origin`;
+`master` is the base branch. This corrects an earlier version of this section
+that said no remote was configured — true once, not since.
