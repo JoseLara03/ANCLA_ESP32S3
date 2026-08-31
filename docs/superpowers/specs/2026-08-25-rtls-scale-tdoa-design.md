@@ -442,7 +442,7 @@ para cobertura es Fase 5, no Fase 1 — aunque el backhaul ya lo permitiría.
 | **1** | Scheduler asiento/horario (§4.1), `proto_ver` v3 | TWR sirve ~275 tags IDLE / 11 movedores. Cap de 11 roto. |
 | **1a** | **Política de admisión: presencia garantizada, tasa best-effort.** Medido con el código real: reservar solo para la ocupación actual dejaba que 10 movedores que llegan primero tomaran el airtime y **rechazaba 54 de 100 tags**. Corregido reservando el piso IDLE para **toda** la tabla de asientos (`GW_SCHED_IDLE_FLOOR`), de modo que un tag siempre puede asociar y solo el *incremento* sobre IDLE compite (`GW_SCHED_UPGRADE_POOL`). Resultado: **128 tags admitidos siempre**, y FAST racionado a `GW_SCHED_MAX_FAST` = **6**. El costo honesto: los movedores simultáneos a 5 Hz bajan de 11 a 6 — pero esos 11 solo coexistían con **cero** otros tags, así que no es regresión sino el límite físico preexistente asignado a propósito en vez de por orden de llegada. Reemplaza el hack `GW_SCHED_OVERSUB_SF`, que parcheaba el síntoma. | |
 | **2** | `sync_model` + CCP entre anclas, medido en hardware | Sincronía sub-ns demostrada o refutada. **Gate de decisión.** |
-| **3** | Blink TDoA + solve en gateway (§4.3) + backhaul de timestamps | 100 tags a 5 Hz. Objetivo de producto alcanzado. |
+| **3** | Blink TDoA + solve en gateway (§4.3) + backhaul de timestamps | **Cadena verificada en hardware (2026-08-30), no el objetivo de 100 tags.** Ver la nota bajo esta tabla. |
 | **4** | Downlink `0xEC`/`0xED` (§4.4) + zonas en NVS (§4.5) | Configurable desde plataforma, multi-celda. |
 | **5** | Anclas como relevo de downlink; TWR conservado en el perímetro | Cobertura fuera del casco convexo. |
 
@@ -450,6 +450,33 @@ La Fase 2 es el **gate real del proyecto**. Si la sincronía sub-ns no se
 demuestra en hardware, la Fase 3 no procede y el producto queda en TWR con el
 scheduler de Fase 1 — 9× corto del objetivo. Por eso la Fase 2 se de-riskea en
 C puro host-testeado **antes** de tocar radio.
+
+**Fase 3, estado medido (2026-08-30) — leer con cuidado, son dos cosas
+distintas.** El gate de Fase 2 CORRIÓ y falló contra su umbral original de 1 ns
+(782 ps a 30 cm, 1.44–1.53 ns a 3 m); la Fase 3 se autorizó de todas formas por
+una **re-derivación consciente del objetivo de producto**, de 10–30 cm a
+~45 cm (`docs/superpowers/plans/2026-08-25-fase3-tdoa.md`, "Estado del gate").
+Sobre esa base, la Tarea 7 corrió en hardware: el tag emite BLINK (`0xF0`), las
+anclas lo estampan y publican, y el gateway agrupa, resuelve y publica fixes
+reales — confirmado con series de fixes capturadas y graficadas, incluyendo
+supervivencia a `kernel reboot cold` tras reaplicar el survey. **Esto mide
+precisión (repetibilidad), no exactitud** — no se ha establecido ninguna
+posición de referencia (`ground truth`) contra la cual comparar, así que
+"~45 cm" sigue siendo el objetivo de producto, no todavía un número verificado
+contra la realidad.
+
+Lo que la tabla de arriba llamaba el objetivo de la Fase 3 — **100 tags a
+5 Hz** — es una afirmación distinta y **no está probada por lo anterior**: esa
+cifra depende de cobrar el ahorro de airtime del BLINK frente al barrido TWR
+que reemplaza, y eso es exactamente lo que la Tarea 4B todavía no hace (ver
+`docs/superpowers/plans/2026-08-25-fase3-tdoa.md`, sección "Lo que T4B
+necesita antes de poder escribirse"). Medido: el BLINK de hoy ocupa la misma
+ranura de 13.32 ms que el barrido TWR, así que la red admite los mismos 11
+tags de siempre — el tag ahorra batería, la red no gana capacidad. Sin T4B
+(mover el TX del BLINK a un TX diferido en DTU desde el RX del beacon,
+re-derivar la ranura, y asignación implícita de ranura desde `seat_id`), la
+Fase 3 resuelve posición correctamente para los tags que ya caben en el
+scheduler de Fase 1, pero no ha movido el techo de capacidad ni un tag.
 
 ---
 
@@ -630,17 +657,40 @@ congelamiento de PHY — decirlo así es más útil que meterlos y no terminarlo
 ## 10. Gates de hardware, en orden
 
 Heredados de `CLAUDE.md` y ahora desbloqueados por el congelamiento de PHY.
-Ninguno se ha ejecutado.
+Actualizado 2026-08-30: 3, 4 y 6 corrieron; 1 corrió parcialmente; 2 y 5
+siguen sin correr (ver la nota bajo cada uno).
 
 1. Calibración de retardo de antena: `cal ref` por ancla hasta `|error_mm| < 15`,
-   sobrevive `kernel reboot cold`, las tres anclas.
-2. Cross-check `cal peer`: `|error_mm| < 30` en todo par.
-3. `apos enum` → `apos run` con `missing_pairs:0` → `apos apply`.
+   sobrevive `kernel reboot cold`, las tres anclas. **Parcial** — una ancla
+   alcanzó -8 mm el 2026-08-25; las otras dos siguen sin resultado registrado,
+   y ninguna ha pasado por la repetición ni por `kernel reboot cold`. Un
+   método aparte (survey de 4 anclas + láser) sí corrió el 2026-08-28 y
+   resolvió los cuatro sesgos por-placa absolutos, pero esas correcciones no
+   estaban aplicadas al escribir esa nota — ver `CLAUDE.md`, "URGENT next
+   work" §1, antes de asumir que este gate está cerrado.
+2. Cross-check `cal peer`: `|error_mm| < 30` en todo par. **No corrido** en
+   ningún par todavía.
+3. `apos enum` → `apos run` con `missing_pairs:0` → `apos apply`. **Corrido**
+   el 2026-08-26 con 3 anclas (`0x0001`, `0x0002`, `0x0004`; `0x0003` no
+   respondió enumeración) — `missing_pairs:0`, `placed:3/3`. Sobrevivió
+   `kernel reboot cold` el 2026-08-28 (survey reaplicado, fixes de TDoA
+   estables tras el reinicio).
 4. Las distancias nodo-a-nodo del survey contra **cinta métrica** — en un arreglo
    de 4 anclas resuelto en 3D es la única verificación real de la geometría.
+   **Corrido y en desacuerdo**: hasta 1037 mm de diferencia entre el survey y
+   `anchor pos`, sin resolver — ver `CLAUDE.md`, "Still outstanding" bajo la
+   sección de auto-posicionamiento.
 5. `residual` del `0xEA` por debajo de ~0.1 m con `(x, y)` estable entre fixes.
+   **No aplica tal cual a TDoA** — con `TDOA_MIN_ANCHORS` = 3 el residual de
+   `tdoa_solve()` es cero por construcción (ver `src/tdoa_solve.c`), así que
+   este gate, escrito para TWR, no tiene lectura equivalente hasta que se
+   ranguee con 4 anclas.
 6. **Nuevo, gate de Fase 2:** sincronía sub-ns entre dos anclas sostenida sobre
-   CCPs, medida contra una distancia conocida.
+   CCPs, medida contra una distancia conocida. **Corrido el 2026-08-27, y
+   falló contra el umbral original de 1 ns** (782 ps a 30 cm, marginal;
+   1.44–1.53 ns a 3 m, fail). La Fase 3 procedió de todas formas por una
+   re-derivación consciente del objetivo de producto a ~45 cm — ver la nota
+   de Fase 3 bajo la tabla de §5 y `docs/anchor-sync-measurement.md` §4.1.
 
 ---
 
@@ -658,3 +708,26 @@ Ninguno se ha ejecutado.
   `dwt_setfinegraintxseq(0)` sigue siendo requerido pero no era la causa y su
   contribución nunca se midió por separado — no citarlo como evidencia.
 - **Divergencia SFD entre repos** (§2.8): se corrige en T1.
+- **§5, fila de la Fase 3, versión original de este spec:** decía "100 tags a
+  5 Hz. Objetivo de producto alcanzado." **Prematuro.** Lo que corrió en
+  hardware (Tarea 7, 2026-08-30) prueba que la cadena de medición —
+  BLINK → estampado por ancla → agrupación → solve TDoA → publicación —
+  funciona y produce fixes repetibles, incluyendo supervivencia a `kernel
+  reboot cold`. No prueba la cifra de 100 tags: el BLINK, tal como se emite
+  hoy, ocupa la misma ranura TDMA de 13.32 ms que el barrido TWR que
+  reemplaza, así que el techo de capacidad sigue en 11 — exactamente el
+  hallazgo que obligó a escribir la Tarea 4B por separado (ver la nota bajo la
+  tabla de §5). Tampoco prueba exactitud: los fixes capturados dan precisión
+  (repetibilidad entre lecturas consecutivas), no exactitud contra una
+  posición de referencia, porque no se ha tomado ninguna.
+- **Tarea 8 (limpieza) de
+  `docs/superpowers/plans/2026-08-25-fase3-tdoa.md`** se ejecutó
+  2026-08-30 en `tag_testting`: se borró `pos_dbg.{c,h}` y su suite (el log
+  binario temporal de captura de rangos crudos usado para calibrar el EKF, ya
+  sin uso), revirtiendo `struct twr_msg`, `ss_twr_msgq` y el comando `dbg` de
+  `tag_cmd.c` a su forma anterior a esa instrumentación. **La propiedad de
+  `pos_solver`/`pos_residual` (ahora del lado de ANCLA, que es quien resuelve
+  en Fase 3) sigue sin transferirse en ningún `CLAUDE.md`** — ninguno de los
+  dos se tocó en esta sesión por instrucción explícita del operador ("esta
+  computadora no es la unidad de desarrollo principal"); queda pendiente para
+  quien sí edite ambos.
