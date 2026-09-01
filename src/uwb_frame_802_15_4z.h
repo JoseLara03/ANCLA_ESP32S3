@@ -53,8 +53,19 @@
  * A v2 tag against a v3 gateway therefore stays deaf in SCAN, which is the
  * correct loud failure rather than a silent misbehaviour -- but it does make
  * this a FLAG DAY: both firmwares are ours and both must be reflashed together.
- * ALERT's move to 0xEE is grouped here for the same reason. */
-#define UWB_PROTO_VER     3
+ * ALERT's move to 0xEE is grouped here for the same reason.
+ *
+ * Bumped 3 -> 4 on 2026-08-31 for Task 4B, the BLINK slotted MAC (see
+ * docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md section 1.3).
+ * Again, the frame LAYOUT is unchanged -- UWB_FRAME_LEN_BEACON is still
+ * `15 + 2 * UWB_FRAME_N_CFP` and `sched[]` still carries UWB_FRAME_N_CFP
+ * entries -- but a v4 gateway running its cell in BLINK mode transmits
+ * `sched[]` reserved/zero and assigns airtime by `blink_sched_slot_index()`
+ * (identity on seat_id) instead. Same class of change as 2 -> 3: the
+ * MEANING of an unchanged wire format changes, so the version has to move
+ * even though nothing byte-visible does. A v3 tag against a v4 gateway
+ * stays deaf in SCAN -- same flag day, both firmwares reflashed together. */
+#define UWB_PROTO_VER     4
 #define UWB_FRAME_N_CFP   11        /* ranging slots per superframe */
 #define UWB_FRAME_N_CAP   4         /* CAP Aloha mini-slots (v1) */
 

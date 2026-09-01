@@ -236,6 +236,33 @@ void gw_core_init(struct gw_core_ctx *c)
      * schema-valid rather than full of zeroes. */
     for (unsigned int slot = 0; slot < GW_N_CFP; slot++)
         c->sched[slot] = UWB_FRAME_ADDR_BCAST;
+
+    /* blink_n_slots defaults to 0 (TWR mode) via the memset above. */
+}
+
+void gw_core_set_blink_mode(struct gw_core_ctx *c, uint16_t blink_n_slots)
+{
+    c->blink_n_slots = blink_n_slots;
+}
+
+void gw_core_debug_fill_seats(struct gw_core_ctx *c, uint16_t n_dummy)
+{
+    if (n_dummy >= GW_MAX_SEATS) n_dummy = GW_MAX_SEATS - 1u;
+
+    for (uint16_t i = 0; i < n_dummy; i++) {
+        /* 0xF000+ is far above GW_TAG_ADDR_BASE (0x0100) and the anchor
+         * range (0x0001..0x0004), so it cannot collide with a real tag's
+         * pool-allocated address or an anchor's fixed one for any bench
+         * run's duration. */
+        c->seats[i].short_addr = (uint16_t)(0xF000u + i);
+        memset(c->seats[i].eui, 0, UWB_FRAME_EUI_LEN);
+        c->seats[i].eui[0] = 0xDBu;   /* 'dummy', not a real EUI's OUI */
+        c->seats[i].eui[1] = (uint8_t)(i >> 8);
+        c->seats[i].eui[2] = (uint8_t)i;
+        c->seats[i].tier            = GW_TIER_IDLE;
+        c->seats[i].lease_remaining = 0xFFFFu; /* outlasts any bench run */
+        c->seats[i].next_due        = c->frame_counter;
+    }
 }
 
 void gw_core_build_slotmap(const struct gw_core_ctx *c, uint16_t out[GW_N_CFP])
@@ -262,7 +289,17 @@ bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
     bool fresh = (idx < 0);
 
     if (fresh) {
-        for (unsigned int i = 0; i < GW_MAX_SEATS; i++)
+        /* TWR mode (blink_n_slots == 0): scan the whole table, as before.
+         * BLINK mode: only seat ids that fit the cell's BLINK slot count are
+         * admissible -- design section 1.1's v1 overflow policy. This is a
+         * bound on the SCAN, not on find_seat_by_eui() above, so a seat that
+         * already exists (idx >= 0 before this block) always keeps its
+         * identity regardless of how blink_n_slots later changes. */
+        unsigned int limit = (c->blink_n_slots != 0 &&
+                              (uint16_t)c->blink_n_slots < GW_MAX_SEATS)
+                                     ? c->blink_n_slots : GW_MAX_SEATS;
+
+        for (unsigned int i = 0; i < limit; i++)
             if (c->seats[i].short_addr == 0) { idx = (int)i; break; }
         if (idx < 0) return false;                   /* no seat left */
     }

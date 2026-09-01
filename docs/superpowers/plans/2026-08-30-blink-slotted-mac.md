@@ -37,6 +37,16 @@ Tarea 5 necesita la 1 (mecanismo de TX) y la 4 (que exista un modo blink del
 lado del gateway contra el cual probar). La Tarea 6 es el cierre de hardware
 end-to-end y necesita todo lo anterior.
 
+**Estado 2026-08-31:** Tareas 1, 3, 4 y 5 escritas y compiladas/host-testeadas
+esta sesión (ninguna tocó hardware). Detalle completo en el `CLAUDE.md` de
+ANCLA, sección TDoA §3. Resumen: `BLINK_N_SLOTS = 134` (Tarea 3),
+`UWB_PROTO_VER`/`UWB_NET_PROTO_VER` en 4 y `anchor cell twr|blink` (Tarea 4),
+TX diferido en DTU y slot por `seat_id` escritos en el tag pero SIN verificar
+en banco (Tareas 1 y 5, con una brecha conocida documentada: los seat_id
+~132-133 de 134 exceden el superframe por el redondeo a ms de las constantes
+heredadas de TWR). Tareas 2 y 6 (medición y verificación de hardware) siguen
+sin empezar — nada de lo anterior se ha ejecutado en un board real.
+
 ---
 
 ## Task 1: El tag programa el BLINK como TX diferido en DTU *(tag_testting, hardware)*
@@ -70,30 +80,44 @@ distinto, nunca ejercido en esta ruta).
   RMARKER del beacon, en vez de a un offset variable en milisegundos después
   de que el software terminó de procesar el beacon.
 
-- [ ] Confirmar qué función del puerto (`port.c`, o donde viva
+- [x] Confirmar qué función del puerto (`port.c`, o donde viva
       `uwb_radio_rx_beacon()`) puede devolver el RX timestamp de 40 bits del
       beacon, y exponerla si no existe ya. No inventar una ruta nueva de SPI
       si la ISR de RX ya deja el dato disponible — mirar cómo
       `uwb_ss_initiator.c` lo hace para sus propias respuestas primero.
-- [ ] Calcular el offset de armado: `DX_TIME` objetivo menos el SHR completo
+      Hecho: `uwb_radio_rx_beacon()` en `uwb_net_runner.c` ahora captura
+      `dwt_readrxtimestamp()` en cada RX exitoso, expuesto vía
+      `uwb_radio_last_rx_ts40()`.
+- [x] Calcular el offset de armado: `DX_TIME` objetivo menos el SHR completo
       de la trama de BLINK (a PLEN_1024, 1 050 194 ns) — el plazo de armado
       real es contra el PREÁMBULO, no contra el RMARKER. Ver `CLAUDE.md`,
       la entrada sobre `DX_TIME - SHR` y la de "delayed TX armado
       inmediatamente después de otro TX" para las dos formas en que esto ya
       falló al 100% la primera vez que se escribió en el otro repo.
-- [ ] Llamar `dwt_forcetrxoff()` antes de armar el TX diferido — el RX del
+      Escrito siguiendo el patrón ya existente en
+      `examples/uwb_ds_initiator.c` (`(rx_ts + offset_ticks) >> 8`); el
+      margen contra el preámbulo en sí se midió en la Tarea 2 (2026-09-01):
+      spread máximo 39.2 ns, muy por debajo del margen disponible.
+- [x] Llamar `dwt_forcetrxoff()` antes de armar el TX diferido — el RX del
       beacon que acaba de completarse deja el Transmit Sequencing Engine en
       un estado que un `dwt_starttx()` inmediatamente posterior puede no
       tolerar sin él. Confirmar en hardware si este puerto tiene el mismo
       comportamiento que el DW3000 del otro repo antes de asumirlo.
-- [ ] Mantener, por ahora, el offset de slot ACTUAL (`ctx.tx_slot`) para el
+      Llamada añadida en `blink_publish()`; confirmado en hardware por la
+      Tarea 2 (BLINKs limpios, sin fallo de armado observado) -- la
+      verificación end-to-end restante es Tarea 6.
+- [x] Mantener, por ahora, el offset de slot ACTUAL (`ctx.tx_slot`) para el
       cálculo del `DX_TIME` — esta tarea cambia CÓMO se programa el TX, no
       DÓNDE cae el slot. Eso es la Tarea 5. Mezclar los dos cambios hace
       imposible saber cuál rompió qué si algo falla en el banco.
 - [ ] Verificar en un sniffer que el BLINK sigue apareciendo, sin cambios de
       formato, y que su RMARKER cae dentro de la ranura esperada (con
       margen de sobra, ya que la guarda real todavía no se ha fijado).
-- [ ] Commit.
+      PENDIENTE — requiere hardware.
+- [x] Commit. Hecho 2026-09-01 en `tag_testting`
+      (`fix(net): blink-mode tags now honor tier cadence instead of never TXing`,
+      branch `feat/rtls-scale-tdoa`) — junto con el bug de tier encontrado en
+      banco (ver nota debajo) y el resto de Tarea 5.
 
 ---
 
@@ -111,23 +135,46 @@ captura llegara a correr nunca). Si un sniffer ya usado en este proyecto
 RMARKER real del BLINK en varias superframes consecutivas, es preferible a
 añadir un contador o un log nuevo al firmware del tag.
 
-- [ ] Con la Tarea 1 en un tag, capturar N >= 200 BLINKs consecutivos con el
+- [x] Con la Tarea 1 en un tag, capturar N >= 200 BLINKs consecutivos con el
       sniffer y medir la dispersión del RMARKER real respecto al instante
       programado (offset fijo en DTU desde el RMARKER del beacon).
-- [ ] Registrar el resultado: media, desviación, peor caso. Comparar contra
+      Hecho 2026-09-01: `tools/blink_jitter.py` contra
+      `COM7_2026_09_01.12.43.19.533.txt`, tres tags reales forzados a
+      seat_id 120/121/122 (`CONFIG_ANCLA_DEBUG_FORCE_HIGH_SEAT`, ver
+      `gw_core.h`/Kconfig) para ejercitar la cola de riesgo del redondeo a
+      ms de la Tarea 5, no solo los seat_id bajos que una flota de 3 tags
+      ocuparía por defecto. n=873, 822 y 733 respectivamente (todos >= 200;
+      una primera captura, `COM7_...12.17.37.616.txt`, quedó descartada por
+      mezclar un RESCAN de uno de los tags a mitad de captura -- spread
+      bimodal de ~10 ms en esa dirección, señal clara de dos asignaciones
+      de slot distintas dentro de la misma dirección de origen).
+- [x] Registrar el resultado: media, desviación, peor caso. Comparar contra
       los 64 us de jitter de armado ya medidos en el ANCLA (gateway) — la
       pregunta que este número contesta es si el tag (nRF52833, puerto de
       radio distinto) se comporta igual, peor o mejor.
-- [ ] Actualizar `docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md`
+      Resultado: spread máximo entre los tres tags = **39.2 ns**
+      (seat 120: 39.2 ns, seat 121: 23.8 ns, seat 122: 20.1 ns) — cuatro
+      órdenes de magnitud POR DEBAJO de los 64 us del gateway. El tag se
+      comporta muchísimo mejor, no peor: el término dominante en la guarda
+      sigue siendo el jitter del gateway, no el del tag.
+- [x] Actualizar `docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md`
       §1.2 con el número medido, reemplazando el valor de arranque
       (`BLINK_SLOT_GUARD_UUS = 200`) por uno derivado del dato real si el
       dato lo justifica. **No mover el valor en el código sin haber
       actualizado primero el documento que dice por qué.**
-- [ ] Si el jitter medido es sorprendentemente alto (peor que el reloj de
+      Hecho: `BLINK_SLOT_GUARD_UUS = 100` (suma de términos conocidos
+      64 + 8 + 0.04 us ≈ 72 us, redondeado hacia arriba con margen),
+      `src/blink_sched.h` y la spec §1.1/§1.2 actualizados juntos.
+      `BLINK_N_SLOTS` pasa de 134 a **144** (`tests/blink_sched/`, PASSED) —
+      y al superar `GW_MAX_SEATS` (128), la banda de desborde que §1.1
+      describía queda hipotética en este build.
+- [x] Si el jitter medido es sorprendentemente alto (peor que el reloj de
       ms que se está reemplazando, lo cual sería una señal de que algo en
       la Tarea 1 está mal, no una propiedad del hardware), volver a la
       Tarea 1 antes de continuar — no fijar una guarda grande para
       compensar un bug de armado.
+      No aplica: el jitter medido (39.2 ns) es órdenes de magnitud MENOR de
+      lo esperado, no mayor -- no hay señal de bug de armado que investigar.
 
 ---
 
@@ -303,7 +350,18 @@ todavía habla `proto_ver` 3).
       slot que le corresponde por `seat_id` y que no hay colisión — esto es
       la prueba de hardware de la propiedad que la spec probó por
       construcción (§1.1); confirmarla en el aire, no solo en el papel.
-- [ ] Commit.
+- [x] Commit. Hecho 2026-09-01, mismo commit que Tarea 1 (ver arriba). Incluye
+      también un bug de banco encontrado y corregido en esta sesión, no listado
+      en el plan original: un tag en modo blink nunca aparece en `in_map`
+      (el gateway en modo blink transmite `sched[]` reservado/cero, spec §1.3),
+      y `uwb_net_handle()` trataba eso como "perdí mi turno TWR" — SLEEP
+      indefinido, luego TO_SCAN tras `UWB_NET_SCHED_GAP_MAX`, en loop infinito
+      sin emitir jamás `UWB_ACT_SEND_BLINK`. Corregido saltando el gate
+      TWR-only en modo blink; además `UWB_NET_BLINK_KA_CYCLES_MAX` como
+      contención para un segundo bug de banco (asiento reclamado sin ack de
+      KEEPALIVE, dos tags colisionando en el mismo slot). Ver el mensaje de
+      commit y `tests/uwb_net/test_blink_mode_ignores_in_map`,
+      `test_blink_mode_forces_rejoin_after_stale_ka` para el detalle completo.
 
 ---
 

@@ -80,6 +80,51 @@ static void test_twelfth_tag_is_admitted(void)
     CHECK(gw_core_seats_used(&c) == GW_N_CFP + 1);
 }
 
+/* Task 4B: in BLINK mode, a fresh join must be refused once its only free
+ * seat id would land outside the cell's BLINK slot count, even though the
+ * seat TABLE (GW_MAX_SEATS) still has plenty of room. See
+ * docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md section 1.1. */
+static void test_blink_mode_rejects_seat_beyond_n_slots(void)
+{
+    struct gw_core_ctx c;
+    gw_core_init(&c);
+    gw_core_set_blink_mode(&c, 5); /* a tiny cell: only seat ids 0..4 fit */
+
+    for (int i = 0; i < 5; i++) {
+        uint8_t eui[UWB_FRAME_EUI_LEN];
+        struct gw_grant g;
+        mk_eui(eui, (uint8_t)(0x30 + i));
+        CHECK(gw_core_join(&c, eui, GW_TIER_IDLE, &g));
+        CHECK(g.seat_id == i);
+    }
+
+    /* The 6th tag: the seat table has 123 free slots left, but none of them
+     * is admissible under a 5-slot BLINK cell. */
+    uint8_t eui6[UWB_FRAME_EUI_LEN];
+    struct gw_grant g6;
+    mk_eui(eui6, 0x40);
+    CHECK(!gw_core_join(&c, eui6, GW_TIER_IDLE, &g6));
+    CHECK(gw_core_seats_used(&c) == 5);
+}
+
+/* blink_n_slots == 0 (the default, and what TWR mode explicitly restores) must
+ * behave exactly as if the field did not exist -- the full GW_MAX_SEATS scan,
+ * unrestricted. */
+static void test_blink_mode_zero_is_unrestricted(void)
+{
+    struct gw_core_ctx c;
+    gw_core_init(&c);
+    gw_core_set_blink_mode(&c, 0);
+
+    for (int i = 0; i < GW_N_CFP + 1; i++) {
+        uint8_t eui[UWB_FRAME_EUI_LEN];
+        struct gw_grant g;
+        mk_eui(eui, (uint8_t)(0x50 + i));
+        CHECK(gw_core_join(&c, eui, GW_TIER_IDLE, &g));
+        CHECK(g.seat_id == i);
+    }
+}
+
 /* The real seat ceiling, and the 100-tag product target inside it. */
 static void test_hundred_tags_fit(void)
 {
@@ -584,6 +629,8 @@ int main(void)
     test_join_fills_slots_in_order();
     test_rejoin_is_idempotent();
     test_twelfth_tag_is_admitted();
+    test_blink_mode_rejects_seat_beyond_n_slots();
+    test_blink_mode_zero_is_unrestricted();
     test_hundred_tags_fit();
     test_seat_table_full();
     test_keepalive();

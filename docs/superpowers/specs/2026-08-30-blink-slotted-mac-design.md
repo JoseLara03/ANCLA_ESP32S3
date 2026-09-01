@@ -92,8 +92,11 @@ Por qué esto es válido y suficiente:
 
 **El caso `BLINK_N_SLOTS < GW_MAX_SEATS` (banda de desborde) — política v1:
 NO ADMITIR asientos con `seat_id >= BLINK_N_SLOTS` en una celda de blink.**
-Medido en §1.2, `BLINK_N_SLOTS` cae entre 96 y 114 según la guarda, es decir
-por debajo de 128. En vez de inventar un esquema de multiplexado por fase para
+Esta banda es ya HIPOTÉTICA en este build: con el guard medido (§1.2),
+`BLINK_N_SLOTS = 144 > GW_MAX_SEATS = 128`, así que la política de rechazo
+descrita abajo no se ejercita hoy -- queda documentada porque una guarda más
+grande (o un `GW_MAX_SEATS` mayor) podría volver a cruzar ese umbral. En vez
+de inventar un esquema de multiplexado por fase para
 la banda de desborde (coloreo de intervalos sobre 3 periodos de tier
 distintos — un problema real, no trivial), la política v1 es que
 `gw_core_join()` en modo blink **rechaza** una solicitud de asiento cuyo único
@@ -103,49 +106,55 @@ distintos — un problema real, no trivial), la política v1 es que
 GW_MAX_SEATS_BLINK = min(GW_MAX_SEATS, BLINK_N_SLOTS)
 ```
 
-**El costo honesto:** esto baja el techo de presencia garantizada de 128 a
-~100-114 asientos en una celda de blink, en vez de los 128 que la Fase 1a
-garantiza en modo TWR. Sigue cumpliendo el objetivo de producto declarado (100
-tags), con margen si `BLINK_N_SLOTS` termina en 106 o más, y sin margen si cae
-por debajo de 100 — lo cual es exactamente la variable que la Tarea 2 (medir
-la incertidumbre real) termina de fijar. No se re-litiga el objetivo de 128
-seats de la Fase 1a: ese número seguirá siendo correcto para una celda que
-corra en modo TWR. Refinar el desborde con multiplexado por fase queda
+**El costo honesto, actualizado con el guard medido (§1.2):** con
+`BLINK_N_SLOTS = 144 > GW_MAX_SEATS = 128`, `min()` arriba se resuelve a 128 --
+el techo de presencia garantizada NO baja en este build; sigue siendo el mismo
+128 que la Fase 1a garantiza en modo TWR, y `GW_MAX_SEATS` (el tamaño físico
+de `seats[]`, no el guard) es ahora el término que limita, no
+`BLINK_N_SLOTS`. Esto era una posibilidad real antes de medir -- con el
+guard provisional de 200 us, `BLINK_N_SLOTS` caía en 96-114, por debajo de
+128, y la banda de desborde de abajo sí se habría ejercitado. Se deja la
+política v1 escrita porque una guarda más floja o un `GW_MAX_SEATS` mayor
+podrían volver a cruzar ese umbral. Refinar el desborde con multiplexado por
+fase queda
 explícitamente diferido — no se hace aquí, igual que §7 del spec de escala
 difiere otras optimizaciones — y solo vale la pena si un despliegue real
 necesita más asientos simultáneos que `BLINK_N_SLOTS`.
 
 ### 1.2 El valor de `BLINK_SLOT_GUARD_UUS`
 
-**No se fija un valor final en este documento — se fija un valor de arranque
-explícitamente provisional, y el mecanismo para reemplazarlo por uno medido.**
-Esto sigue el patrón ya establecido en este proyecto para constantes que
-dependen de hardware no medido todavía (`TX_COMPLETE_TIMEOUT_MS` empezó como
-una estimación y se revisó con datos de banco).
+**Actualizado 2026-09-01 con datos de banco reales — ya no es el valor de
+arranque provisional.** La Tarea 2 de este plan midió el jitter de armado del
+TAG en hardware; este documento se actualiza junto con el código, por su
+propia regla de no divergir.
 
-Entradas conocidas hoy (Decisión 1 del stub, medidas):
+Entradas conocidas (Decisión 1 del stub):
 - Jitter de armado de TX del **gateway** (ANCLA, ESP32-S3): 64 us, medido en
-  hardware. **No se ha medido en el tag** (nRF52833) — pendiente, ver Tarea 2
-  de este plan.
+  hardware.
 - Deriva de cristal del tag sobre un superframe de 200 ms a 40 ppm: ~8 us,
   despreciable frente a lo anterior.
-- El propio armado de TX diferido en DTU hereda la trampa
-  `DX_TIME - SHR` (ver `CLAUDE.md`, "Un TX diferido armado inmediatamente
-  después de otro TX..." y la entrada de CCP sobre el mismo tema): el plazo
-  real es contra el PREÁMBULO, no contra el RMARKER, y esto ya costó dos
-  ciclos de banco en la Fase 2. La Tarea 1 de este plan hereda exactamente esa
-  trampa y debe medir contra el preámbulo desde el principio, no
-  redescubrirlo.
+- **Jitter de armado de TX del TAG (nRF52833), ahora medido**: `tools/blink_jitter.py`
+  contra `COM7_2026_09_01.12.43.19.533.txt`, tres tags reales forzados a
+  seat_id 120/121/122 vía `CONFIG_ANCLA_DEBUG_FORCE_HIGH_SEAT` (para ejercer
+  la cola de riesgo del redondeo a ms que gw_core.h documenta en la nota de
+  la Tarea 5, no solo los seat_id bajos que una flota pequeña ocupa por
+  defecto). >=730 muestras por tag, spread máximo entre los tres:
+  **39.2 ns** — cuatro órdenes de magnitud por debajo de los dos términos ya
+  conocidos, y por tanto no dominante.
 
-Valor de arranque: **`BLINK_SLOT_GUARD_UUS = 200`** (0.2 ms) — el punto medio
-de la tabla del stub, no el extremo agresivo de 0.1 ms. Con el modelo de
-`mac_budget.h` (ver §1.4), esto da `BLINK_N_SLOTS` en el orden de 96-106
-(exacto: Tarea 3, una vez que `blink_sched.c` calcula la cifra real con la
-tabla PHY congelada en vez del número de mano del stub). **Marcado
-explícitamente como provisional** en el código (`BLINK_SLOT_GUARD_UUS`
-lleva un comentario citando esta sección) hasta que la Tarea 2 mida el jitter
-de armado del TAG en hardware y permita apretar o aflojar el número con datos
-reales en vez de la cifra del gateway.
+Suma de términos conocidos/medidos: 64 + 8 + 0.04 us ≈ **72 us**.
+
+Valor fijado: **`BLINK_SLOT_GUARD_UUS = 100`** (0.1 ms) — redondeado
+hacia arriba desde la suma de ~72 us para dejar margen, no la cifra cruda, y
+por debajo del punto medio provisional de 200 us que este documento fijaba
+antes de que hubiera cualquier medición del lado del tag. Con el modelo de
+`mac_budget.h` (ver §1.4) y la tabla PHY congelada, esto da
+**`BLINK_N_SLOTS` = 144** (`tests/blink_sched/`, medido, no estimado).
+
+El jitter del tag se midió solo en la cola de asientos (120-122 de 128); no
+se ha medido en asientos bajos ni se espera que difiera — `blink_sched_slot_index()`
+es la identidad, y nada en el armado TX depende de qué seat_id se trate — pero
+se anota la limitación en vez de asumirla.
 
 ### 1.3 `proto_ver`: sí sube, y el mecanismo ya existe
 

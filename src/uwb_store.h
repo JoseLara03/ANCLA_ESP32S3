@@ -24,6 +24,7 @@ int uwb_store_init(void);
  * attempted; if either fails, the first failure's errno is returned. */
 int uwb_store_save_mode(void);
 int uwb_store_save_id(void);
+int uwb_store_save_cell_mode(void);
 int uwb_store_save_ant(void);
 int uwb_store_save_pos(void);
 

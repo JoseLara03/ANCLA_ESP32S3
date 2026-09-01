@@ -57,10 +57,12 @@ static void print_config(const struct shell *sh)
 
 	shell_print(sh,
 		    "{\"mode\":\"%s\",\"id\":%u,\"short_addr\":\"0x%04X\","
+		    "\"cell_mode\":\"%s\","
 		    "\"ant_tx\":%u,\"ant_rx\":%u,"
 		    "\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"pos_valid\":%u}",
 		    uwb_config_mode_name(cfg->mode), cfg->anchor_id,
 		    uwb_config_short_addr(cfg),
+		    uwb_config_cell_mode_name(cfg->cell_mode),
 		    cfg->ant_delay_tx, cfg->ant_delay_rx,
 		    (double)cfg->x, (double)cfg->y, (double)cfg->z,
 		    cfg->position_valid ? 1u : 0u);
@@ -126,6 +128,34 @@ static int cmd_mode(const struct shell *sh, size_t argc, char **argv)
 
 	shell_print(sh, "ok: mode=%s (saved) — reboot to apply",
 		    uwb_config_mode_name(cfg->mode));
+	return 0;
+}
+
+static int cmd_cell(const struct shell *sh, size_t argc, char **argv)
+{
+	uwb_config_t *cfg = uwb_config_get();
+	uint8_t cell_mode;
+	int ret;
+
+	ARG_UNUSED(argc);
+
+	if (!uwb_config_cell_mode_from_name(argv[1], &cell_mode)) {
+		shell_error(sh, "error: cell must be twr or blink");
+		return -EINVAL;
+	}
+
+	uwb_config_set_cell_mode(cfg, cell_mode);
+	ret = uwb_store_save_cell_mode();
+	if (ret) {
+		shell_error(sh,
+			    "error: cell=%s applied in RAM but NOT persisted "
+			    "(errno %d) — will be lost on reboot",
+			    uwb_config_cell_mode_name(cfg->cell_mode), ret);
+		return ret;
+	}
+
+	shell_print(sh, "ok: cell=%s (saved) — reboot to apply, GATEWAY only",
+		    uwb_config_cell_mode_name(cfg->cell_mode));
 	return 0;
 }
 
@@ -210,10 +240,12 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 
 	uwb_config_set_defaults(cfg);
 
-	/* All four saves are always attempted, even if an earlier one fails;
+	/* All five saves are always attempted, even if an earlier one fails;
 	 * report the first failure. */
 	ret = uwb_store_save_mode();
 	r = uwb_store_save_id();
+	ret = ret ? ret : r;
+	r = uwb_store_save_cell_mode();
 	ret = ret ? ret : r;
 	r = uwb_store_save_ant();
 	ret = ret ? ret : r;
@@ -240,6 +272,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_anchor,
 		      cmd_id,    2, 0),
 	SHELL_CMD_ARG(mode,  NULL, "mode <slave|gateway> — set the boot mode",
 		      cmd_mode,  2, 0),
+	SHELL_CMD_ARG(cell,  NULL, "cell <twr|blink> — set the GATEWAY's CFP mode",
+		      cmd_cell,  2, 0),
 	SHELL_CMD_ARG(pos,   NULL, "pos <x> <y> <z> — set the coordinates in metres",
 		      cmd_pos,   4, 0),
 	SHELL_CMD_ARG(ant,   NULL, "ant <tx> <rx> — set the antenna delays",

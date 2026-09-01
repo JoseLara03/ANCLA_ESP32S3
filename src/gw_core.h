@@ -214,6 +214,14 @@ struct gw_core_ctx {
      * superframe by calling the getter twice -- which would silently halve
      * every tag's update rate. */
     uint16_t sched[GW_N_CFP];
+    /* 0 = TWR mode (default, unrestricted fresh-join scan of the whole seat
+     * table). Nonzero in BLINK mode: the count of BLINK slots this cell's
+     * geometry affords (blink_sched_n_slots() on the caller's side -- this
+     * module does not depend on blink_sched.h, it just enforces the bound).
+     * A fresh join then only considers seat ids admissible under that count
+     * (design section 1.1's v1 overflow policy) instead of scanning the
+     * whole GW_MAX_SEATS table. See gw_core_set_blink_mode(). */
+    uint16_t blink_n_slots;
 };
 
 struct gw_grant {
@@ -228,6 +236,26 @@ struct gw_grant {
 };
 
 void gw_core_init(struct gw_core_ctx *c);
+
+/* Bench-only aid, gated at the call site by CONFIG_ANCLA_DEBUG_FORCE_HIGH_SEAT
+ * (Kconfig) -- this function itself is unconditional so it stays reachable
+ * from a host test. Marks seats[0 .. n_dummy-1] as occupied, IDLE-tier, with
+ * an effectively-infinite lease and a short_addr outside both the anchor
+ * range and the real tag pool (GW_TAG_ADDR_BASE upward), so the next REAL
+ * gw_core_join() lands at seat_id == n_dummy instead of 0. Call once, right
+ * after gw_core_init(), before any real join. Clamps n_dummy to
+ * GW_MAX_SEATS - 1 so at least one real seat stays free. */
+void gw_core_debug_fill_seats(struct gw_core_ctx *c, uint16_t n_dummy);
+
+/* Select the cell's admission policy for FRESH joins. Pass 0 for TWR mode
+ * (the default after gw_core_init(), and what every existing caller keeps
+ * getting). Pass the cell's BLINK_N_SLOTS to switch to BLINK mode: a fresh
+ * join is then refused unless its seat id would land inside that many BLINK
+ * slots (design docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md
+ * section 1.1) -- effectively GW_MAX_SEATS_BLINK = min(GW_MAX_SEATS,
+ * blink_n_slots). Does not affect a seat that already holds one: only the
+ * "find a free seat" scan on a fresh join is bounded by it. */
+void gw_core_set_blink_mode(struct gw_core_ctx *c, uint16_t blink_n_slots);
 
 /* Admit a tag, or refresh it if its EUI already holds a seat.
  *

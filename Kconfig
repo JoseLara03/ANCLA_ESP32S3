@@ -31,6 +31,64 @@ config ANCLA_RANGING_DEBUG
 	  per-frame logging and the heartbeat's extra SPI read both cost time
 	  on the SLAVE loop.
 
+config ANCLA_DEBUG_FORCE_HIGH_SEAT
+	bool "Pre-fill low seat ids with dummy IDLE seats (bench-only)"
+	default n
+	help
+	  Bench aid for measuring BLINK-slot arm jitter at a HIGH seat id with
+	  only a handful of real tags on hand. gw_core assigns seat_id as the
+	  first free index in seats[], so with 2-3 real tags every one of them
+	  lands at seat_id 0, 1, 2.
+
+	  NOTE the real ceiling: a fresh join's scan limit is
+	  min(blink_n_slots, GW_MAX_SEATS), so seat_id can NEVER exceed
+	  GW_MAX_SEATS-1 (127) even though BLINK_N_SLOTS is 134 -- the seats[]
+	  array, not the blink schedule, is what caps this. Do not set
+	  ANCLA_DEBUG_DUMMY_SEATS anywhere near 134; the highest seat_id this
+	  can ever produce is 127, and the tag's known ms-rounding gap near
+	  BLINK_N_SLOTS-1 (CLAUDE.md's Task 5 entry) is therefore structurally
+	  unreachable on this build regardless of this option.
+
+	  With this on, gw_core_debug_fill_seats() marks the first
+	  ANCLA_DEBUG_DUMMY_SEATS entries of seats[] as occupied, IDLE-tier,
+	  effectively-infinite-lease dummy seats before any real join happens
+	  -- so the next real tag to join is pushed to seat_id
+	  ANCLA_DEBUG_DUMMY_SEATS instead of 0. Off by default: it changes real
+	  admission behaviour (fewer real seats available) and must never ship.
+
+config ANCLA_DEBUG_DUMMY_SEATS
+	int "Dummy seats to pre-fill"
+	default 120
+	depends on ANCLA_DEBUG_FORCE_HIGH_SEAT
+	help
+	  Must stay strictly below GW_MAX_SEATS (128) MINUS the number of real
+	  tags you intend to join, or later real tags get refused admission
+	  outright ("no free seat") instead of landing at a high seat id --
+	  gw_core_debug_fill_seats() silently clamps to GW_MAX_SEATS-1 if you
+	  set this at or above 128, which leaves only ONE free seat for every
+	  real tag combined. 120 leaves 8 free seats (GW_MAX_SEATS-120), enough
+	  headroom for a small bench fleet while still landing the first real
+	  tag near the true seat_id ceiling of 127.
+
+config ANCLA_OLD_BOARD
+	bool "Old board revision (IRQ line has no hardware pull-down)"
+	default n
+	help
+	  Early ancla_esp32s3 boards omit the pull-down resistor the DW3220
+	  datasheet recommends (not mandatory) on the IRQ line. The DW3220
+	  IRQ pad is push-pull and normally does not need one, but without it
+	  the pin can float long enough to miss the GPIO_INT_EDGE_RISING
+	  trigger this driver arms it with -- observed on hardware as the
+	  gateway's rx_sem never being given (no real RX, no RXFTO either),
+	  the inner loop stalling every superframe, and the beacon never
+	  transmitting at all.
+
+	  Enable this when flashing a board from that revision: it turns on
+	  the ESP32's internal pull-down on the IRQ pin
+	  (modules/dw3000-decadriver/platform/dw3000_hw.c) to compensate in
+	  software. Boards with the resistor already on the PCB do not need
+	  it and should leave this off.
+
 endmenu
 
 source "Kconfig.zephyr"

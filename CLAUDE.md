@@ -253,10 +253,117 @@ assignment is `slot_index(seat_id) = seat_id`, the CFP is repartitioned
 rather than extended so `T_SUPERFRAME_UUS` stays untouched, a cell runs
 TWR-mode or blink-mode but never both) — and planned,
 `docs/superpowers/plans/2026-08-30-blink-slotted-mac.md`, six tasks across
-both repos. **None of the six tasks in that plan have been implemented yet.**
-The first is the tag's first-ever use of `DWT_START_TX_DELAYED` on this radio
-port — flagged in the design as a genuinely new risk, not a copy-paste from
-the anchor side's existing delayed-TX code.
+both repos.
+
+**Status 2026-09-01: Tasks 1, 2, 3, 4 and 5 are written/measured and
+host-test/build clean; Task 6 (end-to-end hardware verification) has NOT been
+run — nothing below has been verified as a complete BLINK-mode cell on a
+board, only its pieces.**
+
+- **Task 2** (tag TX-arm jitter, hardware, measured 2026-09-01): done.
+  `tools/blink_jitter.py` against `COM7_2026_09_01.12.43.19.533.txt`, three
+  real tags forced to seat_id 120/121/122 (`CONFIG_ANCLA_DEBUG_FORCE_HIGH_SEAT`
+  — see the Kconfig entry below) so the measurement actually covered the
+  known-risky tail of the seat table, not just the low seat ids a 3-tag bench
+  fleet lands on by default. n=873/822/733, all well past the plan's ≥200
+  gate. **Max spread 39.2 ns** — four orders of magnitude below the
+  already-known 64 us gateway TX-arm jitter, so the tag is not the dominant
+  jitter source and does not need its own margin term to speak of. A first
+  capture (`COM7_...12.17.37.616.txt`) was discarded: one address showed a
+  bimodal ~10 ms spread, the signature of a tag RESCAN (new join, same
+  address window) mixing two different slot assignments in one log.
+  `BLINK_SLOT_GUARD_UUS` moved from the 200 us provisional value to
+  **100 us** (sum of the two known terms, 64 + 8 us, rounded up for margin —
+  the tag's own 39.2 ns term is noise against that sum), recorded in
+  `src/blink_sched.h` and
+  `docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md` §1.2
+  together, per that section's own no-diverge rule.
+- **Task 3** (`src/blink_sched.{c,h}`, ANCLA, host-tested): done, and its
+  headline number MOVED with Task 2's measured guard.
+  `blink_sched_n_slots()` on the frozen PHY with the now-measured
+  `BLINK_SLOT_GUARD_UUS = 100` gives **`BLINK_N_SLOTS = 144`** (`tests/blink_sched/`,
+  PASSED) — up from the 134 the 200 us provisional guard gave, and now
+  **greater than `GW_MAX_SEATS` (128)**: the seat table's fixed array size,
+  not the blink schedule, is the binding cap on this build. The overflow-band
+  admission policy described in the design spec §1.1
+  (`gw_core_join()` refusing a seat_id `>= BLINK_N_SLOTS` in BLINK mode) is
+  therefore hypothetical on this build, not exercised — it would only trigger
+  again with a looser guard or a larger `GW_MAX_SEATS`. `tests/blink_sched/`
+  still pins the order of magnitude (100-150), not the exact number.
+- **Task 4** (`src/gw_core.{c,h}`, `src/uwb_gateway.c`,
+  `src/uwb_frame_802_15_4z.h`, ANCLA): done. `UWB_PROTO_VER` is now **4**.
+  Mode selection is `anchor cell <twr|blink>` (persisted, GATEWAY-only,
+  mirrors `anchor mode`'s existing pattern) rather than a Kconfig or a new
+  MQTT trigger — the simplest option that needed no new persistence
+  mechanism. `gw_core_set_blink_mode(ctx, n_slots)` bounds a FRESH join's
+  seat-id scan to `n_slots` in BLINK mode (`tests/gw_core/` covers both the
+  rejection and the `n_slots == 0` = TWR-unrestricted case);
+  `gw_core_build_slotmap()` and `reschedule()` are untouched, per the design
+  — in BLINK mode `tx_beacon()` simply stops reading their output and writes
+  `sched[]` reserved/zero instead.
+- **Task 1** (`tag_testting/src/uwb_net_runner.c`,
+  `tag_testting/src/uwb_ss_initiator.{c,h}`): written, NOT hardware-verified.
+  This is the tag's first-ever use of `DWT_START_TX_DELAYED` — flagged in the
+  design as a genuinely new risk, not a copy-paste from the anchor side's
+  existing delayed-TX code, and the two traps this project already paid for
+  once (arm deadline measured against the preamble, not the RMARKER; a
+  `dwt_forcetrxoff()` immediately before arming) are applied defensively
+  without a bench cycle to confirm they transfer to this port. One thing NOT
+  in the plan's own text but required for correctness once written: the
+  bounded post-`dwt_starttx()` poll `blink_publish()` shares with
+  `position_publish()` was sized for an immediate TX's ~1.3 ms airtime; a
+  delayed BLINK can legitimately not fire for up to ~146 ms (the last blink
+  slot), so `blink_publish()` now sleeps (`k_sleep`, not busy-wait) most of
+  that gap and only busy-polls the last `BLINK_POLL_MARGIN_MS` (5 ms) —
+  without that, every seat past the first would have its BLINK force-aborted
+  before it ever transmitted.
+- **Task 5** (same tag files, plus `UWB_NET_PROTO_VER` → 4 in
+  `tag_testting/src/uwb_net.h`): written, NOT hardware-verified. The tag
+  computes its BLINK slot as `seat_id` (the identity), inlined rather than
+  copying ANCLA's `blink_sched.h` verbatim — that header pulls in
+  `mac_budget.h`'s whole airtime model, which this tag build has no other
+  use for. **Known gap, not fixed, and its numbers are now STALE:** the
+  tag's fixed per-superframe overhead (`T_BEACON_MS`/`T_GUARD_MS`/
+  `T_MINISLOT_MS`) is rounded UP to whole milliseconds, a TWR-era choice
+  harmless against a 24 ms ranging slot and NOT harmless against a BLINK
+  slot. The "roughly 132-133 of 134" figure this bullet used to carry was
+  computed against the 200 us provisional guard; Task 2 moved the guard to
+  100 us and `BLINK_N_SLOTS` to 144 (see above), which changes both the
+  per-slot airtime and the superframe slack the tag's ~3.8 ms of extra
+  rounding eats into. **Re-deriving the affected seat-id range in
+  `tag_testting` against the new 100 us/144-slot numbers is unstarted
+  work**, not done and not carried over automatically — do not keep citing
+  132-133 of 134 now that the inputs it was computed from have changed.
+  Fixing the underlying rounding means touching constants the TWR sweep and
+  beacon prediction also share, so it is left as a known limit either way.
+- **Task 6** (end-to-end hardware verification): **partially run
+  (2026-09-01), ceiling-seat correctness confirmed, DENSITY STILL UNTESTED.**
+  Production image, `CONFIG_ANCLA_DEBUG_FORCE_HIGH_SEAT=y` /
+  `CONFIG_ANCLA_DEBUG_DUMMY_SEATS=125` (see the Kconfig entry below), 3 real
+  tags landed on seats 125/126/127 — the true ceiling this build can reach
+  (`GW_MAX_SEATS`-bound, not 143). Confirmed on hardware: join, range and
+  publish at seat 127; a lease timeout correctly freeing a ceiling seat after
+  ~15 s of inactivity; the freed ceiling seat immediately re-granted to a
+  fresh joiner; `Tid` staying stable across that rejoin (`tid=2082962887`
+  before and after, under two different short addresses) with the documented
+  `"no live seat, Tid falls back to short address"` fallback firing exactly
+  as designed in the gap between expiry and rejoin; two `kernel reboot cold`
+  cycles reproducing identical `seats_used:125/seats_free:3`; and no
+  `"beacon started but TXFRS never completed"` anywhere in ~5 minutes of
+  3-tag load. The rejoining tag's battery read 4% shortly after — likely
+  brownout, not a MAC fault, but not confirmed either way.
+
+  **What this run does NOT establish, and is the reason Task 6 stays open:
+  DENSITY.** Three tags at low airtime (128-180 of 275 slot-superframes
+  used) proves correctness at the seat-id ceiling, not that BLINK mode
+  actually buys more capacity than TWR under real concurrent load — the
+  entire point of this migration (§ "URGENT next work" is elsewhere in this
+  file; the number to beat is TWR's ~11-tag ceiling). Closing Task 6 needs a
+  density test: either more physical tags approaching the product target, or
+  a deliberate synthetic/high-tier load (e.g. several tags forcing FAST tier
+  simultaneously) that actually saturates `GW_SCHED_CAPACITY` (275) the way
+  three IDLE-mostly tags here never did. Until that runs, "100 tags at 5 Hz"
+  remains a schedule-math claim, not a measured one.
 
 **In one sentence, for whoever picks this up next:** the TDoA measurement
 path is real and hardware-verified; the accuracy number is a target, not yet
@@ -802,7 +909,18 @@ sync master                    transmit half — CCP sent/dropped counts as
   beacon's slot map is an earliest-deadline-first schedule over them, rebuilt
   every superframe inside `gw_core_superframe_tick()`. Admission control counts
   slot-superframes against `GW_SCHED_CAPACITY` (275), the same accounting
-  `mac_budget.h` uses.
+  `mac_budget.h` uses. `gw_core_debug_fill_seats(c, n_dummy)` marks
+  `seats[0 .. n_dummy-1]` as occupied, IDLE-tier, effectively-infinite-lease
+  dummy seats before any real join, so the next real `gw_core_join()` lands at
+  seat_id `n_dummy` instead of 0 — a bench aid for reaching a high seat id
+  with only a handful of physical tags (used for Task 6's ceiling-seat run,
+  see the TDoA migration section). The function itself is unconditional and
+  host-test-safe; only its call site in `src/uwb_gateway.c`, gated on
+  `CONFIG_ANCLA_DEBUG_FORCE_HIGH_SEAT`, is bench-only and must never ship.
+  **While active, a dummy seat's `short_addr` is deliberately outside both the
+  anchor range and the real tag address pool — seat_id and short_addr are
+  not a 1:1 pair on this build**, so do not assume the two can be read off
+  each other from the console while dummy fill is on.
 - `src/beacon_guard.{c,h}` — predicts the next beacon and refuses any delayed
   TX that would land on it. Pure C, host-tested in `tests/beacon_guard/`.
 - `src/anchor_respond.{c,h}` — the WAVE/0xE1 and DISCOVERY/0xE4 responders.
@@ -941,7 +1059,9 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `src/cal_shell.c` — the `cal` console command tree (`cal ref`, `cal peer`).
   Calibration image only.
 - `Kconfig` — the project's own `Kconfig`, sourcing `Kconfig.zephyr` last;
-  defines `CONFIG_ANCLA_CAL_MODE`.
+  defines `CONFIG_ANCLA_CAL_MODE`, `CONFIG_ANCLA_RANGING_DEBUG`, and the
+  bench-only `CONFIG_ANCLA_DEBUG_FORCE_HIGH_SEAT` /
+  `CONFIG_ANCLA_DEBUG_DUMMY_SEATS` pair.
 - `cal.conf` — the `EXTRA_CONF_FILE` overlay that builds the calibration image
   instead of production (see "Build & flash").
 - `src/uwb_debug.h` — `ANCLA_LOG_LEVEL`, the one symbol the ranging modules
@@ -970,6 +1090,29 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `docs/dw3000-zephyr-port.md` — the port reference: local deltas, the DW3000
   call-order footgun, resolved RESET polarity, verification status.
 - `docs/superpowers/{specs,plans}/` — board design spec and implementation plan.
+- `tools/blink_jitter.py` — the Task 2 measurement script: parses a
+  `simple_rx.c` sniffer capture and, for one tag's short address, subtracts
+  each BLINK (`0xF0`) frame's RX timestamp from the beacon (`0xE5`, src
+  `0x0000`) immediately preceding it in the same log, giving the tag's real
+  RMARKER offset from the beacon — the quantity `BLINK_SLOT_GUARD_UUS` is
+  provisional against. Uses only the sniffer's own DW3000 clock (no PC/UART
+  timing, and no 40-bit wrap risk: one superframe is ~200 ms, far under the
+  ~17.2 s wrap period), so plain hex subtraction is safe as long as the
+  beacon precedes its blink in the log. This is what produced the **39.2 ns**
+  max-spread figure behind Task 2's `BLINK_SLOT_GUARD_UUS = 100` (see the TDoA
+  migration section's Task 2 bullet).
+- `tools/tag_density.py` — a standalone capacity estimator: how many tags the
+  MAC can track at a given update rate under TWR vs BLINK/TDoA mode, with
+  every PHY/MAC constant overridable on the CLI (defaulting to today's frozen
+  `uwb_phy.h`/`uwb_mac.h`/`gw_core.h`/`blink_sched.h` contract) so it stays
+  useful if a future hardware revision changes the PHY. **It is a hand-written
+  Python reimplementation of `src/mac_budget.{c,h}`, `src/blink_sched.{c,h}`
+  and the tier-cost constants in `src/gw_core.h` — NOT wired to those C files
+  and NOT host-tested against them**, the same drift risk class CLAUDE.md
+  already flags for `src/cal_math.c` and `src/pos_solver.c`: if
+  `mac_budget.c`'s formula, or `GW_MAX_SEATS`/`GW_SCHED_WINDOW_SF`/the tier
+  table change, this file must be updated by hand or it quietly reports a
+  stale number. No build-time or test-time check ties the two together.
 
 ## Hard-won facts (do not re-derive)
 

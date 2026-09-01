@@ -23,11 +23,12 @@
 
 LOG_MODULE_REGISTER(uwb_store, LOG_LEVEL_INF);
 
-#define KEY_MODE   "anchor/mode"
-#define KEY_ID     "anchor/id"
-#define KEY_ANT_TX "anchor/ant_tx"
-#define KEY_ANT_RX "anchor/ant_rx"
-#define KEY_POS    "anchor/pos"
+#define KEY_MODE      "anchor/mode"
+#define KEY_ID        "anchor/id"
+#define KEY_CELL_MODE "anchor/cell_mode"
+#define KEY_ANT_TX    "anchor/ant_tx"
+#define KEY_ANT_RX    "anchor/ant_rx"
+#define KEY_POS       "anchor/pos"
 
 /* Written as one record so x, y, z and the valid flag can never disagree. */
 struct stored_pos {
@@ -84,6 +85,25 @@ static int anchor_settings_set(const char *key, size_t len,
 		}
 		if (!uwb_config_set_id(cfg, v)) {
 			LOG_WRN("stored id %u invalid — keeping %u", v, cfg->anchor_id);
+		}
+		return 0;
+	}
+
+	if (strcmp(key, "cell_mode") == 0) {
+		uint8_t v;
+
+		if (len != sizeof(v)) {
+			LOG_WRN("stored cell_mode size %u invalid — expected %u, keeping %s",
+				(unsigned int)len, (unsigned int)sizeof(v),
+				uwb_config_cell_mode_name(cfg->cell_mode));
+			return -EINVAL;
+		}
+		if (read_val(read_cb, cb_arg, &v, sizeof(v))) {
+			return -EINVAL;
+		}
+		if (!uwb_config_set_cell_mode(cfg, v)) {
+			LOG_WRN("stored cell_mode %u invalid — keeping %s", v,
+				uwb_config_cell_mode_name(cfg->cell_mode));
 		}
 		return 0;
 	}
@@ -175,6 +195,13 @@ int uwb_store_save_id(void)
 	const uwb_config_t *cfg = uwb_config_get();
 
 	return save_one(KEY_ID, &cfg->anchor_id, sizeof(cfg->anchor_id));
+}
+
+int uwb_store_save_cell_mode(void)
+{
+	const uwb_config_t *cfg = uwb_config_get();
+
+	return save_one(KEY_CELL_MODE, &cfg->cell_mode, sizeof(cfg->cell_mode));
 }
 
 int uwb_store_save_ant(void)

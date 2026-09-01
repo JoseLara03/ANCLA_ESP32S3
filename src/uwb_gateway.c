@@ -21,8 +21,10 @@
 
 #include "apos_frame.h"
 #include "apos_gw.h"
+#include "blink_sched.h"
 #include "ccp_master.h"
 #include "gw_core.h"
+#include "mac_budget.h"
 #include "pos_sink.h"
 #include "tag_id.h"
 #include "tdoa_gw.h"
@@ -231,6 +233,13 @@ static void cb_rx_fail(const dwt_cb_data_t *cb_data)
 	k_sem_give(&rx_sem);
 }
 
+/* Set once in uwb_gateway_run(), read every beacon: whether this cell's CFP
+ * is repartitioned into BLINK slots rather than TWR ranging slots. See
+ * docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md section 1.3
+ * -- the beacon's wire format does not change either way, only whether
+ * `sched[]` is read by anyone. */
+static bool gw_blink_mode;
+
 /* Transmit the beacon. Returns its 40-bit TX timestamp, or 0 if it did not go
  * out. delayed=0 for the very first beacon, which has no predecessor to
  * schedule against. */
@@ -238,7 +247,19 @@ static uint64_t tx_beacon(struct gw_core_ctx *ctx, bool delayed, uint32_t tx_at)
 {
 	uint16_t slot_map[GW_N_CFP];
 
-	gw_core_build_slotmap(ctx, slot_map);
+	if (gw_blink_mode) {
+		/* BLINK mode assigns airtime by blink_sched_slot_index(seat_id)
+		 * (the identity), not by this schedule -- nobody on the wire
+		 * reads sched[] in this mode, so it goes out reserved/zero
+		 * rather than carrying gw_core's TWR-only rotation, which would
+		 * otherwise imply a rotating ownership that does not exist
+		 * here. See design section 1.3. */
+		for (unsigned int i = 0; i < GW_N_CFP; i++) {
+			slot_map[i] = UWB_FRAME_ADDR_BCAST;
+		}
+	} else {
+		gw_core_build_slotmap(ctx, slot_map);
+	}
 
 	/* GW_N_CFP == UWB_FRAME_N_CFP == 11, so need = 15 + 22 = 37 =
 	 * UWB_FRAME_MAX_LEN and beacon_buf is exactly large enough.
@@ -477,14 +498,56 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 	static struct gw_core_ctx ctx;
 
 	gw_core_init(&ctx);
+
+#ifdef CONFIG_ANCLA_DEBUG_FORCE_HIGH_SEAT
+	/* Bench-only: pushes the first REAL join to seat_id
+	 * CONFIG_ANCLA_DEBUG_DUMMY_SEATS instead of 0, so BLINK-slot arm
+	 * jitter can be measured at a high seat id with only a handful of
+	 * real tags. Must never be on in a shipped image -- see Kconfig. */
+	gw_core_debug_fill_seats(&ctx, CONFIG_ANCLA_DEBUG_DUMMY_SEATS);
+	LOG_WRN("{\"status\":\"debug_force_high_seat\",\"dummy_seats\":%u,"
+		"\"seats_used\":%u,\"seats_free\":%d}",
+		(unsigned int)CONFIG_ANCLA_DEBUG_DUMMY_SEATS,
+		(unsigned int)gw_core_seats_used(&ctx),
+		(int)GW_MAX_SEATS - (int)gw_core_seats_used(&ctx));
+#endif
+
 	ccp_master_init();
 	apos_gw_init();
 	tdoa_gw_init();
 
+	/* Cell mode: `anchor cell twr|blink`, read once at boot -- a cell runs
+	 * one or the other for its whole life, never both (design section
+	 * 1.1). BLINK mode both bounds gw_core's fresh-join admission to the
+	 * seats this geometry can actually schedule, and tells tx_beacon() to
+	 * stop writing real addresses into the wire-format slot map. */
+	gw_blink_mode = (cfg->cell_mode == UWB_CELL_BLINK);
+
+	uint16_t blink_n_slots = 0;
+
+	if (gw_blink_mode) {
+		struct mac_phy  phy;
+		struct mac_cell cell;
+
+		mac_phy_frozen(&phy);
+		cell.superframe_ns = MAC_UUS_TO_NS(T_SUPERFRAME_UUS);
+		cell.beacon_ns     = mac_frame_ns(&phy, UWB_FRAME_LEN_BEACON);
+		cell.guard_ns      = MAC_UUS_TO_NS(T_GUARD_UUS);
+		cell.minislot_ns   = mac_frame_ns(&phy, UWB_FRAME_LEN_KEEPALIVE) +
+				     100000u;
+		cell.n_cap         = UWB_FRAME_N_CAP;
+
+		blink_n_slots = blink_sched_n_slots(&cell);
+		gw_core_set_blink_mode(&ctx, blink_n_slots);
+	}
+
 	LOG_INF("{\"status\":\"gateway\",\"x\":%.2f,\"y\":%.2f,"
-		"\"superframe_ms\":200,\"slots\":%u,\"seats\":%u,"
+		"\"superframe_ms\":200,\"cell_mode\":\"%s\","
+		"\"slots\":%u,\"blink_n_slots\":%u,\"seats\":%u,"
 		"\"airtime_budget\":%u}",
-		(double)cfg->x, (double)cfg->y, GW_N_CFP,
+		(double)cfg->x, (double)cfg->y,
+		uwb_config_cell_mode_name(cfg->cell_mode), GW_N_CFP,
+		(unsigned int)blink_n_slots,
 		(unsigned int)GW_MAX_SEATS, (unsigned int)GW_SCHED_CAPACITY);
 
 	uint64_t beacon_tx_ts = tx_beacon(&ctx, false, 0);

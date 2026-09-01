@@ -15,11 +15,17 @@ static const char *const mode_names[UWB_MODE_COUNT] = {
 	[UWB_MODE_GATEWAY] = "gateway",
 };
 
+static const char *const cell_mode_names[UWB_CELL_MODE_COUNT] = {
+	[UWB_CELL_TWR]   = "twr",
+	[UWB_CELL_BLINK] = "blink",
+};
+
 void uwb_config_set_defaults(uwb_config_t *c)
 {
 	memset(c, 0, sizeof(*c));
 	c->mode         = UWB_MODE_SLAVE;
 	c->anchor_id    = 0;
+	c->cell_mode    = UWB_CELL_TWR;
 	c->ant_delay_tx = UWB_ANT_DELAY_DEFAULT;
 	c->ant_delay_rx = UWB_ANT_DELAY_DEFAULT;
 	/* x/y/z zeroed above; position_valid stays false so a GATEWAY that has
@@ -54,6 +60,15 @@ bool uwb_config_set_id(uwb_config_t *c, uint8_t id)
 		return false;
 	}
 	c->anchor_id = id;
+	return true;
+}
+
+bool uwb_config_set_cell_mode(uwb_config_t *c, uint8_t cell_mode)
+{
+	if (cell_mode >= UWB_CELL_MODE_COUNT) {
+		return false;
+	}
+	c->cell_mode = cell_mode;
 	return true;
 }
 
@@ -94,6 +109,25 @@ const char *uwb_config_mode_name(uint8_t mode)
 		return "unknown";
 	}
 	return mode_names[mode];
+}
+
+bool uwb_config_cell_mode_from_name(const char *name, uint8_t *out)
+{
+	for (uint8_t i = 0; i < UWB_CELL_MODE_COUNT; i++) {
+		if (strcmp(name, cell_mode_names[i]) == 0) {
+			*out = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+const char *uwb_config_cell_mode_name(uint8_t cell_mode)
+{
+	if (cell_mode >= UWB_CELL_MODE_COUNT) {
+		return "unknown";
+	}
+	return cell_mode_names[cell_mode];
 }
 
 uint16_t uwb_config_short_addr(const uwb_config_t *c)

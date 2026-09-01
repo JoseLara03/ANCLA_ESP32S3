@@ -86,7 +86,19 @@ int dw3000_hw_init_interrupt(void)
 	if (conf.gpio_irq.port) {
 		k_work_init(&dw3000_isr_work, dw3000_hw_isr_work_handler);
 
+		/* LOCAL DELTA vs upstream: CONFIG_ANCLA_OLD_BOARD adds an internal
+		 * pull-down here. Early ancla_esp32s3 boards omit the IRQ line's
+		 * hardware pull-down (datasheet-recommended, not mandatory); the
+		 * DW3220's IRQ pad is push-pull and normally does not need one, but
+		 * on those boards the pin floats enough to miss the
+		 * GPIO_INT_EDGE_RISING trigger below -- see CLAUDE.md's IRQ-float
+		 * hard-won fact. Off by default: boards with the resistor already
+		 * on the PCB do not need it. */
+#if defined(CONFIG_ANCLA_OLD_BOARD)
+		gpio_pin_configure_dt(&conf.gpio_irq, GPIO_INPUT | GPIO_PULL_DOWN);
+#else
 		gpio_pin_configure_dt(&conf.gpio_irq, GPIO_INPUT);
+#endif
 		gpio_init_callback(&gpio_cb, dw3000_hw_isr, BIT(conf.gpio_irq.pin));
 		gpio_add_callback(conf.gpio_irq.port, &gpio_cb);
 		gpio_pin_interrupt_configure_dt(&conf.gpio_irq, GPIO_INT_EDGE_RISING);
