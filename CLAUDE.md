@@ -460,15 +460,42 @@ tests nor code review found, the same way the first round did — worth
 noting as a pattern, not a coincidence: this filter's failure modes only
 show up under real, uncontrolled multi-tag traffic.
 
-**What it still does NOT establish**, and why Task 5 proper remains open: no
-controlled before/after capture (the operator's own before-this-session
-trace was never recorded), no measured dispersion number for the stationary
-tag or continuity number for the walking one, no verification of which
-physical anchors were actually contributing, no `kernel reboot cold` cycle.
-"The trace is smoother" is still not a claim this project can make yet —
-what changed this session is that two real, hardware-only defects were found
-and fixed, which is a precondition for Task 5 meaning anything, not Task 5
-itself.
+**Third round, same day, after the fix and a `kernel reboot cold`: clean.**
+Fresh boot, filter reseeded from nothing with no crash;
+`seeded(8) + filtered(19) + reseed(0) = 27` matched `tdoa.fixes:27` exactly
+and `n_no_update:0` throughout — the republish fix holds across a cold
+reboot, not just a warm one. One tag walking, one stationary (roles
+identified by `Tid`, not short address, which reassigned across the reboot
+as designed):
+
+- **Walking tag, `Tid=693116308`**: `00:00:23.080`-`00:00:26.880`,
+  `(1.31,2.78) -> (1.34,2.69) -> (1.43,2.67) -> (1.58,2.56) -> (1.65,2.52) ->
+  (1.66,2.48) -> (1.60,2.44) -> (1.93,2.20)`, every consecutive 200 ms step
+  under ~15 cm (~0.75 m/s, a plausible walking speed), curving direction
+  tracked continuously. This is the trace-continuity acceptance criterion,
+  met.
+- **Stationary tag, `Tid=2082962887`**: `(3.41,2.63) -> (3.83,2.70) ->
+  (4.17,2.76) -> (4.12,2.73)` over ~65 s (only 4 samples -- likely IDLE-tier
+  reporting since it never moved). ~0.8 m of x-drift for something that
+  should not move: no catastrophic jump this time (contrast the pre-fix
+  3.5 m -> 9.1 m lock-in), but still real dispersion, above the ~45 cm
+  target, and too few samples to call it a settled number.
+- `solve_fail:0`, `jump:0`, `no_anchor:0`, `implausible:0` throughout; both
+  one-time residual warnings (`warned_blind_residual`,
+  `warned_filtered_residual`) fired exactly once as designed.
+
+**What Task 5 has now established**: the mechanism is stable across a cold
+reboot, two real tags, and both bugs this session found; the walking-trace
+continuity criterion is met on real data; the stationary dispersion is
+measurably better than the pre-fix failure mode but not yet at the ~45 cm
+target, on a 4-sample count too small to be a real number. **What it still
+has not established**: a proper before/after comparison against a
+pre-session baseline (none was recorded), a settled stationary-dispersion
+figure (needs a longer undisturbed capture), and which physical anchors were
+actually contributing. Operator has accepted this round as sufficient to
+close out this session's verification; a longer stationary-only capture is
+the natural next step whenever revisited, not a blocker on what shipped
+here.
 
 **In one sentence, for whoever picks this up next:** the TDoA measurement
 path is real and hardware-verified; the accuracy number is a target, not yet

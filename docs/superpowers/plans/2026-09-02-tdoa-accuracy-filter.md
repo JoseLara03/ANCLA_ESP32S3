@@ -52,10 +52,18 @@ Ojo: el árbol de trabajo tenía cambios sin commitear en `Kconfig`,
 al abrir este plan — resolverlos ANTES de ramificar, no arrastrarlos.
 
 **Estado 2026-09-02:** Tareas 1-4 completas (código, host tests, `west build`
-limpio en ambas imágenes). Tarea 5 (hardware) sigue abierta — sin acceso a
-board en esta sesión. Hallazgo importante durante la Tarea 3: la premisa de
+limpio en ambas imágenes). Tarea 5 corrió parcialmente sobre el gateway real
+en producción, en 3 rondas la misma sesión: encontró y corrigió DOS defectos
+reales de hardware (`tdoa_gw_ekf_stats()` nunca conectado a `blink stats`; una
+republicación silenciosa del estado obsoleto del filtro), sobrevivió un
+`kernel reboot cold`, y confirmó el criterio de traza continua con un tag
+caminando real. El criterio de dispersión del tag quieto quedó sin cerrar
+(solo 4 muestras) y nunca se capturó un ANTES — ver CLAUDE.md, sección TDoA,
+para el detalle completo con números reales.
+
+Hallazgo importante durante la Tarea 3: la premisa de
 la spec §4.1 ("`pos_ekf` está muerto en el tag") es **incorrecta** —
-`tag_testting/src/uwb_net_runner.c` lo sigue usando en su camino TWR. Se seguí
+`tag_testting/src/uwb_net_runner.c` lo sigue usando en su camino TWR. Se siguió
 el precedente de `pos_solver.c`/`pos_residual.c` (copia verbatim, el tag
 conserva la propiedad) en vez de la instrucción original de "mover"; ver la
 entrada de `pos_ekf.{c,h}` en el `CLAUDE.md` de ANCLA para el detalle
@@ -260,24 +268,37 @@ divisiones de matriz, así que cumple; verificarlo, no asumirlo.
 Es la lección que este repo ya pagó cuatro sesiones de banco (el desborde de
 `gw_core_ctx`): host tests y code review no ven esta clase de defecto.
 
-- [ ] Gateway en **USB-C**, no en batería. La fuente no sostiene el segundo TX
+- [x] Gateway en **USB-C**, no en batería. La fuente no sostiene el segundo TX
       del CCP y en batería esto se presenta como `sent:0` con `dropped`
       subiendo — indistinguible en consola de una falla de firmware. Anotar la
-      fuente junto a cada medición de sincronía.
-- [ ] Survey aplicado (`apos show` con `"valid":1`) antes de esperar un solo
-      fix: un gateway sin survey descarta toda observación.
+      fuente junto a cada medición de sincronía. (Confirmado USB-C en las tres
+      rondas de esta sesión.)
+- [x] Survey aplicado (`apos show` con `"valid":1`) antes de esperar un solo
+      fix: un gateway sin survey descarta toda observación. (4 nodos, ver
+      CLAUDE.md.)
 - [ ] Captura ANTES (imagen previa) y DESPUÉS, mismo tag, mismas posiciones:
       (a) tag quieto ~2 min, (b) tag caminando un recorrido repetible.
       Comparar dispersión entre fixes consecutivos y continuidad de la traza.
-- [ ] `blink stats`: verificar que `no_sync`, `rx_drop_*` y `sub_fail` siguen
-      planos, y leer los contadores nuevos del filtro.
-- [ ] Confirmar que el beacon sigue a tiempo: ni un
+      **Parcial**: se capturó DESPUÉS con 2 tags reales (uno quieto, uno
+      caminando) en 3 rondas, pero nunca un ANTES de esta sesión ni un
+      recorrido repetible controlado — ver CLAUDE.md para los números reales
+      obtenidos (traza caminando continua, ~0.8 m de dispersión en el tag
+      quieto sobre solo 4 muestras).
+- [x] `blink stats`: verificar que `no_sync`, `rx_drop_*` y `sub_fail` siguen
+      planos, y leer los contadores nuevos del filtro. (Planos en las tres
+      rondas; los 6 contadores del filtro se leyeron y uno de ellos —
+      `no_update` — se agregó A MITAD de esta tarea al descubrir el bug de
+      republicación de estado obsoleto.)
+- [x] Confirmar que el beacon sigue a tiempo: ni un
       `"beacon started but TXFRS never completed"` durante la corrida.
-- [ ] `kernel reboot cold` y repetir — el filtro arranca sin sembrar y tiene
-      que recuperarse solo.
+      (Ninguno visto en ~17 minutos de logs across las tres rondas.)
+- [x] `kernel reboot cold` y repetir — el filtro arranca sin sembrar y tiene
+      que recuperarse solo. (Tercera ronda: boot limpio, sembrado normal desde
+      cero, sin crash.)
 - [ ] Si la Tarea 1 cambió el shift: re-medir `sync stats` (`jitter_est`, no
       `rms`) a 30 cm y 3 m, tras `sync reset`, y actualizar
-      `docs/anchor-sync-measurement.md` §4.1.
+      `docs/anchor-sync-measurement.md` §4.1. **(N/A — la Tarea 1 no cambió el
+      shift.)**
 
 **Aceptación, y su límite:** la dispersión entre fixes consecutivos de un tag
 quieto baja de forma medible, y la traza de uno caminando es continua sin
@@ -287,6 +308,18 @@ tiene que decirlo. La exactitud absoluta sigue limitada por GDOP del arreglo de
 1.2-2.5 m y por el retardo de antena RX sin calibrar (ítem 8), ninguno de los
 dos tocado por este plan.
 
-- [ ] Escribir el resultado en el `CLAUDE.md` de ANCLA, sección TDoA, con la
+**Resultado real: el criterio de traza CONTINUA se cumplió** (tag caminando,
+pasos de 200 ms bajo ~15 cm cada uno). **El criterio de dispersión MEDIBLEMENTE
+menor en el tag quieto queda sin cerrar** — mejoró frente al modo de falla
+pre-fix (que producía saltos catastróficos de 3.5 a 9.1 m y los repetía
+verbatim), pero no hay una cifra de dispersión confiable con solo 4 muestras.
+El hallazgo más importante de esta ronda no estaba en el plan original: se
+encontraron y corrigieron DOS defectos reales de hardware
+(`tdoa_gw_ekf_stats()` nunca conectado a `blink stats`, y una republicación
+silenciosa del estado obsoleto del filtro cuando `dt` es inválido y el
+solve+seed de respaldo también falla) — ninguno de los dos visible en host
+tests ni en revisión de código, solo en hardware real bajo tráfico de 2 tags.
+
+- [x] Escribir el resultado en el `CLAUDE.md` de ANCLA, sección TDoA, con la
       misma honestidad que la Tarea 7: qué se midió, qué NO, y con qué fuente
       de alimentación.
