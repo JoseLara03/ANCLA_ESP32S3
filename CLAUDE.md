@@ -436,14 +436,39 @@ and its limits:
   bug). Neither is evidence against Task 4's dt logic — the gate routing
   both to a fresh solve instead of a bogus predict is exactly correct.
 
-**What this smoke test does NOT establish**, and why Task 5 proper is still
-open: no controlled before/after capture, no stationary/walking comparison,
-no verification of which physical anchors were actually contributing, no
-`kernel reboot cold` cycle, and it ran against whatever this one tag's real
-(uncontrolled) motion and RF conditions happened to be at the time. "The
-trace is smoother" is still a simulation result, not a bench one, until the
-full protocol (USB-C power already true here; an applied survey already true
-here; the actual before/after captures) runs deliberately.
+**Second round, same day, same gateway, operator running one stationary tag
+plus one on their arm: caught a SECOND real bug, worse than the first.**
+`pos_sink`'s console line showed the stationary tag (`0x0100`) publishing the
+exact same `(x, y)` to two decimals across THREE timestamps minutes apart
+(`9.10, 3.74` at `00:14:32`, `00:16:23`, `00:16:43`) — a live filter re-solving
+real data cannot reproduce an identical float twice. Root cause: see
+`src/pos_ekf.{c,h}`'s entry above (`n_no_update`) — a stale-state republish
+bug in `solve_one()`, fixed the same session. Confirmed by the arithmetic
+`blink stats` itself provided: `tdoa.fixes` (114) exceeded
+`seeded + filtered + reseed` (25 + 86 + 0 = 111) by exactly 3, matching the
+three stale republishes visible in the log. Fixed, reflashed, reverified on
+the same live gateway: `seeded + filtered + reseed` matched `fixes` exactly
+in the next capture window (7 + 24 + 0 = 31 = 31), `n_no_update:0`.
+
+**What this smoke-testing round DOES establish, that the first round did
+not**: the mechanism runs stably under two real tags (one stationary, one
+worn) without crashing, without a single `reseed` (the filter never diverged
+past `gate_streak >= reset_after`), and — now that the republish bug is
+fixed — every published fix corresponds to an actual computation that cycle,
+not leftover state. It also caught a second real defect that neither host
+tests nor code review found, the same way the first round did — worth
+noting as a pattern, not a coincidence: this filter's failure modes only
+show up under real, uncontrolled multi-tag traffic.
+
+**What it still does NOT establish**, and why Task 5 proper remains open: no
+controlled before/after capture (the operator's own before-this-session
+trace was never recorded), no measured dispersion number for the stationary
+tag or continuity number for the walking one, no verification of which
+physical anchors were actually contributing, no `kernel reboot cold` cycle.
+"The trace is smoother" is still not a claim this project can make yet —
+what changed this session is that two real, hardware-only defects were found
+and fixed, which is a precondition for Task 5 meaning anything, not Task 5
+itself.
 
 **In one sentence, for whoever picks this up next:** the TDoA measurement
 path is real and hardware-verified; the accuracy number is a target, not yet
@@ -849,12 +874,24 @@ sync master                    transmit half — CCP sent/dropped counts as
   / `_EXIT_MPS`) on the filter's OWN velocity estimate — there is no
   accelerometer on this path — a closed loop on its own output that the
   design spec's section 4.6 accepts can stick on "moving" under high noise;
-  first-cut numbers, unchecked against hardware. Five new counters
-  (`n_seeded`, `n_reseed`, `n_filtered`, `n_dt_invalid`, `n_gate_rejected`
-  — see `tdoa_gw_ekf_stats()`'s own doc comment for exactly what each
-  counts) are the THIRD `blink stats` JSON line, for the same reason the
-  first two exist: without them the filter is a black box on the bench,
-  no way to tell "no tags" from "the filter rejects everything". Verified
+  first-cut numbers, unchecked against hardware. Six counters
+  (`n_seeded`, `n_reseed`, `n_filtered`, `n_dt_invalid`, `n_gate_rejected`,
+  `n_no_update` — see `tdoa_gw_ekf_stats()`'s own doc comment for exactly
+  what each counts) are the THIRD `blink stats` JSON line, for the same
+  reason the first two exist: without them the filter is a black box on
+  the bench, no way to tell "no tags" from "the filter rejects
+  everything". **`n_no_update` exists because of a real bug caught live on
+  hardware, 2026-09-02**, not written in from the start: `pos_ekf_get()`
+  succeeds as soon as a filter has EVER been seeded, so a cycle where `dt`
+  is invalid AND the solve+seed fallback also fails (`solve_fail` or the
+  mirror-branch jump gate) used to fall straight through to publishing the
+  filter's UNCHANGED prior state as a "fresh" fix — caught because a test
+  tag published the exact same `(x, y)` to two decimals, minutes apart, and
+  confirmed independently because `blink stats`' `fixes` count exceeded
+  `seeded + filtered + reseed` by precisely the number of these silent
+  republishes. `solve_one()` now tracks whether the filter's state actually
+  changed each cycle and suppresses the publish (counting it in
+  `n_no_update`, a SUBSET of `n_dt_invalid`) when it did not. Verified
   building clean for both the production and calibration images
   (`pos_ekf.c` is in the unconditional `target_sources` block, same as
   `tdoa_gw.c` itself); `dram0_0_seg` moved 270440 -> 272160 B (+1720 B, one
