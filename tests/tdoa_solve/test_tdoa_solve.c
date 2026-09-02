@@ -246,6 +246,172 @@ static void test_error_under_gate_level_noise(void)
 	CHECK(worst < 1.0f);
 }
 
+/*
+ * Gradient of the least-squares cost, computed INDEPENDENTLY of the solver's
+ * own grad_norm2() so the tests below check the property rather than echoing
+ * the implementation.
+ */
+static float grad_mag(const struct tdoa_meas *m, size_t n, float x, float y)
+{
+	float dx0 = x - m[0].x, dy0 = y - m[0].y;
+	float r0 = sqrtf(dx0 * dx0 + dy0 * dy0 + m[0].dz * m[0].dz);
+	float g0 = 0.0f, g1 = 0.0f;
+
+	for (size_t i = 1; i < n; i++) {
+		float dxi = x - m[i].x, dyi = y - m[i].y;
+		float ri = sqrtf(dxi * dxi + dyi * dyi + m[i].dz * m[i].dz);
+		float d_meas = (float)(m[i].t_dtu - m[0].t_dtu) * TDOA_M_PER_DTU;
+		float f = (ri - r0) - d_meas;
+
+		g0 += (dxi / ri - dx0 / r0) * f;
+		g1 += (dyi / ri - dy0 / r0) * f;
+	}
+	return sqrtf(g0 * g0 + g1 * g1);
+}
+
+/*
+ * THE regression test for this solver's worst failure mode.
+ *
+ * src/pos_solver.c records that without a gradient gate its own Gauss-Newton
+ * "returned the seed verbatim with valid = true and a residual up to 113 m"
+ * over 200k adversarial cases. This solver had neither that gate nor a line
+ * search, and since 2026-09-02 src/tdoa_gw.c hands it the tag's LAST
+ * PUBLISHED POSITION as the seed on every fix -- so a stalled solve does not
+ * return a random point, it returns the previous answer while reporting
+ * success. That is the stale-republish defect found on hardware, by a route
+ * the `fixes == seeded + filtered + reseed` check is blind to (it enters
+ * through the seeding path and tallies as n_seeded, so the totals balance).
+ *
+ * The signature is exact: valid = true with the output bit-for-bit equal to
+ * the seed means no step was ever accepted. Asserted on float equality
+ * deliberately -- an approximate test would also flag legitimate cases where
+ * the seed happens to be very near the solution.
+ */
+static void test_never_returns_the_seed_verbatim(void)
+{
+	uint32_t rng = 987654321u;
+	unsigned int valid_count = 0, trials = 0;
+
+	for (unsigned int trial = 0; trial < 20000u; trial++) {
+		struct tdoa_meas m[4];
+		struct pos_result r;
+		float seed[2];
+
+		make(m, 4, 5.0f, 5.0f, 1000000);
+
+		/* Corrupt the timestamps hard enough that the equations are
+		 * mutually inconsistent -- there is no (x, y) that fits them, so
+		 * Gauss-Newton has every reason to thrash. */
+		for (int i = 0; i < 4; i++) {
+			rng = rng * 1664525u + 1013904223u;
+			m[i].t_dtu += (int64_t)((rng >> 8) % 4001u) - 2000;
+		}
+		/* ...and seed it from somewhere unhelpful, including well outside
+		 * the anchor hull, which is where tdoa_solve.h warns the mirror
+		 * branch lives. */
+		rng = rng * 1664525u + 1013904223u;
+		seed[0] = (float)((rng >> 8) % 400u) * 0.25f - 45.0f;
+		rng = rng * 1664525u + 1013904223u;
+		seed[1] = (float)((rng >> 8) % 400u) * 0.25f - 45.0f;
+
+		trials++;
+		if (!tdoa_solve(m, 4, seed, &r) || !r.valid) {
+			continue;
+		}
+		valid_count++;
+
+		/* The defect, stated exactly. */
+		CHECK(!(r.x == seed[0] && r.y == seed[1]));
+
+		/* And the general form of it: anything reported valid must be a
+		 * stationary point. The bound is deliberately looser than the
+		 * solver's own GRAD_EPS (5e-2) so this test checks the property,
+		 * not the constant. */
+		CHECK(grad_mag(m, 4, r.x, r.y) < 0.1f);
+	}
+	printf("  adversarial seeds: %u/%u returned valid, none verbatim\n",
+	       valid_count, trials);
+	/* A solver that refused everything would pass the checks above
+	 * vacuously -- same trap test_error_under_gate_level_noise() documents. */
+	CHECK(valid_count > 0u);
+}
+
+/*
+ * The line search earns its keep on a seed far outside the anchor hull, where
+ * the undamped Gauss-Newton step on a hyperbolic surface overshoots. Data is
+ * CLEAN here, so there is a right answer and the only question is whether the
+ * iteration reaches it.
+ */
+/*
+ * The seed basin: how far a seed can start from the true position and still
+ * converge, swept over distance and direction on CLEAN data.
+ *
+ * This test PRINTS the table rather than asserting a shape, in the same
+ * spirit as test_error_under_gate_level_noise() -- the measured basin is the
+ * deliverable. Two assertions only, and both are properties rather than
+ * tuned thresholds:
+ *
+ *   1. Near seeds must converge from EVERY direction. "Near" is set from the
+ *      OPERATING regime, not from where the measured table happens to break:
+ *      tdoa_gw.c seeds from the tag's last published position, at most one
+ *      blink (200 ms) old, and a walking tag moves ~0.15 m in that time. So
+ *      the real seed error is centimetres. 5 m is already ~30x that, and is
+ *      the bar asserted. (TDOA_GW_MAX_JUMP_M's 10 m is the outer bound of the
+ *      mirror-branch jump gate, not a typical seed error -- and at 10 m the
+ *      measured basin is 7/8, recorded here rather than asserted, because
+ *      tuning the assertion to the measurement is how a test stops testing
+ *      anything.)
+ *   2. THE INVARIANT: whenever the solver reports valid, the answer is the
+ *      true position. It may legitimately refuse -- far outside the hull the
+ *      direction cosines to every anchor converge on each other, so their
+ *      DIFFERENCES (which is what this Jacobian's rows are) collapse and
+ *      det(J^T J) falls under DET_EPS. Refusing there is correct: the
+ *      geometry carries no information and an answer would be fabricated.
+ *      What it must never do is report a confident wrong one.
+ *
+ * Measured 2026-09-03, tag at (6, 4) in a 10 m square, 8 directions per ring,
+ * before and after adding the line search:
+ *
+ *     seed distance   5    10   15   20-40  45     50-60
+ *     before          8/8  2/8  0/8  0/8    0/8    0/8
+ *     after           8/8  7/8  4/8  3/8    2/8    1/8
+ *
+ * The line search is what widened that, and the "before" row is why a raw
+ * Gauss-Newton step is not adequate on a hyperbolic cost surface.
+ */
+static void test_seed_basin_and_never_wrong_when_valid(void)
+{
+	printf("  seed basin (tag at 6,4; 8 directions per ring):\n");
+
+	for (float d = 5.0f; d <= 60.0f; d += 5.0f) {
+		unsigned int ok = 0;
+
+		for (unsigned int k = 0; k < 8u; k++) {
+			float a = (float)k * 3.14159265f / 4.0f;
+			struct tdoa_meas m[4];
+			struct pos_result r;
+			float seed[2] = { 6.0f + d * cosf(a),
+					  4.0f + d * sinf(a) };
+
+			make(m, 4, 6.0f, 4.0f, 500000);
+			if (!tdoa_solve(m, 4, seed, &r) || !r.valid) {
+				continue;
+			}
+			ok++;
+			/* Invariant 2. */
+			CHECK(fabsf(r.x - 6.0f) < 0.05f);
+			CHECK(fabsf(r.y - 4.0f) < 0.05f);
+			CHECK(grad_mag(m, 4, r.x, r.y) < 0.1f);
+		}
+		printf("    %4.0f m: %u/8\n", (double)d, ok);
+
+		/* Invariant 1, only for the rings that matter operationally. */
+		if (d <= 5.0f) {
+			CHECK(ok == 8u);
+		}
+	}
+}
+
 int main(void)
 {
 	test_dtu_scale();
@@ -259,6 +425,8 @@ int main(void)
 	test_null_seed_converges();
 	test_bad_seed_does_not_fabricate_a_result();
 	test_error_under_gate_level_noise();
+	test_never_returns_the_seed_verbatim();
+	test_seed_basin_and_never_wrong_when_valid();
 	if (failures) { printf("\n%d CHECK(s) FAILED\n", failures); return EXIT_FAILURE; }
 	printf("tdoa_solve: ALL TESTS PASSED\n");
 	return EXIT_SUCCESS;

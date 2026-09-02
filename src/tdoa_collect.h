@@ -52,6 +52,38 @@
  * an eviction policy here has to protect completeness explicitly rather than
  * relying on age as a proxy for it.
  *
+ * ---- The reference anchor is meas[0], and it must be DETERMINISTIC -------
+ *
+ * Everything downstream treats meas[0] as the reference: tdoa_dtu_rebase()
+ * differences against it, tdoa_solve() linearises against it, and
+ * pos_ekf_update_tdoa() writes its n-1 scalar equations against it. Since
+ * 2026-09-02 tdoa_gw.c ALSO takes the filter's dt from meas[0]'s absolute
+ * t_dtu.
+ *
+ * A first revision appended observations in arrival order, so meas[0] was
+ * whichever anchor's MQTT message happened to land first -- different between
+ * consecutive blinks from the same tag, for reasons that have nothing to do
+ * with where the tag is. That makes the linearisation reference wander, so the
+ * conditioning of the solve changes fix to fix with no physical cause: jitter
+ * manufactured by bookkeeping. It also means dt is measured against a
+ * different anchor each time (harmless in magnitude -- the array's propagation
+ * spread is ~8 ns against a 200 ms dt -- but pointless).
+ *
+ * So this module keeps meas[] sorted by anchor_id ascending, making the
+ * reference the LOWEST anchor_id present in the group. Deterministic given the
+ * set of anchors that reported, which is the property downstream needs.
+ *
+ * Note the honest limit: it is deterministic given the SET, not invariant. If
+ * anchor 0 misses a blink, that blink's reference is anchor 1. That is
+ * unavoidable without inventing a reference the group does not contain, and
+ * both the solve and dt tolerate it.
+ *
+ * Alternatives rejected: picking the best-`quality` anchor flips between fixes
+ * whenever two are close, reintroducing exactly the instability this removes;
+ * picking the anchor nearest the previous fix conditions the solve better but
+ * makes the geometry depend on the filter's own previous output, which is one
+ * more closed loop.
+ *
  * ---- Release rule ---------------------------------------------------------
  *
  * A group is handed to the caller (tdoa_collect_take_ready() returns true)
@@ -106,6 +138,14 @@ struct tdoa_group {
 	uint32_t          anchor_bits;   /* anchor_id already seen, one bit each */
 	uint32_t          first_ms;      /* arrival of the first observation */
 	bool              used;
+	/* meas[] is kept sorted by anchor_id ASCENDING, so meas[0] is always the
+	 * lowest anchor_id present -- see the reference-anchor note above.
+	 * aid[i] is the anchor_id that produced meas[i]; it exists ONLY to
+	 * maintain that order, and is deliberately not exposed through
+	 * tdoa_collect_take_ready(). struct tdoa_meas has no anchor_id field and
+	 * must not grow one: nothing downstream of the collector has any use for
+	 * it, and the solver indexes its own equations. */
+	uint8_t           aid[POS_MAX_ANCHORS];
 	struct tdoa_meas  meas[POS_MAX_ANCHORS];
 };
 

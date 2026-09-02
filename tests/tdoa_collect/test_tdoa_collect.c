@@ -565,6 +565,85 @@ static void test_set_expected_does_not_affect_minimum_discard(void)
 	CHECK(!tdoa_collect_take_ready(&c, past_deadline, out, &n_out, &tag_out));
 }
 
+/*
+ * meas[0] is the reference every downstream stage differences, linearises and
+ * takes the filter's dt against, so which anchor lands there must depend on
+ * the SET of anchors that reported and nothing else -- not on which MQTT
+ * message happened to arrive first.
+ *
+ * Each observation carries its anchor's x as a marker, so the delivered order
+ * is readable straight off the output. Every arrival permutation of the same
+ * three anchors must produce the same meas[] order.
+ */
+static void test_reference_anchor_is_deterministic(void)
+{
+	/* All 6 orderings of anchors {1, 2, 3}. */
+	static const uint8_t perm[6][3] = {
+		{1, 2, 3}, {1, 3, 2}, {2, 1, 3},
+		{2, 3, 1}, {3, 1, 2}, {3, 2, 1},
+	};
+
+	for (unsigned int p = 0; p < 6u; p++) {
+		struct tdoa_collect c;
+		struct tdoa_meas out[POS_MAX_ANCHORS];
+		size_t n = 0;
+		uint16_t tag = 0;
+
+		tdoa_collect_init(&c);
+		tdoa_collect_set_expected(&c, 3u);
+
+		for (unsigned int k = 0; k < 3u; k++) {
+			uint8_t a = perm[p][k];
+
+			/* x = anchor id, so meas[i].x reveals the ordering. */
+			CHECK(tdoa_collect_add(&c,
+				&(struct tdoa_obs){
+					.tag_addr = 0x0100, .blink_seq = 7,
+					.anchor_id = a,
+					.meas = fake_meas((float)a, 0.0f,
+							  1000 + 10 * a),
+				}, 1000u));
+		}
+
+		CHECK(tdoa_collect_take_ready(&c, 1000u, out, &n, &tag));
+		CHECK(n == 3u);
+		/* Ascending by anchor_id, whatever the arrival order was. */
+		CHECK(out[0].x == 1.0f);
+		CHECK(out[1].x == 2.0f);
+		CHECK(out[2].x == 3.0f);
+	}
+	printf("  reference anchor: lowest id first for all 6 arrival orders\n");
+}
+
+/* The same, for a group that does NOT contain the lowest possible anchor id:
+ * the reference is the lowest id PRESENT, which is the honest limit stated in
+ * tdoa_collect.h -- deterministic given the set, not invariant across sets. */
+static void test_reference_is_lowest_present_not_lowest_possible(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n = 0;
+	uint16_t tag = 0;
+
+	tdoa_collect_init(&c);
+	tdoa_collect_set_expected(&c, 3u);
+
+	/* Anchor 0 never reports for this blink. */
+	CHECK(tdoa_collect_add(&c, &(struct tdoa_obs){
+		.tag_addr = 0x0100, .blink_seq = 9, .anchor_id = 3,
+		.meas = fake_meas(3.0f, 0.0f, 1030) }, 500u));
+	CHECK(tdoa_collect_add(&c, &(struct tdoa_obs){
+		.tag_addr = 0x0100, .blink_seq = 9, .anchor_id = 1,
+		.meas = fake_meas(1.0f, 0.0f, 1010) }, 500u));
+	CHECK(tdoa_collect_add(&c, &(struct tdoa_obs){
+		.tag_addr = 0x0100, .blink_seq = 9, .anchor_id = 2,
+		.meas = fake_meas(2.0f, 0.0f, 1020) }, 500u));
+
+	CHECK(tdoa_collect_take_ready(&c, 500u, out, &n, &tag));
+	CHECK(n == 3u);
+	CHECK(out[0].x == 1.0f);
+}
+
 int main(void)
 {
 	test_groups_by_tag_and_seq();
@@ -582,6 +661,8 @@ int main(void)
 	test_set_expected_pos_max_matches_default();
 	test_set_expected_clamps_out_of_range();
 	test_set_expected_does_not_affect_minimum_discard();
+	test_reference_anchor_is_deterministic();
+	test_reference_is_lowest_present_not_lowest_possible();
 	if (failures) { printf("\n%d CHECK(s) FAILED\n", failures); return EXIT_FAILURE; }
 	printf("tdoa_collect: ALL TESTS PASSED\n");
 	return EXIT_SUCCESS;

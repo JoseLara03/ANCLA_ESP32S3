@@ -12,6 +12,42 @@
 #define CONV_EPS_M   1e-4f
 #define DET_EPS      1e-6f
 
+/* Backtracking halvings tried per Gauss-Newton step before giving up on that
+ * direction. Same value and same reasoning as POS_GN_MAX_HALVINGS: each
+ * halving is one more diff_residual() evaluation over n-1 equations, and
+ * 2^-8 of a metre-scale step is finer than CONV_EPS_M needs. */
+#define MAX_HALVINGS 8
+
+/*
+ * Stationarity threshold on the gradient of the least-squares cost,
+ * ||J^T f||. This is what makes "converged" mean "this is a stationary
+ * point" rather than "the line search ran out of ideas" -- see the block
+ * comment on the final gate in tdoa_solve() below for why that distinction
+ * is load-bearing HERE in particular.
+ *
+ * DERIVED, NOT COPIED from pos_solver.c's POS_GN_GRAD_EPS (5e-3), and the
+ * difference matters because the threshold carries units:
+ *
+ *   - pos_solver's Jacobian rows are direction cosines, bounded by 1 in each
+ *     component; ours are DIFFERENCES of two direction cosines
+ *     ((x-x_i)/r_i - (x-x_0)/r_0), bounded by 2. For the same displacement
+ *     from a stationary point the gradient here is about twice as large.
+ *   - pos_solver's residual is a RANGE residual against a range sigma of
+ *     ~0.12 m (POS_RANGE_SIGMA_M); ours is a range-DIFFERENCE residual
+ *     against ~0.6 m (pos_ekf.h's r_tdoa, itself derived from the Fase 2
+ *     sync jitter via sqrt(2)).
+ *
+ * So: 5e-3 / 0.12 ~= 4% of sigma, kept as the fraction; 0.04 * 0.6 * 2 =
+ * 0.048, rounded to 5e-2. Tight against a 0.6 m measurement sigma and loose
+ * against float32 noise on an O(1) sum, which is the same pair of bounds
+ * pos_solver.c states for its own value.
+ *
+ * Copying 5e-3 verbatim would have imported a number dimensioned for a
+ * different measurement model -- roughly 10x too tight here, which would
+ * reject good fits as non-stationary.
+ */
+#define GRAD_EPS     5e-2f
+
 /* Division-by-zero guard on r_i = sqrt(...). Same VALUE as POS_H_MIN_M in
  * pos_solver.c, but a different BEHAVIOUR: pos_solver.c clamps h to that
  * floor and continues (max_abs_residual()/gn_solve()), whereas here the
@@ -63,6 +99,46 @@ static float diff_residual(const struct tdoa_meas *m, size_t n, float x, float y
 		acc += f * f;
 	}
 	return sqrtf(acc / (float)(n - 1));
+}
+
+/*
+ * Squared norm of the least-squares gradient, ||J^T f||^2, at (x, y).
+ *
+ * Kept separate from the iteration because the final stationarity gate has to
+ * evaluate it at the point the loop actually STOPPED at, which in general is
+ * not a point the loop ever built a Jacobian for -- the last accepted step
+ * moves (x, y) after the Jacobian that produced it was computed.
+ *
+ * Returns -1.0f when the geometry is degenerate at (x, y) (some r_i under
+ * R_MIN_M); the caller must treat that as a refusal, not as a small gradient.
+ * TRAP 1 applies here too: the int64_t subtraction precedes the float
+ * conversion, for the reason spelled out on diff_residual() above.
+ */
+static float grad_norm2(const struct tdoa_meas *m, size_t n, float x, float y)
+{
+	float r0 = slant(&m[0], x, y);
+	float g0 = 0.0f, g1 = 0.0f;
+
+	if (r0 < R_MIN_M) {
+		return -1.0f;
+	}
+
+	for (size_t i = 1; i < n; i++) {
+		float ri = slant(&m[i], x, y);
+
+		if (ri < R_MIN_M) {
+			return -1.0f;
+		}
+
+		float d_meas = (float)(m[i].t_dtu - m[0].t_dtu) * TDOA_M_PER_DTU;
+		float f  = (ri - r0) - d_meas;
+		float gx = (x - m[i].x) / ri - (x - m[0].x) / r0;
+		float gy = (y - m[i].y) / ri - (y - m[0].y) / r0;
+
+		g0 += gx * f;
+		g1 += gy * f;
+	}
+	return g0 * g0 + g1 * g1;
 }
 
 bool tdoa_solve(const struct tdoa_meas *m, size_t n, const float *seed_xy,
@@ -152,13 +228,95 @@ bool tdoa_solve(const struct tdoa_meas *m, size_t n, const float *seed_xy,
 		float dx = -( jtj11 * jtf0 - jtj01 * jtf1) / det;
 		float dy = -(-jtj01 * jtf0 + jtj00 * jtf1) / det;
 
-		x += dx;
-		y += dy;
-
+		/* Stationarity is judged on the UNDAMPED Newton step, before the
+		 * line search below touches it -- same reasoning pos_solver.c's
+		 * gn_solve() records, and both halves of it apply here. A seed
+		 * that IS already the solution produces dp ~ 0 and no improving
+		 * step, which has to read as converged rather than as a stall;
+		 * and testing the DAMPED step instead would let eight halvings of
+		 * a legitimate 2.5 cm step fall under the threshold and "converge"
+		 * short of a stationary point. */
 		if (fabsf(dx) < CONV_EPS_M && fabsf(dy) < CONV_EPS_M) {
-			if (!isfinite(x) || !isfinite(y)) {
-				return false;
+			break;
+		}
+
+		/*
+		 * Backtracking line search. The raw Gauss-Newton step is a
+		 * direction, not a promise: on the hyperbolic cost surface TDoA
+		 * produces it can overshoot badly, and accepting it unconditionally
+		 * is how the iteration walks away from a solution it was next to.
+		 * diff_residual() is the cost, and it already exists in this file --
+		 * it was written for out->residual_m and needed no new arithmetic.
+		 */
+		float cost0 = diff_residual(m, n, x, y);
+		float step = 1.0f;
+		float nx = x, ny = y;
+		bool improved = false;
+
+		for (int ls = 0; ls < MAX_HALVINGS; ls++) {
+			nx = x + step * dx;
+			ny = y + step * dy;
+
+			float cost1 = diff_residual(m, n, nx, ny);
+
+			if (isfinite(cost1) && cost1 < cost0) {
+				improved = true;
+				break;
 			}
+			step *= 0.5f;
+		}
+
+		if (!improved) {
+			/* Every halving made the fit worse, or non-finite. On the
+			 * FIRST iteration that means no step was ever accepted, so
+			 * (x, y) is still the caller's seed -- see the final gate
+			 * below for why returning it as a result is the specific
+			 * failure this function had to stop being able to commit.
+			 * Whether this point is nonetheless a usable answer is
+			 * decided there, on the gradient, and not here. */
+			break;
+		}
+
+		x = nx;
+		y = ny;
+	}
+
+	if (!isfinite(x) || !isfinite(y)) {
+		return false;
+	}
+
+	/*
+	 * Final gate: is this actually a stationary point?
+	 *
+	 * Covers the three exits that are not an explicit convergence test --
+	 * the stalled line search, the exhausted iteration budget, and a seed
+	 * that was never improved on -- with one criterion that means what the
+	 * contract says. A large RESIDUAL here is fine and is the caller's
+	 * signal that the timestamps disagree; a large GRADIENT means they were
+	 * never fitted at all.
+	 *
+	 * WHY THIS MATTERS MORE HERE THAN IN pos_solver.c, which is where the
+	 * criterion comes from: pos_solver.c records that without this gate it
+	 * "returned the seed verbatim with valid = true and a residual up to
+	 * 113 m" across 200k adversarial cases. In this solver the seed is not
+	 * an arbitrary starting guess -- src/tdoa_gw.c passes the tag's LAST
+	 * PUBLISHED POSITION on every fix. So a stall here does not return a
+	 * random point; it returns the previous answer, reporting success,
+	 * which is the stale-republish defect found on hardware on 2026-09-02
+	 * reached by a second route. And the arithmetic that caught that one
+	 * (fixes == seeded + filtered + reseed, read off `blink stats`) is
+	 * BLIND to this route: the fix enters through the seeding path and
+	 * tallies as n_seeded, so the totals still balance. This gate is the
+	 * only thing standing in front of it.
+	 */
+	{
+		float g2 = grad_norm2(m, n, x, y);
+
+		if (g2 < 0.0f || g2 > GRAD_EPS * GRAD_EPS) {
+			return false;
+		}
+
+		{
 			out->x = x;
 			out->y = y;
 			out->residual_m = diff_residual(m, n, x, y);
@@ -184,5 +342,4 @@ bool tdoa_solve(const struct tdoa_meas *m, size_t n, const float *seed_xy,
 			return true;
 		}
 	}
-	return false;   /* did not converge */
 }

@@ -106,7 +106,28 @@ bool tdoa_collect_add(struct tdoa_collect *c, const struct tdoa_obs *o,
 
 	if (g->anchor_bits & bit) return false;   /* duplicate anchor, ignored */
 
-	g->meas[g->n] = o->meas;
+	/* Insert so meas[] stays sorted by anchor_id ascending, which is what
+	 * makes meas[0] -- the reference every downstream stage differences,
+	 * linearises and takes dt against -- deterministic rather than
+	 * arrival-ordered. See the reference-anchor note in tdoa_collect.h.
+	 *
+	 * Insertion sort over at most POS_MAX_ANCHORS entries, and the array is
+	 * already sorted by construction, so this is a couple of compares and at
+	 * most a handful of moves. Done on ADD rather than at take_ready() so
+	 * the ordering is an invariant of the group at all times, not a
+	 * transformation someone can forget to apply on a new read path. */
+	{
+		uint8_t pos = g->n;
+
+		while (pos > 0u && g->aid[pos - 1u] > o->anchor_id) {
+			g->aid[pos]  = g->aid[pos - 1u];
+			g->meas[pos] = g->meas[pos - 1u];
+			pos--;
+		}
+		g->aid[pos]  = o->anchor_id;
+		g->meas[pos] = o->meas;
+	}
+
 	g->n++;
 	g->anchor_bits |= bit;
 	return true;
