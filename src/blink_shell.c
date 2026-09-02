@@ -73,7 +73,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	uint32_t s_implaus = 0, s_solve_fail = 0, s_jump = 0;
 	uint32_t s_dup = 0, s_shed = 0;
 	uint32_t e_seeded = 0, e_reseed = 0, e_filtered = 0, e_dt_invalid = 0;
-	uint32_t e_gate_rejected = 0;
+	uint32_t e_gate_rejected = 0, e_no_update = 0;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
@@ -86,7 +86,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		      &s_solve_fail, &s_jump);
 	tdoa_gw_reject_detail(&s_dup, &s_shed);
 	tdoa_gw_ekf_stats(&e_seeded, &e_reseed, &e_filtered, &e_dt_invalid,
-			  &e_gate_rejected);
+			  &e_gate_rejected, &e_no_update);
 
 	shell_print(sh,
 		    "{\"blink\":{\"role\":\"%s\","
@@ -121,9 +121,23 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh,
 		    "{\"tdoa_ekf\":{\"role\":\"%s\","
 		    "\"seeded\":%u,\"reseed\":%u,\"filtered\":%u,"
-		    "\"dt_invalid\":%u,\"gate_rejected\":%u}}",
+		    "\"dt_invalid\":%u,\"gate_rejected\":%u,"
+		    "\"no_update\":%u}}",
 		    board_role(), e_seeded, e_reseed, e_filtered,
-		    e_dt_invalid, e_gate_rejected);
+		    e_dt_invalid, e_gate_rejected, e_no_update);
+
+	if (e_no_update > 0u) {
+		shell_warn(sh,
+			   "%u cycle(s) published NOTHING because dt was "
+			   "invalid and the solve+seed fallback also failed: "
+			   "no stale fix was republished in their place "
+			   "(fixed 2026-09-02 - an earlier build would have "
+			   "silently republished the filter's unchanged prior "
+			   "position as if it were a live fix). A high count "
+			   "here alongside a high dt_invalid means marginal "
+			   "anchor coverage for that tag, not a bug.",
+			   e_no_update);
+	}
 
 	if (s_no_anchor > 0u) {
 		shell_warn(sh,

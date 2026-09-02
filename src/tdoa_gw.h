@@ -219,9 +219,17 @@ void tdoa_gw_reject_detail(uint32_t *n_dup, uint32_t *n_shed);
  * filter's first-ever group is NOT counted here, since it has no previous
  * dt to have been invalid); `n_gate_rejected` the cumulative count of
  * individual range-difference equations pos_ekf_update_tdoa() gated out
- * (out of n-1 attempted per filtered fix). */
+ * (out of n-1 attempted per filtered fix); `n_no_update` cycles where
+ * NOTHING published -- dt was invalid AND the solve+seed fallback also
+ * failed (solve_fail or the mirror-branch jump gate), so the filter's
+ * state did not move and publishing its unchanged prior value would have
+ * republished stale data as a live fix (found live on hardware
+ * 2026-09-02: the same tag published the exact same (x, y) to two
+ * decimals, minutes apart -- see solve_one()'s `state_changed` comment).
+ * `n_no_update` is a SUBSET of `n_dt_invalid`, not additional to it: every
+ * no-update cycle already incremented n_dt_invalid too. */
 void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
-		       uint32_t *n_gate_rejected);
+		       uint32_t *n_gate_rejected, uint32_t *n_no_update);
 
 #endif /* TDOA_GW_H */

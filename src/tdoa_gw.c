@@ -113,6 +113,7 @@ static uint32_t n_ekf_reseed;
 static uint32_t n_ekf_filtered;
 static uint32_t n_ekf_dt_invalid;
 static uint32_t n_ekf_gate_rejected;
+static uint32_t n_ekf_no_update;
 
 /* Warn ONCE PER BOOT for each of these, and let the counters carry the rest.
  * All three conditions are per-observation or per-fix and all three persist for
@@ -161,6 +162,7 @@ void tdoa_gw_init(void)
 	n_ekf_filtered      = 0u;
 	n_ekf_dt_invalid    = 0u;
 	n_ekf_gate_rejected = 0u;
+	n_ekf_no_update     = 0u;
 	warned_blind_residual = false;
 	warned_no_anchor = false;
 	warned_shed = false;
@@ -514,6 +516,20 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	mm->last_ref_t_dtu = fix_t_dtu;
 	mm->has_ref_t      = true;
 
+	/* Whether mm->ekf's state actually moved this cycle. pos_ekf_get()
+	 * below succeeds as soon as a filter has EVER been seeded, whatever
+	 * cycle that happened on -- it says nothing about THIS cycle. Without
+	 * this flag, a cycle where dt is invalid AND the solve+seed fallback
+	 * also fails (solve_fail or the jump gate) falls straight through to
+	 * pos_ekf_get() succeeding on the filter's UNCHANGED prior state, and
+	 * that stale state gets published again as if it were a fresh fix --
+	 * found live on hardware 2026-09-02: the same tag published the exact
+	 * same (x, y) to two decimals, minutes apart, no update in between.
+	 * Confirmed independently by `blink stats`: total published fixes
+	 * exceeded seeded+filtered+reseed by exactly the number of these
+	 * silent stale republishes. */
+	bool state_changed = false;
+
 	if (have_filter && dt_ok) {
 		pos_ekf_predict(&mm->ekf, &ekf_cfg, dt_s, mm->ekf_moving);
 
@@ -524,6 +540,7 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 					      (uint32_t)accepted;
 		}
 		n_ekf_filtered++;
+		state_changed = true;
 	} else {
 		/* A fresh memo slot's very first group has no previous dt to
 		 * have been invalid -- that is a cold start, not an anomaly,
@@ -534,6 +551,7 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 		if (resolve_and_seed(mm, m, n, tag_addr, now_ms, &res)) {
 			have_res = true;
 			n_ekf_seeded++;
+			state_changed = true;
 		}
 		/* On failure resolve_and_seed() already counted and warned;
 		 * fall through to the reseed check and final publish below,
@@ -547,7 +565,21 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 			res      = res2;
 			have_res = true;
 			n_ekf_reseed++;
+			state_changed = true;
 		}
+	}
+
+	if (!state_changed) {
+		/* Nothing actually happened to this tag's estimate this cycle:
+		 * dt was invalid and the fallback solve+seed also failed (or
+		 * got jump-gated). Publishing pos_ekf_get()'s unchanged prior
+		 * value here would be republishing stale data as a live fix --
+		 * see the comment on `state_changed` above. Counted apart from
+		 * n_ekf_dt_invalid (which already fired above): this is the
+		 * subset of those cycles where the fallback ALSO produced
+		 * nothing to publish. */
+		n_ekf_no_update++;
+		return true;
 	}
 
 	update_moving_state(mm);
@@ -555,8 +587,9 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	float fx, fy;
 
 	if (!pos_ekf_get(&mm->ekf, &fx, &fy, NULL, NULL)) {
-		/* Cold start and its solve failed or got jump-gated: nothing
-		 * to publish yet, already counted above. */
+		/* Defensive only: state_changed being true already implies a
+		 * successful pos_ekf_seed() or pos_ekf_predict() happened this
+		 * cycle, either of which leaves the filter initialised. */
 		return true;
 	}
 
@@ -688,11 +721,12 @@ void tdoa_gw_reject_detail(uint32_t *dup, uint32_t *shed)
 
 void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
-		       uint32_t *n_gate_rejected)
+		       uint32_t *n_gate_rejected, uint32_t *n_no_update)
 {
 	if (n_seeded != NULL)       { *n_seeded = n_ekf_seeded; }
 	if (n_reseed != NULL)       { *n_reseed = n_ekf_reseed; }
 	if (n_filtered != NULL)     { *n_filtered = n_ekf_filtered; }
 	if (n_dt_invalid != NULL)   { *n_dt_invalid = n_ekf_dt_invalid; }
 	if (n_gate_rejected != NULL) { *n_gate_rejected = n_ekf_gate_rejected; }
+	if (n_no_update != NULL)    { *n_no_update = n_ekf_no_update; }
 }
