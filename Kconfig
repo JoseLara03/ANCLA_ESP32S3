@@ -70,25 +70,6 @@ config ANCLA_DEBUG_DUMMY_SEATS
 	  headroom for a small bench fleet while still landing the first real
 	  tag near the true seat_id ceiling of 127.
 
-config ANCLA_OLD_BOARD
-	bool "Old board revision (IRQ line has no hardware pull-down)"
-	default n
-	help
-	  Early ancla_esp32s3 boards omit the pull-down resistor the DW3220
-	  datasheet recommends (not mandatory) on the IRQ line. The DW3220
-	  IRQ pad is push-pull and normally does not need one, but without it
-	  the pin can float long enough to miss the GPIO_INT_EDGE_RISING
-	  trigger this driver arms it with -- observed on hardware as the
-	  gateway's rx_sem never being given (no real RX, no RXFTO either),
-	  the inner loop stalling every superframe, and the beacon never
-	  transmitting at all.
-
-	  Enable this when flashing a board from that revision: it turns on
-	  the ESP32's internal pull-down on the IRQ pin
-	  (modules/dw3000-decadriver/platform/dw3000_hw.c) to compensate in
-	  software. Boards with the resistor already on the PCB do not need
-	  it and should leave this off.
-
 endmenu
 
 source "Kconfig.zephyr"
