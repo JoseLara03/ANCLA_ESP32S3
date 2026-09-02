@@ -70,11 +70,46 @@ static void test_reserved_bits_rejected(void)
     struct blink_frame out;
 
     CHECK(blink_frame_build(buf, sizeof(buf), 1, 0, &in) > 0);
-    buf[12] = 0x02;
+    /* Bit 1 (0x02) era reservado y desde proto 5 es BLINK_FLAG_MOVING, asi
+     * que aqui se usa 0x04, el primero que sigue reservado. Esa migracion es
+     * justo lo que la mascara protege: un receptor proto 4 RECHAZA un BLINK
+     * con el bit de movimiento en vez de malinterpretarlo, que es por lo que
+     * UWB_PROTO_VER tuvo que subir en el mismo commit. */
+    buf[12] = 0x04;
     CHECK(blink_frame_parse(buf, sizeof(buf), &out) == -EPROTO);
     buf[12] = 0x00;
     buf[13] = 0x01;
     CHECK(blink_frame_parse(buf, sizeof(buf), &out) == -EPROTO);
+}
+
+/* BLINK_FLAG_MOVING (proto 5) va y vuelve intacto, solo y combinado con
+ * ALERT. La combinacion importa: el gateway reenvia el BYTE entero, no un
+ * booleano decodificado, asi que los dos flags tienen que convivir. */
+static void test_moving_flag_round_trip(void)
+{
+    static const uint8_t cases[4] = {
+        0u,
+        BLINK_FLAG_ALERT,
+        BLINK_FLAG_MOVING,
+        BLINK_FLAG_ALERT | BLINK_FLAG_MOVING,
+    };
+
+    for (unsigned int k = 0; k < 4u; k++) {
+        uint8_t buf[BLINK_FRAME_LEN];
+        struct blink_frame in = { .seq = 7, .batt_soc = 42,
+                                  .flags = cases[k] };
+        struct blink_frame out;
+
+        CHECK(blink_frame_build(buf, sizeof(buf), 0x0100, 0, &in) > 0);
+        CHECK(buf[12] == cases[k]);
+        CHECK(blink_frame_parse(buf, sizeof(buf), &out) == 0);
+        CHECK(out.flags == cases[k]);
+    }
+
+    /* La mascara y los flags no pueden solaparse: si alguien agrega un flag
+     * sin encoger la mascara, el parser rechaza su propio frame. */
+    CHECK((BLINK_FLAG_ALERT & BLINK_FLAG_RESERVED_MASK) == 0u);
+    CHECK((BLINK_FLAG_MOVING & BLINK_FLAG_RESERVED_MASK) == 0u);
 }
 
 static void test_rejects_other_codes(void)
@@ -120,6 +155,7 @@ int main(void)
     test_roundtrip();
     test_length_tolerates_the_fcs();
     test_reserved_bits_rejected();
+    test_moving_flag_round_trip();
     test_rejects_other_codes();
     test_arg_checks();
     test_airtime();

@@ -1140,6 +1140,22 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `src/pos_sink.{c,h}` — consumes decoded tag position fixes. Logs one JSON line
   per fix (the only place `residual`/`batt` stay visible) and hands the fix to
   `net_uplink` through a bounded queue.
+- **`BLINK_FLAG_MOVING` is the tag's accelerometer, and its ABSENCE is
+  indistinguishable from "still".** Proto 5 (2026-09-03) puts the LIS2HH12's
+  activity verdict on the air in `blink_frame.flags` bit 1, so the gateway can
+  apply `pos_ekf_zupt()` to a stationary tag -- which `pos_ekf.h` calls the
+  single largest visual improvement available, because a motionless tag is the
+  common case. It REPLACED a heuristic that inferred motion from the filter's
+  own velocity output; that heuristic is DELETED, not kept as a fallback, since
+  two criteria competing for one process-noise parameter is worse than either
+  alone. The trap: an anchor still on proto 4 sends no `f` field, the parser
+  leaves it 0, and 0 reads as "not moving" -- so a version-skewed fleet applies
+  a ZUPT on EVERY cycle and looks exactly like a healthy stationary one.
+  `blink stats`' `zupt` counter exists for that, and the shell warns when
+  `zupt == filtered`. The gateway forwards the whole flags BYTE rather than a
+  decoded boolean, so `BLINK_FLAG_ALERT` became visible for free and the next
+  flag needs no new field.
+
 - **The TDoA height model (`apos tagz`) is a PER-SITE number and nobody has
   measured one yet.** `tdoa_gw.c` sets each observation's `dz` to
   `anchor z - apos_store's tag_z_m`, defaulting to 0.0 — i.e. tags assumed to

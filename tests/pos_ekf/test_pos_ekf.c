@@ -872,8 +872,71 @@ static void test_tdoa_degenerate_geometry_no_nan(void)
     CHECK(all_finite_state(&f));
 }
 
+/*
+ * ZUPT on the TDoA path: a stationary tag whose accelerometer says so.
+ *
+ * The failure this guards against is a constant-velocity model integrating
+ * measurement noise into a drift that does not exist -- which is exactly what
+ * a motionless tag looks like on a live gateway, and is the ~0.8 m dispersion
+ * the 2026-09-02 hardware round left open. pos_ekf.h calls a zero-velocity
+ * update the single largest visual improvement available for that reason.
+ */
+static void test_tdoa_zupt_pins_velocity(void)
+{
+    struct pos_ekf_cfg c;
+    struct pos_ekf f_zupt, f_free;
+
+    pos_ekf_cfg_defaults(&c);
+    pos_ekf_reset(&f_zupt);
+    pos_ekf_reset(&f_free);
+    pos_ekf_seed(&f_zupt, 5.0f, 5.0f);
+    pos_ekf_seed(&f_free, 5.0f, 5.0f);
+
+    /* The same noisy observations of a tag that never moves, fed to two
+     * filters that differ ONLY in whether ZUPT is applied. */
+    for (unsigned int k = 0; k < 60u; k++) {
+        struct tdoa_meas m[4];
+
+        make_tdoa(5.0f, 5.0f, 4, m);
+        for (int a = 0; a < 4; a++) {
+            m[a].t_dtu += (int64_t)rng_noise_dtu(64);
+        }
+
+        pos_ekf_predict(&f_zupt, &c, 0.2f, false);
+        pos_ekf_update_tdoa(&f_zupt, &c, m, 4);
+        pos_ekf_zupt(&f_zupt, &c);
+
+        pos_ekf_predict(&f_free, &c, 0.2f, true);
+        pos_ekf_update_tdoa(&f_free, &c, m, 4);
+    }
+
+    float zx, zy, zvx, zvy, fx, fy, fvx, fvy;
+
+    CHECK(pos_ekf_get(&f_zupt, &zx, &zy, &zvx, &zvy));
+    CHECK(pos_ekf_get(&f_free, &fx, &fy, &fvx, &fvy));
+
+    float zs = sqrtf(zvx * zvx + zvy * zvy);
+    float fs = sqrtf(fvx * fvx + fvy * fvy);
+
+    printf("  zupt: |v| %.4f m/s (with) vs %.4f m/s (without); "
+           "pos err %.3f vs %.3f m\n",
+           (double)zs, (double)fs,
+           (double)sqrtf((zx - 5.0f) * (zx - 5.0f) +
+                         (zy - 5.0f) * (zy - 5.0f)),
+           (double)sqrtf((fx - 5.0f) * (fx - 5.0f) +
+                         (fy - 5.0f) * (fy - 5.0f)));
+
+    /* The point of the update: velocity is pinned near zero. */
+    CHECK(zs < 0.05f);
+    /* And it is doing something -- an unconstrained filter on the same data
+     * carries real velocity. A test that only checked zs could pass on a
+     * filter that never moves for unrelated reasons. */
+    CHECK(zs < fs);
+}
+
 int main(void)
 {
+    test_tdoa_zupt_pins_velocity();
     test_converges_static_from_poor_seed();
     test_tracks_constant_velocity();
     test_outlier_gated();

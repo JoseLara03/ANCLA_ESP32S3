@@ -266,11 +266,17 @@ int pos_json_blink(char *buf, size_t len, const struct pos_blink_obs *o)
 		return -1;
 	}
 
+	/* "f" is the BLINK's flags byte, added at proto 5. It is appended LAST
+	 * so the field order of every pre-existing key is untouched -- the
+	 * parser is a key scanner and does not care, but a human diffing two
+	 * captures does. */
 	n = snprintf(buf, len,
-		     "{\"a\":%u,\"t\":%u,\"s\":%u,\"ts\":\"%lld\",\"q\":%u,\"b\":%u}",
+		     "{\"a\":%u,\"t\":%u,\"s\":%u,\"ts\":\"%lld\",\"q\":%u,\"b\":%u,"
+		     "\"f\":%u}",
 		     (unsigned int)o->anchor_id, (unsigned int)o->tag_addr,
 		     (unsigned int)o->blink_seq, (long long)o->t_dtu,
-		     (unsigned int)o->quality, (unsigned int)o->batt_soc);
+		     (unsigned int)o->quality, (unsigned int)o->batt_soc,
+		     (unsigned int)o->flags);
 
 	if (n < 0 || (size_t)n >= len) {
 		return -1;
@@ -285,6 +291,7 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 	 * bounds. */
 	char scratch[POS_JSON_BLINK_MAX_LEN];
 	uint32_t a, t, s, q, b;
+	uint32_t f = 0u;
 	int64_t ts;
 
 	if (buf == NULL || out == NULL) {
@@ -301,6 +308,19 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 	    !scan_u32(scratch, "b", &b) || !scan_i64(scratch, "ts", &ts)) {
 		return -1;
 	}
+	/* "f" (proto 5) is OPTIONAL, unlike every field above: an anchor still
+	 * on proto 4 does not send it, and a gateway must keep consuming that
+	 * anchor's observations rather than dropping them wholesale. Absent
+	 * reads as 0 -- no alert, not moving -- which is the safe direction:
+	 * the gateway then simply does not apply a zero-velocity update to
+	 * that tag, exactly as it behaved before this field existed. A field
+	 * that is PRESENT but out of range is still rejected, same as the
+	 * others: tolerating an unknown field is not the same as tolerating a
+	 * malformed one. */
+	if (scan_u32(scratch, "f", &f) && f > 0xFFu) {
+		return -1;
+	}
+
 	if (a > 0xFFu || t > 0xFFFFu || s > 0xFFu || q > 0xFFFFu || b > 0xFFu) {
 		return -1;
 	}
@@ -321,6 +341,7 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 	out->batt_soc  = (uint8_t)b;
 	out->tag_addr  = (uint16_t)t;
 	out->quality   = (uint16_t)q;
+	out->flags     = (uint8_t)f;
 	out->t_dtu     = ts;
 	return 0;
 }

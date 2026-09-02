@@ -7,6 +7,7 @@
 #include "tdoa_gw.h"
 
 #include "apos_store.h"
+#include "blink_frame.h"   /* BLINK_FLAG_MOVING */
 #include "net_uplink.h"
 #include "pos_ekf.h"
 #include "pos_json.h"
@@ -76,11 +77,12 @@ struct tag_memo {
 	 * than a cold start. */
 	int64_t  last_ref_t_dtu;
 	bool     has_ref_t;
-	/* Hysteresis state for pos_ekf_predict()'s `moving` process-noise
-	 * selector, fed from the filter's OWN velocity estimate -- see
-	 * TDOA_GW_MOVING_ENTER_MPS/EXIT_MPS in tdoa_gw.h for why this is a
-	 * closed loop and not ZUPT. */
-	bool     ekf_moving;
+	/* pos_ekf_predict()'s `moving` process-noise selector, and the gate on
+	 * pos_ekf_zupt(). Since proto 5 this is the TAG's own accelerometer
+	 * (BLINK_FLAG_MOVING), latched from the last group processed for this
+	 * tag -- not, as it was until 2026-09-03, an inference from the
+	 * filter's own velocity output. See the removal note above solve_one(). */
+	bool     tag_moving;
 };
 
 /* All module state static -- the gateway loop runs on the 4096-byte main stack,
@@ -114,6 +116,12 @@ static uint32_t n_ekf_filtered;
 static uint32_t n_ekf_dt_invalid;
 static uint32_t n_ekf_gate_rejected;
 static uint32_t n_ekf_no_update;
+/* Zero-velocity updates applied, i.e. filtered cycles where the tag's own
+ * accelerometer said it was still. Its own counter because without it there
+ * is no way to tell "the MOVING bit never arrives" (an anchor still on
+ * proto 4, or a tag that never reports still) from "it arrives and says
+ * moving" -- the two look identical from every other number here. */
+static uint32_t n_ekf_zupt;
 
 /* Warn ONCE PER BOOT for each of these, and let the counters carry the rest.
  * All three conditions are per-observation or per-fix and all three persist for
@@ -163,6 +171,7 @@ void tdoa_gw_init(void)
 	n_ekf_dt_invalid    = 0u;
 	n_ekf_gate_rejected = 0u;
 	n_ekf_no_update     = 0u;
+	n_ekf_zupt          = 0u;
 	warned_blind_residual = false;
 	warned_no_anchor = false;
 	warned_shed = false;
@@ -335,6 +344,13 @@ static bool ingest_one(uint32_t now_ms)
 	 * per tag and read back when the fix is built. */
 	mm = memo_claim(obs.tag_addr, now_ms);
 	mm->batt_soc = obs.batt_soc;
+	/* Same treatment, same reason: the collector carries only struct
+	 * tdoa_meas, so anything that rides on the OBSERVATION rather than on
+	 * the geometry is remembered here per tag and read back when the fix
+	 * is built. Every observation of one blink carries the same flags byte
+	 * (it is one frame, heard by several anchors), so latching the last
+	 * one to arrive is not a choice between disagreeing values. */
+	mm->tag_moving = (obs.flags & BLINK_FLAG_MOVING) != 0u;
 
 	if (tdoa_collect_add(&collect, &t, now_ms)) {
 		n_obs_in++;
@@ -446,30 +462,28 @@ static bool resolve_and_seed(struct tag_memo *mm, const struct tdoa_meas *m,
 	return true;
 }
 
-/* Update the hysteresis state pos_ekf_predict()'s `moving` selector reads on
- * the NEXT call, from the filter's own just-updated velocity estimate. A
- * dead zone between the two thresholds (see tdoa_gw.h) is what keeps this
- * from chattering at the boundary. No-op on an unseeded filter. */
-static void update_moving_state(struct tag_memo *mm)
-{
-	float vx, vy;
-
-	if (!pos_ekf_get(&mm->ekf, NULL, NULL, &vx, &vy)) {
-		return;
-	}
-
-	float speed = sqrtf(vx * vx + vy * vy);
-
-	if (mm->ekf_moving) {
-		if (speed < TDOA_GW_MOVING_EXIT_MPS) {
-			mm->ekf_moving = false;
-		}
-	} else {
-		if (speed > TDOA_GW_MOVING_ENTER_MPS) {
-			mm->ekf_moving = true;
-		}
-	}
-}
+/*
+ * REMOVED 2026-09-03: update_moving_state(), which derived `moving` from the
+ * filter's OWN velocity estimate with a hysteresis band.
+ *
+ * It was a deliberate stand-in, accepted in the 2026-09-02 design (its §4.6)
+ * only because the alternative cost a wire change. That design also named its
+ * flaw: a filter deciding "am I moving?" from its own output is a closed loop,
+ * and under high noise it can stick on "moving" -- which is exactly the case
+ * where a stationary tag most needs the still branch.
+ *
+ * BLINK_FLAG_MOVING (proto 5) replaces it with the tag's own accelerometer.
+ * The heuristic is DELETED rather than kept as a fallback: two criteria
+ * competing for one process-noise parameter is worse than either alone, and a
+ * fallback that only engages when the real signal is missing would be
+ * exercised on precisely the boards nobody tested.
+ *
+ * An anchor still on proto 4 sends no flags field, which parses as 0 --
+ * "not moving". That is the safe direction: the filter gets the still process
+ * noise and a ZUPT it may not deserve, and pos_ekf's gate streak plus
+ * pos_ekf_needs_reseed() is what recovers from that, exactly as it does for a
+ * tag carried too smoothly for its accelerometer to notice.
+ */
 
 /* One ready group into one published fix. Returns false when no group was
  * ready, so the caller can stop early. */
@@ -541,7 +555,7 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	bool state_changed = false;
 
 	if (have_filter && dt_ok) {
-		pos_ekf_predict(&mm->ekf, &ekf_cfg, dt_s, mm->ekf_moving);
+		pos_ekf_predict(&mm->ekf, &ekf_cfg, dt_s, mm->tag_moving);
 
 		int accepted = pos_ekf_update_tdoa(&mm->ekf, &ekf_cfg, m, n);
 
@@ -549,6 +563,30 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 			n_ekf_gate_rejected += (uint32_t)(n - 1u) -
 					      (uint32_t)accepted;
 		}
+
+		/* Zero-velocity update, gated on the TAG's accelerometer.
+		 * pos_ekf.h calls this the single largest visual improvement
+		 * available, because a stationary tag is the common case: it
+		 * pins vx/vy at 0 with two scalar pseudo-measurements, which
+		 * stops the constant-velocity model from integrating
+		 * measurement noise into a drift that does not exist.
+		 *
+		 * AFTER the measurement update, not before: the ZUPT is a
+		 * statement about the state this cycle produced, and applying
+		 * it first would let the very next update undo it.
+		 *
+		 * If the accelerometer is wrong -- a tag carried slowly and
+		 * smoothly enough to read still -- this feeds the filter a
+		 * constraint it does not deserve. The recovery is pos_ekf's
+		 * own gate streak reaching cfg->reset_after, which
+		 * resolve_and_seed() below already handles. Deliberately no
+		 * second defence here: two overlapping recovery paths for one
+		 * condition is how the one that never fires goes stale. */
+		if (!mm->tag_moving) {
+			pos_ekf_zupt(&mm->ekf, &ekf_cfg);
+			n_ekf_zupt++;
+		}
+
 		n_ekf_filtered++;
 		state_changed = true;
 	} else {
@@ -591,8 +629,6 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 		n_ekf_no_update++;
 		return true;
 	}
-
-	update_moving_state(mm);
 
 	float fx, fy;
 
@@ -731,7 +767,8 @@ void tdoa_gw_reject_detail(uint32_t *dup, uint32_t *shed)
 
 void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
-		       uint32_t *n_gate_rejected, uint32_t *n_no_update)
+		       uint32_t *n_gate_rejected, uint32_t *n_no_update,
+		       uint32_t *n_zupt)
 {
 	if (n_seeded != NULL)       { *n_seeded = n_ekf_seeded; }
 	if (n_reseed != NULL)       { *n_reseed = n_ekf_reseed; }
@@ -739,4 +776,5 @@ void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 	if (n_dt_invalid != NULL)   { *n_dt_invalid = n_ekf_dt_invalid; }
 	if (n_gate_rejected != NULL) { *n_gate_rejected = n_ekf_gate_rejected; }
 	if (n_no_update != NULL)    { *n_no_update = n_ekf_no_update; }
+	if (n_zupt != NULL)         { *n_zupt = n_ekf_zupt; }
 }

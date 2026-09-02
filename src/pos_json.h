@@ -51,6 +51,17 @@ struct pos_blink_obs {
 	uint8_t  batt_soc;    /* 0-100, or UWB_FRAME_POS_SOC_CONNECTED */
 	uint16_t tag_addr;    /* short address of the emitting tag */
 	uint16_t quality;     /* CIR quality, diagnostics -- the solver ignores it */
+	/* The BLINK's flags byte, forwarded WHOLE rather than as a decoded
+	 * `moving` boolean. Same size, same code, and BLINK_FLAG_ALERT (which
+	 * already exists and which the gateway has never seen) comes along for
+	 * free -- as does the next flag, with no new field and no new parser
+	 * branch. Decode with the BLINK_FLAG_* masks in blink_frame.h.
+	 *
+	 * Zero when the publishing anchor is older than proto 5 and did not
+	 * send the field: the parser leaves it at 0, which reads as "not
+	 * moving, no alert". That is the safe direction for the consumer --
+	 * see pos_json_blink_parse()'s note. */
+	uint8_t  flags;
 	int64_t  t_dtu;       /* RX in the master's base, sync_model_to_master() */
 };
 

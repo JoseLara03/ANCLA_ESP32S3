@@ -76,6 +76,11 @@ bool blink_rx_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
 	obs.batt_soc  = bf.batt_soc;
 	obs.tag_addr  = bf.src_addr;
 	obs.quality   = quality;
+	/* Forwarded WHOLE, not decoded: this module stamps and relays, it does
+	 * not interpret. BLINK_FLAG_MOVING is what the gateway's filter wants
+	 * out of it; blink_frame_parse() has already rejected any reserved
+	 * bit, so whatever survives to here is a flag this build knows. */
+	obs.flags     = bf.flags;
 	obs.t_dtu     = (int64_t)t_master;
 
 	net_uplink_submit_blink(&obs);

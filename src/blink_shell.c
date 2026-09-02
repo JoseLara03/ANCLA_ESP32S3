@@ -73,7 +73,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	uint32_t s_implaus = 0, s_solve_fail = 0, s_jump = 0;
 	uint32_t s_dup = 0, s_shed = 0;
 	uint32_t e_seeded = 0, e_reseed = 0, e_filtered = 0, e_dt_invalid = 0;
-	uint32_t e_gate_rejected = 0, e_no_update = 0;
+	uint32_t e_gate_rejected = 0, e_no_update = 0, e_zupt = 0;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
@@ -86,7 +86,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		      &s_solve_fail, &s_jump);
 	tdoa_gw_reject_detail(&s_dup, &s_shed);
 	tdoa_gw_ekf_stats(&e_seeded, &e_reseed, &e_filtered, &e_dt_invalid,
-			  &e_gate_rejected, &e_no_update);
+			  &e_gate_rejected, &e_no_update, &e_zupt);
 
 	shell_print(sh,
 		    "{\"blink\":{\"role\":\"%s\","
@@ -122,9 +122,24 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		    "{\"tdoa_ekf\":{\"role\":\"%s\","
 		    "\"seeded\":%u,\"reseed\":%u,\"filtered\":%u,"
 		    "\"dt_invalid\":%u,\"gate_rejected\":%u,"
-		    "\"no_update\":%u}}",
+		    "\"no_update\":%u,\"zupt\":%u}}",
 		    board_role(), e_seeded, e_reseed, e_filtered,
-		    e_dt_invalid, e_gate_rejected, e_no_update);
+		    e_dt_invalid, e_gate_rejected, e_no_update, e_zupt);
+
+	/* The one reading an operator cannot get from any other number here.
+	 * An anchor still on proto 4 sends no flags field, which parses as 0 =
+	 * "not moving", so EVERY filtered cycle applies a ZUPT. That looks like
+	 * a healthy stationary fleet and is actually a firmware version
+	 * mismatch, so it is called out rather than left to be spotted. */
+	if (e_filtered > 0u && e_zupt == e_filtered) {
+		shell_warn(sh,
+			   "every filtered cycle (%u) applied a zero-velocity "
+			   "update. Either nothing is moving, or the anchors are "
+			   "older than proto 5 and send no MOVING bit at all - "
+			   "which parses as \"still\" and looks identical from "
+			   "here. Check the anchors' firmware before trusting a "
+			   "still fleet.", e_zupt);
+	}
 
 	if (e_no_update > 0u) {
 		shell_warn(sh,

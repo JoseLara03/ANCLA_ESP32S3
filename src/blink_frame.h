@@ -41,7 +41,7 @@
  *   0..9    802.15.4 header: FC 0x41 0x88, seq, PANID, dest 0xFFFF, src, type
  *   10      blink_seq   monotonic, wraps at 256; the grouping key
  *   11      batt_soc    0..100, or UWB_FRAME_POS_SOC_CONNECTED (0xFF)
- *   12      flags       bit0 = ALERT pending; bits 1..7 reserved, must be 0
+ *   12      flags       bit0 = ALERT pending, bit1 = MOVING; 2..7 reserved
  *   13      reserved    must be 0; exists so the length is even
  */
 #define BLINK_OFF_SEQ     10u
@@ -51,7 +51,37 @@
 #define BLINK_FRAME_LEN   14u
 
 #define BLINK_FLAG_ALERT          0x01u
-#define BLINK_FLAG_RESERVED_MASK  0xFEu
+
+/*
+ * BLINK_FLAG_MOVING (proto 5): the tag's accelerometer says it is in motion.
+ *
+ * The gateway needs this because a stationary tag is the common case and the
+ * single largest visual improvement available to the position filter is a
+ * zero-velocity update -- pos_ekf_zupt(), whose own header says exactly that.
+ * Without a real motion signal the gateway can only infer "still" from the
+ * filter's OWN velocity estimate, which is a closed loop on its own output and
+ * can stick on "moving" under high noise.
+ *
+ * The tag already has this bit and already uses it: motion.c sets
+ * motion_moving from the LIS2HH12 activity interrupt, and the tag's own TWR
+ * path already drives pos_ekf_predict()/pos_ekf_zupt() from it. All this flag
+ * does is put it on the air so the TDoA path can use it too.
+ *
+ * WHAT IT DOES NOT MEAN: "not moving" is the accelerometer's opinion, not
+ * ground truth. A tag carried slowly and smoothly can report still, which
+ * would feed the filter a zero-velocity update it does not deserve. The
+ * defence against that is not in this frame -- it is pos_ekf's gate streak and
+ * pos_ekf_needs_reseed(), which the gateway already honours.
+ *
+ * Adding this bit is why UWB_PROTO_VER moves to 5: blink_frame_parse()
+ * rejects any reserved bit, so a proto-4 receiver drops a BLINK carrying it
+ * rather than misreading it. That rejection is the whole point of the
+ * reserved-bit check, and it is why the mask has to shrink in the same commit
+ * on both sides.
+ */
+#define BLINK_FLAG_MOVING         0x02u
+
+#define BLINK_FLAG_RESERVED_MASK  0xFCu
 
 struct blink_frame {
 	uint16_t src_addr;

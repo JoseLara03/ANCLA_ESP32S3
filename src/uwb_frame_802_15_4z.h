@@ -65,7 +65,7 @@
  * MEANING of an unchanged wire format changes, so the version has to move
  * even though nothing byte-visible does. A v3 tag against a v4 gateway
  * stays deaf in SCAN -- same flag day, both firmwares reflashed together. */
-#define UWB_PROTO_VER     4
+#define UWB_PROTO_VER     5
 #define UWB_FRAME_N_CFP   11        /* ranging slots per superframe */
 #define UWB_FRAME_N_CAP   4         /* CAP Aloha mini-slots (v1) */
 

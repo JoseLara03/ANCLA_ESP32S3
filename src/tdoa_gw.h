@@ -135,15 +135,12 @@
  * the gate around it. */
 #define TDOA_DT_MAX_MS  2000
 
-/* Hysteresis thresholds for scheduling the EKF's process noise
- * (sigma_a_move vs sigma_a_still) from the FILTER'S OWN velocity estimate --
- * there is no accelerometer on this path, unlike tag_testting's pos_ekf
- * consumer. This is a closed loop on its own output, not ZUPT, and it can
- * get stuck reporting "moving" under high noise (see the design spec
- * section 4.6): a FIRST-CUT pair of numbers, not yet checked against
- * hardware data, and Task 5's job to confirm or retune. */
-#define TDOA_GW_MOVING_ENTER_MPS  0.20f
-#define TDOA_GW_MOVING_EXIT_MPS   0.10f
+/* TDOA_GW_MOVING_ENTER_MPS / _EXIT_MPS lived here until 2026-09-03. They
+ * scheduled the EKF's process noise from the FILTER'S OWN velocity estimate,
+ * because at the time nothing on this path carried an accelerometer reading.
+ * BLINK_FLAG_MOVING (proto 5) now does, so the closed loop is gone rather
+ * than kept as a fallback -- see the removal note above solve_one() in
+ * tdoa_gw.c for why having both would be worse than either. */
 
 /* Clear the collector and every cache. Call once, before the gateway loop. */
 void tdoa_gw_init(void);
@@ -227,9 +224,16 @@ void tdoa_gw_reject_detail(uint32_t *n_dup, uint32_t *n_shed);
  * 2026-09-02: the same tag published the exact same (x, y) to two
  * decimals, minutes apart -- see solve_one()'s `state_changed` comment).
  * `n_no_update` is a SUBSET of `n_dt_invalid`, not additional to it: every
- * no-update cycle already incremented n_dt_invalid too. */
+ * no-update cycle already incremented n_dt_invalid too.
+ *
+ * `n_zupt` counts zero-velocity updates applied, i.e. filtered cycles where
+ * the tag's accelerometer reported still. A SUBSET of `n_filtered`. Read it
+ * to tell "the MOVING bit never arrives" -- an anchor still on proto 4 sends
+ * no flags field, which parses as 0, so n_zupt would equal n_filtered --
+ * from "it arrives and says moving", which no other counter distinguishes. */
 void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
-		       uint32_t *n_gate_rejected, uint32_t *n_no_update);
+		       uint32_t *n_gate_rejected, uint32_t *n_no_update,
+		       uint32_t *n_zupt);
 
 #endif /* TDOA_GW_H */

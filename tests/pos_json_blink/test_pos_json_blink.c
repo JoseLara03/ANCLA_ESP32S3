@@ -143,8 +143,61 @@ static void test_ts_out_of_domain_and_overflow_are_rejected(void)
     CHECK(POS_JSON_BLINK_TS_MAX == 1099511627775LL);
 }
 
+/*
+ * "f" (the BLINK flags byte, proto 5) is OPTIONAL on parse, unlike every
+ * other field. An anchor still on proto 4 does not send it, and a gateway
+ * must keep consuming that anchor's observations rather than dropping them
+ * wholesale -- a version skew that silently zeroes the TDoA input would look
+ * exactly like anchors going quiet.
+ *
+ * Absent reads as 0 (no alert, not moving), which is the safe direction: the
+ * gateway then does not apply a zero-velocity update to that tag, i.e. it
+ * behaves exactly as it did before the field existed.
+ *
+ * PRESENT but out of range is still rejected. Tolerating an unknown field is
+ * not the same as tolerating a malformed one.
+ */
+static void test_flags_field_is_optional(void)
+{
+    struct pos_blink_obs o;
+
+    /* A proto-4 payload: every required key, no "f". */
+    const char *old_style =
+        "{\"a\":2,\"t\":256,\"s\":9,\"ts\":\"123456\",\"q\":100,\"b\":80}";
+
+    CHECK(pos_json_blink_parse(old_style, strlen(old_style), &o) == 0);
+    CHECK(o.flags == 0u);
+    CHECK(o.anchor_id == 2u);
+    CHECK(o.batt_soc == 80u);
+
+    /* Present and valid. */
+    const char *with_f =
+        "{\"a\":2,\"t\":256,\"s\":9,\"ts\":\"123456\",\"q\":100,\"b\":80,\"f\":3}";
+
+    CHECK(pos_json_blink_parse(with_f, strlen(with_f), &o) == 0);
+    CHECK(o.flags == 3u);
+
+    /* Present and out of range: rejected, not clamped. */
+    const char *bad_f =
+        "{\"a\":2,\"t\":256,\"s\":9,\"ts\":\"123456\",\"q\":100,\"b\":80,\"f\":999}";
+
+    CHECK(pos_json_blink_parse(bad_f, strlen(bad_f), &o) == -1);
+
+    /* Round trip through the builder. */
+    struct pos_blink_obs src = { .anchor_id = 1, .blink_seq = 5,
+                                 .batt_soc = 55, .tag_addr = 0x0101,
+                                 .quality = 7, .flags = 0x02,
+                                 .t_dtu = 999 };
+    char buf[POS_JSON_BLINK_MAX_LEN];
+
+    CHECK(pos_json_blink(buf, sizeof(buf), &src) > 0);
+    CHECK(pos_json_blink_parse(buf, strlen(buf), &o) == 0);
+    CHECK(o.flags == 0x02u);
+}
+
 int main(void)
 {
+    test_flags_field_is_optional();
     test_topic_is_zone_scoped();
     test_roundtrip();
     test_ts_is_a_quoted_string_and_survives_40_bits();
