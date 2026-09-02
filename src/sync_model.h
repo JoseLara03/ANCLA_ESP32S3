@@ -130,8 +130,57 @@
 /* Residual EMA shift: correction = residual >> SYNC_PHASE_EMA_SHIFT. A shift of
  * 3 averages the phase over ~8 observations, cutting reference noise by ~sqrt(8)
  * while still following a real step within a second. Integer shift rather than a
- * fractional gain so no float and no division appear on this path. */
+ * fractional gain so no float and no division appear on this path.
+ *
+ * Wrapped in #ifndef, not a bare #define, so a host test can override it with
+ * -DSYNC_PHASE_EMA_SHIFT=N to sweep it -- the same reason tools/tag_density.py
+ * exposes its constants on the CLI: a value that is a measured CONCLUSION has
+ * to be re-measurable by whoever re-derives it.
+ *
+ * ---- 2026-09-02 sweep result: NEGATIVE, shift stays at 3 -----------------
+ *
+ * Swept {3, 4, 5, 6} x jitter {0, 6, 32, 64, 320, 640, 3200} DTU, 12 seeds
+ * each, via tests/sync_model/test_sync_model.c's
+ * test_shift_sensitivity_sweep() (worst_error(), SYNC_BASELINE_USEFUL*2
+ * observations, mean of 12 seeds per cell, each shift built separately with
+ * -DSYNC_PHASE_EMA_SHIFT=N since it is a compile-time constant). Worst cell
+ * in the whole table is the highest jitter (3200 DTU), and it is also the
+ * cell where a real gain would show up most, since the phase term this
+ * constant controls scales with jitter:
+ *
+ *     shift   jitter=3200 DTU, mean worst error   vs shift=3
+ *     3       1928 DTU                            --
+ *     4       1831 DTU                             -5.0%
+ *     5       1772 DTU                             -8.1%
+ *     6       1759 DTU                             -8.7%
+ *
+ * Checked again at the cell closest to the actual Fase 2 hardware jitter
+ * measurement (~92-98 DTU, between the 64 and 320 DTU rows): at jitter=64,
+ * shift 3->4/5/6 is 40->37 DTU (-7.5%); at jitter=320, 205->198/196/196 DTU
+ * (-3.4% to -4.4%). All figures, at every jitter level, land far under the
+ * design spec's 20% bar (section 2.5) -- **shift stays 3, unchanged**.
+ *
+ * Confirms the algebra in that section (section 2.1): the EMA already
+ * contributes only ~6% of the converted error at shift=3 (the dominant term
+ * is the single noisy phase-reference sample, which no amount of averaging
+ * on the RESIDUAL side of the loop can touch), so raising it buys almost
+ * nothing. The simulation's feedback loop (section 2.2) narrows the gap
+ * between "EMA-limited" and "phase-reference-limited" slightly versus a pure
+ * quadrature-sum guess, but not by enough to change the verdict.
+ *
+ * Raising the shift also has a real cost that was NOT charged against it
+ * above: SYNC_RESIDUAL_TO_JITTER (below) is empirical for shift=3, and the
+ * same sweep run showed the shift-4/5/6 builds under-report the true jitter
+ * (inferred 340/334/332 DTU against a true sigma of 369 DTU at amplitude 640,
+ * versus 350 at shift=3) -- exactly the trap the design spec's section 2.4
+ * warns about, and it would have to be re-derived for zero measured benefit.
+ *
+ * **Do not re-propose raising this constant without new evidence** -- e.g. a
+ * hardware jitter figure with a qualitatively different noise shape than the
+ * uniform noise this simulation assumes. */
+#ifndef SYNC_PHASE_EMA_SHIFT
 #define SYNC_PHASE_EMA_SHIFT  3
+#endif
 
 /* Consecutive missed CCPs after which the model stops claiming validity.
  * Coasting is safe for a while -- the residual after drift correction is second

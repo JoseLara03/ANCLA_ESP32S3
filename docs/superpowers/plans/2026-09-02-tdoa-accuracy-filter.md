@@ -51,7 +51,15 @@ Ojo: el árbol de trabajo tenía cambios sin commitear en `Kconfig`,
 `modules/dw3000-decadriver/platform/dw3000_hw.c` y un `old_board.conf` borrado
 al abrir este plan — resolverlos ANTES de ramificar, no arrastrarlos.
 
-**Estado 2026-09-02:** ninguna tarea empezada. Spec escrito esta sesión.
+**Estado 2026-09-02:** Tareas 1-4 completas (código, host tests, `west build`
+limpio en ambas imágenes). Tarea 5 (hardware) sigue abierta — sin acceso a
+board en esta sesión. Hallazgo importante durante la Tarea 3: la premisa de
+la spec §4.1 ("`pos_ekf` está muerto en el tag") es **incorrecta** —
+`tag_testting/src/uwb_net_runner.c` lo sigue usando en su camino TWR. Se seguí
+el precedente de `pos_solver.c`/`pos_residual.c` (copia verbatim, el tag
+conserva la propiedad) en vez de la instrucción original de "mover"; ver la
+entrada de `pos_ekf.{c,h}` en el `CLAUDE.md` de ANCLA para el detalle
+completo. `tag_testting/CLAUDE.md` NO se tocó.
 
 ---
 
@@ -66,22 +74,23 @@ Y su resultado fija el default de `r_tdoa` en la Tarea 4.
 ganancia casi nula), §2.2 (la simulación mide otra cosa y gana la simulación) y
 §2.4 (la trampa de `SYNC_RESIDUAL_TO_JITTER`).
 
-- [ ] Envolver `SYNC_PHASE_EMA_SHIFT` en `#ifndef` en `src/sync_model.h`, para
+- [x] Envolver `SYNC_PHASE_EMA_SHIFT` en `#ifndef` en `src/sync_model.h`, para
       que un test pueda pasarlo por `-D`. No cambiar el valor.
-- [ ] Extender `tests/sync_model/test_sync_model.c` con un barrido de shift que
+- [x] Extender `tests/sync_model/test_sync_model.c` con un barrido de shift que
       reuse `worst_error()` tal cual: shift en {3, 4, 5, 6}, jitter en la tabla
       que `test_jitter_sensitivity_sweep()` ya usa, 12 semillas (una sola
       semilla es demasiado ruidosa para ver la tendencia — el propio
       `sync_model.h` documenta que leyó una tendencia falsa así).
-- [ ] Imprimir la tabla y compilar el suite una vez por shift con
+- [x] Imprimir la tabla y compilar el suite una vez por shift con
       `-DSYNC_PHASE_EMA_SHIFT=N`. Registrar los números crudos.
-- [ ] Aplicar el criterio de §2.5: mejora >= 20% en el error peor -> cambiar la
-      constante; < 20% -> **no cambiar nada**.
+- [x] Aplicar el criterio de §2.5: mejora >= 20% en el error peor -> cambiar la
+      constante; < 20% -> **no cambiar nada**. Resultado: peor mejora medida
+      8.8% (shift 6 vs 3, celda jitter=3200) — **no se cambia**.
 - [ ] Si se cambia: re-derivar `SYNC_RESIDUAL_TO_JITTER` en el MISMO commit
       (`test_residual_rms_measures_the_jitter()` es el instrumento), y
       actualizar la tabla de `sync_model.h` y
-      `docs/anchor-sync-measurement.md` §4.1.
-- [ ] Si NO se cambia: escribir el hallazgo NEGATIVO en `sync_model.h`, junto a
+      `docs/anchor-sync-measurement.md` §4.1. **(N/A — no se cambió el shift.)**
+- [x] Si NO se cambia: escribir el hallazgo NEGATIVO en `sync_model.h`, junto a
       la constante, con los números. Un hallazgo negativo sin registrar se
       vuelve a proponer.
 
@@ -109,18 +118,18 @@ alimentado con esa cadencia hereda el batido.
 y nota de agotamiento de ranuras) manda sobre cualquier "simplificación" que se
 ocurra aquí.
 
-- [ ] `tdoa_collect_set_expected(struct tdoa_collect *c, uint8_t n)` en
+- [x] `tdoa_collect_set_expected(struct tdoa_collect *c, uint8_t n)` en
       `src/tdoa_collect.{c,h}`, acotando `n` a
       `[TDOA_MIN_ANCHORS, POS_MAX_ANCHORS]`.
-- [ ] `expected` por defecto = `POS_MAX_ANCHORS`, para que un llamador que
+- [x] `expected` por defecto = `POS_MAX_ANCHORS`, para que un llamador que
       nunca invoque el setter conserve exactamente el comportamiento de hoy.
-- [ ] La condición de liberación temprana pasa a `g->n >= c->expected`. **No
+- [x] La condición de liberación temprana pasa a `g->n >= c->expected`. **No
       tocar** la política de eviction ni la de descarte por debajo del mínimo —
       su razonamiento está en la cabecera y no se re-abre.
-- [ ] `tdoa_gw_step()` llama al setter con `apos_store_get()->n_nodes`
+- [x] `tdoa_gw_step()` llama al setter con `apos_store_get()->n_nodes`
       (`anchor_xyz()` ya lee ese struct). Si no hay survey aplicado, no llamar:
       un gateway sin survey ya descarta toda observación en `ingest_one()`.
-- [ ] Tests en `tests/tdoa_collect/`: liberación temprana con `expected = 3`;
+- [x] Tests en `tests/tdoa_collect/`: liberación temprana con `expected = 3`;
       que `expected = 4` reproduzca el comportamiento actual; que un `n` fuera
       de rango se acote y no rompa; y que un grupo con `n < TDOA_MIN_ANCHORS`
       siga descartándose al expirar la ventana.
@@ -143,28 +152,37 @@ que la Fase 3 movió el solve al gateway.
 **Leer antes:** spec §4.1 (la propiedad se MUEVE, no se copia, y por qué eso
 rompe la regla verbatim-copy a propósito), §4.2 (TRAMPA 1) y §4.3 (`r_tdoa`).
 
-- [ ] Copiar `tag_testting/src/pos_ekf.{c,h}` a `src/` y
+- [x] Copiar `tag_testting/src/pos_ekf.{c,h}` a `src/` y
       `tag_testting/tests/pos_ekf/` a `tests/pos_ekf/`. Verificar que el suite
       migrado PASA sin cambios antes de tocar una línea — es la línea base.
-- [ ] Agregar `pos_ekf_update_tdoa()` con la firma y el modelo de §4.2.
+- [x] Agregar `pos_ekf_update_tdoa()` con la firma y el modelo de §4.2.
       Updates escalares secuenciales, gate a `c->gate_k` sigmas, misma
       mecánica que `pos_ekf_update_ranges()`. Sin inversa de matriz.
-- [ ] **TRAMPA 1:** `(m[i].t_dtu - m[0].t_dtu)` se resta en `int64_t` ANTES de
+- [x] **TRAMPA 1:** `(m[i].t_dtu - m[0].t_dtu)` se resta en `int64_t` ANTES de
       convertir a float. Un test debe FALLAR si alguien invierte el orden —
       con timestamps del orden de 2^40, no con valores chicos donde el bug es
-      invisible.
-- [ ] `float r_tdoa` en `struct pos_ekf_cfg`, default 0.6 m en
+      invisible. Verificado inyectando el bug a propósito: el test diseñado
+      para la geometría de 10x10 m NO lo detectaba (gate demasiado laxo con P
+      recién sembrada); se rediseñó con una línea base más grande y asimétrica
+      hasta confirmar que SÍ falla con el bug inyectado y pasa sin él.
+- [x] `float r_tdoa` en `struct pos_ekf_cfg`, default 0.6 m en
       `pos_ekf_cfg_defaults()`, con el comentario que dice de dónde sale
-      (jitter de Fase 2) y que se re-deriva si la Tarea 1 lo mueve.
-- [ ] Tests nuevos en `tests/pos_ekf/`: trayectoria sintética con ruido de
+      (jitter de Fase 2) y que se re-deriva si la Tarea 1 lo mueve. (La Tarea 1
+      no cambió nada, así que el default queda como está.)
+- [x] Tests nuevos en `tests/pos_ekf/`: trayectoria sintética con ruido de
       diferencia de 0.6 m — el filtro debe converger y su RMS debe quedar por
       DEBAJO del de `tdoa_solve()` sobre los mismos datos (esa comparación es
       el punto del task, no un extra); un tag quieto que no derive; que el gate
       rechace un outlier gordo; que la geometría degenerada no produzca NaN.
-- [ ] Declarar la propiedad en el `CLAUDE.md` de ANCLA y cederla en el de
-      `tag_testting`; marcar muerta (o borrar) la copia del tag en este mismo
-      ciclo. No dejar dos copias vivas — es exactamente el modo de falla de
-      `cal_math.c`.
+      Medido: RMS filtro 0.216 m vs RMS solve crudo 0.397 m (n=80 fixes).
+- [x] Declarar la propiedad en el `CLAUDE.md` de ANCLA. **NO se cedió en el de
+      `tag_testting` ni se marcó/borró su copia — la premisa de la spec de que
+      es código muerto ahí es INCORRECTA** (`uwb_net_runner.c` lo sigue usando
+      en su camino TWR). Se siguió el precedente de `pos_solver.c`/
+      `pos_residual.c` (copia verbatim, propiedad compartida hasta que el tag
+      deje de resolver su propio fix) en vez de esta instrucción original de
+      "mover". Ver la entrada de `pos_ekf.{c,h}` en `CLAUDE.md` para el detalle
+      completo.
 
 **Aceptación:** `tests/pos_ekf/` PASSED (el suite heredado sin regresiones, más
 los tests nuevos), y ningún `CLAUDE.md` afirmando que el otro repo es dueño.
@@ -185,38 +203,44 @@ Necesita las Tareas 2 y 3.
 bits, los dos casos de re-seed), §4.4 (por qué `static`) y §4.5 (el flujo
 completo, y que el gate de salto de 10 m se conserva).
 
-- [ ] `struct pos_ekf` dentro de `struct tag_memo`, más el `t_dtu` absoluto de
+- [x] `struct pos_ekf` dentro de `struct tag_memo`, más el `t_dtu` absoluto de
       referencia del último fix y un flag de sembrado. Todo dentro del `memo[]`
       que ya es `static` — **ningún automático nuevo en este hilo**, por el
       desborde silencioso de stack que `CLAUDE.md` documenta.
-- [ ] En `solve_one()`, guardar `m[0].t_dtu` **antes** de
+- [x] En `solve_one()`, guardar `m[0].t_dtu` **antes** de
       `tdoa_dtu_rebase(m, n)`. Ese es el instante del fix.
-- [ ] `dt` = diferencia con SIGNO sobre 40 bits contra el guardado del fix
+- [x] `dt` = diferencia con SIGNO sobre 40 bits contra el guardado del fix
       anterior (patrón `sdelta40()` de `sync_model.c`), convertida a segundos.
       Una resta plana es incorrecta al envolver cada ~17.2 s y falla raro.
-- [ ] `TDOA_DT_MAX_MS` = 2000 en `tdoa_gw.h`, con el porqué. `dt <= 0` o
+- [x] `TDOA_DT_MAX_MS` = 2000 en `tdoa_gw.h`, con el porqué. `dt <= 0` o
       `dt > TDOA_DT_MAX_MS` -> re-seed, no propagar.
-- [ ] El flujo de §4.5, exactamente en ese orden: predict+update si hay filtro
+- [x] El flujo de §4.5, exactamente en ese orden: predict+update si hay filtro
       sembrado y `dt` válido; `tdoa_solve()` + `pos_ekf_seed()` si no;
       re-seed vía `tdoa_solve()` si `pos_ekf_needs_reseed()`; publicar
       `pos_ekf_get()`.
-- [ ] Programación del ruido de proceso desde la velocidad estimada del propio
+- [x] Programación del ruido de proceso desde la velocidad estimada del propio
       filtro, con histéresis (§4.6). Comentar en el código que esto es un
       sustituto de ZUPT y que es un lazo cerrado sobre sí mismo — puede quedar
       pegado en "moviéndose" bajo ruido alto.
-- [ ] Conservar el gate de salto de 10 m sin cambios. Cubre el camino de
+- [x] Conservar el gate de salto de 10 m sin cambios. Cubre el camino de
       siembra, que es justo el que el filtro no cubre.
-- [ ] Contadores nuevos, expuestos por `blink stats`: fixes sembrados, fixes
+- [x] Contadores nuevos, expuestos por `blink stats`: fixes sembrados, fixes
       filtrados, re-seeds, `dt` inválidos, ecuaciones rechazadas por el gate.
       Sin esto el filtro es una caja negra en banco y no hay forma de
       distinguir "no hay tags" de "el filtro rechaza todo".
-- [ ] Todo `LOG_WRN` nuevo: **una vez por boot**, con el contador cargando la
+- [x] Todo `LOG_WRN` nuevo: **una vez por boot**, con el contador cargando la
       magnitud. Es el lazo `K_PRIO_COOP(0)` y `CONFIG_LOG_MODE_OVERFLOW`
       sobreescribe justo las líneas que el operador está leyendo. Mismo patrón
       que los cinco `warned_*` que este archivo ya tiene.
-- [ ] Verificar que el payload publicado sigue siendo
+- [x] Verificar que el payload publicado sigue siendo
       `{"Tid","x","y","z"}` — contrato congelado. Sin velocidad, sin sigma.
-- [ ] `west build` limpio, y anotar el delta de `.bss` (se esperan ~1.3 kB).
+- [x] `west build` limpio, y anotar el delta de `.bss`. Real: `dram0_0_seg`
+      270440 -> 272160 B (+1720 B), un poco por encima de los ~1.3 kB
+      estimados (los campos nuevos por tag además de `struct pos_ekf` — 
+      `last_ref_t_dtu`/`has_ref_t`/`ekf_moving` — no estaban en la estimación
+      original). Verificado también que la imagen de calibración sigue
+      enlazando (`pos_ekf.c` está en el bloque incondicional de
+      `target_sources`, igual que `tdoa_gw.c`).
 
 **Aceptación:** compila limpio; `tests/tdoa_collect/`, `tests/pos_ekf/`,
 `tests/tdoa_solve/`, `tests/tdoa_dtu/` y `tests/pos_json/` PASSED; ningún

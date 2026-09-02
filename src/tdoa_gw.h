@@ -104,6 +104,47 @@
 #define TDOA_GW_INGEST_MAX  32u
 #define TDOA_GW_SOLVE_MAX   8u
 
+/* ---- The per-tag EKF (2026-09-02 accuracy/smoothing work) -----------------
+ *
+ * Largest gap accepted between a tag's consecutive fixes before the filter's
+ * dt is treated as meaningless and a fresh tdoa_solve()+pos_ekf_seed() runs
+ * instead of a predict(). Same order as TDOA_GW_SEED_AGE_MS (ten blinks at
+ * 5 Hz): a gateway reboot re-bases sync_model and the master clock jumps, and
+ * a tag reappearing after minutes has no velocity worth extrapolating either
+ * way. See docs/superpowers/specs/2026-09-02-tdoa-accuracy-filter-design.md
+ * section 3.2.
+ *
+ * **Observed live on hardware, 2026-09-02, on this project's own deployed
+ * gateway (real anchors, real MQTT broker, one real joined tag): `n_filtered`
+ * stayed low against `n_dt_invalid`.** Diagnosed with temporary logging
+ * (removed once root-caused, not left in-tree) rather than guessed at.
+ * Two DISTINCT causes, both already correctly handled, neither a defect:
+ * (1) a NEGATIVE raw_dt with no 40-bit wrap crossed -- two of the same tag's
+ * groups draining out of blink-chronology order in one tdoa_gw_step() call,
+ * because tdoa_collect_take_ready() scans slots in table order, not time
+ * order, and a tag with patchy anchor coverage can have more than one of its
+ * groups pending at once; (2) a raw_dt of several SECONDS, wrap-corrected --
+ * long gaps between the RARE blinks that actually reached TDOA_MIN_ANCHORS
+ * anchors for that tag, i.e. marginal RF coverage upstream in
+ * tdoa_collect, not a timing bug here. Both are exactly the "dt <= 0
+ * (reordering)" and "gap too large" cases this section already documents,
+ * and the gate routing them to a fresh solve instead of a bogus predict is
+ * the CORRECT behaviour, not the anomaly. Recorded here so nobody re-chases
+ * this as a Task 4 defect: a dt_invalid-heavy site is a coverage/RF
+ * observation about THAT deployment, not evidence against this constant or
+ * the gate around it. */
+#define TDOA_DT_MAX_MS  2000
+
+/* Hysteresis thresholds for scheduling the EKF's process noise
+ * (sigma_a_move vs sigma_a_still) from the FILTER'S OWN velocity estimate --
+ * there is no accelerometer on this path, unlike tag_testting's pos_ekf
+ * consumer. This is a closed loop on its own output, not ZUPT, and it can
+ * get stuck reporting "moving" under high noise (see the design spec
+ * section 4.6): a FIRST-CUT pair of numbers, not yet checked against
+ * hardware data, and Task 5's job to confirm or retune. */
+#define TDOA_GW_MOVING_ENTER_MPS  0.20f
+#define TDOA_GW_MOVING_EXIT_MPS   0.10f
+
 /* Clear the collector and every cache. Call once, before the gateway loop. */
 void tdoa_gw_init(void);
 
@@ -161,5 +202,26 @@ void tdoa_gw_stats(uint32_t *n_obs, uint32_t *n_reject, uint32_t *n_fix,
  * and is otherwise indistinguishable at the console from anchors going quiet.
  * Same split, and the same reason, as net_uplink_obs_rx_drops(). */
 void tdoa_gw_reject_detail(uint32_t *n_dup, uint32_t *n_shed);
+
+/* The per-tag EKF's own counters, distinct from the ingest/solve counters
+ * above: those are about whether a GROUP made it to a solve attempt at all,
+ * these are about what the FILTER did with it once solved. Without these
+ * the filter is a black box on the bench -- no way to tell "no tags" from
+ * "the filter rejects everything".
+ *
+ * `n_seeded` fixes produced by a COLD-START tdoa_solve()+pos_ekf_seed()
+ * (no filter running yet for that tag); `n_reseed` fixes produced the same
+ * way but recovering an ALREADY-seeded filter whose gate_streak reached
+ * cfg.reset_after (pos_ekf_needs_reseed()); `n_filtered` fixes produced by
+ * predict()+update_tdoa() with no solve at all -- the steady-state case;
+ * `n_dt_invalid` cycles where an ALREADY-seeded filter could not get a
+ * usable dt (forcing the reseed path instead of a predict -- a fresh
+ * filter's first-ever group is NOT counted here, since it has no previous
+ * dt to have been invalid); `n_gate_rejected` the cumulative count of
+ * individual range-difference equations pos_ekf_update_tdoa() gated out
+ * (out of n-1 attempted per filtered fix). */
+void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
+		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
+		       uint32_t *n_gate_rejected);
 
 #endif /* TDOA_GW_H */

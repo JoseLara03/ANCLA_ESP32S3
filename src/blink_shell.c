@@ -72,6 +72,8 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	uint32_t s_obs = 0, s_reject = 0, s_fix = 0, s_no_anchor = 0;
 	uint32_t s_implaus = 0, s_solve_fail = 0, s_jump = 0;
 	uint32_t s_dup = 0, s_shed = 0;
+	uint32_t e_seeded = 0, e_reseed = 0, e_filtered = 0, e_dt_invalid = 0;
+	uint32_t e_gate_rejected = 0;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
@@ -83,6 +85,8 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	tdoa_gw_stats(&s_obs, &s_reject, &s_fix, &s_no_anchor, &s_implaus,
 		      &s_solve_fail, &s_jump);
 	tdoa_gw_reject_detail(&s_dup, &s_shed);
+	tdoa_gw_ekf_stats(&e_seeded, &e_reseed, &e_filtered, &e_dt_invalid,
+			  &e_gate_rejected);
 
 	shell_print(sh,
 		    "{\"blink\":{\"role\":\"%s\","
@@ -108,6 +112,18 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		    "\"implausible\":%u,\"solve_fail\":%u,\"jump\":%u}}",
 		    board_role(), s_obs, s_reject, s_dup, s_shed, s_fix,
 		    s_no_anchor, s_implaus, s_solve_fail, s_jump);
+
+	/* The per-tag EKF's own counters (Task 4 of
+	 * docs/superpowers/plans/2026-09-02-tdoa-accuracy-filter.md), on their
+	 * own line for the same reason the solve half got its own line above:
+	 * without this there is no way to tell "no tags" from "the filter
+	 * rejects everything". Same role field, same reason. */
+	shell_print(sh,
+		    "{\"tdoa_ekf\":{\"role\":\"%s\","
+		    "\"seeded\":%u,\"reseed\":%u,\"filtered\":%u,"
+		    "\"dt_invalid\":%u,\"gate_rejected\":%u}}",
+		    board_role(), e_seeded, e_reseed, e_filtered,
+		    e_dt_invalid, e_gate_rejected);
 
 	if (s_no_anchor > 0u) {
 		shell_warn(sh,
@@ -181,10 +197,11 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_blink,
 	SHELL_CMD_ARG(stats, NULL,
-		      "stats — the TDoA path as JSON, in two lines: the "
+		      "stats — the TDoA path as JSON, in three lines: the "
 		      "anchor's stamping counters plus the uplink's "
 		      "publish/subscribe counters, then the gateway's "
-		      "ingest/solve/publish counters. Both carry a role field",
+		      "ingest/solve/publish counters, then the per-tag EKF's "
+		      "own counters. All three carry a role field",
 		      cmd_stats, 1, 0),
 	SHELL_SUBCMD_SET_END
 );

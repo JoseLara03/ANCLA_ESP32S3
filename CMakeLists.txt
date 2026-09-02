@@ -33,6 +33,7 @@ target_sources(app PRIVATE
 	src/net_shell.c
 	src/net_store.c
 	src/net_uplink.c
+	src/pos_ekf.c
 	src/pos_json.c
 	src/pos_residual.c
 	src/pos_sink.c

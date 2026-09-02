@@ -12,6 +12,14 @@
 void tdoa_collect_init(struct tdoa_collect *c)
 {
 	memset(c, 0, sizeof(*c));
+	c->expected = POS_MAX_ANCHORS;
+}
+
+void tdoa_collect_set_expected(struct tdoa_collect *c, uint8_t n)
+{
+	if (n < TDOA_MIN_ANCHORS) n = TDOA_MIN_ANCHORS;
+	if (n > POS_MAX_ANCHORS) n = POS_MAX_ANCHORS;
+	c->expected = n;
 }
 
 /* Signed age of a group at `now_ms`, correct across a wrapping ms counter for
@@ -116,7 +124,7 @@ bool tdoa_collect_take_ready(struct tdoa_collect *c, uint32_t now_ms,
 
 		if (!g->used) continue;
 
-		if (g->n >= POS_MAX_ANCHORS) {
+		if (g->n >= c->expected) {
 			if (!have_ready) { ready = g; have_ready = true; }
 			continue;
 		}

@@ -446,6 +446,125 @@ static void test_collector_feeds_solver(void)
 	       (double)tx, (double)ty, (double)r.x, (double)r.y);
 }
 
+/* tdoa_collect_set_expected(): a 3-anchor deployment must release as soon as
+ * its 3rd anchor reports, not wait out the window the way a 4-anchor
+ * deployment (today's hardcoded POS_MAX_ANCHORS) would. This is the actual
+ * defect the setter exists to fix: without it, a live 3-anchor array never
+ * hits the early-release branch at all. */
+static void test_set_expected_releases_early(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_obs o;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+
+	tdoa_collect_init(&c);
+	tdoa_collect_set_expected(&c, 3);
+
+	o = obs(0x0E00, 1, 0, 0.0f, 0.0f, 100);
+	CHECK(tdoa_collect_add(&c, &o, 0));
+	o = obs(0x0E00, 1, 1, 10.0f, 0.0f, 110);
+	CHECK(tdoa_collect_add(&c, &o, 1));
+
+	/* Only 2 of 3 expected: window is 150 ms, so this must NOT release yet. */
+	CHECK(!tdoa_collect_take_ready(&c, 2, out, &n_out, &tag_out));
+
+	o = obs(0x0E00, 1, 2, 10.0f, 10.0f, 120);
+	CHECK(tdoa_collect_add(&c, &o, 2));
+
+	/* 3rd of 3 expected: releases immediately, well inside the 150 ms
+	 * window -- the whole point of the setter. */
+	CHECK(tdoa_collect_take_ready(&c, 2, out, &n_out, &tag_out));
+	CHECK(n_out == 3);
+	CHECK(tag_out == 0x0E00);
+}
+
+/* tdoa_collect_set_expected(c, POS_MAX_ANCHORS) must reproduce exactly
+ * today's behaviour -- a caller that always has 4 anchors and calls the
+ * setter explicitly sees no change from one that never calls it at all. */
+static void test_set_expected_pos_max_matches_default(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_obs o;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+
+	tdoa_collect_init(&c);
+	tdoa_collect_set_expected(&c, POS_MAX_ANCHORS);
+
+	for (uint8_t a = 0; a < 3; a++) {
+		o = obs(0x0F00, 2, a, (float)a, 0.0f, 1000 + a);
+		CHECK(tdoa_collect_add(&c, &o, a));
+	}
+	/* 3 of 4: must still wait for the window, exactly like the unset-setter
+	 * case in test_groups_by_tag_and_seq(). */
+	CHECK(!tdoa_collect_take_ready(&c, 3, out, &n_out, &tag_out));
+
+	o = obs(0x0F00, 2, 3, 3.0f, 0.0f, 1003);
+	CHECK(tdoa_collect_add(&c, &o, 3));
+	CHECK(tdoa_collect_take_ready(&c, 3, out, &n_out, &tag_out));
+	CHECK(n_out == 4);
+}
+
+/* An out-of-range `n` is clamped, not rejected or left to corrupt state --
+ * checked at both ends against the behaviour the clamp is supposed to
+ * produce (TDOA_MIN_ANCHORS on the low side, POS_MAX_ANCHORS on the high
+ * side). */
+static void test_set_expected_clamps_out_of_range(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_obs o;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+
+	/* Below TDOA_MIN_ANCHORS clamps up to it: 3 anchors releases early. */
+	tdoa_collect_init(&c);
+	tdoa_collect_set_expected(&c, 0);
+	for (uint8_t a = 0; a < 3; a++) {
+		o = obs(0x1000, 1, a, (float)a, 0.0f, 1000 + a);
+		CHECK(tdoa_collect_add(&c, &o, a));
+	}
+	CHECK(tdoa_collect_take_ready(&c, 2, out, &n_out, &tag_out));
+	CHECK(n_out == 3);
+
+	/* Above POS_MAX_ANCHORS clamps down to it: 3 of 4 still waits. */
+	tdoa_collect_init(&c);
+	tdoa_collect_set_expected(&c, 255);
+	for (uint8_t a = 0; a < 3; a++) {
+		o = obs(0x1001, 1, a, (float)a, 0.0f, 1000 + a);
+		CHECK(tdoa_collect_add(&c, &o, a));
+	}
+	CHECK(!tdoa_collect_take_ready(&c, 2, out, &n_out, &tag_out));
+}
+
+/* Lowering `expected` must not touch the below-minimum discard path: a group
+ * that never reaches TDOA_MIN_ANCHORS is still silently dropped once its
+ * window expires, whatever `expected` is set to -- the setter changes the
+ * EARLY-release threshold only, never the floor. */
+static void test_set_expected_does_not_affect_minimum_discard(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_obs o;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+
+	tdoa_collect_init(&c);
+	tdoa_collect_set_expected(&c, 3);
+
+	o = obs(0x1100, 1, 0, 0.0f, 0.0f, 100);
+	CHECK(tdoa_collect_add(&c, &o, 0));
+	o = obs(0x1100, 1, 1, 10.0f, 0.0f, 110);
+	CHECK(tdoa_collect_add(&c, &o, 1));
+
+	uint32_t past_deadline = TDOA_COLLECT_WINDOW_MS + 1;
+
+	CHECK(!tdoa_collect_take_ready(&c, past_deadline, out, &n_out, &tag_out));
+}
+
 int main(void)
 {
 	test_groups_by_tag_and_seq();
@@ -459,6 +578,10 @@ int main(void)
 	test_duplicate_anchor_is_ignored();
 	test_ms_clock_wrap();
 	test_collector_feeds_solver();
+	test_set_expected_releases_early();
+	test_set_expected_pos_max_matches_default();
+	test_set_expected_clamps_out_of_range();
+	test_set_expected_does_not_affect_minimum_discard();
 	if (failures) { printf("\n%d CHECK(s) FAILED\n", failures); return EXIT_FAILURE; }
 	printf("tdoa_collect: ALL TESTS PASSED\n");
 	return EXIT_SUCCESS;

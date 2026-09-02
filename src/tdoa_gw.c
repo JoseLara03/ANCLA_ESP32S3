@@ -8,6 +8,7 @@
 
 #include "apos_store.h"
 #include "net_uplink.h"
+#include "pos_ekf.h"
 #include "pos_json.h"
 #include "pos_sink.h"
 #include "pos_solver.h"
@@ -59,6 +60,27 @@ struct tag_memo {
 	uint8_t  batt_soc;
 	bool     valid;
 	bool     has_pos;   /* x/y are a real previous fix, not zero-init */
+
+	/* ---- The per-tag EKF (2026-09-02 accuracy/smoothing work) ---------
+	 *
+	 * x/y/pos_ms/has_pos above are UNCHANGED in purpose: the last
+	 * PUBLISHED position, used only to seed a fresh tdoa_solve() and to
+	 * jump-gate it. `ekf` is a separate, independent piece of state: the
+	 * running filter. The two are synchronised only at publish time. */
+	struct pos_ekf ekf;
+	/* Reference anchor's ABSOLUTE 40-bit t_dtu from this tag's last
+	 * processed group, captured before tdoa_dtu_rebase() -- the filter's
+	 * dt clock, in hardware, at 15.65 ps. `has_ref_t` distinguishes "no
+	 * previous group yet" (fresh memo slot) from a genuine dt failure;
+	 * without it a freshly claimed slot would read as a dt anomaly rather
+	 * than a cold start. */
+	int64_t  last_ref_t_dtu;
+	bool     has_ref_t;
+	/* Hysteresis state for pos_ekf_predict()'s `moving` process-noise
+	 * selector, fed from the filter's OWN velocity estimate -- see
+	 * TDOA_GW_MOVING_ENTER_MPS/EXIT_MPS in tdoa_gw.h for why this is a
+	 * closed loop and not ZUPT. */
+	bool     ekf_moving;
 };
 
 /* All module state static -- the gateway loop runs on the 4096-byte main stack,
@@ -72,6 +94,11 @@ struct tag_memo {
 static struct tdoa_collect collect;
 static struct tag_memo     memo[TDOA_GW_SEED_SLOTS];
 
+/* One shared config for every tag's filter -- there is no per-tag tuning,
+ * so a per-tag copy would only cost memory (9 floats x TDOA_GW_SEED_SLOTS)
+ * for nothing. Set once in tdoa_gw_init(). */
+static struct pos_ekf_cfg ekf_cfg;
+
 static uint32_t n_obs_in;
 static uint32_t n_dup;
 static uint32_t n_shed;
@@ -80,6 +107,12 @@ static uint32_t n_no_anchor;
 static uint32_t n_implausible;
 static uint32_t n_solve_fail;
 static uint32_t n_jump;
+
+static uint32_t n_ekf_seeded;
+static uint32_t n_ekf_reseed;
+static uint32_t n_ekf_filtered;
+static uint32_t n_ekf_dt_invalid;
+static uint32_t n_ekf_gate_rejected;
 
 /* Warn ONCE PER BOOT for each of these, and let the counters carry the rest.
  * All three conditions are per-observation or per-fix and all three persist for
@@ -102,11 +135,19 @@ static bool warned_shed;
 static bool warned_implausible;
 static bool warned_solve_fail;
 static bool warned_jump;
+/* A FILTERED fix (predict()+update_tdoa(), no solve this cycle) has no
+ * least-squares residual to report at all, which is a different reason to
+ * read 0.0f than warned_blind_residual's "residual is zero by construction
+ * at 3 anchors" -- worth its own one-time note rather than being folded
+ * into that warning, since after the first seed this is the STEADY STATE,
+ * not a rare edge case. */
+static bool warned_filtered_residual;
 
 void tdoa_gw_init(void)
 {
 	tdoa_collect_init(&collect);
 	memset(memo, 0, sizeof(memo));
+	pos_ekf_cfg_defaults(&ekf_cfg);
 	n_obs_in      = 0u;
 	n_dup         = 0u;
 	n_shed        = 0u;
@@ -115,12 +156,18 @@ void tdoa_gw_init(void)
 	n_implausible = 0u;
 	n_solve_fail  = 0u;
 	n_jump        = 0u;
+	n_ekf_seeded        = 0u;
+	n_ekf_reseed        = 0u;
+	n_ekf_filtered      = 0u;
+	n_ekf_dt_invalid    = 0u;
+	n_ekf_gate_rejected = 0u;
 	warned_blind_residual = false;
 	warned_no_anchor = false;
 	warned_shed = false;
 	warned_implausible = false;
 	warned_solve_fail = false;
 	warned_jump = false;
+	warned_filtered_residual = false;
 }
 
 /* Where anchor `anchor_id` is, from the applied survey.
@@ -153,18 +200,6 @@ static bool anchor_xyz(uint8_t anchor_id, float *x, float *y, float *z)
 		}
 	}
 	return false;
-}
-
-static struct tag_memo *memo_find(uint16_t tag_addr)
-{
-	uint8_t i;
-
-	for (i = 0u; i < TDOA_GW_SEED_SLOTS; i++) {
-		if (memo[i].valid && memo[i].tag_addr == tag_addr) {
-			return &memo[i];
-		}
-	}
-	return NULL;
 }
 
 /* An entry for `tag_addr`: the existing one, a free slot, or the oldest one.
@@ -313,6 +348,117 @@ static bool ingest_one(uint32_t now_ms)
 	return true;
 }
 
+/* Signed 40-bit difference, same discipline as sync_model.c's sdelta40() and
+ * tdoa_dtu.c's rebase -- this project's "every timestamp comparison is a
+ * signed difference" rule, applied at the DW3220's own 40-bit modulo. Local
+ * copy: same precedent as sync_model.c and ccp_slave.c, which each keep
+ * their own rather than sharing a header for a four-line function. */
+static int64_t sdelta40(uint64_t a, uint64_t b)
+{
+	uint64_t d = (a - b) & 0xFFFFFFFFFFULL;
+
+	if (d & (1ULL << 39)) {
+		return (int64_t)d - (int64_t)(1ULL << 40);
+	}
+	return (int64_t)d;
+}
+
+/* Seconds per DW3220 device time unit: 1 / (499.2 MHz x 128). Matches
+ * sync_model.h's "1 DTU = 15.65 ps" (SYNC_DTU_PER_NS = 64, rounded); kept as
+ * its own local constant rather than pulling in sync_model.h for one
+ * conversion factor this module has no other use for. */
+#define TDOA_GW_S_PER_DTU  1.56498e-11f
+
+/* One fresh tdoa_solve() against the group, the mirror-branch jump gate
+ * against the last PUBLISHED position, and a pos_ekf_seed() on success. Used
+ * for both a filter's first-ever seed (cold start) and its
+ * pos_ekf_needs_reseed() recovery -- the jump gate is what actually covers
+ * this path, since the filter's own statistical innovation gate does not
+ * exist until a seed does (see the design spec section 4.5). Returns false
+ * (mm->ekf untouched; n_solve_fail or n_jump already counted and warned) on
+ * a solve failure or a rejected jump; true (and *out filled in) on success. */
+static bool resolve_and_seed(struct tag_memo *mm, const struct tdoa_meas *m,
+			     size_t n, uint16_t tag_addr, uint32_t now_ms,
+			     struct pos_result *out)
+{
+	float seed_xy[2];
+	const float *seed = NULL;
+
+	if (mm->has_pos) {
+		int32_t age = (int32_t)(now_ms - mm->pos_ms);
+
+		if (age >= 0 && age < TDOA_GW_SEED_AGE_MS) {
+			seed_xy[0] = mm->x;
+			seed_xy[1] = mm->y;
+			seed = seed_xy;
+		}
+	}
+
+	if (!tdoa_solve(m, n, seed, out) || !out->valid) {
+		n_solve_fail++;
+		if (!warned_solve_fail) {
+			warned_solve_fail = true;
+			LOG_WRN("blink from 0x%04X: solve failed over %u "
+				"anchors. Warned ONCE; `blink stats` carries "
+				"the count", tag_addr, (unsigned int)n);
+		}
+		return false;
+	}
+
+	/* The mirror-branch gate. tdoa_solve()'s header says outright that a
+	 * tag outside the anchor hull can converge on the reflected solution
+	 * and still report valid, and that its residual is too weak to tell --
+	 * zero by construction at n == 3. A recent previous fix is the
+	 * corroboration that header asks for. */
+	if (seed != NULL) {
+		float dx = out->x - seed_xy[0];
+		float dy = out->y - seed_xy[1];
+
+		if (sqrtf(dx * dx + dy * dy) > TDOA_GW_MAX_JUMP_M) {
+			n_jump++;
+			if (!warned_jump) {
+				warned_jump = true;
+				LOG_WRN("blink from 0x%04X: fix (%.2f, %.2f) "
+					"jumps more than %.1f m from the last "
+					"one - dropped. Warned ONCE; `blink "
+					"stats` carries the count",
+					tag_addr, (double)out->x,
+					(double)out->y,
+					(double)TDOA_GW_MAX_JUMP_M);
+			}
+			return false;
+		}
+	}
+
+	pos_ekf_seed(&mm->ekf, out->x, out->y);
+	return true;
+}
+
+/* Update the hysteresis state pos_ekf_predict()'s `moving` selector reads on
+ * the NEXT call, from the filter's own just-updated velocity estimate. A
+ * dead zone between the two thresholds (see tdoa_gw.h) is what keeps this
+ * from chattering at the boundary. No-op on an unseeded filter. */
+static void update_moving_state(struct tag_memo *mm)
+{
+	float vx, vy;
+
+	if (!pos_ekf_get(&mm->ekf, NULL, NULL, &vx, &vy)) {
+		return;
+	}
+
+	float speed = sqrtf(vx * vx + vy * vy);
+
+	if (mm->ekf_moving) {
+		if (speed < TDOA_GW_MOVING_EXIT_MPS) {
+			mm->ekf_moving = false;
+		}
+	} else {
+		if (speed > TDOA_GW_MOVING_ENTER_MPS) {
+			mm->ekf_moving = true;
+		}
+	}
+}
+
 /* One ready group into one published fix. Returns false when no group was
  * ready, so the caller can stop early. */
 static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
@@ -322,14 +468,19 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	struct pos_fix fix;
 	struct tag_memo *mm;
 	uint8_t eui[UWB_FRAME_EUI_LEN];
-	const float *seed = NULL;
-	float seed_xy[2];
+	bool have_res = false;
+	int64_t fix_t_dtu;
 	size_t n = 0u;
 	uint16_t tag_addr = 0u;
 
 	if (!tdoa_collect_take_ready(&collect, now_ms, m, &n, &tag_addr)) {
 		return false;
 	}
+
+	/* The instant of this fix: the reference anchor's ABSOLUTE 40-bit
+	 * t_dtu, captured BEFORE tdoa_dtu_rebase() turns m[] into signed
+	 * differences. This is the filter's dt clock. */
+	fix_t_dtu = m[0].t_dtu;
 
 	/* Absolute 40-bit timestamps in, signed differences out. Must happen
 	 * before the solver sees them and before the plausibility test. */
@@ -347,62 +498,72 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 		return true;
 	}
 
-	mm = memo_find(tag_addr);
-	if (mm != NULL && mm->has_pos) {
-		int32_t age = (int32_t)(now_ms - mm->pos_ms);
+	mm = memo_claim(tag_addr, now_ms);
 
-		if (age >= 0 && age < TDOA_GW_SEED_AGE_MS) {
-			seed_xy[0] = mm->x;
-			seed_xy[1] = mm->y;
-			seed = seed_xy;
+	bool have_filter = pos_ekf_get(&mm->ekf, NULL, NULL, NULL, NULL);
+	float dt_s = 0.0f;
+	bool dt_ok = false;
+
+	if (mm->has_ref_t) {
+		int64_t raw_dt = sdelta40((uint64_t)fix_t_dtu,
+					 (uint64_t)mm->last_ref_t_dtu);
+
+		dt_s = (float)raw_dt * TDOA_GW_S_PER_DTU;
+		dt_ok = dt_s > 0.0f && dt_s <= ((float)TDOA_DT_MAX_MS / 1000.0f);
+	}
+	mm->last_ref_t_dtu = fix_t_dtu;
+	mm->has_ref_t      = true;
+
+	if (have_filter && dt_ok) {
+		pos_ekf_predict(&mm->ekf, &ekf_cfg, dt_s, mm->ekf_moving);
+
+		int accepted = pos_ekf_update_tdoa(&mm->ekf, &ekf_cfg, m, n);
+
+		if (n >= 1u) {
+			n_ekf_gate_rejected += (uint32_t)(n - 1u) -
+					      (uint32_t)accepted;
+		}
+		n_ekf_filtered++;
+	} else {
+		/* A fresh memo slot's very first group has no previous dt to
+		 * have been invalid -- that is a cold start, not an anomaly,
+		 * so it is not counted here. */
+		if (have_filter) {
+			n_ekf_dt_invalid++;
+		}
+		if (resolve_and_seed(mm, m, n, tag_addr, now_ms, &res)) {
+			have_res = true;
+			n_ekf_seeded++;
+		}
+		/* On failure resolve_and_seed() already counted and warned;
+		 * fall through to the reseed check and final publish below,
+		 * both of which are safe on a filter that is still unseeded. */
+	}
+
+	if (pos_ekf_needs_reseed(&mm->ekf, &ekf_cfg)) {
+		struct pos_result res2;
+
+		if (resolve_and_seed(mm, m, n, tag_addr, now_ms, &res2)) {
+			res      = res2;
+			have_res = true;
+			n_ekf_reseed++;
 		}
 	}
 
-	if (!tdoa_solve(m, n, seed, &res) || !res.valid) {
-		n_solve_fail++;
-		if (!warned_solve_fail) {
-			warned_solve_fail = true;
-			LOG_WRN("blink from 0x%04X: solve failed over %u "
-				"anchors. Warned ONCE; `blink stats` carries "
-				"the count", tag_addr, (unsigned int)n);
-		}
+	update_moving_state(mm);
+
+	float fx, fy;
+
+	if (!pos_ekf_get(&mm->ekf, &fx, &fy, NULL, NULL)) {
+		/* Cold start and its solve failed or got jump-gated: nothing
+		 * to publish yet, already counted above. */
 		return true;
 	}
 
-	/* The mirror-branch gate. tdoa_solve()'s header says outright that a
-	 * tag outside the anchor hull can converge on the reflected solution
-	 * and still report valid, and that its residual is too weak to tell --
-	 * zero by construction at n == 3. A recent previous fix is the
-	 * corroboration that header asks for. */
-	if (seed != NULL) {
-		float dx = res.x - seed_xy[0];
-		float dy = res.y - seed_xy[1];
-
-		if (sqrtf(dx * dx + dy * dy) > TDOA_GW_MAX_JUMP_M) {
-			n_jump++;
-			if (!warned_jump) {
-				warned_jump = true;
-				LOG_WRN("blink from 0x%04X: fix (%.2f, %.2f) "
-					"jumps more than %.1f m from the last "
-					"one - dropped. Warned ONCE; `blink "
-					"stats` carries the count",
-					tag_addr, (double)res.x, (double)res.y,
-					(double)TDOA_GW_MAX_JUMP_M);
-			}
-			return true;
-		}
-	}
-
-	mm = memo_claim(tag_addr, now_ms);
-	mm->x       = res.x;
-	mm->y       = res.y;
-	mm->pos_ms  = now_ms;
-	mm->has_pos = true;
-
 	fix.src_addr   = tag_addr;
-	fix.x          = res.x;
-	fix.y          = res.y;
-	fix.n_anchors  = res.n_used;
+	fix.x          = fx;
+	fix.y          = fy;
+	fix.n_anchors  = (uint8_t)n;
 	fix.batt_soc   = mm->batt_soc;
 
 	/* tdoa_solve.h's caller contract, honoured here: at TDOA_MIN_ANCHORS the
@@ -411,21 +572,43 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	 * forwarded, so nothing downstream can read a near-zero float off
 	 * pos_sink's console line as evidence of a good fit. From n_used == 4
 	 * there is one spare equation and it carries (weak) information, so it
-	 * is forwarded. */
-	if (res.n_used <= TDOA_MIN_ANCHORS) {
-		fix.residual_m = 0.0f;
-		if (!warned_blind_residual) {
-			warned_blind_residual = true;
-			LOG_WRN("TDoA fixes are being solved over %u anchors: "
-				"`residual` on the console line is ZERO BY "
-				"CONSTRUCTION at this anchor count and is NOT "
-				"a quality signal - a fourth surveyed anchor "
-				"is what makes it one",
-				(unsigned int)res.n_used);
+	 * is forwarded. A FILTERED fix (no solve ran this cycle at all) has no
+	 * least-squares residual to report in the first place -- zeroed the
+	 * same way, but for a different reason, worth its own one-time note. */
+	if (have_res) {
+		if (res.n_used <= TDOA_MIN_ANCHORS) {
+			fix.residual_m = 0.0f;
+			if (!warned_blind_residual) {
+				warned_blind_residual = true;
+				LOG_WRN("TDoA fixes are being solved over %u "
+					"anchors: `residual` on the console "
+					"line is ZERO BY CONSTRUCTION at this "
+					"anchor count and is NOT a quality "
+					"signal - a fourth surveyed anchor is "
+					"what makes it one",
+					(unsigned int)res.n_used);
+			}
+		} else {
+			fix.residual_m = res.residual_m;
 		}
 	} else {
-		fix.residual_m = res.residual_m;
+		fix.residual_m = 0.0f;
+		if (!warned_filtered_residual) {
+			warned_filtered_residual = true;
+			LOG_WRN("TDoA fixes are now smoothed by a per-tag "
+				"filter: `residual` on the console line reads "
+				"0 on every FILTERED fix (no least-squares "
+				"solve ran this cycle) - it is not a quality "
+				"signal there either. Warned ONCE.");
+		}
 	}
+
+	/* Synchronise the seed/jump-gate memo to the position actually
+	 * published -- whichever of the filter's or a fresh solve's it was. */
+	mm->x       = fx;
+	mm->y       = fy;
+	mm->pos_ms  = now_ms;
+	mm->has_pos = true;
 
 	/* Identical Tid derivation to the 0xEA path in uwb_gateway.c, including
 	 * the fallback and its cost: a straggler whose seat expired gets
@@ -455,6 +638,21 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 void tdoa_gw_step(const struct gw_core_ctx *ctx, uint32_t now_ms)
 {
 	unsigned int i;
+	const struct apos_survey *s = apos_store_get();
+
+	/* The collector's early-release threshold is a DEPLOYMENT fact (how
+	 * many anchors the survey actually placed), not the compile-time
+	 * POS_MAX_ANCHORS ceiling -- see tdoa_collect_set_expected()'s header.
+	 * Re-set every step rather than once at init: it is one field write
+	 * behind an already-read pointer, and it means a re-survey applied
+	 * while the gateway is running (anchor count changed, no reboot) takes
+	 * effect on the very next step instead of needing one. Skipped while
+	 * unsurveyed, matching ingest_one(), which already drops every
+	 * observation in that state via anchor_xyz() -- there is no anchor
+	 * count to set expectations from yet. */
+	if (s != NULL && s->valid) {
+		tdoa_collect_set_expected(&collect, s->n_nodes);
+	}
 
 	for (i = 0u; i < TDOA_GW_INGEST_MAX; i++) {
 		if (!ingest_one(now_ms)) {
@@ -486,4 +684,15 @@ void tdoa_gw_reject_detail(uint32_t *dup, uint32_t *shed)
 {
 	if (dup != NULL)  { *dup = n_dup; }
 	if (shed != NULL) { *shed = n_shed; }
+}
+
+void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
+		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
+		       uint32_t *n_gate_rejected)
+{
+	if (n_seeded != NULL)       { *n_seeded = n_ekf_seeded; }
+	if (n_reseed != NULL)       { *n_reseed = n_ekf_reseed; }
+	if (n_filtered != NULL)     { *n_filtered = n_ekf_filtered; }
+	if (n_dt_invalid != NULL)   { *n_dt_invalid = n_ekf_dt_invalid; }
+	if (n_gate_rejected != NULL) { *n_gate_rejected = n_ekf_gate_rejected; }
 }

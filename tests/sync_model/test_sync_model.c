@@ -69,7 +69,12 @@ static void sim_init(struct sim *s, uint64_t m0, uint64_t l0, int32_t ppb,
 /* True local time corresponding to a master-time offset of `x` DTU from m0. */
 static uint64_t sim_local_at(const struct sim *s, uint64_t x)
 {
-	int64_t skew = (int64_t)((__int128)x * s->ppb / 1000000000LL);
+	/* Plain int64 multiply, not __int128: the toolchain on some build hosts
+	 * (32-bit MinGW) has no __int128, and every x this suite ever passes
+	 * (up to a few e12, bounded by SYNC_BASELINE_MAX and the largest n_ccp
+	 * sweep) times a +/-40000 ppb keeps the product under ~2e17, three
+	 * orders inside the int64 ceiling -- no wider type is needed here. */
+	int64_t skew = ((int64_t)x * (int64_t)s->ppb) / 1000000000LL;
 
 	return (s->l0 + x + (uint64_t)skew) & SYNC_DTU_MASK;
 }
@@ -321,6 +326,42 @@ static void test_jitter_sensitivity_sweep(void)
 			  SYNC_BASELINE_USEFUL * 2, 11) >= NS);
 }
 
+/* Sweep SYNC_PHASE_EMA_SHIFT's effect on conversion error. Built once per shift
+ * value via -DSYNC_PHASE_EMA_SHIFT=N (see sync_model.h's #ifndef), so this
+ * function only ever sees the ONE shift it was compiled with -- comparing
+ * shifts means running this binary multiple times and diffing the printed
+ * table, not looping over shift in-process.
+ *
+ * No pass/fail threshold here on purpose: the decision criterion (design spec
+ * section 2.5, >= 20% improvement in the worst cell) is a comparison ACROSS
+ * builds, and this test must stay green whichever shift a given build was
+ * compiled with. */
+static void test_shift_sensitivity_sweep(void)
+{
+	const int32_t jits[] = { 0, 6, 32, 64, 320, 640, 3200 };
+
+	printf("  shift sweep: SYNC_PHASE_EMA_SHIFT=%d (n=%u, worst over 16"
+	       " probes, mean of 12 seeds):\n",
+	       (int)SYNC_PHASE_EMA_SHIFT, SYNC_BASELINE_USEFUL * 2);
+	for (unsigned int i = 0; i < sizeof(jits) / sizeof(jits[0]); i++) {
+		int64_t sum = 0;
+
+		for (uint32_t seed = 1; seed <= 12; seed++) {
+			int64_t e = worst_error(40000, jits[i],
+						SYNC_BASELINE_USEFUL * 2, seed);
+
+			CHECK(e != INT64_MAX);
+			sum += e;
+		}
+
+		int64_t mean = sum / 12;
+
+		printf("      jitter %5d DTU -> mean worst error %6" PRId64
+		       " DTU (%6.3f ns)\n",
+		       jits[i], mean, (double)mean / (double)NS);
+	}
+}
+
 /* ---- 4. Wrap, overflow and coasting ------------------------------------ */
 
 static void test_survives_the_40_bit_wrap(void)
@@ -504,6 +545,7 @@ int main(void)
 	test_error_scaling_is_measured_not_assumed();
 	test_deterministic_floor();
 	test_jitter_sensitivity_sweep();
+	test_shift_sensitivity_sweep();
 	test_survives_the_40_bit_wrap();
 	test_max_baseline_does_not_overflow();
 	test_coasting_then_giving_up();

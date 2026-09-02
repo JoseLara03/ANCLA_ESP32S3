@@ -55,12 +55,13 @@
  * ---- Release rule ---------------------------------------------------------
  *
  * A group is handed to the caller (tdoa_collect_take_ready() returns true)
- * as soon as it is COMPLETE -- POS_MAX_ANCHORS distinct anchors have all
- * reported -- without waiting out the rest of the window, since nothing more
- * can arrive for it. Short of that, it is released once the window has
- * expired PROVIDED at least TDOA_MIN_ANCHORS observations were gathered;
- * fewer than that is not resolvable in 2D (see tdoa_solve.h) and the group is
- * silently discarded, freeing its slot.
+ * as soon as it is COMPLETE -- `expected` distinct anchors have all reported
+ * (see tdoa_collect_set_expected(); POS_MAX_ANCHORS until that is called) --
+ * without waiting out the rest of the window, since nothing more can arrive
+ * for it. Short of that, it is released once the window has expired PROVIDED
+ * at least TDOA_MIN_ANCHORS observations were gathered; fewer than that is
+ * not resolvable in 2D (see tdoa_solve.h) and the group is silently
+ * discarded, freeing its slot.
  *
  * ---- Clock discipline ------------------------------------------------------
  *
@@ -110,9 +111,33 @@ struct tdoa_group {
 
 struct tdoa_collect {
 	struct tdoa_group slot[TDOA_COLLECT_SLOTS];
+	/* Anchors expected to report per blink, i.e. the release threshold used
+	 * in place of a hardcoded POS_MAX_ANCHORS. See
+	 * tdoa_collect_set_expected() below. */
+	uint8_t           expected;
 };
 
 void tdoa_collect_init(struct tdoa_collect *c);
+
+/*
+ * Set how many anchors are expected to report each blink -- a DEPLOYMENT
+ * fact (how many anchors the survey actually placed), not a compile-time one.
+ * Without this call, tdoa_collect_take_ready() only releases a group early at
+ * POS_MAX_ANCHORS observations, which is correct only when every possible
+ * anchor slot is populated. On a deployment with fewer anchors than
+ * POS_MAX_ANCHORS, that early-release condition is never reached and every
+ * group pays the full TDOA_COLLECT_WINDOW_MS wait.
+ *
+ * `n` is clamped to [TDOA_MIN_ANCHORS, POS_MAX_ANCHORS]; a value outside that
+ * range is pulled to the nearest bound rather than rejected, since a caller
+ * has no better fallback to offer for an out-of-range anchor count. Calling
+ * this does not affect any group already open -- only take_ready()'s
+ * early-release check on subsequent calls.
+ *
+ * tdoa_collect_init() sets `expected` to POS_MAX_ANCHORS, so a caller that
+ * never invokes this setter keeps exactly today's behaviour.
+ */
+void tdoa_collect_set_expected(struct tdoa_collect *c, uint8_t n);
 
 /*
  * Fold one anchor's observation into its blink's group, opening a new group
@@ -136,10 +161,11 @@ bool tdoa_collect_add(struct tdoa_collect *c, const struct tdoa_obs *o,
 
 /*
  * Release at most one ready or expired group per call. A group is ready when
- * it holds POS_MAX_ANCHORS observations, or when its window has expired
- * (see TDOA_COLLECT_WINDOW_MS) with at least TDOA_MIN_ANCHORS gathered; on
- * release, `out` receives up to POS_MAX_ANCHORS struct tdoa_meas, `*n_out`
- * the count, and `*tag_addr_out` the tag. A group whose window has expired
+ * it holds `expected` observations (see tdoa_collect_set_expected()) or when
+ * its window has expired (see TDOA_COLLECT_WINDOW_MS) with at least
+ * TDOA_MIN_ANCHORS gathered; on release, `out` receives up to
+ * POS_MAX_ANCHORS struct tdoa_meas, `*n_out` the count, and `*tag_addr_out`
+ * the tag. A group whose window has expired
  * with fewer than TDOA_MIN_ANCHORS observations is discarded silently
  * (returns nothing for it) and its slot freed.
  *

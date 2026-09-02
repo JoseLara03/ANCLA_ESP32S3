@@ -365,6 +365,86 @@ board, only its pieces.**
   three IDLE-mostly tags here never did. Until that runs, "100 tags at 5 Hz"
   remains a schedule-math claim, not a measured one.
 
+### Precisión y suavizado de la posición TDoA (Tasks 1-4 done 2026-09-02, Task 5 open)
+
+Separate branch (`feat/tdoa-accuracy-filter`, from `feat/rtls-scale-tdoa`) and
+separate plan/spec
+(`docs/superpowers/plans/2026-09-02-tdoa-accuracy-filter.md`,
+`docs/superpowers/specs/2026-09-02-tdoa-accuracy-filter-design.md`) from
+everything above: this is about making the position a given fix reports LESS
+NOISY and TEMPORALLY COHERENT, not about capacity or the ~45 cm accuracy
+target. **Suavidad no es exactitud** — nothing here can move that number,
+which is still bounded by the array's 1.2-2.5 m GDOP and the uncalibrated RX
+antenna delay (item 8, still untouched).
+
+- **Task 1** (`src/sync_model.h`, host-tested): a `SYNC_PHASE_EMA_SHIFT`
+  sweep, {3,4,5,6} x seven jitter levels x 12 seeds, is a NEGATIVE finding,
+  recorded with its real numbers next to the constant — worst cell across
+  the table improves at most ~8.8% (shift 6 vs 3) against a 20% bar, and the
+  algebra in the design spec's section 2.1 predicted exactly this. **Shift
+  stays 3, unchanged.**
+- **Task 2** (`src/tdoa_collect.{c,h}`, host-tested): `tdoa_collect_set_expected()`
+  replaces the hardcoded `POS_MAX_ANCHORS` early-release threshold with the
+  survey's actual anchor count (`apos_store_get()->n_nodes`, wired in
+  `tdoa_gw_step()`), fixing a real defect — on this project's 3-anchor
+  deployment, no group had EVER released early, paying the full 150 ms
+  window plus up to 200 ms more every single fix.
+- **Task 3** (`src/pos_ekf.{c,h}`, host-tested): the tag's own constant-velocity
+  EKF gained `pos_ekf_update_tdoa()` (range-DIFFERENCE sequential scalar
+  updates) and a `r_tdoa` config field (0.6 m default, sqrt(2)-derived from
+  the Fase 2 jitter). **The design spec's premise that this file was dead
+  code on the tag is WRONG** — `tag_testting/src/uwb_net_runner.c` still
+  runs the range-based half of it on its TWR path — so this followed the
+  `pos_solver.c`/`pos_residual.c` verbatim-copy precedent instead of the
+  spec's "move" instruction; see `pos_ekf.{c,h}`'s own entry above for the
+  full correction. On synthetic noisy data the filter's tracking RMS beat
+  `tdoa_solve()`'s raw per-fix RMS by roughly 2x (0.216 m vs 0.397 m in the
+  host test) — the actual point of adding it.
+- **Task 4** (`src/tdoa_gw.{c,h}`, `CMakeLists.txt`): the filter wired into
+  `tdoa_gw_step()`, `dt` from the reference anchor's absolute 40-bit `t_dtu`
+  rather than the gateway loop's quantized `now_ms`, the 10 m jump gate
+  preserved on every path that seeds. Builds clean for BOTH the production
+  and calibration images; `dram0_0_seg` +1720 B. See `tdoa_gw.{c,h}`'s own
+  entry above for the full flow and the new `blink stats` counters.
+
+**Task 5 (the full protocol) has NOT run — but an opportunistic smoke test
+has, 2026-09-02, on this project's own LIVE deployed gateway** (found already
+running on the bench USB port, not a spare board — flashing it interrupted
+whatever it was serving at the time). What that smoke test actually covered,
+and its limits:
+
+- Flashed clean, booted clean: real survey (4 nodes, `apos show`), WiFi/MQTT
+  connected, a real tag joined, CCP master healthy (`sent` climbing,
+  `dropped:0`), no `"beacon started but TXFRS never completed"`.
+- **Caught a real bug the moment it was exercised on hardware, that host
+  tests and code review both missed**: `tdoa_gw_ekf_stats()` was declared in
+  `tdoa_gw.h` and documented as wired into `blink stats`'s third JSON line,
+  but the function was never actually DEFINED or called from
+  `blink_shell.c` — a genuine gap between what got reported as done and what
+  shipped. Fixed, rebuilt, reflashed, confirmed the third line
+  (`{"tdoa_ekf":{...}}`) now prints real counters on the live board.
+- With that fixed, real fixes were flowing (`{"tdoa":{"ingested":82,
+  "fixes":7}}`) and `n_dt_invalid` (4) dominated `n_filtered` (2) for the one
+  live tag — investigated with TEMPORARY diagnostic logging (added, used,
+  then REMOVED once root-caused, not left in-tree) rather than guessed at.
+  Two real, already-correctly-handled causes, recorded as their own
+  hard-won fact next to `TDOA_DT_MAX_MS` in `tdoa_gw.h`: reordering across
+  `tdoa_collect_take_ready()`'s table-order (not time-order) scan when a
+  tag has more than one group pending, and multi-second gaps between the
+  rare blinks that actually reached `TDOA_MIN_ANCHORS` anchors for that
+  specific tag (a coverage/RF fact about that tag right then, not a timing
+  bug). Neither is evidence against Task 4's dt logic — the gate routing
+  both to a fresh solve instead of a bogus predict is exactly correct.
+
+**What this smoke test does NOT establish**, and why Task 5 proper is still
+open: no controlled before/after capture, no stationary/walking comparison,
+no verification of which physical anchors were actually contributing, no
+`kernel reboot cold` cycle, and it ran against whatever this one tag's real
+(uncontrolled) motion and RF conditions happened to be at the time. "The
+trace is smoother" is still a simulation result, not a bench one, until the
+full protocol (USB-C power already true here; an applied survey already true
+here; the actual before/after captures) runs deliberately.
+
 **In one sentence, for whoever picks this up next:** the TDoA measurement
 path is real and hardware-verified; the accuracy number is a target, not yet
 checked against ground truth; and the capacity number the whole migration was
@@ -701,7 +781,8 @@ sync master                    transmit half — CCP sent/dropped counts as
   observation of its own (`blink_rx_init()` is called only from `uwb_slave.c`) —
   correct, not a gap: it holds reserved address `0x0000`, is not in the survey,
   and its observation could not be positioned. No host suite: its arithmetic all
-  lives in `tdoa_dtu`, `tdoa_collect` and `tdoa_solve`, which have theirs.
+  lives in `tdoa_dtu`, `tdoa_collect`, `tdoa_solve` and (since 2026-09-02)
+  `pos_ekf`, which have theirs.
   Carries the one piece of new POLICY in Phase 3 that can silently DISCARD a
   valid fix, recorded here rather than left in the source: a per-tag seed memo
   (`TDOA_GW_SEED_SLOTS`, 16, LRU) remembers each tag's last fix and battery
@@ -729,6 +810,60 @@ sync master                    transmit half — CCP sent/dropped counts as
   loop, where `CONFIG_LOG_MODE_OVERFLOW` lets a steady condition destroy the
   very records an operator is reading.
   Counters read from the console with `blink stats` (second JSON line).
+
+  **Since 2026-09-02 (`docs/superpowers/plans/2026-09-02-tdoa-accuracy-filter.md`),
+  every tag also carries a `pos_ekf` in its seed memo** — the same struct
+  `tag_testting/src/uwb_net_runner.c` runs for TWR, moved here for TDoA use
+  (see `src/pos_ekf.{c,h}`'s own entry for why this is a verbatim copy, not
+  a full ownership move, contradicting what the design spec assumed). The
+  memo's existing `x`/`y`/`pos_ms`/`has_pos` are UNCHANGED in purpose — the
+  last PUBLISHED position, used only to seed a fresh `tdoa_solve()` and to
+  jump-gate it — and are synchronised to the filter's output only at publish
+  time; the running filter itself is a second, independent piece of state.
+  Per group: `dt` for `pos_ekf_predict()` comes from the reference anchor's
+  ABSOLUTE 40-bit `t_dtu`, captured in `solve_one()` BEFORE
+  `tdoa_dtu_rebase()` converts `m[]` to signed differences, differenced
+  against the tag's own last-processed value with a **local `sdelta40()`**
+  (same 40-bit signed-difference discipline as `sync_model.c`'s and
+  `ccp_slave.c`'s copies — no shared header for it, same precedent) rather
+  than any gateway-loop timestamp: `now_ms` is quantized to the superframe
+  and battles the collector's own release cadence, and feeding that to a
+  constant-velocity filter would fabricate velocity that does not exist. A
+  `dt` that is non-positive or exceeds `TDOA_DT_MAX_MS` (2000, ten blinks at
+  5 Hz — same order as `TDOA_GW_SEED_AGE_MS`) is treated as no dt at all: a
+  fresh `tdoa_solve()` reseeds instead of predicting through it. Flow, per
+  the design spec's own diagram: an already-seeded filter with a valid `dt`
+  gets `pos_ekf_predict()` + `pos_ekf_update_tdoa()`; anything else (cold
+  start, or a dt failure) runs a fresh `tdoa_solve()` — through the SAME
+  `resolve_and_seed()` helper that also handles `pos_ekf_needs_reseed()`
+  recovery, so the mirror-branch jump gate (`TDOA_GW_MAX_JUMP_M`) covers
+  every path that ever calls `pos_ekf_seed()`, cold start and recovery
+  alike — the filter's own statistical innovation gate is what covers
+  everything else, and it does not exist until a seed does. The published
+  fix is always `pos_ekf_get()`'s result; `residual_m` is the solve's
+  (zeroed per the `TDOA_MIN_ANCHORS` rule above) whenever a solve actually
+  ran this cycle, and a flat `0.0f` with its own one-time warning on a
+  purely-filtered cycle, since `pos_ekf` performs no least-squares fit for
+  that number to come from. Process noise (`sigma_a_move` vs
+  `sigma_a_still`) is scheduled from a hysteresis (`TDOA_GW_MOVING_ENTER_MPS`
+  / `_EXIT_MPS`) on the filter's OWN velocity estimate — there is no
+  accelerometer on this path — a closed loop on its own output that the
+  design spec's section 4.6 accepts can stick on "moving" under high noise;
+  first-cut numbers, unchecked against hardware. Five new counters
+  (`n_seeded`, `n_reseed`, `n_filtered`, `n_dt_invalid`, `n_gate_rejected`
+  — see `tdoa_gw_ekf_stats()`'s own doc comment for exactly what each
+  counts) are the THIRD `blink stats` JSON line, for the same reason the
+  first two exist: without them the filter is a black box on the bench,
+  no way to tell "no tags" from "the filter rejects everything". Verified
+  building clean for both the production and calibration images
+  (`pos_ekf.c` is in the unconditional `target_sources` block, same as
+  `tdoa_gw.c` itself); `dram0_0_seg` moved 270440 -> 272160 B (+1720 B, one
+  `struct pos_ekf` per `TDOA_GW_SEED_SLOTS` plus the new per-tag and static
+  fields — close to but a little over the plan's ~1.3 kB estimate, which did
+  not fully account for the per-tag `last_ref_t_dtu`/`has_ref_t`/`ekf_moving`
+  fields alongside it). **Not yet run on hardware** — see the TDoA migration
+  section's own status for what Task 5 still has to verify: this build
+  result is compile-and-link correctness, not behaviour.
 - `src/tdoa_solve.{c,h}` — the Phase 3 position solver: hyperbolic 2D
   multilateration by Gauss-Newton over range DIFFERENCES (`r_i - r_0`) rather
   than ranges, with anchor 0 as the reference — same closed-form 2x2 normal
@@ -952,6 +1087,36 @@ sync master                    transmit half — CCP sent/dropped counts as
   (`<math.h>`, `sqrtf`/`fabsf` — the deliberate float exception to the "no
   float on time/scheduling paths" rule, since this is geometry, not a clock),
   host-tested in `tests/pos_solver/` and `tests/pos_residual/`.
+- `src/pos_ekf.{c,h}` — constant-velocity EKF (state `[x,y,vx,vy]`, sequential
+  scalar updates, no matrix inverse), copied verbatim from
+  `tag_testting/src/` for the 2026-09-02 TDoA accuracy/smoothing work, same
+  rule and same reason as `pos_solver.c`/`pos_residual.c` just above:
+  **the design spec that authorised this copy assumed the tag's own copy was
+  dead (Phase 3 having moved solving to the gateway), and that assumption is
+  WRONG** — `tag_testting/src/uwb_net_runner.c` still runs the full
+  `pos_ekf_seed()`/`predict()`/`update_ranges()`/`zupt()`/`needs_reseed()`
+  sequence on its TWR-ranging path; Phase 3 added a blink-only path
+  alongside it, it did not replace it. So this follows the identical
+  precedent to `pos_solver.c`: the tag owns the range-based half of this
+  file while it still solves its own TWR fix, ownership has not moved, and
+  `tag_testting/CLAUDE.md` was deliberately left untouched. `pos_ekf_seed()`,
+  `predict()`, `update_ranges()`, `zupt()`, `needs_reseed()`, `get()`,
+  `pos_sigma()` and `cfg_defaults()`'s range-related fields must not drift
+  from the tag's copy; diff both files before ever re-copying, same
+  discipline the `cal_math.c` drift incident above exists to enforce.
+  `pos_ekf_update_tdoa()` and `struct pos_ekf_cfg`'s `r_tdoa` field are new,
+  added only here: a range-DIFFERENCE update over `struct tdoa_meas` with the
+  same sequential-scalar mechanics as `update_ranges()`, `r_tdoa` defaulted
+  to 0.6 m (derived from the Fase 2 hardware sync jitter via sqrt(2), since a
+  range difference is two independent noisy timestamps rather than one — see
+  the field's own comment in `pos_ekf.h`), and the same int64-before-float
+  timestamp-subtraction discipline `tdoa_solve.c` documents twice, applied
+  here as its own trap since it does not inherit automatically to a second
+  consumer of `struct tdoa_meas`. Pure C (`<math.h>`, no CMSIS-DSP, no
+  Zephyr), host-tested in `tests/pos_ekf/` — the tag's original suite,
+  migrated unchanged, plus new tests for the TDoA update, the int64
+  subtraction-order trap, and a direct RMS comparison against `tdoa_solve()`
+  on the same noisy synthetic data (the actual point of adding this filter).
 - `src/tag_id.{c,h}` — FNV-1a 32-bit hash used to derive a tag's stable
   platform identity (`Tid`) from its EUI. Pure C, host-tested in
   `tests/tag_id/`.
@@ -2061,6 +2226,9 @@ gcc -Wall -Wextra -Isrc -o tests/tdoa_dtu/test_tdoa_dtu.exe tests/tdoa_dtu/test_
 
 gcc -Wall -Wextra -Isrc -o tests/tdoa_solve/test_tdoa_solve.exe tests/tdoa_solve/test_tdoa_solve.c src/tdoa_solve.c src/pos_residual.c -lm
 ./tests/tdoa_solve/test_tdoa_solve.exe          # tdoa_solve: ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/pos_ekf/test_pos_ekf.exe tests/pos_ekf/test_pos_ekf.c src/pos_ekf.c src/pos_solver.c src/pos_residual.c src/tdoa_solve.c -lm
+./tests/pos_ekf/test_pos_ekf.exe                # ALL TESTS PASSED, exits 0
 ```
 
 `-lm` is required by the suites that link `apos_geom.c`, `pos_solver.c`,
