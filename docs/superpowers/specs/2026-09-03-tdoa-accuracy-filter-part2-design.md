@@ -149,9 +149,24 @@ r_i - r_0 = sqrt(rho_i^2 + h^2) - sqrt(rho_0^2 + h^2)
 ```
 
 que **no** es `rho_i - rho_0`. La raíz es no lineal: un `h` uniforme comprime
-las diferencias de rango, y resolver con `h = 0` cuando el `h` real es 1.4 m
-estira las distancias horizontales hacia afuera. Es un sesgo geométrico real,
-no un offset.
+las diferencias de rango, así que un modelo con `h = 0` tiene que moverse a
+donde las diferencias horizontales sean menores — o sea **HACIA ADENTRO**, al
+centroide de las anclas. Es un sesgo geométrico real, no un offset.
+
+**CORRECCIÓN (2026-09-03).** Una versión anterior de este párrafo decía "hacia
+afuera". Está mal, y se corrigió midiendo, no razonando
+(`tests/tdoa_solve/test_height_model`):
+
+| arreglo | H | error peor | offset al centro |
+|---|---|---|---|
+| 10.0 m | 1.5 m | 0.098 m | 4.000 -> 3.902 |
+| **2.5 m** | **1.4 m** | **0.230 m** | **1.000 -> 0.770** |
+| 2.5 m | 0.0 m | 0.002 m | no-op |
+
+La fila del medio es el arreglo de ESTE proyecto (aristas de 1.2-2.5 m): una
+separación de 1.4 m sin modelar encoge el offset al centro un **~23%**, el
+mismo orden que todo el objetivo de ~45 cm. En un arreglo de 10 m la misma `H`
+es un efecto del 2.5%, que es justo por qué esto se descarta fácil sobre papel.
 
 **Decisión: un solo escalar de sitio**, `dz_i = z_i(survey) - z_tag_asumido`.
 En un survey 2D todos los `z_i` son 0, así que se reduce a un `h` uniforme; en

@@ -234,6 +234,7 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 			    s->node[k].short_addr, (double)s->node[k].x,
 			    (double)s->node[k].y, (double)s->node[k].z);
 	}
+	shell_print(sh, "  {\"tag_z_m\":%.3f}", (double)s->tag_z_m);
 	if (s->ref_valid) {
 		shell_print(sh, "  {\"ref_lat\":%.6f,\"ref_lon\":%.6f}",
 			    s->ref_lat, s->ref_lon);
@@ -303,6 +304,67 @@ static int cmd_zoff(const struct shell *sh, size_t argc, char **argv)
 	apos_gw_set_zoff(v);
 	shell_print(sh, "{\"apos_zoff_m\":%.3f} — takes effect on the next "
 			"`apos run`", (double)v);
+	return 0;
+}
+
+/*
+ * `apos tagz <metres>` -- the tag plane's z in the survey's own frame.
+ *
+ * NOT `apos zoff`, which answers a different question: zoff moves the SURVEY's
+ * z = 0 (so it lands on the floor rather than on the plane through the gauge
+ * anchors) and is applied when the survey is solved. This one is the vertical
+ * separation between the anchors and the tags, applied to every observation as
+ * it is ingested, and it is what stops a 2D survey's dz = 0 from biasing every
+ * fix outward. See tag_z_m in apos_store.h.
+ *
+ * Persisted immediately, like `apos ref` and unlike `apos zoff` (a runtime-only
+ * static in apos_gw.c that a reboot discards). Takes effect on the next
+ * observation ingested -- no reboot, no re-survey.
+ */
+static int cmd_tagz(const struct shell *sh, size_t argc, char **argv)
+{
+	char *endptr;
+	float v;
+
+	ARG_UNUSED(argc);
+
+	int rc = require_gateway(sh);
+
+	if (rc) {
+		return rc;
+	}
+
+	v = strtof(argv[1], &endptr);
+	if (endptr == argv[1] || *endptr != '\0') {
+		shell_error(sh, "error: \"%s\" is not a number of metres",
+			    argv[1]);
+		return -EINVAL;
+	}
+
+	/* A coordinate, not a magnitude: negative means the tags sit BELOW the
+	 * anchors, which is the normal case. The bound is a sanity check on a
+	 * typo (a decimal point in the wrong place), not a physical limit. */
+	if (!(v > -50.0f && v < 50.0f)) {
+		shell_error(sh, "error: %.3f m is out of range (-50..50)",
+			    (double)v);
+		return -EINVAL;
+	}
+
+	rc = apos_store_set_tag_z(v);
+	if (rc) {
+		shell_error(sh, "error: could not persist tagz (%d)", rc);
+		return rc;
+	}
+
+	shell_print(sh, "{\"apos_tag_z_m\":%.3f} — applies to the next "
+			"observation; no reboot needed", (double)v);
+	if (v == 0.0f) {
+		shell_warn(sh, "tag_z 0 means the tags are assumed to be in "
+			       "the SAME plane as the anchors. If they are "
+			       "not, every fix is biased outward — measure "
+			       "the separation and set it (negative for tags "
+			       "below ceiling-mounted anchors).");
+	}
 	return 0;
 }
 
@@ -485,6 +547,11 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_apos,
 		      "zoff <metres> — shift z so z=0 is the floor rather than "
 		      "the plane through the gauge anchors",
 		      cmd_zoff, 2, 0),
+	SHELL_CMD_ARG(tagz,  NULL,
+		      "tagz <metres> — the TAG plane's z in the survey frame "
+		      "(negative when tags sit below the anchors). Not zoff: "
+		      "that moves the survey's z=0. Persists immediately",
+		      cmd_tagz, 2, 0),
 	SHELL_CMD_ARG(show,  NULL,
 		      "show — current phase, enumerated anchors and the stored "
 		      "survey, as JSON",

@@ -309,12 +309,22 @@ static bool ingest_one(uint32_t now_ms)
 		return true;
 	}
 
-	/* dz follows struct pos_meas's convention: anchor z minus TAG z, and
-	 * the tag's z is unmeasured, so it is assumed 0 -- exactly the
-	 * assumption the tag's own solver already makes with the coordinates
-	 * a WAVE response carries. A survey run in APOS_GEOM_2D mode pins
-	 * every z at 0 anyway, which is the deployment this project has. */
-	t.meas.dz    = z;
+	/* dz follows struct pos_meas's convention: anchor z minus TAG z.
+	 *
+	 * The tag's z is still unmeasured -- nothing on the wire carries it --
+	 * but it is no longer ASSUMED to be zero: apos_store's tag_z_m is the
+	 * site's answer, set once with `apos tagz`. It defaults to 0.0, which
+	 * is exactly the old behaviour, so an unconfigured gateway reports the
+	 * same numbers it did before.
+	 *
+	 * Do not "simplify" this away on the grounds that a 2D survey pins
+	 * every anchor at z = 0 and a common dz cancels in a range difference.
+	 * It does not cancel: sqrt(rho^2 + dz^2) is nonlinear in rho, so a
+	 * uniform dz compresses the differences and solving with dz = 0
+	 * against a real 1.4 m separation pulls the reported positions INWARD,
+	 * by 0.23 m at 1 m from centre on this project's 2.5 m array. The
+	 * numbers and the full statement are on tag_z_m in apos_store.h. */
+	t.meas.dz    = z - apos_store_get()->tag_z_m;
 	t.meas.t_dtu = obs.t_dtu;
 	t.tag_addr   = obs.tag_addr;
 	t.blink_seq  = obs.blink_seq;

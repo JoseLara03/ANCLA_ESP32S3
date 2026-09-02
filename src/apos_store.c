@@ -26,6 +26,7 @@ LOG_MODULE_REGISTER(apos_store, LOG_LEVEL_INF);
 
 #define KEY_SURVEY "apos/survey"
 #define KEY_REF    "apos/ref"
+#define KEY_TAGZ   "apos/tagz"
 
 /* Only the geometry, so adding a field to struct apos_survey does not silently
  * change the stored layout: this record is what is written, and the size check
@@ -42,6 +43,13 @@ struct stored_ref {
 	double  lat;
 	double  lon;
 	uint8_t valid;
+};
+
+/* Own key, own record: the tag plane's z is a fact about the SITE, not a
+ * result of the survey, so it must survive apos_store_save() and
+ * apos_store_clear() -- exactly like stored_ref. */
+struct stored_tagz {
+	float z;
 };
 
 static struct apos_survey g_survey;
@@ -100,6 +108,22 @@ static int apos_settings_set(const char *key, size_t len,
 		g_survey.ref_lat = r.lat;
 		g_survey.ref_lon = r.lon;
 		g_survey.ref_valid = r.valid != 0u;
+		return 0;
+	}
+
+	if (strcmp(key, "tagz") == 0) {
+		struct stored_tagz t;
+
+		if (len != sizeof(t)) {
+			LOG_WRN("stored tagz size %u invalid — expected %u, "
+				"keeping 0",
+				(unsigned int)len, (unsigned int)sizeof(t));
+			return -EINVAL;
+		}
+		if (read_val(read_cb, cb_arg, &t, sizeof(t))) {
+			return -EINVAL;
+		}
+		g_survey.tag_z_m = t.z;
 		return 0;
 	}
 
@@ -177,6 +201,24 @@ int apos_store_set_ref(double lat, double lon)
 	g_survey.ref_lat = lat;
 	g_survey.ref_lon = lon;
 	g_survey.ref_valid = true;
+	return 0;
+}
+
+int apos_store_set_tag_z(float z)
+{
+	struct stored_tagz rec = {.z = z};
+
+	int ret = settings_save_one(KEY_TAGZ, &rec, sizeof(rec));
+
+	if (ret) {
+		LOG_ERR("failed to persist %s (%d)", KEY_TAGZ, ret);
+		return ret;
+	}
+
+	/* Cache updated only after the write succeeded, same discipline as
+	 * apos_store_save() -- a failed write must leave apos_store_get()
+	 * reporting what is actually on flash. */
+	g_survey.tag_z_m = z;
 	return 0;
 }
 

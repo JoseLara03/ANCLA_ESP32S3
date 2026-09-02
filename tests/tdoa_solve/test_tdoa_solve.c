@@ -412,6 +412,98 @@ static void test_seed_basin_and_never_wrong_when_valid(void)
 	}
 }
 
+/* Build observations for a tag whose TRUE vertical separation from the anchor
+ * plane is `true_h`, but hand the solver a model dz of `model_dz`. With the
+ * two equal this is the honest case; with model_dz = 0 it is what the gateway
+ * did before `apos tagz` existed. */
+static void make_h(struct tdoa_meas *m, size_t n, float tx, float ty,
+		   float true_h, float model_dz, const float *ax,
+		   const float *ay)
+{
+	for (size_t i = 0; i < n; i++) {
+		float dx = tx - ax[i], dy = ty - ay[i];
+		float r = sqrtf(dx * dx + dy * dy + true_h * true_h);
+
+		m[i].x = ax[i];
+		m[i].y = ay[i];
+		m[i].dz = model_dz;
+		m[i].t_dtu = 500000 + (int64_t)llroundf(r / TDOA_M_PER_DTU);
+	}
+}
+
+/*
+ * The height model (`apos tagz`, apos_store.h's tag_z_m).
+ *
+ * The tempting simplification is that with every anchor at one height the dz
+ * is a common term that cancels in a range DIFFERENCE. It does not:
+ * sqrt(rho^2 + dz^2) is nonlinear, so a uniform dz COMPRESSES the differences,
+ * and a model that assumes dz = 0 has to move the estimate to somewhere the
+ * horizontal differences are smaller -- i.e. TOWARD the anchor centroid.
+ *
+ * Direction measured, not reasoned: the bias is consistently INWARD. An
+ * earlier draft of this work asserted "outward" in three places and was simply
+ * wrong; the numbers below are what settled it.
+ *
+ * Magnitude, measured 2026-09-03, tag on the mid-line, error at the worst
+ * point tested:
+ *
+ *     10.0 m array, H = 1.5 m   ->  0.098 m   (offset from centre 4.000 -> 3.902)
+ *      2.5 m array, H = 1.4 m   ->  0.230 m   (offset from centre 1.000 -> 0.770)
+ *      2.5 m array, H = 0.0 m   ->  0.002 m   (no-op, as the default must be)
+ *
+ * The middle row is the one that matters: THIS project's array measures
+ * 1.2-2.5 m per edge, so an unmodelled 1.4 m separation shrinks the reported
+ * offset from centre by ~23% -- the same order as the whole ~45 cm accuracy
+ * target. On a 10 m array the same H is a 2.5% effect and easy to dismiss.
+ */
+static void test_height_model(void)
+{
+	/* A 2.5 m square, this deployment's scale rather than the 10 m one the
+	 * rest of this file uses. */
+	static const float SX[4] = { 0.0f, 2.5f, 2.5f, 0.0f };
+	static const float SY[4] = { 0.0f, 0.0f, 2.5f, 2.5f };
+	const float H = 1.4f;
+	const float tx = 2.25f, ty = 1.25f;
+	const float cx = 1.25f;          /* array centre, x */
+	struct tdoa_meas m[4];
+	struct pos_result r;
+
+	/* 1. Modelled correctly: the true position comes back. */
+	make_h(m, 4, tx, ty, H, H, SX, SY);
+	CHECK(tdoa_solve(m, 4, NULL, &r));
+	CHECK(r.valid);
+	CHECK(fabsf(r.x - tx) < 0.02f);
+	CHECK(fabsf(r.y - ty) < 0.02f);
+
+	/* 2. Modelled as dz = 0 against a real 1.4 m separation: a real error,
+	 *    and it pulls the estimate INWARD. Both parts asserted -- a test
+	 *    that only checked the magnitude would pass on a bias in either
+	 *    direction. */
+	make_h(m, 4, tx, ty, H, 0.0f, SX, SY);
+	CHECK(tdoa_solve(m, 4, NULL, &r));
+	CHECK(r.valid);
+	{
+		float err = sqrtf((r.x - tx) * (r.x - tx) +
+				  (r.y - ty) * (r.y - ty));
+
+		printf("  height model: true (%.2f,%.2f), dz=0 gives "
+		       "(%.3f,%.3f), err %.3f m\n",
+		       (double)tx, (double)ty, (double)r.x, (double)r.y,
+		       (double)err);
+		CHECK(err > 0.15f);                       /* the bias is real */
+		CHECK(fabsf(r.x - cx) < fabsf(tx - cx));  /* and it is INWARD */
+	}
+
+	/* 3. dz = 0 is a NO-OP when the tags really are in the anchor plane.
+	 *    This is what makes apos_store's 0.0 default safe to ship: an
+	 *    unconfigured gateway reports exactly what it reported before. */
+	make_h(m, 4, tx, ty, 0.0f, 0.0f, SX, SY);
+	CHECK(tdoa_solve(m, 4, NULL, &r));
+	CHECK(r.valid);
+	CHECK(fabsf(r.x - tx) < 0.01f);
+	CHECK(fabsf(r.y - ty) < 0.01f);
+}
+
 int main(void)
 {
 	test_dtu_scale();
@@ -427,6 +519,7 @@ int main(void)
 	test_error_under_gate_level_noise();
 	test_never_returns_the_seed_verbatim();
 	test_seed_basin_and_never_wrong_when_valid();
+	test_height_model();
 	if (failures) { printf("\n%d CHECK(s) FAILED\n", failures); return EXIT_FAILURE; }
 	printf("tdoa_solve: ALL TESTS PASSED\n");
 	return EXIT_SUCCESS;

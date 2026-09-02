@@ -597,6 +597,13 @@ apos ref <lat> <lon>           the origin anchor's real-world position, for the
 apos zoff <metres>             shift z so z=0 is the floor rather than the
                                plane through the gauge anchors; applied on the
                                next `apos run`
+apos tagz <metres>             the TAG plane's z in the survey frame, NEGATIVE
+                               when tags sit below ceiling anchors. NOT zoff:
+                               that moves the survey's z=0, this is the
+                               anchor-to-tag vertical separation the TDoA solve
+                               uses as dz. Persists immediately, applies to the
+                               next observation. **Default 0.0 and UNMEASURED
+                               on every site so far** — see below
 apos show                      phase, enumerated anchors and the stored survey
                                as JSON — the one subcommand a SLAVE accepts
 ```
@@ -1133,6 +1140,23 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `src/pos_sink.{c,h}` — consumes decoded tag position fixes. Logs one JSON line
   per fix (the only place `residual`/`batt` stay visible) and hands the fix to
   `net_uplink` through a bounded queue.
+- **The TDoA height model (`apos tagz`) is a PER-SITE number and nobody has
+  measured one yet.** `tdoa_gw.c` sets each observation's `dz` to
+  `anchor z - apos_store's tag_z_m`, defaulting to 0.0 — i.e. tags assumed to
+  be in the anchors' own plane, which is exactly what the code did before the
+  setting existed, so an unconfigured gateway is unchanged. The trap is that a
+  uniform `dz` looks like it should cancel in a range DIFFERENCE and **does
+  not**: `sqrt(rho^2 + dz^2)` is nonlinear, so an unmodelled separation pulls
+  every reported position INWARD toward the anchor centroid. Measured
+  2026-09-03 (`tests/tdoa_solve/test_height_model`): on a 10 m array a 1.4-1.5 m
+  separation is a 2.5% effect (0.098 m), but on **this project's 1.2-2.5 m
+  array it is ~23% — 0.230 m at 1 m from centre**, the same order as the whole
+  ~45 cm accuracy target. An earlier draft of this work asserted the bias went
+  OUTWARD, in three places; it was measurement, not reasoning, that settled the
+  direction. Setting a wrong value is a NEW bias, which is why the default is
+  0.0 rather than a plausible ceiling figure: somebody has to put a tape
+  measure on the site.
+
 - `src/pos_solver.{c,h}` and `src/pos_residual.{c,h}` — the tag's own
   range-based position solver (`pos_solve()`) and RMS residual helper
   (`pos_residual_rms()`), copied verbatim from `tag_testting/src/` for Phase 3
