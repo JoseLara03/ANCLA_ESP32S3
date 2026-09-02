@@ -230,7 +230,7 @@ static struct tag_memo *memo_claim(uint16_t tag_addr, uint32_t now_ms)
 			memo[i].tag_addr = tag_addr;
 			memo[i].last_ms  = now_ms;
 			memo[i].pos_ms   = now_ms;
-			memo[i].batt_soc = UWB_FRAME_POS_SOC_UNKNOWN;
+			memo[i].batt_soc = UWB_FRAME_POS_SOC_CONNECTED;
 			return &memo[i];
 		}
 		/* Signed difference: now_ms wraps freely. */
@@ -244,7 +244,7 @@ static struct tag_memo *memo_claim(uint16_t tag_addr, uint32_t now_ms)
 	oldest->tag_addr = tag_addr;
 	oldest->last_ms  = now_ms;
 	oldest->pos_ms   = now_ms;
-	oldest->batt_soc = UWB_FRAME_POS_SOC_UNKNOWN;
+	oldest->batt_soc = UWB_FRAME_POS_SOC_CONNECTED;
 	return oldest;
 }
 

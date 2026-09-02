@@ -17,7 +17,7 @@ struct pos_fix {
     float    y;           /* metres */
     float    residual_m;  /* RMS range residual; larger means less trustworthy */
     uint8_t  n_anchors;   /* 3 or 4 */
-    uint8_t  batt_soc;    /* 0-100, or UWB_FRAME_POS_SOC_UNKNOWN */
+    uint8_t  batt_soc;    /* 0-100, or UWB_FRAME_POS_SOC_CONNECTED */
 };
 
 /* Consume one fix. In E1 this logs a JSON line on the console; E2 kept that

@@ -23,11 +23,17 @@ void pos_sink_publish(const struct pos_fix *fix)
      * pos_json.c) -- and it is what makes the gateway debuggable over USB with
      * no broker present.
      *
-     * An unknown battery is reported as JSON null, not as 0 or 255: a consumer
-     * must be able to tell "no reading" from "flat battery". */
-    if (fix->batt_soc == UWB_FRAME_POS_SOC_UNKNOWN) {
+     * A battery with no percentage reading is reported as the STRING
+     * "connected", not as 0 or 255: a consumer must be able to tell "no
+     * reading" from "flat battery", and a bare 255 reads as a percentage.
+     *
+     * Quoted deliberately. An unquoted bare word (Connected, or the earlier
+     * null-replacement) is not JSON at all, so a consumer parsing this line
+     * rejects the WHOLE record rather than just that field -- and this line
+     * is the only place residual, n_anchors and batt_soc stay visible. */
+    if (fix->batt_soc == UWB_FRAME_POS_SOC_CONNECTED) {
         LOG_INF("{\"tag\":\"0x%04X\",\"tid\":%u,\"x\":%.2f,\"y\":%.2f,"
-                "\"residual\":%.3f,\"n\":%u,\"batt\":null}",
+                "\"residual\":%.3f,\"n\":%u,\"batt\":\"connected\"}",
                 fix->src_addr, fix->tag_id, (double)fix->x, (double)fix->y,
                 (double)fix->residual_m, fix->n_anchors);
     } else {

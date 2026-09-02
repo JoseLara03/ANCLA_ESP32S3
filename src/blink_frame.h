@@ -40,7 +40,7 @@
  *
  *   0..9    802.15.4 header: FC 0x41 0x88, seq, PANID, dest 0xFFFF, src, type
  *   10      blink_seq   monotonic, wraps at 256; the grouping key
- *   11      batt_soc    0..100, or UWB_FRAME_POS_SOC_UNKNOWN (0xFF)
+ *   11      batt_soc    0..100, or UWB_FRAME_POS_SOC_CONNECTED (0xFF)
  *   12      flags       bit0 = ALERT pending; bits 1..7 reserved, must be 0
  *   13      reserved    must be 0; exists so the length is even
  */

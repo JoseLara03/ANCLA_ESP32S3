@@ -275,7 +275,7 @@ static void test_pos(void)
 
     CHECK(UWB_FRAME_TYPE_POS == 0xEA);
     CHECK(UWB_FRAME_LEN_POS == 24);
-    CHECK(UWB_FRAME_POS_SOC_UNKNOWN == 0xFF);
+    CHECK(UWB_FRAME_POS_SOC_CONNECTED == 0xFF);
 
     /* -3.25, 7.5 and 0.125 are exactly representable in binary32, so these
      * round-trip comparisons can use == without a tolerance. */
@@ -305,11 +305,11 @@ static void test_pos(void)
     /* The unknown-battery sentinel survives the round trip unchanged, and is
      * not confused with a real 0 % reading. */
     n = uwb_frame_pos_build(buf, sizeof(buf), 0x0103, 0.0f, 0.0f, 0.0f, 3,
-                            UWB_FRAME_POS_SOC_UNKNOWN);
+                            UWB_FRAME_POS_SOC_CONNECTED);
     CHECK(n == UWB_FRAME_LEN_POS);
     CHECK(uwb_frame_parse_pos(buf, (size_t)n, NULL, NULL, NULL, NULL, &na, &soc) == 0);
     CHECK(na == 3);
-    CHECK(soc == UWB_FRAME_POS_SOC_UNKNOWN);
+    CHECK(soc == UWB_FRAME_POS_SOC_CONNECTED);
 
     /* Wrong length is rejected by both the predicate and the parser. */
     CHECK(!uwb_frame_is_pos(buf, UWB_FRAME_LEN_POS - 1));

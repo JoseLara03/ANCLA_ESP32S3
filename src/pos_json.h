@@ -48,7 +48,7 @@
 struct pos_blink_obs {
 	uint8_t  anchor_id;   /* 0..UWB_MAX_ANCHORS-1, the anchor that heard it */
 	uint8_t  blink_seq;   /* from the frame; with tag_addr it is the group key */
-	uint8_t  batt_soc;    /* 0-100, or UWB_FRAME_POS_SOC_UNKNOWN */
+	uint8_t  batt_soc;    /* 0-100, or UWB_FRAME_POS_SOC_CONNECTED */
 	uint16_t tag_addr;    /* short address of the emitting tag */
 	uint16_t quality;     /* CIR quality, diagnostics -- the solver ignores it */
 	int64_t  t_dtu;       /* RX in the master's base, sync_model_to_master() */
