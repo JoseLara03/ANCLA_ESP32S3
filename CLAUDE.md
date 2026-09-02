@@ -505,7 +505,7 @@ for (100 tags) has a finished design and zero lines of implementation.
 ## Build & flash
 
 ```powershell
-$env:ZEPHYR_BASE = "C:\Users\JoseAntonioLaraPerez\zephyrproject\zephyr"
+$env:ZEPHYR_BASE = "C:\Users\Menay\zephyrproject\zephyr"
 west build -b ancla_esp32s3/esp32s3/procpu
 west flash
 west espressif monitor -p COM5
@@ -1186,14 +1186,22 @@ sync master                    transmit half — CCP sent/dropped counts as
   `tests/tag_id/`.
 - `src/pos_json.{c,h}` — MQTT payload formatting. Pure C, host-tested in
   `tests/pos_json/`. The position payload is a **fixed contract** with the
-  downstream consumer: `{"Tid":<decimal>,"x":...,"y":...,"z":0}` — `Tid` is
+  downstream consumer:
+  `{"Tid":<decimal>,"x":...,"y":...,"z":0,"batt":<int>,"chg":<0|1>}`.
+  `batt` is 0..100 or **-1** when the tag sent no percentage (never 255,
+  which is a legal byte and reads as a real reading; never `null`, so the
+  column type never varies); `chg` is 1 in exactly that case. Both are
+  derived from the SAME sentinel (`UWB_FRAME_POS_SOC_CONNECTED`), so `chg`
+  carries no information of its own and **also reads 1 for a failed fuel
+  gauge** — the tag distinguishes the causes internally but the wire does
+  not. `Tid` is
   `fix->tag_id` (`src/tag_id.c`'s `tag_id_from_eui()` of the tag's EUI, a
   **stable per-physical-device id**, resolved from the gateway's seat table
   at dispatch time — see the "stable tag identity" entry below for why this
   is not `fix->src_addr`) as a **plain decimal number** (not hex, not a
   string; e.g. `0x1234` → `4660`), `z` is the integer `0`, there is no
   `zoneName` (the
-  consumer gets the zone from the anchors topic), and the diagnostic fields
+  consumer gets the zone from the anchors topic), and `residual`/`n_anchors`
   are deliberately absent. `pos_json_anchors()` takes a
   `const struct apos_survey *` and publishes the **surveyed** geometry when one
   has been applied — one entry per surveyed anchor, `node[0]` (the gauge origin)

@@ -1,4 +1,5 @@
 #include "../../src/pos_json.h"
+#include "../../src/uwb_frame_802_15_4z.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,16 +18,21 @@ static void test_fix_exact_contract(void)
     int n = pos_json_fix(buf, sizeof(buf), &f);
 
     CHECK(n > 0);
-    CHECK(strcmp(buf, "{\"Tid\":4660,\"x\":1.23,\"y\":4.56,\"z\":0}") == 0);
+    CHECK(strcmp(buf, "{\"Tid\":4660,\"x\":1.23,\"y\":4.56,\"z\":0,"
+                      "\"batt\":87,\"chg\":0}") == 0);
     CHECK(n == (int)strlen(buf));
 }
 
 static void test_fix_drops_diagnostics(void)
 {
-    /* residual, n_anchors and batt_soc must NOT reach the payload -- they stay
-     * on the console log line. zoneName is also gone: the consumer looks the
-     * zone up via the anchors topic instead. Changing this breaks the
-     * consumer contract. */
+    /* residual and n_anchors must NOT reach the payload -- they stay on the
+     * console log line. zoneName is also gone: the consumer looks the zone up
+     * via the anchors topic instead. Changing this breaks the consumer
+     * contract.
+     *
+     * batt_soc DOES reach the payload since 2026-09-03 (as "batt"/"chg"), so
+     * it is no longer part of what this test excludes -- see
+     * test_battery_fields(). The other three are unchanged. */
     struct pos_fix f = { .src_addr = 0x0001, .x = 0.0f, .y = 0.0f,
                          .residual_m = 9.99f, .n_anchors = 4, .batt_soc = 42 };
     char buf[POS_JSON_MAX_LEN];
@@ -36,7 +42,66 @@ static void test_fix_drops_diagnostics(void)
     CHECK(strstr(buf, "anchors")  == NULL);
     CHECK(strstr(buf, "battery")  == NULL);
     CHECK(strstr(buf, "zoneName") == NULL);
-    CHECK(strstr(buf, "42")       == NULL);
+}
+
+/*
+ * "batt" and "chg", added to the payload 2026-09-03.
+ *
+ * The properties pinned here are the ones a downstream consumer's schema
+ * depends on, not the formatting:
+ *
+ *   - Both fields are ALWAYS present, in every message. A field that comes
+ *     and goes forces the consumer to handle two shapes.
+ *   - Both are ALWAYS integers. Never null, never a quoted string. The Tid
+ *     int32 truncation (CLAUDE.md) is the standing reminder that this
+ *     consumer drops what it cannot parse, without saying so.
+ *   - The no-reading sentinel is -1, NOT 255. 255 is a legal byte value and
+ *     reads as a percentage; -1 cannot be mistaken for one.
+ */
+static void test_battery_fields(void)
+{
+    char buf[POS_JSON_MAX_LEN];
+
+    /* A real percentage: chg is 0, and 255 must appear nowhere. */
+    struct pos_fix ok = { .src_addr = 0x0001, .tag_id = 7, .x = 0.0f, .y = 0.0f,
+                          .residual_m = 0.0f, .n_anchors = 3, .batt_soc = 87 };
+
+    CHECK(pos_json_fix(buf, sizeof(buf), &ok) > 0);
+    CHECK(strstr(buf, "\"batt\":87") != NULL);
+    CHECK(strstr(buf, "\"chg\":0")   != NULL);
+    CHECK(strstr(buf, "255")         == NULL);
+    CHECK(strstr(buf, "null")        == NULL);
+
+    /* 0 % is a REAL reading and must survive as 0, not be confused with the
+     * no-reading case. This is the distinction UWB_FRAME_POS_SOC_CONNECTED
+     * exists to preserve, carried all the way to the payload. */
+    struct pos_fix flat = ok;
+
+    flat.batt_soc = 0;
+    CHECK(pos_json_fix(buf, sizeof(buf), &flat) > 0);
+    CHECK(strstr(buf, "\"batt\":0")  != NULL);
+    CHECK(strstr(buf, "\"chg\":0")   != NULL);
+    CHECK(strstr(buf, "\"batt\":-1") == NULL);
+
+    /* No reading: -1 and chg = 1. */
+    struct pos_fix conn = ok;
+
+    conn.batt_soc = UWB_FRAME_POS_SOC_CONNECTED;
+    CHECK(pos_json_fix(buf, sizeof(buf), &conn) > 0);
+    CHECK(strstr(buf, "\"batt\":-1") != NULL);
+    CHECK(strstr(buf, "\"chg\":1")   != NULL);
+    CHECK(strstr(buf, "255")         == NULL);
+    CHECK(strstr(buf, "null")        == NULL);
+
+    /* 100 % is the top of the valid range and must not be clipped. */
+    struct pos_fix full = ok;
+
+    full.batt_soc = 100;
+    CHECK(pos_json_fix(buf, sizeof(buf), &full) > 0);
+    CHECK(strstr(buf, "\"batt\":100") != NULL);
+    CHECK(strstr(buf, "\"chg\":0")    != NULL);
+
+    printf("  payload with battery: %s\n", buf);
 }
 
 static void test_tid_is_plain_decimal_not_hex(void)
@@ -82,7 +147,7 @@ static void test_z_is_an_integer_literal(void)
     char buf[POS_JSON_MAX_LEN];
 
     CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
-    CHECK(strstr(buf, "\"z\":0}") != NULL);
+    CHECK(strstr(buf, "\"z\":0,") != NULL);
     CHECK(strstr(buf, "\"z\":0.00") == NULL);
 }
 
@@ -390,6 +455,7 @@ int main(void)
 {
     test_fix_exact_contract();
     test_fix_drops_diagnostics();
+    test_battery_fields();
     test_tid_is_plain_decimal_not_hex();
     test_tid_is_tag_id_not_src_addr();
     test_z_is_an_integer_literal();

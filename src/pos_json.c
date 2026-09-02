@@ -6,6 +6,8 @@
 
 #include "pos_json.h"
 
+#include "uwb_frame_802_15_4z.h"   /* UWB_FRAME_POS_SOC_CONNECTED */
+
 #include <errno.h>
 #include <math.h>
 #include <stdbool.h>
@@ -34,12 +36,47 @@ int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix)
 	 * z is the integer literal 0, not %.2f: the solver is 2D and there is
 	 * no z measurement yet.
 	 *
-	 * residual_m, n_anchors and batt_soc are deliberately absent. They stay
-	 * on pos_sink.c's console log line. */
-	n = snprintf(buf, len,
-		     "{\"Tid\":%u,\"x\":%.2f,\"y\":%.2f,\"z\":0}",
-		     (unsigned int)fix->tag_id,
-		     (double)fix->x, (double)fix->y);
+	 * residual_m and n_anchors are deliberately absent. They stay on
+	 * pos_sink.c's console log line.
+	 *
+	 * ---- Battery, added 2026-09-03 -------------------------------------
+	 *
+	 * TWO fields, not one, and both are always present and always the same
+	 * JSON type -- a schema that changes shape per message is what made the
+	 * Tid int32 truncation so slow to find (see CLAUDE.md): this consumer
+	 * drops what it cannot parse, silently.
+	 *
+	 *   "batt"  0..100, or -1 when the tag reported no percentage.
+	 *   "chg"   1 when there is no percentage reading, else 0.
+	 *
+	 * -1 rather than 255 for the no-reading case, because 255 is IN RANGE
+	 * for a byte and reads as a percentage; -1 cannot be mistaken for one.
+	 * Never emitted as JSON null, so the column type stays integer.
+	 *
+	 * HONESTY NOTE ON "chg", because the name promises more than the wire
+	 * can deliver: both fields are derived from the SAME single sentinel,
+	 * batt_soc == UWB_FRAME_POS_SOC_CONNECTED (0xFF). There is exactly one
+	 * bit of information here, so "chg" carries none of its own -- it is a
+	 * restatement of "batt == -1", not an independent measurement. The tag
+	 * DOES distinguish the causes internally (batt.c returns -EBUSY
+	 * specifically for a connected charger, and other failures separately),
+	 * but every one of them collapses to 0xFF before transmission. So a
+	 * FAILED FUEL GAUGE also publishes chg = 1. Making this field mean what
+	 * its name says needs a flag on the wire -- the POS frame and
+	 * blink_frame.flags both have room -- which is a protocol change, not a
+	 * formatting one. */
+	{
+		bool no_reading =
+			(fix->batt_soc == UWB_FRAME_POS_SOC_CONNECTED);
+
+		n = snprintf(buf, len,
+			     "{\"Tid\":%u,\"x\":%.2f,\"y\":%.2f,\"z\":0,"
+			     "\"batt\":%d,\"chg\":%u}",
+			     (unsigned int)fix->tag_id,
+			     (double)fix->x, (double)fix->y,
+			     no_reading ? -1 : (int)fix->batt_soc,
+			     no_reading ? 1u : 0u);
+	}
 
 	if (n < 0 || (size_t)n >= len) {
 		return -1;
