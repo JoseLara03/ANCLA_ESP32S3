@@ -236,4 +236,64 @@ void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 		       uint32_t *n_gate_rejected, uint32_t *n_no_update,
 		       uint32_t *n_zupt);
 
+
+#if defined(CONFIG_ANCLA_TDOA_TRACE)
+
+/* ---- TEMPORARY: per-cycle filter trace (CONFIG_ANCLA_TDOA_TRACE) --------
+ *
+ * Added 2026-09-03 for Task 7, to root-cause the filter runaway. DELETE ALL
+ * OF THIS once the mechanism is explained -- `git grep ANCLA_TDOA_TRACE`
+ * finds every line.
+ *
+ * Why a ring rather than log lines: the runaway happens at ~2 fixes/s, and
+ * that rate already loses 80 % of console records (1424 fixes counted, 291
+ * delivered, no Zephyr drop report because the loss is below its
+ * accounting). Per-cycle logging would destroy the very burst being chased.
+ *
+ * CONCURRENCY, stated because it is not airtight: the writer is the
+ * K_PRIO_COOP(0) gateway loop and the reader is the preemptible shell, which
+ * cannot preempt a cooperative thread -- so the shell only ever reads while
+ * the loop is blocked. A tear is still possible if the loop yields between
+ * filling an entry and advancing the head, and the worst case is one garbled
+ * entry in a dump. Acceptable for instrumentation that is on its way out;
+ * not a pattern to copy into anything that stays.
+ */
+#define TDOA_TRACE_SLOTS  128u
+
+enum tdoa_trace_path {
+	TDOA_TRACE_FILTERED = 0,   /* predict + update_tdoa ran */
+	TDOA_TRACE_SEEDED,         /* dt invalid -> fresh solve + seed */
+	TDOA_TRACE_NO_UPDATE,      /* nothing changed; publish suppressed */
+};
+
+struct tdoa_trace_entry {
+	uint32_t t_ms;         /* the gateway loop's now_ms */
+	uint16_t tag_addr;
+	uint8_t  path;         /* enum tdoa_trace_path */
+	uint8_t  n;            /* anchors in the group */
+	uint8_t  accepted;     /* equations the gate let through, of n-1 */
+	uint8_t  gate_streak;  /* pos_ekf's own counter, AFTER the update */
+	uint8_t  zupt;         /* 1 when pos_ekf_zupt() was applied */
+	uint8_t  reseed;       /* 1 when needs_reseed() fired this cycle */
+	float    dt_s;
+	float    x, y, vx, vy;
+	float    sigma;        /* pos_ekf_pos_sigma() after the cycle */
+};
+
+/* Snapshot of the ring. `n_out` is how many entries are valid (up to
+ * TDOA_TRACE_SLOTS) and `dropped` how many were overwritten since the last
+ * clear -- a nonzero `dropped` means the window is shorter than the episode
+ * and the dump has to be taken sooner.
+ *
+ * `head_out` is the write cursor, and the caller NEEDS it: once the ring has
+ * wrapped (n_out == TDOA_TRACE_SLOTS) the OLDEST entry sits at head, not at
+ * index 0. Reading from 0 unconditionally silently reorders the dump, which
+ * on a trace whose whole point is the time evolution of gate_streak would be
+ * worse than no dump at all. */
+void tdoa_gw_trace_snapshot(const struct tdoa_trace_entry **out,
+			    uint32_t *n_out, uint32_t *dropped,
+			    uint32_t *head_out);
+void tdoa_gw_trace_clear(void);
+#endif /* CONFIG_ANCLA_TDOA_TRACE */
+
 #endif /* TDOA_GW_H */

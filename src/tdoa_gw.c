@@ -101,6 +101,65 @@ static struct tag_memo     memo[TDOA_GW_SEED_SLOTS];
  * for nothing. Set once in tdoa_gw_init(). */
 static struct pos_ekf_cfg ekf_cfg;
 
+#if defined(CONFIG_ANCLA_TDOA_TRACE)
+/* TEMPORARY -- see the block on tdoa_gw.h's trace API. Static for the same
+ * reason everything else here is: this thread's 4096-byte stack. */
+static struct tdoa_trace_entry trace_ring[TDOA_TRACE_SLOTS];
+static uint32_t trace_head;
+static uint32_t trace_n;
+static uint32_t trace_dropped;
+
+static void trace_put(uint32_t t_ms, uint16_t tag_addr,
+		      enum tdoa_trace_path path, const struct tag_memo *mm,
+		      float dt_s, size_t n, int accepted, bool zupt,
+		      bool reseed)
+{
+	struct tdoa_trace_entry *e = &trace_ring[trace_head];
+	float x = 0.0f, y = 0.0f, vx = 0.0f, vy = 0.0f;
+
+	(void)pos_ekf_get(&mm->ekf, &x, &y, &vx, &vy);
+
+	e->t_ms        = t_ms;
+	e->tag_addr    = tag_addr;
+	e->path        = (uint8_t)path;
+	e->n           = (uint8_t)n;
+	e->accepted    = (accepted < 0) ? 0u : (uint8_t)accepted;
+	/* Read straight off the filter rather than tracked here: gate_streak
+	 * is the quantity pos_ekf_needs_reseed() actually turns on, and the
+	 * whole question is whether it ever advances. */
+	e->gate_streak = mm->ekf.gate_streak;
+	e->zupt        = zupt ? 1u : 0u;
+	e->reseed      = reseed ? 1u : 0u;
+	e->dt_s        = dt_s;
+	e->x = x; e->y = y; e->vx = vx; e->vy = vy;
+	e->sigma       = pos_ekf_pos_sigma(&mm->ekf);
+
+	trace_head = (trace_head + 1u) % TDOA_TRACE_SLOTS;
+	if (trace_n < TDOA_TRACE_SLOTS) {
+		trace_n++;
+	} else {
+		trace_dropped++;
+	}
+}
+
+void tdoa_gw_trace_snapshot(const struct tdoa_trace_entry **out,
+			    uint32_t *n_out, uint32_t *dropped,
+			    uint32_t *head_out)
+{
+	if (out != NULL)      { *out = trace_ring; }
+	if (n_out != NULL)    { *n_out = trace_n; }
+	if (dropped != NULL)  { *dropped = trace_dropped; }
+	if (head_out != NULL) { *head_out = trace_head; }
+}
+
+void tdoa_gw_trace_clear(void)
+{
+	trace_head = 0u;
+	trace_n = 0u;
+	trace_dropped = 0u;
+}
+#endif /* CONFIG_ANCLA_TDOA_TRACE */
+
 static uint32_t n_obs_in;
 static uint32_t n_dup;
 static uint32_t n_shed;
@@ -154,6 +213,9 @@ static bool warned_filtered_residual;
 
 void tdoa_gw_init(void)
 {
+#if defined(CONFIG_ANCLA_TDOA_TRACE)
+	tdoa_gw_trace_clear();
+#endif
 	tdoa_collect_init(&collect);
 	memset(memo, 0, sizeof(memo));
 	pos_ekf_cfg_defaults(&ekf_cfg);
@@ -561,11 +623,13 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	 * exceeded seeded+filtered+reseed by exactly the number of these
 	 * silent stale republishes. */
 	bool state_changed = false;
+	int  accepted = -1;          /* -1 = no update ran this cycle */
+	bool zupt_done = false;
 
 	if (have_filter && dt_ok) {
 		pos_ekf_predict(&mm->ekf, &ekf_cfg, dt_s, mm->tag_moving);
 
-		int accepted = pos_ekf_update_tdoa(&mm->ekf, &ekf_cfg, m, n);
+		accepted = pos_ekf_update_tdoa(&mm->ekf, &ekf_cfg, m, n);
 
 		if (n >= 1u) {
 			n_ekf_gate_rejected += (uint32_t)(n - 1u) -
@@ -593,6 +657,7 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 		if (!mm->tag_moving) {
 			pos_ekf_zupt(&mm->ekf, &ekf_cfg);
 			n_ekf_zupt++;
+			zupt_done = true;
 		}
 
 		n_ekf_filtered++;
@@ -614,7 +679,19 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 		 * both of which are safe on a filter that is still unseeded. */
 	}
 
-	if (pos_ekf_needs_reseed(&mm->ekf, &ekf_cfg)) {
+	bool reseed_asked = pos_ekf_needs_reseed(&mm->ekf, &ekf_cfg);
+
+#if defined(CONFIG_ANCLA_TDOA_TRACE)
+	/* Recorded BEFORE the reseed acts, so the entry shows the state that
+	 * triggered it rather than the state that replaced it. */
+	trace_put(now_ms, tag_addr,
+		  state_changed ? (accepted >= 0 ? TDOA_TRACE_FILTERED
+						 : TDOA_TRACE_SEEDED)
+				: TDOA_TRACE_NO_UPDATE,
+		  mm, dt_s, n, accepted, zupt_done, reseed_asked);
+#endif
+
+	if (reseed_asked) {
 		struct pos_result res2;
 
 		if (resolve_and_seed(mm, m, n, tag_addr, now_ms, &res2)) {

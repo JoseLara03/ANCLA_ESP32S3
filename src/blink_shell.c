@@ -40,6 +40,8 @@
 #include "blink_rx.h"
 #include "net_uplink.h"
 #include "tdoa_gw.h"
+
+#include <string.h>
 #include "uwb_config.h"
 
 #include <zephyr/shell/shell.h>
@@ -224,6 +226,68 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+#if defined(CONFIG_ANCLA_TDOA_TRACE)
+/*
+ * TEMPORARY -- Task 7's instrumentation. DELETE with the rest of
+ * CONFIG_ANCLA_TDOA_TRACE once the runaway is explained.
+ *
+ * shell_print and NOT LOG_INF, deliberately and for the same reason the data
+ * lives in a ring: the console loses ~80 % of records at 2 fixes/s, and a
+ * 128-line dump through the deferred log pool (8192 B in debug.conf) would
+ * drop most of itself. Shell output is synchronous and flow-controlled.
+ *
+ * Read `gs` (gate_streak) first: it is the quantity pos_ekf_needs_reseed()
+ * turns on, and the whole question is whether it ever reaches reset_after (3)
+ * during an escape. `acc` is how many of the n-1 equations the gate let
+ * through -- if that stays >= 1 while x,y walk away, the streak is being
+ * reset every cycle and the recovery can never arm, which is the hypothesis.
+ */
+static int cmd_trace(const struct shell *sh, size_t argc, char **argv)
+{
+	const struct tdoa_trace_entry *ring = NULL;
+	uint32_t n = 0u, dropped = 0u, head = 0u;
+
+	if (argc == 2 && strcmp(argv[1], "clear") == 0) {
+		tdoa_gw_trace_clear();
+		shell_print(sh, "trace cleared");
+		return 0;
+	}
+
+	tdoa_gw_trace_snapshot(&ring, &n, &dropped, &head);
+	if (ring == NULL || n == 0u) {
+		shell_print(sh, "trace empty (role %s -- only a GATEWAY fills "
+				"it)", board_role());
+		return 0;
+	}
+
+	shell_print(sh, "%u entries, %u overwritten%s", n, dropped,
+		    dropped ? "  <-- WINDOW TOO SHORT, dump sooner" : "");
+	shell_print(sh, "     t_ms  tag  path  n acc gs z r    dt_s      x"
+			"      y     vx     vy  sigma");
+
+	/* Oldest first. Once the ring has wrapped, the oldest entry is at the
+	 * write cursor; before that it is at 0. Getting this wrong reorders a
+	 * trace whose entire value is the time evolution of gate_streak. */
+	uint32_t start = (n == TDOA_TRACE_SLOTS) ? head : 0u;
+	static const char *const pname[3] = {"filt", "seed", "none"};
+
+	for (uint32_t k = 0; k < n; k++) {
+		const struct tdoa_trace_entry *e =
+			&ring[(start + k) % TDOA_TRACE_SLOTS];
+
+		shell_print(sh, "%9u %04X  %-4s %2u %3u %2u %1u %1u %7.3f "
+				"%6.2f %6.2f %6.2f %6.2f %6.2f",
+			    e->t_ms, e->tag_addr,
+			    pname[(e->path < 3u) ? e->path : 2u],
+			    e->n, e->accepted, e->gate_streak, e->zupt,
+			    e->reseed, (double)e->dt_s, (double)e->x,
+			    (double)e->y, (double)e->vx, (double)e->vy,
+			    (double)e->sigma);
+	}
+	return 0;
+}
+#endif /* CONFIG_ANCLA_TDOA_TRACE */
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_blink,
 	SHELL_CMD_ARG(stats, NULL,
 		      "stats — the TDoA path as JSON, in three lines: the "
@@ -232,6 +296,14 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_blink,
 		      "ingest/solve/publish counters, then the per-tag EKF's "
 		      "own counters. All three carry a role field",
 		      cmd_stats, 1, 0),
+#if defined(CONFIG_ANCLA_TDOA_TRACE)
+	SHELL_CMD_ARG(trace, NULL,
+		      "trace [clear] — TEMPORARY per-cycle filter trace ring "
+		      "(Task 7). Read gate_streak (gs) against acc: a streak "
+		      "stuck at 0 while acc stays >= 1 is the runaway "
+		      "hypothesis",
+		      cmd_trace, 1, 1),
+#endif
 	SHELL_SUBCMD_SET_END
 );
 

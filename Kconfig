@@ -14,6 +14,31 @@ config ANCLA_CAL_MODE
 	  enable this: a deployed anchor transmitting unsolicited polls would
 	  collide with tag ranging traffic.
 
+config ANCLA_TDOA_TRACE
+	bool "TDoA filter per-cycle trace ring (TEMPORARY)"
+	help
+	  Records one entry per tdoa_gw_step() filter cycle into a fixed ring
+	  in RAM, dumped on demand with `blink trace`. Added 2026-09-03 to
+	  root-cause the filter runaway (Task 7 of
+	  docs/superpowers/plans/2026-09-03-tdoa-accuracy-filter-part2.md).
+
+	  A RING AND NOT LOG LINES, deliberately. The runaway happens at ~2
+	  fixes/s, and that rate already loses 80 % of console records: the
+	  2026-09-03 stationary capture had the gateway count 1424 fixes while
+	  the console delivered 291, with no Zephyr drop report because the
+	  loss is below its accounting. Per-cycle LOG_INF would therefore
+	  destroy exactly the burst being chased -- the same trap CLAUDE.md
+	  records for CONFIG_LOG_MODE_OVERFLOW. The ring loses nothing and is
+	  read once, afterwards, at human speed.
+
+	  THIS IS TEMPORARY AND MUST BE REMOVED once the mechanism is
+	  explained -- same discipline part 1 used for its dt investigation:
+	  add, measure, root-cause, delete. It is its own symbol rather than
+	  riding on ANCLA_RANGING_DEBUG precisely so `git grep
+	  ANCLA_TDOA_TRACE` finds every line of it on the way out.
+
+	  Costs TDOA_TRACE_SLOTS * 40 B of .bss and nothing on the radio path.
+
 config ANCLA_RANGING_DEBUG
 	bool "Ranging-path diagnostics"
 	help
