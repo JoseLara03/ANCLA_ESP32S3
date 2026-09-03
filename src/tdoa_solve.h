@@ -28,6 +28,22 @@ struct tdoa_meas {
 	float   x;
 	float   y;
 	float   dz;
+	/* 1-sigma uncertainty of THIS anchor's timestamp, in metres of path.
+	 * From the anchor's own measured CCP jitter (pos_blink_obs.sigma_dtu x
+	 * TDOA_M_PER_DTU), so it discriminates between anchors -- a weak or
+	 * distant link counts for less.
+	 *
+	 * <= 0 means UNKNOWN, and every consumer must fall back to a flat
+	 * sigma rather than reading it as zero uncertainty. That is not a
+	 * corner case: an anchor that has not gathered enough CCP residuals
+	 * yet, or one still on proto 4, sends nothing here.
+	 *
+	 * tdoa_solve() IGNORES this field -- it is an unweighted least-squares
+	 * fit and stays one; weighting the seed solve is separate work with
+	 * its own validation. Only pos_ekf_update_tdoa() reads it. Costs
+	 * nothing to carry: it lands in padding the struct already had, so
+	 * sizeof(struct tdoa_meas) is 24 either way. */
+	float   sigma_m;
 	int64_t t_dtu;
 };
 

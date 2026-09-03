@@ -62,28 +62,46 @@ struct pos_blink_obs {
 	 * moving, no alert". That is the safe direction for the consumer --
 	 * see pos_json_blink_parse()'s note. */
 	uint8_t  flags;
+	/* The publishing anchor's own MEASURED per-observation timestamp
+	 * jitter, 1-sigma, in DTU (sync_model_jitter_est_dtu()). Lets the
+	 * gateway weight each anchor's equations instead of assuming every
+	 * link is equally good.
+	 *
+	 * 0 means UNKNOWN -- either the anchor has not gathered enough CCP
+	 * residuals yet, or it is older than proto 5 and never sent the field.
+	 * A consumer must treat 0 as "fall back to a flat sigma" and never as
+	 * zero uncertainty, which would read as infinite confidence.
+	 *
+	 * Per-ANCHOR and slowly varying, not per-blink: it is a long-run
+	 * statistic for that anchor's CCP link. Per-blink discrimination is
+	 * what `quality` above would be for, and whether ipatovAccumCount
+	 * carries any at fixed PLEN has NOT been measured -- until it has,
+	 * `quality` stays diagnostic and nothing weights by it. */
+	uint16_t sigma_dtu;
 	int64_t  t_dtu;       /* RX in the master's base, sync_model_to_master() */
 };
 
-/* Buffer big enough for pos_json_blink()'s worst case plus its NUL. The worst
- * case is 66 bytes (every field at maximum, a 13-digit ts -- measured by
- * tests/pos_json_blink/, which prints it); 96 leaves room for one more field
- * without re-sizing every caller.
+/* Buffer big enough for pos_json_blink()'s worst case plus its NUL, and ALSO
+ * the parser's hard rejection ceiling: pos_json_blink_parse() refuses any
+ * payload of this size or more outright.
  *
- * ---- This constant is ALSO the parser's hard rejection ceiling ---------
+ * ---- This constant is a VERSIONING CONSTRAINT, not just a buffer size ----
  *
- * pos_json_blink_parse() refuses any payload of 96 bytes or more outright, so
- * the "tolerates unknown fields" promise below is NOT unconditional: it holds
- * only while the whole document stays at 95 bytes or less, i.e. 29 bytes past
- * today's 66-byte worst case. A newer publisher that adds two modest fields
- * would push a maximal payload past that and make an OLDER gateway reject
- * EVERY observation rather than ignore the extras -- a silent, total loss of
- * the TDoA input, not a graceful degradation. So this is a VERSIONING
- * CONSTRAINT, not just a buffer size: adding a field to the observation
- * document means checking the new worst case against 95 first, and raising
- * this constant (on gateways BEFORE anchors) if it no longer fits.
- * tests/pos_json_blink/ pins the 96-byte rejection deliberately. */
-#define POS_JSON_BLINK_MAX_LEN 96
+ * Because it is a hard rejection, the "tolerates unknown fields" promise on
+ * the parser holds only while the whole document stays under it. A newer
+ * publisher whose maximal payload crosses the line makes an OLDER gateway
+ * reject EVERY observation rather than ignore the extras -- a silent, total
+ * loss of the TDoA input, not a graceful degradation. So adding a field means
+ * measuring the new worst case first, and raising this (on GATEWAYS BEFORE
+ * ANCHORS) if it no longer fits with room to spare.
+ *
+ * Raised 96 -> 128 on 2026-09-03, when proto 5 added "f" (flags) and "e"
+ * (the anchor's measured sigma). Measured worst case went 66 -> 84 bytes,
+ * which still fit under the old 95-byte limit but left only 11 bytes of
+ * headroom -- enough to make the NEXT field an emergency rather than an
+ * edit. tests/pos_json_blink/ prints the measured figure on every run
+ * precisely so this is never estimated again. */
+#define POS_JSON_BLINK_MAX_LEN 128
 
 /* Upper bound on t_dtu: the DW3220's system counter is 40 bits, so anything
  * above this is not a timestamp this network can have produced. Named here

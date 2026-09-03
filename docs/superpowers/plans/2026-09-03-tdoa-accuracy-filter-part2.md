@@ -53,7 +53,37 @@ ya fusionada.
 `POS_JSON_BLINK_MAX_LEN` sube en la Tarea 5 y el modo de falla al invertirlo no
 es degradación: un gateway viejo rechaza **todas** las observaciones.
 
-**Estado 2026-09-03:** ninguna tarea empezada. Spec escrito esta sesión.
+**Estado 2026-09-03:** Tareas 2, 3, 4 y **5b** escritas y host-testeadas.
+Tarea 1 (línea base de banco) y Tarea 6 (hardware) sin empezar — nada de esto
+ha tocado un board.
+
+**Tarea 5a NO se puede cerrar en esta sesión, y no por falta de código.** Pide
+medir la correlación entre `quality` (`diag.ipatovAccumCount`) y el residual
+por ecuación *sobre una captura real*, y no hay captura ni hardware
+disponible. Estado: **no se pondera por `quality`**, que es el
+comportamiento seguro y es uno de los dos resultados que el spec §4.1 admite
+de antemano. Lo que falta para cerrarla, para quien la retome:
+
+1. Capturar, sobre un gateway vivo con >= 4 anclas, pares
+   `(quality_i, |residual_i|)` por ecuación durante varios minutos con un tag
+   quieto y otro caminando. Hoy `quality` llega al gateway y se descarta, así
+   que hace falta instrumentación temporal — con la disciplina que la parte 1
+   ya usó: agregar, medir, y RETIRAR una vez explicada, no dejarla en el
+   árbol.
+2. Si la correlación es débil (lo esperable: a PLEN fijo el conteo de
+   acumulación puede ser casi constante), escribir el hallazgo NEGATIVO junto
+   al campo con los números y dejar `quality` como diagnóstico. Ese es el
+   mismo desenlace que tuvo el barrido de `SYNC_PHASE_EMA_SHIFT` en la
+   parte 1.
+3. Si es fuerte, la ponderación ya tiene dónde entrar: `struct tdoa_meas`
+   lleva `sigma_m` y `pos_ekf_update_tdoa()` ya la consume por ancla. Sería
+   combinar el término por-blink con el por-ancla, no cablear nada nuevo.
+
+La 5b (la sigma de sincronía) sí está hecha, y con una **corrección al spec**:
+publica `sync_model_jitter_est_dtu()` (medido) y no
+`sync_model_error_dtu()` (que se calcula desde `SYNC_JITTER_DTU`, una
+constante asumida de ~100 ps contra los 782 ps-1.53 ns que el hardware
+midió — habría dado una sigma ~15x demasiado optimista).
 
 ---
 

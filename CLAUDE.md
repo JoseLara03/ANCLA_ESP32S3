@@ -1140,6 +1140,30 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `src/pos_sink.{c,h}` — consumes decoded tag position fixes. Logs one JSON line
   per fix (the only place `residual`/`batt` stay visible) and hands the fix to
   `net_uplink` through a bounded queue.
+- **Per-anchor TDoA weighting publishes the MEASURED jitter, not the assumed
+  one, and that distinction is a factor of ~15.** Proto 5 adds `sigma_dtu` to
+  the observation: each anchor's own 1-sigma timestamp jitter, which
+  `pos_ekf_update_tdoa()` turns into a per-equation `R = sigma_0^2 + sigma_k^2`
+  (a range DIFFERENCE carries two independent timestamps, so the variances add
+  -- the same sqrt(2) behind `r_tdoa`'s default, applied per anchor instead of
+  once for all). The trap the obvious implementation walks into: the design
+  spec said to publish `sync_model_error_dtu()`, but that function is computed
+  from `SYNC_JITTER_DTU`, a hardcoded **assumption** of ~100 ps, while Fase 2
+  measured 782 ps to 1.53 ns on real hardware. Publishing it would have made
+  the filter roughly 15x overconfident in every observation -- worse than the
+  flat fallback it replaced. `sync_model_jitter_est_dtu()` is the measured one,
+  derived from that anchor's own CCP residuals, and is what ships. It is
+  per-ANCHOR and slowly varying, NOT per-blink: it discriminates a weak or
+  distant link from a good one, not one blink from the next. `sigma_m <= 0` or
+  non-finite means UNKNOWN and falls back to `cfg->r_tdoa` **per anchor**, so a
+  mixed-firmware fleet still gets real weighting from the anchors that report
+  one; the `isfinite` half of that check is not decorative, since an
+  uninitialised `struct tdoa_meas` on the stack is exactly how a NaN sigma
+  arrives (it broke a host test on the way in). Weighting by `quality`
+  (`ipatovAccumCount`) is deliberately NOT done: whether it carries any
+  information at fixed PLEN is unmeasured, and measuring it needs a real
+  capture nobody has taken yet.
+
 - **`BLINK_FLAG_MOVING` is the tag's accelerometer, and its ABSENCE is
   indistinguishable from "still".** Proto 5 (2026-09-03) puts the LIS2HH12's
   activity verdict on the air in `blink_frame.flags` bit 1, so the gateway can

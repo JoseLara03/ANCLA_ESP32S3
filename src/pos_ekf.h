@@ -131,6 +131,11 @@ int pos_ekf_update_ranges(struct pos_ekf *f, const struct pos_ekf_cfg *c,
  * same convention tdoa_solve.c's slant() uses. Returns the number of range
  * differences accepted, out of n-1.
  */
+/* Since 2026-09-03 each equation is weighted by the two anchors it involves:
+ * R = sigma_0^2 + sigma_k^2, from struct tdoa_meas's per-anchor sigma_m.
+ * cfg->r_tdoa is the FALLBACK for any anchor that reported no sigma, applied
+ * per anchor rather than per group, so a mixed-firmware deployment still gets
+ * real weighting from the anchors that do report one. */
 int pos_ekf_update_tdoa(struct pos_ekf *f, const struct pos_ekf_cfg *c,
                         const struct tdoa_meas *m, size_t n);
 

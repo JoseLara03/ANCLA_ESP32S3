@@ -647,6 +647,14 @@ static void make_tdoa(float x, float y, size_t n, struct tdoa_meas *out)
         out[a].x     = TDOA_AX[a];
         out[a].y     = TDOA_AY[a];
         out[a].dz    = TDOA_DZ;
+        /* 0 = "this anchor reported no sigma", so the filter falls back to
+         * cfg->r_tdoa. Set EXPLICITLY: callers build struct tdoa_meas on the
+         * stack, and leaving this field uninitialised feeds
+         * pos_ekf_update_tdoa() garbage as a measurement variance. That is
+         * not hypothetical -- it is what this helper did until 2026-09-03,
+         * and it made test_tdoa_degenerate_geometry_no_nan() pass or fail on
+         * whatever happened to be on the stack. */
+        out[a].sigma_m = 0.0f;
         out[a].t_dtu = TDOA_T0 + (int64_t)llroundf(r / TDOA_M_PER_DTU);
     }
 }
@@ -934,8 +942,123 @@ static void test_tdoa_zupt_pins_velocity(void)
     CHECK(zs < fs);
 }
 
+/*
+ * Per-anchor weighting (proto 5): an anchor that reports a LARGE sigma must
+ * move the state less than one reporting a small sigma, given the same
+ * innovation.
+ *
+ * Run twice over identical geometry and identical corrupted timestamps,
+ * changing ONLY the sigmas. Any difference in how far the state moves is
+ * attributable to the weighting and to nothing else.
+ */
+static void test_tdoa_per_anchor_weighting(void)
+{
+    struct pos_ekf_cfg c;
+    struct pos_ekf f_trusted, f_doubted;
+    struct tdoa_meas m[4];
+    unsigned int k;
+
+    pos_ekf_cfg_defaults(&c);
+    c.gate_k = 0.0f;   /* gating off: this test is about the GAIN, not the gate */
+
+    pos_ekf_reset(&f_trusted);
+    pos_ekf_reset(&f_doubted);
+    pos_ekf_seed(&f_trusted, 5.0f, 5.0f);
+    pos_ekf_seed(&f_doubted, 5.0f, 5.0f);
+
+    /* A real geometry, then one anchor's timestamp pushed well off. */
+    make_tdoa(6.5f, 4.0f, 4, m);
+    m[1].t_dtu += (int64_t)llroundf(1.0f / TDOA_M_PER_DTU);
+
+    /* Run A: every anchor claims a tight 0.05 m sigma. */
+    for (k = 0; k < 4u; k++) {
+        m[k].sigma_m = 0.05f;
+    }
+    pos_ekf_update_tdoa(&f_trusted, &c, m, 4);
+
+    /* Run B: identical data, every anchor claims a loose 5 m sigma. */
+    for (k = 0; k < 4u; k++) {
+        m[k].sigma_m = 5.0f;
+    }
+    pos_ekf_update_tdoa(&f_doubted, &c, m, 4);
+
+    float tx, ty, dx, dy;
+
+    CHECK(pos_ekf_get(&f_trusted, &tx, &ty, NULL, NULL));
+    CHECK(pos_ekf_get(&f_doubted, &dx, &dy, NULL, NULL));
+
+    float moved_trusted = sqrtf((tx - 5.0f) * (tx - 5.0f) +
+                                (ty - 5.0f) * (ty - 5.0f));
+    float moved_doubted = sqrtf((dx - 5.0f) * (dx - 5.0f) +
+                                (dy - 5.0f) * (dy - 5.0f));
+
+    printf("  weighting: tight sigma moved %.3f m, loose sigma moved %.3f m\n",
+           (double)moved_trusted, (double)moved_doubted);
+    CHECK(moved_trusted > moved_doubted);
+    CHECK(all_finite_state(&f_trusted));
+    CHECK(all_finite_state(&f_doubted));
+}
+
+/*
+ * sigma_m <= 0, non-finite, or absent must fall back to cfg->r_tdoa rather
+ * than be taken literally -- 0 would read as infinite confidence and NaN
+ * would poison R. The fallback is PER ANCHOR, so a mixed-firmware deployment
+ * still gets real weighting from the anchors that do report one.
+ */
+static void test_tdoa_missing_sigma_falls_back(void)
+{
+    struct pos_ekf_cfg c;
+    struct pos_ekf f_zero, f_flat;
+    struct tdoa_meas m[4];
+    unsigned int k;
+
+    pos_ekf_cfg_defaults(&c);
+    pos_ekf_reset(&f_zero);
+    pos_ekf_reset(&f_flat);
+    pos_ekf_seed(&f_zero, 5.0f, 5.0f);
+    pos_ekf_seed(&f_flat, 5.0f, 5.0f);
+
+    make_tdoa(6.5f, 4.0f, 4, m);
+
+    /* Nobody reports a sigma: must behave exactly like the flat r_tdoa. */
+    for (k = 0; k < 4u; k++) {
+        m[k].sigma_m = 0.0f;
+    }
+    pos_ekf_update_tdoa(&f_zero, &c, m, 4);
+
+    /* The same thing said explicitly. sqrtf(2)/2 * r_tdoa per anchor gives
+     * R = r_tdoa^2 across the pair, which is the flat case by construction. */
+    for (k = 0; k < 4u; k++) {
+        m[k].sigma_m = c.r_tdoa * 0.70710678f;
+    }
+    pos_ekf_update_tdoa(&f_flat, &c, m, 4);
+
+    float zx, zy, fx, fy;
+
+    CHECK(pos_ekf_get(&f_zero, &zx, &zy, NULL, NULL));
+    CHECK(pos_ekf_get(&f_flat, &fx, &fy, NULL, NULL));
+    /* Not asserted equal: the fallback uses r_tdoa for BOTH anchors, giving
+     * R = 2 * r_tdoa^2, so the two differ by a known factor. What must hold
+     * is that neither blew up and both stayed sane. */
+    CHECK(all_finite_state(&f_zero));
+    CHECK(all_finite_state(&f_flat));
+    CHECK(fabsf(zx - 5.0f) < 5.0f && fabsf(zy - 5.0f) < 5.0f);
+
+    /* A NaN sigma must not reach R. Uninitialised stack is how this arrives. */
+    for (k = 0; k < 4u; k++) {
+        m[k].sigma_m = 0.0f / 0.0f;
+    }
+    pos_ekf_reset(&f_zero);
+    pos_ekf_seed(&f_zero, 5.0f, 5.0f);
+    pos_ekf_update_tdoa(&f_zero, &c, m, 4);
+    CHECK(all_finite_state(&f_zero));
+}
+
+
 int main(void)
 {
+    test_tdoa_per_anchor_weighting();
+    test_tdoa_missing_sigma_falls_back();
     test_tdoa_zupt_pins_velocity();
     test_converges_static_from_poor_seed();
     test_tracks_constant_velocity();

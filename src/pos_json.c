@@ -272,11 +272,11 @@ int pos_json_blink(char *buf, size_t len, const struct pos_blink_obs *o)
 	 * captures does. */
 	n = snprintf(buf, len,
 		     "{\"a\":%u,\"t\":%u,\"s\":%u,\"ts\":\"%lld\",\"q\":%u,\"b\":%u,"
-		     "\"f\":%u}",
+		     "\"f\":%u,\"e\":%u}",
 		     (unsigned int)o->anchor_id, (unsigned int)o->tag_addr,
 		     (unsigned int)o->blink_seq, (long long)o->t_dtu,
 		     (unsigned int)o->quality, (unsigned int)o->batt_soc,
-		     (unsigned int)o->flags);
+		     (unsigned int)o->flags, (unsigned int)o->sigma_dtu);
 
 	if (n < 0 || (size_t)n >= len) {
 		return -1;
@@ -292,6 +292,7 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 	char scratch[POS_JSON_BLINK_MAX_LEN];
 	uint32_t a, t, s, q, b;
 	uint32_t f = 0u;
+	uint32_t e = 0u;
 	int64_t ts;
 
 	if (buf == NULL || out == NULL) {
@@ -321,6 +322,13 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 		return -1;
 	}
 
+	/* "e" (proto 5), optional for the same reason and with the same
+	 * consequences as "f": absent reads as 0, and 0 means UNKNOWN here,
+	 * not "zero uncertainty". The consumer falls back to a flat sigma. */
+	if (scan_u32(scratch, "e", &e) && e > 0xFFFFu) {
+		return -1;
+	}
+
 	if (a > 0xFFu || t > 0xFFFFu || s > 0xFFu || q > 0xFFFFu || b > 0xFFu) {
 		return -1;
 	}
@@ -342,6 +350,7 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 	out->tag_addr  = (uint16_t)t;
 	out->quality   = (uint16_t)q;
 	out->flags     = (uint8_t)f;
+	out->sigma_dtu = (uint16_t)e;
 	out->t_dtu     = ts;
 	return 0;
 }

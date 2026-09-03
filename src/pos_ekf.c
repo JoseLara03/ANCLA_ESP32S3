@@ -337,7 +337,43 @@ int pos_ekf_update_tdoa(struct pos_ekf *f, const struct pos_ekf_cfg *c,
         float   z      = (float)dt_dtu * TDOA_M_PER_DTU;
         float   h      = rk - r0;
         float   innov  = z - h;
-        float   R      = c->r_tdoa * c->r_tdoa;
+
+        /*
+         * Per-equation measurement variance.
+         *
+         * The measurement is a range DIFFERENCE, so it carries the noise of
+         * TWO independent timestamps -- anchor k's and the reference's -- and
+         * the variances ADD. That is the same sqrt(2) that produced r_tdoa's
+         * default in the first place, applied here per anchor instead of once
+         * for all of them. The reference anchor's sigma therefore enters
+         * EVERY equation, which is why a bad reference degrades the whole fix
+         * rather than one row of it.
+         *
+         * sigma_m <= 0 means the anchor did not report one (not enough CCP
+         * residuals yet, or firmware older than proto 5). Falling back per
+         * ANCHOR rather than per group is deliberate: a mixed-firmware
+         * deployment still gets real weighting from the anchors that do
+         * report, instead of losing it entirely because one anchor is stale.
+         */
+        /* isfinite as well as > 0: a NaN sigma compares false against every
+         * bound, so a bare `> 0.0f` would let it through and poison R -- and
+         * an uninitialised struct tdoa_meas is exactly how that arrives. Both
+         * conditions collapse to the same fallback, which is the safe one. */
+        float   s0     = (m[0].sigma_m > 0.0f && isfinite(m[0].sigma_m))
+                                 ? m[0].sigma_m : c->r_tdoa;
+        float   sk     = (m[k].sigma_m > 0.0f && isfinite(m[k].sigma_m))
+                                 ? m[k].sigma_m : c->r_tdoa;
+        float   R      = s0 * s0 + sk * sk;
+
+        /* Floor, not a formality: sigma_m arrives from a 16-bit DTU count, so
+         * a link reporting 1 DTU yields ~4.7 mm and an R near 4e-5 -- a gain
+         * close to 1, which would let a single noisy observation snap the
+         * state onto itself and undo the filtering this function exists for.
+         * The floor is a hundredth of r_tdoa's variance, well below any real
+         * measurement and far above float32 noise. */
+        if (R < 0.0001f * c->r_tdoa * c->r_tdoa) {
+            R = 0.0001f * c->r_tdoa * c->r_tdoa;
+        }
 
         if (ekf_scalar_update(f, H, innov, R, c->gate_k)) {
             accepted++;

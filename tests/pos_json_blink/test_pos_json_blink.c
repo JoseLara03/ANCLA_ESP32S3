@@ -68,14 +68,24 @@ static void test_worst_case_fits_and_short_buffer_refuses(void)
 {
     char buf[POS_JSON_BLINK_MAX_LEN];
     char tiny[16];
+    /* EVERY field at its widest, `f` and `e` included -- the worst case is
+     * only worth measuring if it is actually the worst case, and a fixture
+     * that leaves new fields at 0 quietly under-reports it. */
     struct pos_blink_obs in = {
         .anchor_id = 255, .blink_seq = 255, .batt_soc = 255,
-        .tag_addr = 0xFFFF, .quality = 0xFFFF, .t_dtu = 1099511627775LL,
+        .tag_addr = 0xFFFF, .quality = 0xFFFF, .flags = 0xFF,
+        .sigma_dtu = 0xFFFF, .t_dtu = 1099511627775LL,
     };
     int n = pos_json_blink(buf, sizeof(buf), &in);
 
     CHECK(n > 0 && (size_t)n < POS_JSON_BLINK_MAX_LEN);
     CHECK(pos_json_blink(tiny, sizeof(tiny), &in) == -1);
+
+    /* The number this test exists to produce. POS_JSON_BLINK_MAX_LEN is also
+     * the parser's HARD rejection ceiling, so the gap between this and it is
+     * the whole margin a future field has to fit in -- see that constant. */
+    printf("  worst-case observation payload: %d bytes of %u\n",
+           n, (unsigned int)POS_JSON_BLINK_MAX_LEN - 1u);
 }
 
 static void test_parse_rejects_garbage(void)

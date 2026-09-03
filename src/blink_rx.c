@@ -81,6 +81,42 @@ bool blink_rx_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
 	 * out of it; blink_frame_parse() has already rejected any reserved
 	 * bit, so whatever survives to here is a flag this build knows. */
 	obs.flags     = bf.flags;
+
+	/*
+	 * This anchor's own MEASURED timestamp jitter, so the gateway can
+	 * weight its equations against the other anchors' instead of assuming
+	 * every link is equally good.
+	 *
+	 * sync_model_jitter_est_dtu(), NOT sync_model_error_dtu(), and the
+	 * difference is not cosmetic: error_dtu() is built from
+	 * SYNC_JITTER_DTU, a hardcoded ASSUMPTION of ~100 ps, while the Fase 2
+	 * hardware measurement came in at 782 ps to 1.53 ns. Publishing
+	 * error_dtu() would hand the gateway a sigma roughly 15x too
+	 * optimistic and make its filter overconfident in every observation --
+	 * worse than the flat r_tdoa fallback it would be replacing.
+	 * jitter_est_dtu() is derived from this anchor's own residual
+	 * statistics, i.e. from what its link actually did.
+	 *
+	 * WHAT IT IS NOT: a per-BLINK figure. It is a long-run statistic for
+	 * this anchor's CCP link, so it discriminates between ANCHORS (a weak
+	 * or distant one counts less) and not between one blink and the next.
+	 * Per-blink SNR is what `quality` would be for, and whether that
+	 * carries any information is unmeasured -- see pos_json.h.
+	 *
+	 * 0 means "not enough observations yet" (the RMS is 0 before any
+	 * residual has been folded in), and it must NOT reach the gateway as a
+	 * sigma: zero sigma reads as infinite confidence. It is forwarded as 0
+	 * on purpose and the gateway treats 0 as "unknown, use the fallback".
+	 * Saturated rather than wrapped at 16 bits: 65535 DTU is 307 m of path
+	 * error, so anything near it is already meaningless and the exact
+	 * value does not matter, but a wrap would turn a terrible link into an
+	 * excellent-looking one. */
+	{
+		uint32_t j = sync_model_jitter_est_dtu(ccp_slave_model());
+
+		obs.sigma_dtu = (j > 0xFFFFu) ? 0xFFFFu : (uint16_t)j;
+	}
+
 	obs.t_dtu     = (int64_t)t_master;
 
 	net_uplink_submit_blink(&obs);

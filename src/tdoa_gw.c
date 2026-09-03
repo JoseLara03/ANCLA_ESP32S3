@@ -334,6 +334,14 @@ static bool ingest_one(uint32_t now_ms)
 	 * by 0.23 m at 1 m from centre on this project's 2.5 m array. The
 	 * numbers and the full statement are on tag_z_m in apos_store.h. */
 	t.meas.dz    = z - apos_store_get()->tag_z_m;
+
+	/* The publishing anchor's own measured timestamp jitter, DTU -> metres
+	 * of path. 0 means the anchor sent none (too few CCP residuals yet, or
+	 * firmware older than proto 5), and it is forwarded as 0.0f so
+	 * pos_ekf_update_tdoa() falls back to the flat r_tdoa FOR THAT ANCHOR
+	 * only -- never as a real sigma, which at 0 would read as infinite
+	 * confidence. */
+	t.meas.sigma_m = (float)obs.sigma_dtu * TDOA_M_PER_DTU;
 	t.meas.t_dtu = obs.t_dtu;
 	t.tag_addr   = obs.tag_addr;
 	t.blink_seq  = obs.blink_seq;
