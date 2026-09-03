@@ -361,6 +361,43 @@ def main():
         print("no pos_sink lines found -- is this a GATEWAY capture?")
         return 1
 
+    # ---- console loss: the trap this check exists to stop -----------------
+    #
+    # tdoa.fixes counts what the gateway PRODUCED; the pos_sink lines are what
+    # the console DELIVERED. The USB-JTAG console and the terminal program both
+    # sit outside Zephyr's log accounting, so records can vanish with no
+    # "--- N messages dropped ---" line anywhere. When that happens every
+    # cadence figure above turns into a statement about the console, and the
+    # gaps it reports are not gaps in the fix stream at all.
+    #
+    # Measured on COM15_2026_09_03.12.26.58.574: 1424 fixes produced, 291
+    # logged (20.4%), with the shortfall concentrated in the tail -- which
+    # reads exactly like a tag dropping to a slow tier and is nothing of the
+    # kind. Worth an explicit check because that misreading was one sentence
+    # away from being written down as a finding.
+    prod = None
+    for kind, kv in stats:
+        if kind == "tdoa" and "fixes" in kv:
+            try:
+                prod = int(kv["fixes"])
+            except ValueError:
+                pass
+    if prod:
+        frac = 100.0 * len(fixes) / prod
+        print()
+        print("console delivery: %d of %d fixes the gateway counted (%.1f%%)"
+              % (len(fixes), prod, frac))
+        if frac < 90.0:
+            print("  *** THE CONSOLE DROPPED RECORDS. Zephyr reports no drop")
+            print("  *** here because the loss is below its accounting (USB")
+            print("  *** console / terminal). Treat every cadence and gap")
+            print("  *** figure below as a property of the CONSOLE, not of")
+            print("  *** the fix stream. Dispersion and hull figures survive")
+            print("  *** (they are per-fix), but they are a SAMPLE, and the")
+            print("  *** sampling is not uniform in time.")
+            print("  *** For real cadence use the gateway's own counters:")
+            print("  *** ingested / anchors = blinks, and dt_invalid.")
+
     if args.csv:
         with io.open(args.csv, "w", encoding="utf-8", newline="") as fh:
             fh.write("t,tid,addr,x,y\n")
