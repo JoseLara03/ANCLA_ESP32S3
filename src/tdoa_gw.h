@@ -135,6 +135,40 @@
  * the gate around it. */
 #define TDOA_DT_MAX_MS  2000
 
+/* The largest BACKWARDS dt that can still be genuine group reordering rather
+ * than a forward gap that aliased through sdelta40()'s sign boundary.
+ *
+ * Two different things produce a negative dt and they need opposite handling:
+ *
+ *  - REORDERING. Two adjacent blinks whose observations interleave over MQTT
+ *    can be released inverted, so the second group processed describes an
+ *    EARLIER instant. tdoa_collect_take_ready() releases oldest-first
+ *    precisely to make this rare, but it orders by gateway ARRIVAL and cannot
+ *    make it impossible (see its own contract). Such a group is STALE: it must
+ *    not step the filter, and above all it must not be allowed to rewind
+ *    `last_ref_t_dtu`, or the next group's dt then covers time already
+ *    integrated. Bounded by TDOA_COLLECT_WINDOW_MS (150 ms) plus the drain
+ *    latency of one superframe -- the largest inversion actually measured on
+ *    hardware 2026-09-03 was 800 ms.
+ *
+ *  - AN ALIASED FORWARD GAP. sdelta40() resolves +/-2^39 DTU, i.e. +/-8.6 s,
+ *    and a tag in a slow reporting tier legitimately goes 9-15 s between
+ *    blinks that reach TDOA_MIN_ANCHORS anchors. Those read NEGATIVE: a real
+ *    10.2 s gap comes back as -7.007 s, which is exactly what the 2026-09-03
+ *    trace shows. The group is genuinely NEW; its reference timestamp must
+ *    advance, and the filter must reseed rather than predict through it.
+ *    There is no un-wrapped clock available here to disambiguate these by
+ *    arithmetic -- t_dtu wraps at 17.2 s, full stop -- so the discriminator is
+ *    the magnitude, and it works only because the two populations are three
+ *    orders of magnitude apart.
+ *
+ * 1000 ms sits above the measured reordering worst case with margin and an
+ * order of magnitude below the aliasing boundary. Getting this wrong in the
+ * generous direction (too large) makes a real short gap look like reordering
+ * and drops a valid fix; too small lets an aliased gap rewind the reference,
+ * which is the defect this exists to close. */
+#define TDOA_DT_REORDER_MAX_MS  1000
+
 /* TDOA_GW_MOVING_ENTER_MPS / _EXIT_MPS lived here until 2026-09-03. They
  * scheduled the EKF's process noise from the FILTER'S OWN velocity estimate,
  * because at the time nothing on this path carried an accelerometer reading.
@@ -234,7 +268,7 @@ void tdoa_gw_reject_detail(uint32_t *n_dup, uint32_t *n_shed);
 void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
 		       uint32_t *n_gate_rejected, uint32_t *n_no_update,
-		       uint32_t *n_zupt);
+		       uint32_t *n_zupt, uint32_t *n_reorder);
 
 
 #if defined(CONFIG_ANCLA_TDOA_TRACE)

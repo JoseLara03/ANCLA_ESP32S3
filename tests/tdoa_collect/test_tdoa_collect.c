@@ -644,6 +644,109 @@ static void test_reference_is_lowest_present_not_lowest_possible(void)
 	CHECK(out[0].x == 1.0f);
 }
 
+/* ---- Release ORDER, not just release ------------------------------------
+ *
+ * Regression test for the defect measured on hardware 2026-09-03: several
+ * groups releasable at once came out in TABLE order (slot allocation order,
+ * i.e. unrelated to time), and tdoa_gw's filter derives its `dt` from the
+ * difference between consecutive groups' reference timestamps -- so an
+ * inverted release fed a constant-velocity filter a negative or
+ * double-counted time step. The observed symptom was three groups drained in
+ * one gateway cycle with dt of 0.400, 0.200 and 0.600 s for 200 ms of real
+ * elapsed time, and FILTERED fixes noisier than the raw solve.
+ *
+ * The scenario has to put the OLDER group in a HIGHER slot, or table order
+ * and time order agree by accident and the test proves nothing. find_free()
+ * hands out the lowest unused slot, so: open A (slot 0) and B (slot 1),
+ * release A to free slot 0, then open C -- which lands in slot 0 while the
+ * older B still sits in slot 1. */
+static void test_release_is_oldest_first(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_obs o;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+
+	tdoa_collect_init(&c);
+	tdoa_collect_set_expected(&c, 3);
+
+	/* A: complete at t=0, takes slot 0. */
+	o = obs(0x0100, 1, 0, 0.0f, 0.0f, 1000); CHECK(tdoa_collect_add(&c, &o, 0));
+	o = obs(0x0100, 1, 1, 10.0f, 0.0f, 1000); CHECK(tdoa_collect_add(&c, &o, 0));
+	o = obs(0x0100, 1, 2, 10.0f, 10.0f, 1000); CHECK(tdoa_collect_add(&c, &o, 0));
+
+	/* B opens at t=10 and takes slot 1 -- still incomplete. */
+	o = obs(0x0100, 2, 0, 0.0f, 0.0f, 2000); CHECK(tdoa_collect_add(&c, &o, 10));
+
+	/* Drain A, freeing slot 0. */
+	CHECK(tdoa_collect_take_ready(&c, 10, out, &n_out, &tag_out));
+	CHECK(out[0].t_dtu == 1000);
+
+	/* C: complete at t=20, and it lands in the slot A vacated -- so the
+	 * NEWER group is now at a LOWER index than the older B. */
+	o = obs(0x0100, 3, 0, 0.0f, 0.0f, 3000); CHECK(tdoa_collect_add(&c, &o, 20));
+	o = obs(0x0100, 3, 1, 10.0f, 0.0f, 3000); CHECK(tdoa_collect_add(&c, &o, 20));
+	o = obs(0x0100, 3, 2, 10.0f, 10.0f, 3000); CHECK(tdoa_collect_add(&c, &o, 20));
+
+	/* Complete B, which is older (first_ms 10 against C's 20). */
+	o = obs(0x0100, 2, 1, 10.0f, 0.0f, 2000); CHECK(tdoa_collect_add(&c, &o, 20));
+	o = obs(0x0100, 2, 2, 10.0f, 10.0f, 2000); CHECK(tdoa_collect_add(&c, &o, 20));
+
+	/* Both releasable. Table order would hand back C (slot 0) first; the
+	 * contract is oldest-first, so B must come out before C. This is the
+	 * assertion that fails against the pre-2026-09-03 scan. */
+	CHECK(tdoa_collect_take_ready(&c, 20, out, &n_out, &tag_out));
+	CHECK(out[0].t_dtu == 2000);
+
+	CHECK(tdoa_collect_take_ready(&c, 20, out, &n_out, &tag_out));
+	CHECK(out[0].t_dtu == 3000);
+
+	CHECK(!tdoa_collect_take_ready(&c, 20, out, &n_out, &tag_out));
+}
+
+/* The same property over a full drain of several groups: whatever slots they
+ * occupy, consecutive take_ready() calls must hand them back in
+ * non-decreasing first_ms order -- which is what makes the caller's dt
+ * positive. Groups are opened in an order that scrambles slot index against
+ * time by draining and refilling in between. */
+static void test_full_drain_is_monotonic_in_time(void)
+{
+	struct tdoa_collect c;
+	struct tdoa_obs o;
+	struct tdoa_meas out[POS_MAX_ANCHORS];
+	size_t n_out;
+	uint16_t tag_out;
+	int64_t prev = 0;
+	unsigned int i;
+
+	tdoa_collect_init(&c);
+	tdoa_collect_set_expected(&c, 3);
+
+	/* Open five complete groups whose first_ms DESCENDS with slot index:
+	 * seq 1 in slot 0 at t=50, seq 2 in slot 1 at t=40, and so on. Table
+	 * order is then exactly the reverse of time order. */
+	for (i = 0; i < 5u; i++) {
+		uint8_t seq = (uint8_t)(i + 1u);
+		uint32_t at = 50u - (i * 10u);
+		int64_t ts  = (int64_t)at * 1000;
+
+		o = obs(0x0100, seq, 0, 0.0f, 0.0f, ts);
+		CHECK(tdoa_collect_add(&c, &o, at));
+		o = obs(0x0100, seq, 1, 10.0f, 0.0f, ts);
+		CHECK(tdoa_collect_add(&c, &o, at));
+		o = obs(0x0100, seq, 2, 10.0f, 10.0f, ts);
+		CHECK(tdoa_collect_add(&c, &o, at));
+	}
+
+	for (i = 0; i < 5u; i++) {
+		CHECK(tdoa_collect_take_ready(&c, 60, out, &n_out, &tag_out));
+		CHECK(out[0].t_dtu > prev);
+		prev = out[0].t_dtu;
+	}
+	CHECK(!tdoa_collect_take_ready(&c, 60, out, &n_out, &tag_out));
+}
+
 int main(void)
 {
 	test_groups_by_tag_and_seq();
@@ -663,6 +766,8 @@ int main(void)
 	test_set_expected_does_not_affect_minimum_discard();
 	test_reference_anchor_is_deterministic();
 	test_reference_is_lowest_present_not_lowest_possible();
+	test_release_is_oldest_first();
+	test_full_drain_is_monotonic_in_time();
 	if (failures) { printf("\n%d CHECK(s) FAILED\n", failures); return EXIT_FAILURE; }
 	printf("tdoa_collect: ALL TESTS PASSED\n");
 	return EXIT_SUCCESS;

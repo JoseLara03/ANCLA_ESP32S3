@@ -181,6 +181,12 @@ static uint32_t n_ekf_no_update;
  * proto 4, or a tag that never reports still) from "it arrives and says
  * moving" -- the two look identical from every other number here. */
 static uint32_t n_ekf_zupt;
+/* Groups discarded because they were released out of order -- see
+ * TDOA_DT_REORDER_MAX_MS. Not a subset of any other counter: such a group
+ * never reaches the filter at all, so it appears in neither n_ekf_filtered
+ * nor n_ekf_dt_invalid, and `tdoa.fixes` does not count it either. */
+static uint32_t n_ekf_reorder;
+static bool warned_reorder;
 
 /* Warn ONCE PER BOOT for each of these, and let the counters carry the rest.
  * All three conditions are per-observation or per-fix and all three persist for
@@ -234,6 +240,8 @@ void tdoa_gw_init(void)
 	n_ekf_gate_rejected = 0u;
 	n_ekf_no_update     = 0u;
 	n_ekf_zupt          = 0u;
+	n_ekf_reorder       = 0u;
+	warned_reorder      = false;
 	warned_blind_residual = false;
 	warned_no_anchor = false;
 	warned_shed = false;
@@ -606,6 +614,37 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 
 		dt_s = (float)raw_dt * TDOA_GW_S_PER_DTU;
 		dt_ok = dt_s > 0.0f && dt_s <= ((float)TDOA_DT_MAX_MS / 1000.0f);
+
+		/* A small NEGATIVE dt is a group released out of order -- it
+		 * describes an instant this tag's filter has already passed.
+		 * Discard it whole: do not step the filter, do not publish,
+		 * and above all do NOT advance last_ref_t_dtu. Letting it
+		 * advance (which is what this function did until 2026-09-03)
+		 * rewinds the reference, so the NEXT group's dt spans time
+		 * already integrated -- measured as three groups in one
+		 * gateway cycle predicting 0.400 + 0.200 + 0.600 s for 200 ms
+		 * of real elapsed time, with the filtered fixes coming out
+		 * noisier than the raw solve they smooth.
+		 *
+		 * A LARGE negative dt is the opposite case and must fall
+		 * through: it is a forward gap that aliased through
+		 * sdelta40()'s sign boundary, the group is genuinely new, and
+		 * the reference has to advance so the reseed below measures
+		 * from the right instant. TDOA_DT_REORDER_MAX_MS carries the
+		 * full derivation of where the two populations separate. */
+		if (raw_dt <= 0 &&
+		    -dt_s <= ((float)TDOA_DT_REORDER_MAX_MS / 1000.0f)) {
+			n_ekf_reorder++;
+			if (!warned_reorder) {
+				warned_reorder = true;
+				LOG_WRN("blink from 0x%04X released out of "
+					"order (dt %d ms): group discarded, "
+					"filter reference held. Warned ONCE; "
+					"`blink stats` carries the count",
+					tag_addr, (int)(dt_s * 1000.0f));
+			}
+			return true;
+		}
 	}
 	mm->last_ref_t_dtu = fix_t_dtu;
 	mm->has_ref_t      = true;
@@ -853,7 +892,7 @@ void tdoa_gw_reject_detail(uint32_t *dup, uint32_t *shed)
 void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
 		       uint32_t *n_gate_rejected, uint32_t *n_no_update,
-		       uint32_t *n_zupt)
+		       uint32_t *n_zupt, uint32_t *n_reorder)
 {
 	if (n_seeded != NULL)       { *n_seeded = n_ekf_seeded; }
 	if (n_reseed != NULL)       { *n_reseed = n_ekf_reseed; }
@@ -862,4 +901,5 @@ void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
 	if (n_gate_rejected != NULL) { *n_gate_rejected = n_ekf_gate_rejected; }
 	if (n_no_update != NULL)    { *n_no_update = n_ekf_no_update; }
 	if (n_zupt != NULL)         { *n_zupt = n_ekf_zupt; }
+	if (n_reorder != NULL)      { *n_reorder = n_ekf_reorder; }
 }

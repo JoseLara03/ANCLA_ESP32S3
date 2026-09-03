@@ -209,6 +209,26 @@ bool tdoa_collect_add(struct tdoa_collect *c, const struct tdoa_obs *o,
  * with fewer than TDOA_MIN_ANCHORS observations is discarded silently
  * (returns nothing for it) and its slot freed.
  *
+ * When SEVERAL groups are releasable at once -- routine, since the gateway
+ * drains up to TDOA_GW_SOLVE_MAX groups per superframe -- the OLDEST by
+ * `first_ms` is released first. That ordering is part of this function's
+ * contract, not an implementation detail: the caller derives its filter's
+ * `dt` from consecutive groups' reference timestamps, so releasing them out
+ * of order feeds a constant-velocity filter negative and double-counted time
+ * steps. An earlier revision released the first releasable group the table
+ * scan reached, which is blink_seq/slot-allocation order and unrelated to
+ * time; measured on hardware 2026-09-03 it drained three groups in one
+ * gateway cycle with dt of 0.400, 0.200 and 0.600 s (1.2 s of prediction for
+ * 200 ms of elapsed time), and the filtered fixes came out NOISIER than the
+ * unfiltered solve (dispersion RMS 0.512 m against 0.345 m).
+ *
+ * `first_ms` is gateway ARRIVAL, not tag emission, and is the only key
+ * available here -- the reference timestamp lives in `meas[].t_dtu`, is
+ * comparable only within one tag, and this function is tag-agnostic by
+ * design. Interleaved MQTT arrivals can therefore still invert two adjacent
+ * blinks; the caller keeps its own guard for that residue. Strictly better
+ * than table order, not a total order.
+ *
  * Every call scans the full table once, so an expired-and-discarded group is
  * freed as soon as some call reaches it, even if that same call also returns
  * a different, ready group. Returns false when nothing was ready to release

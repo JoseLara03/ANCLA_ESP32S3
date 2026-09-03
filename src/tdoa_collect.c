@@ -137,29 +137,61 @@ bool tdoa_collect_take_ready(struct tdoa_collect *c, uint32_t now_ms,
 			     struct tdoa_meas *out, size_t *n_out,
 			     uint16_t *tag_addr_out)
 {
-	bool have_ready = false;
 	struct tdoa_group *ready = NULL;
+	int32_t ready_age = 0;
 
 	for (unsigned int i = 0; i < TDOA_COLLECT_SLOTS; i++) {
 		struct tdoa_group *g = &c->slot[i];
+		int32_t age;
 
 		if (!g->used) continue;
 
-		if (g->n >= c->expected) {
-			if (!have_ready) { ready = g; have_ready = true; }
-			continue;
-		}
+		age = age_ms(now_ms, g->first_ms);
 
-		if (age_ms(now_ms, g->first_ms) >= (int32_t)TDOA_COLLECT_WINDOW_MS) {
-			if (g->n >= TDOA_MIN_ANCHORS) {
-				if (!have_ready) { ready = g; have_ready = true; }
-			} else {
-				g->used = false;   /* below minimum: discard */
+		if (g->n < c->expected) {
+			if (age < (int32_t)TDOA_COLLECT_WINDOW_MS) {
+				continue;          /* still filling */
 			}
+			if (g->n < TDOA_MIN_ANCHORS) {
+				g->used = false;   /* below minimum: discard */
+				continue;
+			}
+		}
+		/* Releasable from here down. */
+
+		/* OLDEST releasable group wins, not the first one the table
+		 * scan happens to reach. This is a correctness requirement of
+		 * the CALLER, not a fairness nicety: tdoa_gw's solve_one()
+		 * derives the filter's `dt` from the difference between
+		 * consecutive groups' reference timestamps, so releasing them
+		 * out of order feeds a constant-velocity filter negative and
+		 * double-counted time steps. Measured on hardware 2026-09-03
+		 * with the table-order scan this replaces: three groups
+		 * drained in ONE gateway cycle with dt of 0.400, 0.200 and
+		 * 0.600 s -- 1.2 s of prediction for 200 ms of real elapsed
+		 * time -- and the FILTERED fixes came out noisier than the
+		 * raw tdoa_solve() output they were supposed to smooth
+		 * (dispersion RMS 0.512 m against 0.345 m). Table order is
+		 * blink_seq/slot-allocation order, which has no relationship
+		 * to time at all.
+		 *
+		 * `first_ms` is the arrival of the group's first observation
+		 * at the GATEWAY, not the tag's emission instant, so this
+		 * orders by the best proxy available here rather than by the
+		 * 40-bit reference timestamp itself -- that lives in
+		 * `meas[].t_dtu`, is only comparable within one tag, and this
+		 * function is tag-agnostic by design. Two blinks whose MQTT
+		 * observations interleave can still arrive inverted; the
+		 * caller keeps a guard for that residue (see tdoa_gw.c's
+		 * TDOA_DT_REORDER_MAX_MS). Strictly better than table order,
+		 * not a total order. */
+		if (ready == NULL || age > ready_age) {
+			ready     = g;
+			ready_age = age;
 		}
 	}
 
-	if (!have_ready) return false;
+	if (ready == NULL) return false;
 
 	memcpy(out, ready->meas, ready->n * sizeof(*out));
 	*n_out = ready->n;
