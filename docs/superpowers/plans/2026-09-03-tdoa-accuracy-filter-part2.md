@@ -322,3 +322,125 @@ calibrar (ítem 8, sin campaña).
 
 - [ ] Escribir el resultado en `CLAUDE.md` con la franqueza de la parte 1: qué
       se midió, qué no, con cuántas muestras y con qué fuente de alimentación.
+
+---
+
+## Task 7: el filtro se FUGA, y la recuperación por divergencia está muerta *(ANCLA)*
+
+**Añadida 2026-09-03, después de correr la parte 2 en hardware.** No es tuning
+y no es una mejora: es un defecto que la parte 2 introdujo y que su propia
+verificación de host no podía ver.
+
+### La evidencia
+
+Captura `COM15_2026_09_03.11.58.45.067.txt`, gateway con survey de **3** anclas
+en `(0.000, 0.000)`, `(1.752, 0.920)`, `(2.385, 0.000)` — triángulo plano, base
+2.385 m y ápice a 0.920 m. Un tag, 421 fixes, 155.8 s, moviéndose y luego
+quieto.
+
+```
+Solo 32.5% de los 421 fixes cayeron DENTRO del triangulo de anclas.
+Una sola fuga: 30.2 s, 137 fixes, de (1.58, 1.95) a (-2.45, 17.64).
+Maximo 17.24 m FUERA de un arreglo de 2.4 m.
+22.6% de todos los fixes a mas de 5 m fuera del casco.
+Periodo quieto (ultimos 60 s): RMS 0.394 m, media en (0.820, -0.305).
+```
+
+`blink stats` al final de esa corrida:
+
+```
+seeded:11  filtered:304  reseed:0  dt_invalid:12  gate_rejected:70
+no_update:2  zupt:99   (fixes:315 = 11 + 304, cuadra)
+```
+
+La escapada es **monótona a ~1.5 m/s en una dirección durante 30 segundos** —
+no es ruido, y `reseed` se quedó en **0** todo el tiempo.
+
+Dos cosas que la captura descarta y conviene no volver a proponer:
+
+- **El bit `MOVING` funciona.** `zupt:99` de `filtered:304` = 32.6%, o sea que
+  llega y VARÍA. La hipótesis de polaridad invertida en `motion.c` queda
+  descartada.
+- **`residual` no podía avisar.** Sale `0.000` en las 421 líneas, que a 3
+  anclas es cero por construcción (contrato de `tdoa_solve.h`). La única señal
+  de calidad es estructuralmente ciega justo en esta configuración.
+
+### La causa, exacta
+
+`pos_ekf_needs_reseed()` exige `gate_streak >= reset_after` (3), y
+`gate_streak` solo incrementa cuando **`accepted == 0`**: todas las ecuaciones
+rechazadas. Con 3 anclas, `pos_ekf_update_tdoa()` produce **2** ecuaciones, así
+que basta que una se acepte para resetear el streak. `gate_rejected:70` sobre
+~608 ecuaciones es 11.5% (contra ~0.3% esperable a 3 sigma), pero casi nunca
+las dos a la vez.
+
+Y el mecanismo de la fuga: **una sola ecuación de diferencia de rangos
+restringe una sola dirección.** El filtro acepta un update por ciclo — streak
+reseteado, reseed nunca — mientras corre por la dirección que esa ecuación no
+restringe. En este triángulo la dirección débil es `y`, y `y` es lo que llegó a
+17.64.
+
+**Origen: la parte 1.** El criterio "todas las mediciones rechazadas" fue
+diseñado para `pos_ekf_update_ranges()`, donde 4 anclas dan 4 updates escalares
+independientes y cada uno restringe un rango completo. Se reusó verbatim para
+diferencias de rango con `n-1 = 2` ecuaciones, y eso vació la recuperación sin
+que nada fallara. Los host tests no lo vieron porque ninguno corre 30 segundos
+de datos ruidosos con geometría delgada.
+
+### Lo que se hace, y en este orden
+
+Tres defensas INDEPENDIENTES, porque la fuga demostró que una sola condición
+puede fallar en silencio. Cada una con su contador — sin contador no hay forma
+de saber cuál actuó.
+
+- [ ] **Un test host que REPRODUZCA la fuga, antes de arreglarla**, con esta
+      geometría (triángulo plano de 3 anclas) y huecos de `dt` como los
+      medidos. Si el test no falla contra HEAD, no está reproduciendo el
+      defecto. Ninguno de los tests actuales lo hace: corren geometrías
+      cuadradas y `dt` constante. Va primero por eso.
+- [ ] **Cota física sobre la posición FILTRADA.** Un tag no puede estar a 17 m
+      de un arreglo de 2.4 m. Se acota contra el survey: `R_anclas` = máxima
+      distancia ancla-centroide, y el fix filtrado tiene que caer dentro de
+      `R_anclas + TDOA_GW_MAX_HULL_EXCESS_M`. Fuera de eso, **re-sembrar desde
+      un solve fresco** (no clampear: clampear esconde el problema y publica
+      una posición inventada) y contarlo. En este arreglo `R_anclas` es 1.413 m,
+      así que un margen de 3 m da una cota de 4.4 m del centroide; la fuga
+      llegó a 17.6 m y se corta en el primer paso.
+      **Límite del producto que hay que declarar:** eso también recorta el
+      seguimiento legítimo de un tag lejos del arreglo. Con 3 anclas y este
+      GDOP esas posiciones no son confiables de todos modos, pero el margen es
+      una constante nombrada y no un número escondido.
+- [ ] **`pos_ekf_pos_sigma()` como detector de divergencia.** Ya está escrita y
+      **nadie la llama** (verificado: cero consumidores fuera de `pos_ekf.c`).
+      Durante una fuga `P` crece en cada `predict()` y los updates rechazados no
+      la encogen, así que es el indicador correcto y no depende de la cuenta de
+      ecuaciones — que es exactamente el defecto de arriba.
+      **El umbral se MIDE, no se elige:** una semilla fresca ya arranca en
+      `sqrt(1.5^2 + 1.5^2) = 2.12 m` (`POS_EKF_SEED_POS_VAR`), así que un
+      umbral por debajo de eso re-sembraría en cada siembra. Barrer en host
+      contra las tres trazas sintéticas que ya existen (quieto, quieto con bit
+      pegado, para-tras-caminar) más la geometría delgada de esta captura.
+- [ ] **Bajar `TDOA_DT_MAX_MS`.** Está en 2000 y la captura muestra `dt` p90 =
+      **1.000 s**, máximo **8.000 s**, con 20 huecos de más de 1 s. Un hueco de
+      1 s se acepta hoy y se predice: a 1.5 m/s son 1.5 m en un solo paso.
+      Predecir 1-2 s de velocidad constante en un arreglo de 2.4 m no es
+      defendible. Candidato ~600 ms (tres blinks), con el hueco cayendo al
+      camino de solve fresco — que es lo correcto y es baratísimo aquí
+      (`solve_fail:2` de 315, el solve funciona).
+- [ ] Contadores nuevos en `blink stats`, uno por defensa. Y revisar que la
+      aritmética `fixes == seeded + filtered + reseed` siga cerrando con los
+      caminos nuevos: es el control que cazó el bug de la ronda 2, la Tarea 2
+      ya le agregó una vía, y esta le agrega otras dos.
+
+**Aceptación:** el test de fuga falla contra HEAD y pasa después; y en
+hardware, sobre una corrida equivalente, el porcentaje de fixes dentro del
+triángulo sube muy por encima del 32.5% medido, con `reseed` moviéndose en vez
+de quedarse en 0.
+
+**Lo que esto NO arregla, y hay que decirlo:** el triángulo de 3 anclas con
+ápice a 0.920 m sobre una base de 2.385 m tiene `y` mal observable por
+geometría, y `residual` es cero por construcción a 3 anclas. Ninguna defensa de
+software cambia eso — es el plan de anclas
+(`docs/superpowers/plans/2026-09-02-blink-anchor-scale.md`) y la cinta métrica.
+Y `apos tagz` sigue en 0.0, con su sesgo del ~23% medido en la Tarea 3, que
+aquí es de segundo orden frente a una fuga de 17 m.
