@@ -421,8 +421,11 @@ de saber cuál actuó.
       contra las tres trazas sintéticas que ya existen (quieto, quieto con bit
       pegado, para-tras-caminar) más la geometría delgada de esta captura.
 - [ ] **Bajar `TDOA_DT_MAX_MS`.** Está en 2000 y la captura muestra `dt` p90 =
-      **1.000 s**, máximo **8.000 s**, con 20 huecos de más de 1 s. Un hueco de
-      1 s se acepta hoy y se predice: a 1.5 m/s son 1.5 m en un solo paso.
+      **0.800 s**, máximo **8.000 s**, con 20 huecos de más de 1 s (cifras de
+      `tools/pos_trace.py`, que es el instrumento reproducible; un primer
+      análisis a mano dijo p90 = 1.000 s por un off-by-one en el percentil —
+      el argumento no cambia). Un hueco de 0.8-1 s se acepta hoy y se
+      predice: a 1.5 m/s es más de 1 m en un solo paso.
       Predecir 1-2 s de velocidad constante en un arreglo de 2.4 m no es
       defendible. Candidato ~600 ms (tres blinks), con el hueco cayendo al
       camino de solve fresco — que es lo correcto y es baratísimo aquí
