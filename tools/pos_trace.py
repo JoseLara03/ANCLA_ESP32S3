@@ -65,16 +65,24 @@ def clean(path):
     return out
 
 
+BOOT_RE = re.compile(r"Booting Zephyr OS")
+TS_RE = re.compile(r"\[(\d+):(\d+):([0-9.]+)")
+
+
 def parse(lines):
     fixes = []
     anchors = {}
     stats = []
-    for ln in lines:
+    boot = 0
+    for idx, ln in enumerate(lines):
+        if BOOT_RE.search(ln):
+            boot += 1
+            continue
         m = FIX_RE.search(ln)
         if m:
             t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
             fixes.append(
-                dict(t=t, addr=m.group(4), tid=int(m.group(5)),
+                dict(t=t, boot=boot, idx=idx, addr=m.group(4), tid=int(m.group(5)),
                      x=float(m.group(6)), y=float(m.group(7)))
             )
             continue
@@ -92,7 +100,10 @@ def parse(lines):
                     continue
                 k, v = part.split(":", 1)
                 kv[k.strip().strip('"')] = v.strip().strip('"')
-            stats.append((m.group(1), kv))
+            # `blink stats` prints from the SHELL, so its lines carry no
+            # [hh:mm:ss] log prefix. The file line index is what orders it
+            # against the fixes; a timestamp is simply not available.
+            stats.append((m.group(1), kv, boot, idx))
     return fixes, anchors, stats
 
 
@@ -333,7 +344,7 @@ def main():
         print()
         print("last stats line of each kind:")
         seen = {}
-        for kind, kv in stats:
+        for kind, kv, _b, _t in stats:
             seen[kind] = kv
         for kind in ("blink", "tdoa", "tdoa_ekf"):
             if kind in seen:
@@ -375,18 +386,50 @@ def main():
     # reads exactly like a tag dropping to a slow tier and is nothing of the
     # kind. Worth an explicit check because that misreading was one sentence
     # away from being written down as a finding.
+    #
+    # TWO ways this comparison lies if made naively, both found on real
+    # captures 2026-09-03:
+    #
+    #   - A REBOOT resets the counters while the log keeps accumulating
+    #     lines, so a multi-boot capture reports more lines than fixes.
+    #   - `blink stats` run MID-RUN snapshots a counter that later fixes are
+    #     not in, with the same effect.
+    #
+    # So the comparison is scoped to the counter's own boot and to fixes at or
+    # before its timestamp. A capture whose stats line is not the last thing
+    # in it simply gets no delivery figure, which is better than a wrong one.
     prod = None
-    for kind, kv in stats:
+    prod_boot = None
+    prod_idx = None
+    for kind, kv, b, i in stats:
         if kind == "tdoa" and "fixes" in kv:
             try:
-                prod = int(kv["fixes"])
+                prod, prod_boot, prod_idx = int(kv["fixes"]), b, i
             except ValueError:
                 pass
+    frac = 100.0
     if prod:
-        frac = 100.0 * len(fixes) / prod
+        boots = sorted({r["boot"] for r in fixes})
+        if len(boots) > 1:
+            print()
+            print("capture spans %d boot(s) with fixes in them (%s). Counters"
+                  % (len(boots), ",".join(str(b) for b in boots)))
+            print("reset on every boot, so the delivery check below is scoped")
+            print("to boot %d, the one the last `blink stats` came from."
+                  % prod_boot)
+        scoped = [r for r in fixes
+                  if r["boot"] == prod_boot and r["idx"] < prod_idx]
+        after = len([r for r in fixes
+                     if r["boot"] == prod_boot and r["idx"] > prod_idx])
+        frac = 100.0 * len(scoped) / prod
         print()
         print("console delivery: %d of %d fixes the gateway counted (%.1f%%)"
-              % (len(fixes), prod, frac))
+              % (len(scoped), prod, frac))
+        if after:
+            print("  (%d further fix line(s) came AFTER that `blink stats`, so"
+                  % after)
+            print("   the counter does not cover them and they are excluded.")
+            print("   Run `blink stats` LAST for this figure to cover the run.)")
         if frac < 90.0:
             print("  *** THE CONSOLE DROPPED RECORDS. Zephyr reports no drop")
             print("  *** here because the loss is below its accounting (USB")
