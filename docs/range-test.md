@@ -160,32 +160,70 @@ Nothing measured before this is worth recording.
 
 ## 5. Procedure
 
-### 5a. The one-way link (what sets everything else)
+### 5a. The SS-TWR link (what the survey needs) -- use `cal peer`
 
-The cleanest instrument is the **survey's own** `apos_pair` report, because
-it gives success rate and distance together:
+The calibration image's `cal peer <id> <mm>` is the better instrument here,
+and not only because it is convenient:
+
+| | `apos run` | `cal peer` |
+|---|---|---|
+| attempts per batch | 64 while the link is good, **~19 near the edge** (the 700 ms deadline, see §2) | **128, fixed, no deadline** |
+| needs a gateway | yes, and it must reach BOTH anchors | no -- **two boards** |
+| beacon_guard / superframe | yes | not in that image |
+| spread reported | `sd_mm` | **no sd** -- only `kept` vs `valid` |
+
+The fixed denominator is the point. `apos`'s `n_ok` saturates exactly where
+resolution is wanted, because a failing exchange costs ~37 ms and the batch is
+cut off by time rather than by count. `valid / 128` does not.
 
 ```
-apos gauge origin=<id> xaxis=<id> plane=<id>
-apos run
+west build -b ancla_esp32s3/esp32s3/procpu --pristine -d build_cal -- "-DEXTRA_CONF_FILE=cal.conf"
+west flash -d build_cal
 ```
 
-then read, per pair:
+on BOTH boards -- from the same tree, so their TX power agrees (§4). Then, on
+one of them, at each distance:
 
-```json
-{"apos_pair":{"i":3,"of":6,"from":"0x0004","to":"0x0003","mean_mm":2750,"sd_mm":39,"n_ok":35}}
+```
+cal peer <peer anchor id> <tape distance in mm>
 ```
 
-`n_ok` out of 64 is the exchange success count; `mean_mm` and `sd_mm` are the
-distance and its spread. Walk one anchor out in steps (10, 20, 30, 40, 50,
-75, 100 m), running `apos run` at each, and record `n_ok`, `mean_mm`, `sd_mm`
-plus the tape-measured truth.
+`cal peer` **never persists anything** -- it reports and returns -- so it is
+safe to run repeatedly at every distance. (`cal ref` does persist; do not
+confuse them during a range test.)
 
-The number to plot is `n_ok / attempts`, and remember from §2 that
-`attempts` is 64 only while the link is good — near the edge it is ~19.
+Read `valid` out of `attempted` (128). That is the exchange success rate.
+`error_mm` is the ranging accuracy at that distance, for free.
 
-Acceptance for "the survey works at distance d": `n_ok >= APOS_MIN_N_OK`
-(10) on every pair, and `sd_mm` still in the tens rather than the hundreds.
+**Below 32 of 128 (25 %) `cal peer` refuses to report a distance** -- that
+gate exists for its actual job, calibration, where a mean over a handful of
+lucky frames would look like a result. It still prints `attempted` and
+`valid`, which in a range test is the measurement, so the region below the
+gate is not lost. (It did not print them before 2026-09-03; the message named
+three causes that are all wrong when the real one is distance.)
+
+Sweep 10, 20, 30, 40, 50, 75, 100 m and record `valid`, `kept`, `error_mm`
+and the tape truth at each.
+
+Acceptance for "the survey works at distance d": from §2, `valid/128 >= 0.363`
+-- i.e. **at least 47 of 128**. Below that the real survey's batch runs out of
+its 700 ms deadline before collecting `APOS_MIN_N_OK` successes, whatever the
+link is doing.
+
+**Two things this instrument does NOT tell you**, both worth writing down
+before the numbers are trusted:
+
+- **No spread.** `cal_result` carries no `sd_mm`, so degradation short of
+  outright failure is only visible as `kept` falling away from `valid`
+  (samples lost to outlier rejection). `apos run` reports `sd_mm` properly;
+  cross-check the final distance there.
+- **The cal image draws far less current than production.** `cal.conf` sets
+  `CONFIG_WIFI=n` / `CONFIG_NETWORKING=n`, and this project has twice
+  measured supply sag taking out a transmission (the wedged-DW3220 entry and
+  the battery-gateway CCP entry in CLAUDE.md). So a range measured on the cal
+  image is an **upper bound** for production, and the gap between them is
+  itself worth measuring: repeat the best distance with `apos run` on the
+  production image and compare.
 
 ### 5b. The TDoA receive path (tag -> anchor, the unamplified direction)
 

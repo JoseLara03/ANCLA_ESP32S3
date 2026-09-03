@@ -11,6 +11,7 @@
  */
 
 #include "cal_run.h"
+#include "cal_math.h"   /* CAL_MAX_SAMPLES, for the -ENODATA gate */
 #include "uwb_config.h"
 #include "uwb_store.h"
 
@@ -44,13 +45,29 @@ static void print_result(const struct shell *sh, const struct cal_result *r)
 		    r->mean_mm, r->ref_mm, r->error_mm);
 }
 
-static void print_failure(const struct shell *sh, int status)
+static void print_failure(const struct shell *sh, const struct cal_result *r,
+			  int status)
 {
 	switch (status) {
 	case -ENODATA:
+		/* The counts are the one thing that IS valid here, and on a
+		 * RANGE test they are the measurement -- `valid` out of a
+		 * fixed 128 attempts is the exchange success rate, and the
+		 * region below this gate is exactly the region a range test
+		 * cares about (see docs/range-test.md). Printing only the
+		 * error message threw them away, and pointed at three causes
+		 * that are all wrong when the real one is distance. */
+		shell_print(sh,
+			    "{\"attempted\":%u,\"valid\":%u,\"ref_mm\":%d}",
+			    r->attempted, r->valid, r->ref_mm);
 		shell_error(sh,
-			    "error: too few valid responses — check the peer is "
-			    "powered, addressed correctly, and on the same PHY");
+			    "error: only %u of %u exchanges succeeded (under "
+			    "the %u needed for a calibration) -- no distance "
+			    "reported. If the peer is powered, addressed "
+			    "correctly and on the same PHY, this is the link: "
+			    "the count above is still a usable range "
+			    "measurement",
+			    r->valid, r->attempted, CAL_MAX_SAMPLES / 4U);
 		break;
 	case -EBUSY:
 		shell_error(sh, "error: a calibration batch is already running");
@@ -90,7 +107,7 @@ static int cmd_peer(const struct shell *sh, size_t argc, char **argv)
 
 	ret = cal_run_execute(&req, &res);
 	if (ret) {
-		print_failure(sh, ret);
+		print_failure(sh, &res, ret);
 		return ret;
 	}
 
@@ -128,7 +145,7 @@ static int cmd_ref(const struct shell *sh, size_t argc, char **argv)
 		return ret;
 	}
 	if (ret) {
-		print_failure(sh, ret);
+		print_failure(sh, &res, ret);
 		return ret;
 	}
 
