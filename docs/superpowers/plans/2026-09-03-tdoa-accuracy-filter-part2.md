@@ -447,3 +447,122 @@ software cambia eso — es el plan de anclas
 (`docs/superpowers/plans/2026-09-02-blink-anchor-scale.md`) y la cinta métrica.
 Y `apos tagz` sigue en 0.0, con su sesgo del ~23% medido en la Tarea 3, que
 aquí es de segundo orden frente a una fuga de 17 m.
+
+---
+
+## Task 1 — CERRADA 2026-09-03, con números y con su atribución
+
+Captura `COM15_2026_09_03.12.26.58.574.txt`, tag **inmóvil dentro del
+triángulo, entre el ancla origen y la del eje x**, 687 s, imagen con la
+parte 2 completa. Analizada con `tools/pos_trace.py`.
+
+### El número de la Tarea 1
+
+```
+dispersion sobre la media de la traza:  RMS 1.023 m
+                                        std x 0.372 m   std y 0.953 m
+paso consecutivo p50: 0.063 m
+media reportada: (0.665, -1.504)
+```
+
+**Eso es PRECISIÓN.** Y hay además un **sesgo de exactitud de ~1.5 m en `y`**:
+el tag estaba sobre la línea base (`y ~ 0`) y se reportó 1.5 m por debajo. Cero
+de 291 fixes cayeron dentro del triángulo.
+
+### Lo que el filtro sí arregló, medido contra el log del tag en movimiento
+
+| | tag moviéndose | tag quieto |
+|---|---|---|
+| `zupt / filtered` | 99/304 = 32.6% | **1066/1253 = 85.1%** |
+| `gate_rejected` / ecuaciones | 70/608 = 11.5% | **39/2506 = 1.6%** |
+| dispersión RMS | 4.772 m | **1.023 m** |
+
+ZUPT dispara el 85% de los ciclos con el tag quieto y el gate de innovación
+baja a 1.6%. **El bit `MOVING` funciona** — la hipótesis de polaridad invertida
+en `motion.c` queda enterrada y no se vuelve a proponer.
+
+### La atribución del sesgo, medida y no supuesta
+
+El sitio donde estuvo el tag es el PEOR de este arreglo. Sensibilidad de las dos
+ecuaciones en `(0.665, 0.0)`:
+
+```
+ecuacion vs apice (1.752, 0.920):  d/dy = -0.647
+ecuacion vs xaxis (2.385, 0.000):  d/dy = -0.001   <- CERO informacion de y
+```
+
+Con el tag sobre la base, el par origen-xaxis no aporta **nada** en `y`: por
+simetría, moverlo perpendicular a la base cambia los dos rangos casi igual.
+Todo `y` cuelga de una sola ecuación con ganancia 0.647.
+
+Amplificación (metros de error de posición por metro de sesgo en la diferencia
+de rangos, mayor singular de la pseudo-inversa del Jacobiano):
+
+```
+punto del tag (0.665, 0.0), geometria de hoy : 2.09
+mismo punto, apice a 1.840 (el doble)        : 1.49
+mismo punto, apice a 2.760 (el triple)       : 1.33
+CENTRO del triangulo (1.379, 0.307), hoy     : 1.16
+```
+
+Y la conversión directa: **1 DTU (4.69 mm) de sesgo en la ecuación del ápice
+mueve `y` 8.0 mm.** Los −1.504 m observados necesitan **~187 DTU = 2.9 ns**
+(~0.88 m) de sesgo en esa diferencia de rangos.
+
+**Dos causas candidatas, las dos ya abiertas en `CLAUDE.md`, y esto NO decide
+entre ellas:**
+
+1. **Retardo de antena RX sin calibrar** (ítem 8). En TDoA el observable lleva
+   `(dR_i - dR_0)` a 4.69 mm/DTU **sin nada que lo cancele**, y ninguna
+   medición TWR puede restringirlo. La campaña con láser de 2026-08-28 midió
+   sesgos por board con un spread de 485 mm en la SUMA (~207 unidades), así que
+   187 DTU entre dos boards es exactamente del orden ya observado en estos
+   mismos boards.
+2. **La geometría del survey nunca se validó con cinta.** `CLAUDE.md` tiene
+   abierto que el `apos run` de 2026-08-26 discrepó hasta **1037 mm** contra
+   los `anchor pos` que los boards cargaban. Si la `y` surveyada del ápice
+   (0.920) está mal, sesga `y` directamente.
+
+La causa (2) es **gratis de descartar** y va primero: medir las tres aristas
+con cinta.
+
+### Lo que este análisis DESCARTA como causa principal
+
+**El modelo de altura (`apos tagz`) no explica esto.** Medido con esta
+geometría exacta: incluso con una separación real de 1.6 m, resolver con
+`dz = 0` da 0.222 m de error y mueve `y` solo a −0.042. Y el signo es el
+contrario del observado — el sesgo por altura tira hacia el centroide, no hacia
+afuera. Sigue valiendo la pena medir el sitio, pero aquí es de segundo orden
+por un orden de magnitud.
+
+### Dos acciones físicas, ambas más grandes que cualquier arreglo de software
+
+- **Para la próxima captura de línea base: pon el tag cerca del CENTRO del
+  triángulo** (~1.38, 0.31), no sobre la base. La amplificación pasa de 2.09 a
+  **1.16** sin tocar hardware. La corrida de hoy midió el peor punto del
+  arreglo.
+- **Para el despliegue: sube el ápice.** De 0.920 a ~1.840 m lleva la
+  amplificación peor caso del área de **4.21 a 1.73**. Triplicarla apenas
+  mejora más (1.33 vs 1.49), así que duplicar captura casi toda la ganancia
+  disponible.
+
+### Lo que queda abierto de la Tarea 1
+
+- [ ] Medir las tres aristas con cinta y compararlas contra el survey. Decide
+      entre las causas (1) y (2) de arriba, y es gratis.
+- [ ] Una captura de línea base con el tag en el CENTRO, para tener la cifra de
+      precisión en un punto usable y no en el peor.
+- [x] Cifra de dispersión con `n` suficiente: 291 fixes sobre 687 s.
+- [x] Traza cruda guardada y reducible con `tools/pos_trace.py`.
+- [x] Qué anclas contribuyeron: las tres, `no_anchor:0` y `ingested/3 = 1590`
+      blinks.
+
+**Un aviso sobre la captura, que costó casi un hallazgo falso:** el gateway
+contó **1424** fixes y la consola entregó **291** (20.4%), con la pérdida
+concentrada en la cola. Eso se lee igual que un tag bajando a un tier lento y
+no lo es — `ingested/anclas` muestra que el tag blinkeó a ~2.3 Hz los 687 s
+completos. Zephyr no reporta drops porque la pérdida está por debajo de su
+contabilidad (consola USB / terminal). `tools/pos_trace.py` ahora lo detecta y
+lo grita antes de que las cifras de cadencia se lean como propiedades del
+stream de fixes. **`dt_invalid: 180` de 1424 (12.6%) sí es real** — sale del
+reloj DTU, no del log.

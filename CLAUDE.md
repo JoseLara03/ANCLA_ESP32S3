@@ -1177,6 +1177,50 @@ sync master                    transmit half — CCP sent/dropped counts as
   gateways -> anchors -> tags because a proto-4 gateway rejects EVERY
   proto-5 observation.
 
+- **A 3-anchor TDoA cell has spots where y is UNOBSERVABLE, and the first
+  stationary baseline was taken in one of them.** Measured 2026-09-03 on the
+  deployed geometry -- origin (0,0), apex (1.752,0.920), xaxis (2.385,0) -- with
+  the tag inside the triangle on the base line between origin and xaxis. The
+  two range-difference equations there have `d/dy` of **-0.647** (vs the apex)
+  and **-0.001** (vs the xaxis anchor): the origin/xaxis pair carries NO y
+  information at all for a tag on that baseline, because moving perpendicular
+  to it changes both ranges almost equally. All of y hangs on one weak
+  equation. Amplification (metres of position error per metre of
+  range-difference bias, largest singular value of the Jacobian's
+  pseudo-inverse) is **2.09** at that spot, **1.16** at the triangle's centre,
+  and up to **4.21** near the origin corner. Consequences worth keeping: a
+  baseline capture on the base line measures the worst point in the array, not
+  the array; **1 DTU (4.69 mm) of bias on the apex equation moves y by 8.0 mm**,
+  so the -1.504 m offset that run reported needs only ~187 DTU (2.9 ns, ~0.88 m)
+  of range-difference bias; and raising the apex from 0.920 m to ~1.840 m takes
+  the area's worst-case amplification from 4.21 to 1.73, with tripling it adding
+  almost nothing (1.33 vs 1.49) -- doubling captures nearly all of the available
+  gain. That physical change is larger than any software fix on this path.
+  The ~187 DTU itself is NOT attributed by this measurement: the uncalibrated RX
+  antenna delay (which TDoA cannot cancel, at 4.69 mm/DTU, and whose per-board
+  spread the 2026-08-28 laser campaign measured at ~207 units) and the still
+  tape-unvalidated survey geometry (up to 1037 mm of disagreement recorded
+  2026-08-26) are both sufficient on their own. Measuring the three edges with a
+  tape is free and settles it. What this DOES rule out as the main cause is the
+  height model: with this geometry a real 1.6 m separation solved at `dz = 0`
+  costs 0.222 m and moves y by only -0.042, in the opposite direction to the
+  one observed.
+
+- **A console capture is not the fix stream, and the shortfall looks exactly
+  like a tag going idle.** The 2026-09-03 stationary run had the gateway count
+  **1424** fixes while the console delivered **291** (20.4%), the loss
+  concentrated in the tail -- which reads as a still tag dropping to a slow
+  reporting tier and is nothing of the kind: `ingested / anchors` shows it
+  blinked at ~2.3 Hz for the whole 687 s. Zephyr logs no
+  `--- N messages dropped ---` because the loss is below its accounting (the
+  USB-JTAG console and the terminal program). Every cadence and gap figure read
+  off such a capture is a property of the CONSOLE; dispersion and hull figures
+  survive because they are per-fix, but they are a non-uniform sample.
+  `tools/pos_trace.py` cross-checks its own line count against `tdoa.fixes` and
+  says so, because this misreading was one sentence away from being recorded as
+  a finding about dt gaps. The gateway's own `dt_invalid` (180 of 1424 = 12.6%
+  on that run) IS real -- it comes off the DTU clock, not the log.
+
 - **Per-anchor TDoA weighting publishes the MEASURED jitter, not the assumed
   one, and that distinction is a factor of ~15.** Proto 5 adds `sigma_dtu` to
   the observation: each anchor's own 1-sigma timestamp jitter, which
