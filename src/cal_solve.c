@@ -5,7 +5,6 @@
  */
 
 #include "cal_solve.h"
-#include <math.h>
 
 #include "cal_math.h"
 
@@ -105,17 +104,4 @@ bool cal_link_stats_compute(const int32_t *samples, size_t n,
 	out->min_mm  = lo;
 	out->max_mm  = hi;
 	return true;
-}
-
-int32_t cal_rx_level_dbm_x10(uint32_t cir_power, uint16_t accum_count)
-{
-	if (cir_power == 0u || accum_count == 0u) {
-		return CAL_RX_LEVEL_INVALID;
-	}
-
-	double c = (double)cir_power * 2097152.0;          /* C * 2^21 */
-	double n = (double)accum_count * (double)accum_count;
-	double lvl = 10.0 * log10(c / n) - 121.7;          /* A at 64 MHz PRF */
-
-	return (int32_t)((lvl < 0.0) ? (lvl * 10.0 - 0.5) : (lvl * 10.0 + 0.5));
 }

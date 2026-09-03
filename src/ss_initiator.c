@@ -165,7 +165,7 @@ static uint32_t ts_from(const uint8_t *p)
 
 int32_t ss_initiator_range(uint8_t peer_wire_id)
 {
-	return ss_initiator_range_ex(peer_wire_id, NULL, NULL);
+	return ss_initiator_range_ex(peer_wire_id, NULL);
 }
 
 void ss_initiator_diag(uint32_t *ok, uint32_t *tx_start_fail,
@@ -182,11 +182,9 @@ void ss_initiator_diag(uint32_t *ok, uint32_t *tx_start_fail,
 	if (layout_unknown) *layout_unknown = diag_counts.layout_unknown;
 }
 
-int32_t ss_initiator_range_ex(uint8_t peer_wire_id, uint32_t *cir_power,
-			      uint16_t *accum_count)
+int32_t ss_initiator_range_ex(uint8_t peer_wire_id, int16_t *rssi_q8)
 {
-	if (cir_power) *cir_power = 0u;
-	if (accum_count) *accum_count = 0u;
+	if (rssi_q8) *rssi_q8 = SS_INITIATOR_RSSI_INVALID;
 
 	tx_poll[ALL_MSG_SN_IDX] = poll_seq++;
 	tx_poll[POLL_PEER_ID_IDX] = peer_wire_id;
@@ -228,16 +226,20 @@ int32_t ss_initiator_range_ex(uint8_t peer_wire_id, uint32_t *cir_power,
 	 * (ss_initiator_enter) and nothing clears it first. Bounded, and a
 	 * timeout leaves the counts at zero, which the caller reports as
 	 * UNKNOWN rather than as a weak signal. */
-	if (cir_power != NULL || accum_count != NULL) {
+	if (rssi_q8 != NULL) {
 		if (wait_any_sysstatus_lo(DWT_INT_CIADONE_BIT_MASK,
 					  CIA_DONE_TIMEOUT_MS) &
 		    DWT_INT_CIADONE_BIT_MASK) {
-			dwt_rxdiag_t diag;
+			dwt_cirdiags_t cir;
+			int16_t lvl = 0;
 
-			memset(&diag, 0, sizeof(diag));
-			dwt_readdiagnostics(&diag);
-			if (cir_power) *cir_power = diag.ipatovPower;
-			if (accum_count) *accum_count = diag.ipatovAccumCount;
+			memset(&cir, 0, sizeof(cir));
+			if (dwt_readdiagnostics_acc(&cir, DWT_ACC_IDX_IP_M) ==
+				    DWT_SUCCESS &&
+			    dwt_calculate_rssi(&cir, DWT_ACC_IDX_IP_M, &lvl) ==
+				    DWT_SUCCESS) {
+				*rssi_q8 = lvl;
+			}
 		}
 	}
 

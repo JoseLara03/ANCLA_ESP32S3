@@ -123,13 +123,11 @@ static void run_batch(const struct cal_request *req, struct cal_result *res,
 	ss_initiator_enter();
 
 	for (uint32_t i = 0; i < attempts; i++) {
-		uint32_t cir_power = 0;
-		uint16_t accum = 0;
+		int16_t rssi_q8 = SS_INITIATOR_RSSI_INVALID;
 		int32_t mm;
 
 		if (req->link) {
-			mm = ss_initiator_range_ex(req->peer_wire_id,
-						   &cir_power, &accum);
+			mm = ss_initiator_range_ex(req->peer_wire_id, &rssi_q8);
 		} else {
 			mm = ss_initiator_range(req->peer_wire_id);
 		}
@@ -147,9 +145,13 @@ static void run_batch(const struct cal_request *req, struct cal_result *res,
 			}
 			valid++;
 
-			int32_t lvl = cal_rx_level_dbm_x10(cir_power, accum);
+			/* q8.8 dBm -> dBm x10, rounded to nearest. The
+			 * driver's own value; see ss_initiator.h for why this
+			 * is not computed here. */
+			int32_t lvl = ((int32_t)rssi_q8 * 10 +
+				       ((rssi_q8 < 0) ? -128 : 128)) / 256;
 
-			if (lvl != CAL_RX_LEVEL_INVALID) {
+			if (rssi_q8 != SS_INITIATOR_RSSI_INVALID) {
 				if (res->rx_level_n == 0u) {
 					res->rx_level_min_x10 = lvl;
 					res->rx_level_max_x10 = lvl;

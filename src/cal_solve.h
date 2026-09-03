@@ -115,21 +115,4 @@ struct cal_link_stats {
 bool cal_link_stats_compute(const int32_t *samples, size_t n,
 			    struct cal_link_stats *out);
 
-/* Received signal level in dBm x10 (so -81.2 dBm reads -812), from the
- * DW3000's Ipatov CIR power and preamble accumulation count:
- *
- *     level = 10 * log10(C * 2^21 / N^2) - A
- *
- * with A = 121.7 dB at the 64 MHz PRF this PHY runs (channel 5, preamble
- * code 9). This is the DW3000 user manual's own formula.
- *
- * dBm x10 rather than a float because the value is a report, and an integer
- * cannot pick up a different last digit between two builds. Returns
- * INT32_MIN when `accum_count` is 0 or `cir_power` is 0 -- i.e. when the CIA
- * had not finished when the diagnostics were read, which is a real outcome on
- * a polled (interrupt-free) receive path and must not be reported as a very
- * low signal level. */
-#define CAL_RX_LEVEL_INVALID  INT32_MIN
-int32_t cal_rx_level_dbm_x10(uint32_t cir_power, uint16_t accum_count);
-
 #endif /* CAL_SOLVE_H */

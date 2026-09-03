@@ -215,42 +215,12 @@ static void test_link_stats_no_int32_overflow(void)
 	CHECK(st.sd_mm == 50000000);
 }
 
-/* ---- RX level ----------------------------------------------------------- */
-
-static void test_rx_level_formula(void)
-{
-	/* level = 10*log10(C * 2^21 / N^2) - 121.7.
-	 * With C = 12000 and N = 1024: 12000 * 2097152 = 2.5166e10,
-	 * / 1048576 = 24000, 10*log10 = 43.802, - 121.7 = -77.898 -> -779. */
-	CHECK(cal_rx_level_dbm_x10(12000u, 1024u) == -779);
-
-	/* Doubling the accumulation count at fixed power drops the level by
-	 * 6.02 dB (N is squared), which is the property worth pinning rather
-	 * than a second magic number. */
-	int32_t a = cal_rx_level_dbm_x10(12000u, 512u);
-	int32_t b = cal_rx_level_dbm_x10(12000u, 1024u);
-
-	CHECK(a - b == 60 || a - b == 61);
-}
-
-/* A CIA that had not finished when the diagnostics were read reports zeros.
- * That must NOT come back as a very low signal level -- on a polled,
- * interrupt-free receive path (ss_initiator.c) it is a routine outcome, and
- * reporting it as -infinity dBm would look exactly like a link at its floor. */
-static void test_rx_level_invalid_is_not_a_weak_signal(void)
-{
-	CHECK(cal_rx_level_dbm_x10(0u, 1024u) == CAL_RX_LEVEL_INVALID);
-	CHECK(cal_rx_level_dbm_x10(12000u, 0u) == CAL_RX_LEVEL_INVALID);
-}
-
 int main(void)
 {
 	test_link_stats_basic();
 	test_link_stats_single_and_empty();
 	test_link_stats_isqrt_never_overshoots();
 	test_link_stats_no_int32_overflow();
-	test_rx_level_formula();
-	test_rx_level_invalid_is_not_a_weak_signal();
     test_tag_selftest_vectors_pass();
     test_measuring_too_far_increases_tx();
     test_measuring_too_short_decreases_tx();
