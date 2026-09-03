@@ -2290,6 +2290,75 @@ sync master                    transmit half — CCP sent/dropped counts as
   and the fit's own residual (24 mm) is a floor on what the method can resolve,
   not a proven accuracy.
 
+- **A collector that releases groups in TABLE order can make a
+  constant-velocity filter WORSE than no filter, and the console gives no
+  hint of it.** Measured 2026-09-03 with the `blink trace` ring on a
+  stationary tag over 128 cycles: FILTERED fixes had dispersion RMS
+  **0.512 m** against the raw `tdoa_solve()` output's **0.345 m**. The
+  filter was amplifying, not smoothing. Two defects, harmless alone:
+  `tdoa_collect_take_ready()` returned the first releasable group its table
+  scan reached (slot-allocation order, unrelated to time) while
+  `tdoa_gw_step()` drains up to `TDOA_GW_SOLVE_MAX` (8) groups per
+  superframe, so several came out scrambled; and `solve_one()` advanced
+  `mm->last_ref_t_dtu` unconditionally, **including for a group whose dt came
+  back negative**, so an out-of-order group rewound the dt reference and the
+  next group's dt then spanned time already integrated. The trace shows it
+  directly — three groups at one `t_ms` with dt 0.400 / 0.200 / 0.600 s, i.e.
+  **1.2 s of prediction charged for 200 ms of elapsed time**, and the
+  position ramping 2.45 -> 3.02 over three cycles before collapsing 1.6 m.
+  Fixed by releasing oldest-first (now a documented part of `take_ready()`'s
+  CONTRACT, since the caller's dt depends on it) and by discarding a
+  small-negative-dt group outright while HOLDING the reference (counted as
+  `reorder` on `blink stats`). Three general lessons: (a) `first_ms` is
+  gateway ARRIVAL, not tag emission, so oldest-first is strictly better than
+  table order but is **not** a total order — the caller keeps a guard for the
+  residue; (b) **a large negative dt is the opposite case and must NOT be
+  treated as reordering** — it is a forward gap that aliased through
+  `sdelta40()`'s +/-8.6 s boundary, and the same capture shows real 9-15 s
+  gaps (slow reporting tier) reading as -7.007 / -8.007 / -8.415 s; treating
+  those as reordering wedges the reference permanently, a regression worse
+  than the defect, which is what `TDOA_DT_REORDER_MAX_MS` (1000) separates;
+  (c) the hypothesis this replaced — that the overconfident published sigma
+  closed the innovation gate and the filter coasted — was **killed by the
+  same capture**, which reported `gate_rejected: 0`. Host tests and code
+  review had both missed this; the instrument that found it was the temporary
+  trace ring, third time in this migration that a defect was only reachable
+  from real multi-tag traffic.
+
+- **RX antenna delay is calibrated from the raw blink topic against
+  tape-measured tag positions — and the fit is falsifiable, which is the
+  whole reason it is worth trusting.** `cal ref`/`cal peer` calibrate the SUM
+  `ant_tx + ant_rx` because that is all SS-TWR observes; TDoA depends on the
+  SPLIT, which they constrain not at all. The observable: the DW3220
+  SUBTRACTS `ant_rx` from every RX timestamp, and `T_emit` (with the tag's
+  own TX delay) is common to every anchor hearing one blink, so it cancels in
+  a range difference, leaving
+  `(tau_k - tau_0)*4.69mm - (r_k - r_0) = -(delta_k - delta_0)*4.69mm` — a
+  **constant, independent of where the tag is**. So the fit is a plain
+  per-anchor mean, no matrix; and estimated independently at several
+  tape-measured positions, a genuine offset must come out IDENTICAL at every
+  one. Drift with position means geometry or tag height instead, so
+  `tools/rx_cal.py` prints the cross-spot spread and refuses to emit an apply
+  command when it is large — verified both ways on synthetic data (+150 DTU
+  recovered as +147.9 with 33 DTU of timestamp noise and 220 blinks x 4
+  spots; the same data fitted with a wrong `--tag-z` turns a 5-8 DTU spread
+  into 136-162 and is correctly refused). Three things worth not
+  re-deriving. **(1) No firmware is needed at either end**: the input is
+  already published on `uwb/anchor/blink/<zone>` (`"a"` and `"ts"` are the
+  anchor id and its master-base RX timestamp) and `anchor ant` already
+  applies a correction. **(2) Apply by holding the SUM and moving only the
+  SPLIT** (`ant_rx += b`, `ant_tx -= b`): SS-TWR sees only the sum, so TWR
+  ranging, the `apos` survey and the existing `cal ref` result all come out
+  unchanged — which is what makes the campaign safe on an already-calibrated
+  fleet, and is why it does NOT contradict CLAUDE.md's standing rule that
+  changing `ant_delay_rx` alone decalibrates a board. **(3) The sensitivity
+  is asymmetric and easy to get backwards**: one unit of `ant_rx` is a FULL
+  4.69 mm in TDoA (a one-way timestamp) but 2.35 mm in SS-TWR (half of each
+  unit lands in the round trip). Only DIFFERENCES are observable, which is
+  not a limitation — a common RX offset is invisible to TDoA — so the
+  lowest-id anchor is pinned as the gauge and left untouched. Procedure:
+  `docs/rx-antenna-delay-calibration.md`. **Not yet run on hardware.**
+
 ## Reporting progress on multi-task work
 
 The operator asked (2026-08-28) to be given, for any task being worked on, its
