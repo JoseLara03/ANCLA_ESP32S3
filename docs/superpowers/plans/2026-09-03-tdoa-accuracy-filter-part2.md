@@ -566,3 +566,96 @@ contabilidad (consola USB / terminal). `tools/pos_trace.py` ahora lo detecta y
 lo grita antes de que las cifras de cadencia se lean como propiedades del
 stream de fixes. **`dt_invalid: 180` de 1424 (12.6%) sí es real** — sale del
 reloj DTU, no del log.
+
+### Actualización 2026-09-03: el survey está VALIDADO, el sesgo es el ítem 8
+
+El operador midió las aristas con cinta y **el survey está correcto**. Eso
+elimina la causa (2) de arriba, así que el sesgo de ~1.5 m queda atribuido
+**por eliminación al retardo de antena RX** (ítem 8). Confirmado en el
+propio hardware: un ancla reporta `ant_tx: 16356` (calibrado) y
+`ant_rx: 16385` — **el default de fábrica, intacto**. En TDoA nada cancela
+la parte RX, a 4.69 mm/DTU.
+
+Y la prueba definitiva, con el tag en el MISMO punto físico las dos veces:
+
+```
+3 anclas -> (0.665, -1.504)     error en y: -1.50 m
+4 anclas -> (1.222, +1.553)     error en y: +1.55 m
+la posicion REPORTADA se movio 3.11 m por agregar un ancla
+
+std y (RUIDO):   0.953 -> 0.403 m   bajo 58%
+media y (SESGO): -1.504 -> +1.553   se movio 3.06 m
+```
+
+El ruido bajó a la mitad mientras la posición reportada saltó 3.11 m. Un
+sistema dominado por ruido habría convergido a la MISMA media con menos
+dispersión. **El error dominante es sesgo por ancla, y ninguna tarea de este
+plan lo arregla.**
+
+Nota de alcance del operador: pasar de SS-TWR a DS-TWR se considera trabajo
+futuro y queda **fuera** de este plan. No re-litigar aquí.
+
+### La `sigma` publicada es ~3x sobreconfiada, y alimenta la fuga
+
+`sync stats` en un ancla desplegada: `jitter_est_dtu: 33` (516 ps),
+`rms_dtu: 52`, `max_dtu: 633`, `verdict: "marginal"`, `count: 3710`.
+
+Así que la Tarea 5b **está viva, no inerte** — se publica `sigma_dtu = 33`.
+Pero 33 DTU x 4.69 mm = **0.155 m** por ancla, y por ecuación
+`sqrt(2) x 0.155 = 0.219 m`. Contra eso, el residual medido con 4 anclas tuvo
+**mediana 0.514 m**: el error real es ~3.3x mayor que la sigma que el filtro
+cree. `jitter_est` mide el ruido del **CCP**, no el del timestamp del BLINK,
+que no está en esa cifra.
+
+Consecuencia mecánica, y conecta la 5b con la 7: `R` demasiado chica cierra
+el gate a 3 sigma sobre mediciones legítimas, el filtro se queda en
+`predict()` puro, y se fuga. Es `gate_rejected: 70` a 3 anclas y 39 a 4.
+**Corregir la sigma publicada es probablemente parte del arreglo de la
+Tarea 7, no una tarea aparte.**
+
+Y `max_dtu: 633` = 9.9 ns = **~2.97 m** en una sola observación, 12x el RMS.
+La propia shell lo llama cola no gaussiana. Es una fuente de outliers real
+que ninguna sigma constante describe.
+
+### La primera casilla FALLÓ, y eso es información
+
+El test que debía reproducir la fuga **pasa contra HEAD**:
+
+```
+thin geometry, unbiased noise: worst 0.54 m outside; needs_reseed 0, all-gated 0
+```
+
+Se conserva en `tests/pos_ekf/` renombrado a
+`test_thin_geometry_stays_bounded_under_noise()`, porque lo que sí fija es
+una propiedad real, y porque el intento acota el mecanismo. **Ruido no
+sesgado sobre esta geometría NO hace que el filtro se escape.**
+
+Y la aritmética dice que la recuperación nunca estuvo ni ARMADA:
+`gate_streak` solo avanza en un ciclo donde **todas** las ecuaciones fueron
+rechazadas, y `gate_rejected: 70` sobre 304 ciclos filtrados de 2 ecuaciones
+permite como máximo 35 de esos — mientras `reset_after` necesita **3
+CONSECUTIVOS**. O sea que durante la fuga el filtro estaba **aceptando al
+menos una ecuación casi cada ciclo**. Eso es una situación distinta de "el
+gate se cerró y el filtro navegó a ciegas", y las defensas hay que
+dimensionarlas contra la real.
+
+También se descartó una parte de la hipótesis original leyendo el flujo:
+`pos_ekf_seed()` pone `gate_streak = 0`, y `pos_ekf_needs_reseed()` se
+consulta DESPUÉS de la rama de siembra, así que en un ciclo sembrado no puede
+disparar nunca. Inofensivo, pero no es la causa.
+
+### Por lo tanto la primera casilla cambia: instrumentar, no adivinar
+
+- [ ] **Instrumentación temporal en el gateway**, con la disciplina que la
+      parte 1 ya usó (agregar, medir, root-causear, **RETIRAR**): por ciclo y
+      para un tag, registrar el camino tomado (filtered/seeded), `dt_s`,
+      `accepted` de `n-1`, `gate_streak`, `pos_ekf_pos_sigma()` y el estado
+      `(x, y, vx, vy)`. Acotado, y es lo único que dice qué pasa realmente
+      durante una fuga. Dos defectos de esta sesión se encontraron así y
+      ninguno era alcanzable desde host tests.
+- [ ] Solo DESPUÉS de eso, escribir el test de reproducción con el mecanismo
+      real en la mano, y entonces sí exigir que falle contra HEAD.
+
+Las tres defensas de abajo siguen siendo el plan, pero sus umbrales se
+dimensionan contra lo que la instrumentación mida — y la sigma sobreconfiada
+de arriba entra como cuarta pieza del mismo arreglo.

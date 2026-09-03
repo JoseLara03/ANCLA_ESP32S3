@@ -1055,8 +1055,184 @@ static void test_tdoa_missing_sigma_falls_back(void)
 }
 
 
+/*
+ * ---- Task 7: an ATTEMPT at reproducing the runaway that does NOT ------
+ *
+ * READ THIS BEFORE TRUSTING IT. This test was written to fail against HEAD
+ * and reproduce the hardware runaway. IT PASSES against HEAD, so it does not
+ * reproduce it. It is kept because what it DOES pin is a real property --
+ * the filter stays bounded on the deployed thin geometry under unbiased
+ * noise -- and because the attempt narrows the mechanism, which is worth
+ * more in the file than in a session log.
+ *
+ * What it establishes by failing to fail: unbiased measurement noise on this
+ * geometry does NOT make the filter escape. Worst excursion measured 0.54 m
+ * with +/-64 DTU of noise over 300 cycles, needs_reseed never asked, no
+ * all-gated cycle. So the hardware runaway needs an ingredient this
+ * scenario lacks -- and the two measured candidates are the per-anchor BIAS
+ * (~0.88 m of range difference, which displaces the solution the equations
+ * agree on) and the outlier TAIL (`sync stats` reported max_dtu 633 = 2.97 m
+ * against an RMS of 52, which the shell itself calls non-Gaussian).
+ *
+ * The runaway itself, measured on hardware 2026-09-03
+ * (COM15_2026_09_03.11.58.45.067.txt): a single tag left the 2.4 m array and
+ * ran to 17.24 m outside it over 30.2 s and 137 consecutive fixes,
+ * monotonically, at ~1.5 m/s -- while `blink stats` reported reseed:0 for the
+ * entire episode. Full evidence in
+ * docs/superpowers/plans/2026-09-03-tdoa-accuracy-filter-part2.md, Task 7.
+ *
+ * And the arithmetic that says the recovery was never even ARMED, which is
+ * why the next step is instrumenting the gateway rather than tuning this
+ * test until it fails: gate_streak advances only on a cycle where every
+ * equation is gated, and `gate_rejected:70` over 304 filtered cycles of 2
+ * equations each allows at most 35 such cycles -- while reset_after needs 3
+ * CONSECUTIVE ones. So the filter was accepting at least one equation on
+ * almost every cycle of the escape, which is a different situation from
+ * "the gate closed and it coasted".
+ *
+ * THE MECHANISM this was built to exercise:
+ * pos_ekf_needs_reseed() fires on gate_streak >= cfg->reset_after, and
+ * gate_streak only ADVANCES when accepted == 0 -- every equation gated. At
+ * TDOA_MIN_ANCHORS (3) pos_ekf_update_tdoa() produces just 2 equations, so a
+ * single acceptance resets the streak to zero. And one range-difference
+ * equation constrains ONE direction, so the filter can accept an update every
+ * cycle -- streak permanently zero, recovery never armed -- while running
+ * away along the direction that equation does not constrain.
+ *
+ * The geometry below is the deployed one, and it is what makes that direction
+ * exist: with the tag on the base line between origin and xaxis, the
+ * origin/xaxis equation has d/dy = -0.001 (measured) because moving
+ * perpendicular to that base changes both ranges almost equally. All of y
+ * rests on the apex equation's gain of 0.647.
+ */
+
+/* The surveyed geometry from that capture. Thin on purpose -- a square array
+ * does NOT reproduce this, which is why the existing tests miss it. */
+static const float RUN_AX[3] = { 0.000f, 1.752f, 2.385f };
+static const float RUN_AY[3] = { 0.000f, 0.920f, 0.000f };
+
+static void make_runaway_obs(struct tdoa_meas *m, float tx, float ty,
+                             int32_t noise_dtu)
+{
+    for (int i = 0; i < 3; i++) {
+        float dx = tx - RUN_AX[i], dy = ty - RUN_AY[i];
+        float r = sqrtf(dx * dx + dy * dy);
+
+        m[i].x = RUN_AX[i];
+        m[i].y = RUN_AY[i];
+        m[i].dz = 0.0f;          /* apos tagz is 0.0 on that site */
+        /* The sigma the anchors actually publish: sync stats reported
+         * jitter_est_dtu 33 on a deployed anchor, i.e. 0.155 m. Used here
+         * BECAUSE it is overconfident against the ~0.5 m residual the
+         * 4-anchor run measured -- an R that small is what closes the 3-sigma
+         * gate on real measurements and leaves the filter predicting. */
+        m[i].sigma_m = 33.0f * TDOA_M_PER_DTU;
+        m[i].t_dtu = 500000 + (int64_t)llroundf(r / TDOA_M_PER_DTU)
+                     + rng_noise_dtu(noise_dtu);
+    }
+}
+
+static float dist_outside_triangle(float x, float y)
+{
+    float best = 1e9f;
+    int neg = 0, pos = 0;
+
+    for (int i = 0; i < 3; i++) {
+        int j = (i + 1) % 3;
+        float ax = RUN_AX[i], ay = RUN_AY[i];
+        float bx = RUN_AX[j], by = RUN_AY[j];
+        float cr = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+
+        if (cr < 0.0f) neg = 1;
+        if (cr > 0.0f) pos = 1;
+
+        float ex = bx - ax, ey = by - ay;
+        float L2 = ex * ex + ey * ey;
+        float t = (L2 <= 0.0f) ? 0.0f
+                  : ((x - ax) * ex + (y - ay) * ey) / L2;
+
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+
+        float d = sqrtf((x - (ax + t * ex)) * (x - (ax + t * ex)) +
+                        (y - (ay + t * ey)) * (y - (ay + t * ey)));
+
+        if (d < best) best = d;
+    }
+    return (neg && pos) ? best : 0.0f;   /* 0 when inside */
+}
+
+static void test_thin_geometry_stays_bounded_under_noise(void)
+{
+    struct pos_ekf_cfg c;
+    struct pos_ekf f;
+    struct tdoa_meas m[3];
+    const float tx = 0.665f, ty = 0.0f;   /* the spot the tag actually was */
+    const float dt = 0.2f;
+    float worst_out = 0.0f;
+    int reseed_asked = 0;
+    int cycles_gated_all = 0;
+
+    pos_ekf_cfg_defaults(&c);
+    pos_ekf_reset(&f);
+    g_rng_state = 20260903u;
+    pos_ekf_seed(&f, tx, ty);
+
+    /* 300 cycles at 5 Hz = 60 s, the order of the observed 30.2 s episode.
+     * `moving` is true throughout: the hardware runaway happened while the
+     * tag's accelerometer reported motion, so no ZUPT pins the velocity.
+     * That is the case to reproduce -- ZUPT working is already covered by
+     * test_tdoa_zupt_pins_velocity(). */
+    for (int k = 0; k < 300; k++) {
+        make_runaway_obs(m, tx, ty, 64);   /* +/-64 DTU = +/-0.30 m */
+
+        pos_ekf_predict(&f, &c, dt, true);
+
+        int accepted = pos_ekf_update_tdoa(&f, &c, m, 3);
+
+        if (accepted == 0) {
+            cycles_gated_all++;
+        }
+        if (pos_ekf_needs_reseed(&f, &c)) {
+            reseed_asked++;
+            /* What tdoa_gw.c does on that signal: reseed from a fresh
+             * solve. Modelled as a seed at the truth, which is the most
+             * favourable version of it -- if even that does not keep the
+             * filter bounded, the recovery is not the problem. */
+            pos_ekf_seed(&f, tx, ty);
+        }
+
+        float x, y;
+
+        if (pos_ekf_get(&f, &x, &y, NULL, NULL)) {
+            float out = dist_outside_triangle(x, y);
+
+            if (out > worst_out) worst_out = out;
+        }
+    }
+
+    printf("  thin geometry, unbiased noise: worst %.2f m outside; "
+           "needs_reseed fired %d time(s), all-gated cycles %d\n",
+           (double)worst_out, reseed_asked, cycles_gated_all);
+
+    /* A tag cannot be 3 m outside a 2.4 m array. This bound HOLDS against
+     * HEAD, which is the finding: unbiased noise alone does not produce the
+     * hardware escape. Keep the assertion anyway -- it is a real property and
+     * a future change that breaks it is a regression worth catching. */
+    CHECK(worst_out < 3.0f);
+    CHECK(all_finite_state(&f));
+
+    /* And the diagnosis, pinned separately so a future change that fixes the
+     * distance by luck rather than by arming the recovery still shows up:
+     * if the filter DID escape, the recovery must have been asked. */
+    if (worst_out >= 3.0f) {
+        CHECK(reseed_asked > 0);
+    }
+}
+
 int main(void)
 {
+    test_thin_geometry_stays_bounded_under_noise();
     test_tdoa_per_anchor_weighting();
     test_tdoa_missing_sigma_falls_back();
     test_tdoa_zupt_pins_velocity();
