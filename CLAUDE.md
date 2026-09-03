@@ -506,21 +506,44 @@ for (100 tags) has a finished design and zero lines of implementation.
 
 ```powershell
 $env:ZEPHYR_BASE = "C:\Users\Menay\zephyrproject\zephyr"
+$env:ZEPHYR_SDK_INSTALL_DIR = "C:\Users\Menay\zephyrproject\zephyr-sdk-1.0.1"
 west build -b ancla_esp32s3/esp32s3/procpu
 west flash
 west espressif monitor -p COM5
 ```
 
 `$env:ZEPHYR_BASE` is **required** — this project lives outside the
-`zephyrproject` west workspace. Zephyr 4.4.x, SDK at `~/zephyr-sdk-1.0.1`.
+`zephyrproject` west workspace. Zephyr 4.4.x.
+
+**The SDK is INSIDE the workspace, at
+`C:\Users\Menay\zephyrproject\zephyr-sdk-1.0.1`** — NOT at
+`~/zephyr-sdk-1.0.1`, which an earlier version of this section claimed and
+which does not exist on this machine. Setting `ZEPHYR_SDK_INSTALL_DIR`
+explicitly is what makes a build work without relying on whatever the CMake
+package registry happens to remember from a previous one.
+
+**There is a `.venv` in `zephyrproject` and it is NOT the build
+environment.** It holds only `pip` and `python` — no `west`, no Zephyr Python
+requirements. The `west` that works is the SYSTEM Python's
+(`AppData\Local\Programs\Python\Python312\Scripts\west.exe`), and activating
+that venv changes nothing except to make it look like it should have. That
+system Python is also the one whose broken TLS cert path makes
+`west blobs fetch` fail, which is a separate problem with its own `curl.exe`
+workaround — do not go looking for a venv to fix either of them.
 
 There is also a separate **calibration image**, selected with an
 `EXTRA_CONF_FILE` overlay rather than a runtime mode:
 
 ```powershell
-west build -b ancla_esp32s3/esp32s3/procpu --pristine -- -DEXTRA_CONF_FILE=cal.conf
-west flash
+west build -b ancla_esp32s3/esp32s3/procpu --pristine -d build_cal -- "-DEXTRA_CONF_FILE=cal.conf"
+west flash -d build_cal
 ```
+
+Two details there are load-bearing, and both are the same ones the debug image
+below documents. `-d build_cal` keeps this out of the default `build/`, so
+building the calibration image does not destroy the production build — with
+`--pristine` and no `-d`, it does. And the `-D` must be QUOTED, or PowerShell
+splits it at the dot and the build fails looking for a file named `cal`.
 
 `cal.conf` sets `CONFIG_ANCLA_CAL_MODE=y` and turns off WiFi/MQTT/networking
 entirely. The resulting image is an ordinary WAVE responder that can be told,
@@ -1140,6 +1163,20 @@ sync master                    transmit half — CCP sent/dropped counts as
 - `src/pos_sink.{c,h}` — consumes decoded tag position fixes. Logs one JSON line
   per fix (the only place `residual`/`batt` stay visible) and hands the fix to
   `net_uplink` through a bounded queue.
+- **Part 2 of the TDoA accuracy work is BUILD-VERIFIED, not hardware-verified
+  (2026-09-03).** Both images link clean with zero compiler warnings:
+  production `dram0_0_seg` 272160 -> **272840 B (+680 B)** for the whole of
+  part 2, and the calibration image links too, which is the check that
+  matters there because `net_uplink.c` and `blink_shell.c` compile into it
+  with `CONFIG_NETWORKING=n` while consuming the structs part 2 changed. The
+  +680 B is smaller than it looks like it should be because `sigma_m` lands
+  in padding `struct tdoa_meas` already had (sizeof stays 24); what actually
+  grew is `tdoa_collect`'s `aid[]` (+136 B), one bool per memo slot, and a
+  counter. **Nothing in part 2 has run on a board** — Tasks 1 (stationary
+  baseline) and 6 (end-to-end) are bench work, and the deploy order is
+  gateways -> anchors -> tags because a proto-4 gateway rejects EVERY
+  proto-5 observation.
+
 - **Per-anchor TDoA weighting publishes the MEASURED jitter, not the assumed
   one, and that distinction is a factor of ~15.** Proto 5 adds `sigma_dtu` to
   the observation: each anchor's own 1-sigma timestamp jitter, which
