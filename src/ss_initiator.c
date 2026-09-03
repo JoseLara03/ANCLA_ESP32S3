@@ -39,6 +39,10 @@ LOG_MODULE_REGISTER(ss_initiator, LOG_LEVEL_INF);
 #define TX_DONE_TIMEOUT_MS 10U
 #define RX_DONE_TIMEOUT_MS 25U
 
+/* The CIA runs after RXFCG and takes tens of microseconds; this is a bound,
+ * not a budget. Only paid when a caller asks for diagnostics. */
+#define CIA_DONE_TIMEOUT_MS 2U
+
 #define ALL_MSG_COMMON_LEN 10U
 #define ALL_MSG_SN_IDX 2U
 #define POLL_PEER_ID_IDX 10U
@@ -161,6 +165,29 @@ static uint32_t ts_from(const uint8_t *p)
 
 int32_t ss_initiator_range(uint8_t peer_wire_id)
 {
+	return ss_initiator_range_ex(peer_wire_id, NULL, NULL);
+}
+
+void ss_initiator_diag(uint32_t *ok, uint32_t *tx_start_fail,
+		       uint32_t *tx_done_timeout, uint32_t *rx_timeout_or_err,
+		       uint32_t *frame_len_bad, uint32_t *header_mismatch,
+		       uint32_t *layout_unknown)
+{
+	if (ok) *ok = diag_counts.ok;
+	if (tx_start_fail) *tx_start_fail = diag_counts.tx_start_fail;
+	if (tx_done_timeout) *tx_done_timeout = diag_counts.tx_done_timeout;
+	if (rx_timeout_or_err) *rx_timeout_or_err = diag_counts.rx_timeout_or_err;
+	if (frame_len_bad) *frame_len_bad = diag_counts.frame_len_bad;
+	if (header_mismatch) *header_mismatch = diag_counts.header_mismatch;
+	if (layout_unknown) *layout_unknown = diag_counts.layout_unknown;
+}
+
+int32_t ss_initiator_range_ex(uint8_t peer_wire_id, uint32_t *cir_power,
+			      uint16_t *accum_count)
+{
+	if (cir_power) *cir_power = 0u;
+	if (accum_count) *accum_count = 0u;
+
 	tx_poll[ALL_MSG_SN_IDX] = poll_seq++;
 	tx_poll[POLL_PEER_ID_IDX] = peer_wire_id;
 
@@ -193,6 +220,27 @@ int32_t ss_initiator_range(uint8_t peer_wire_id)
 		diag_counts.rx_timeout_or_err++;
 		return INT32_MIN;
 	}
+	/* Diagnostics BEFORE clearing RXFCG and before any other SPI traffic:
+	 * the CIA runs after RXFCG, so poll briefly for CIADONE rather than
+	 * assume it. CLAUDE.md's standing warning against polling CIADONE
+	 * applies to the ISR path, where dwt_isr() clears SYS_STATUS_ALL_RX_GOOD
+	 * before the callback -- here every interrupt is disabled
+	 * (ss_initiator_enter) and nothing clears it first. Bounded, and a
+	 * timeout leaves the counts at zero, which the caller reports as
+	 * UNKNOWN rather than as a weak signal. */
+	if (cir_power != NULL || accum_count != NULL) {
+		if (wait_any_sysstatus_lo(DWT_INT_CIADONE_BIT_MASK,
+					  CIA_DONE_TIMEOUT_MS) &
+		    DWT_INT_CIADONE_BIT_MASK) {
+			dwt_rxdiag_t diag;
+
+			memset(&diag, 0, sizeof(diag));
+			dwt_readdiagnostics(&diag);
+			if (cir_power) *cir_power = diag.ipatovPower;
+			if (accum_count) *accum_count = diag.ipatovAccumCount;
+		}
+	}
+
 	dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
 
 	uint8_t rng = 0;

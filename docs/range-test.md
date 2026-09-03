@@ -160,7 +160,88 @@ Nothing measured before this is worth recording.
 
 ## 5. Procedure
 
-### 5a. The SS-TWR link (what the survey needs) -- use `cal peer`
+### 5a. The SS-TWR link (what the survey needs) -- use `cal link`
+
+`cal link <peer id> [attempts]` measures the RADIO. It takes **no reference
+distance**, never persists anything, and does not apply the 25 % floor that
+`cal peer` does -- at range a low success rate is not a failed measurement, it
+IS the measurement.
+
+```
+west build -b ancla_esp32s3/esp32s3/procpu --pristine -d build_cal -- "-DEXTRA_CONF_FILE=cal.conf"
+west flash -d build_cal
+```
+
+on BOTH boards, from the same tree so their TX power agrees (see 4). Then on
+one of them, at each distance:
+
+```
+cal link 2          # 128 attempts, the default
+cal link 2 512      # a bigger denominator, for the far end of the sweep
+```
+
+```json
+{"link":{"peer":2,"attempted":128,"valid":96,
+ "p_exch_permille":750,"p_oneway_permille":866,
+ "p_dstwr_projected_permille":649,
+ "stats_over":96,"mean_mm":30124,"sd_mm":47,"min_mm":29980,"max_mm":30310,
+ "rx_dbm_x10":{"mean":-812,"min":-874,"max":-771,"n":94},
+ "fail":{"tx_start":0,"tx_done":0,"rx_to_err":32,"len":0,"hdr":0,"layout":0}}}
+```
+
+Four things it reports that a success count alone does not:
+
+- **`p_dstwr_projected_permille`** -- the DS-TWR exchange rate this link would
+  give, **without DS-TWR being implemented**. Any TWR variant's exchange rate
+  is `p_oneway^frames`: 2 for SS-TWR, 3 for DS-TWR. `p_oneway = sqrt(p_exch)`
+  assumes the two directions are equally reliable, which holds for
+  anchor-to-anchor (identical hardware, reciprocal channel) and would NOT hold
+  against a tag, which has no PA. At the survey's own 36.3 % floor, DS-TWR
+  projects to **21.8 %** -- below the same floor. That is section 2's
+  conclusion, measured rather than assumed.
+- **`sd_mm`** -- success rate is a CLIFF; the spread widens well before the
+  count moves. This is the early-warning number and `cal peer` never had it.
+- **`rx_dbm_x10`** -- the actual received level. It degrades smoothly where
+  the success rate does not, so it says how far from the -93 dBm floor the
+  link is rather than only whether it is over it. **This is also the
+  measurement that settles section 0's open hypothesis**: read it at a known
+  short distance and compare against the -57 dBm at 0.5 m prediction. Nothing
+  has ever checked that on a post-rework board. `n` counts the exchanges that
+  produced a level at all -- the CIA can legitimately not have finished on
+  this polled path, which is UNKNOWN, not weak.
+- **`fail`** -- at range `rx_to_err` should dominate (the response never
+  arrived). A batch dominated by `hdr` or `layout` instead is interference or
+  a peer on a different build, and needs the opposite response.
+
+`stats_over` is how many samples the distance statistics used: `attempts` may
+exceed the 128-sample store, in which case `valid` keeps counting past it and
+the statistics cover the first 128.
+
+Sweep 10, 20, 30, 40, 50, 75, 100 m. Acceptance for "the survey works at
+distance d" is `p_exch_permille >= 363` (section 2); the command warns below it.
+
+#### Cross-check with `apos run`
+
+`cal link` measures the radio; `apos run` measures the thing that has to work.
+They are not interchangeable, and the differences run both ways:
+
+| | `apos run` | `cal link` |
+|---|---|---|
+| attempts per batch | 64 while good, **~19 near the edge** (the 700 ms deadline, section 2) | **128 fixed (up to 512), no deadline** |
+| needs a gateway | yes, and it must reach BOTH anchors | no -- **two boards** |
+| beacon_guard / superframe | yes | not in that image |
+| RX level, spread, failure breakdown | no | yes |
+| runs the code that ships | **yes** | no |
+
+So sweep with `cal link`, then confirm the best usable distance with
+`apos run` on the production image. **The cal image draws far less current**
+(`cal.conf` sets `CONFIG_WIFI=n` / `CONFIG_NETWORKING=n`) and this project has
+twice measured supply sag taking out a transmission -- so a `cal link` range
+is an **upper bound** for production, and the gap between the two is itself
+worth recording.
+
+### 5a-bis. `cal peer` (needs a reference distance)
+
 
 The calibration image's `cal peer <id> <mm>` is the better instrument here,
 and not only because it is convenient:

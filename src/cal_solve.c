@@ -5,6 +5,7 @@
  */
 
 #include "cal_solve.h"
+#include <math.h>
 
 #include "cal_math.h"
 
@@ -52,4 +53,69 @@ int cal_solve_tx_delay(int32_t measured_mm, int32_t ref_mm,
 
 	*out_tx = (uint16_t)new_tx;
 	return 0;
+}
+
+bool cal_link_stats_compute(const int32_t *samples, size_t n,
+			    struct cal_link_stats *out)
+{
+	int64_t sum = 0;
+	int64_t var = 0;
+	int32_t lo, hi;
+	size_t i;
+
+	if (samples == NULL || out == NULL || n == 0u) {
+		return false;
+	}
+
+	lo = hi = samples[0];
+	for (i = 0; i < n; i++) {
+		sum += samples[i];
+		if (samples[i] < lo) lo = samples[i];
+		if (samples[i] > hi) hi = samples[i];
+	}
+
+	int32_t mean = (int32_t)(sum / (int64_t)n);
+
+	for (i = 0; i < n; i++) {
+		int64_t d = (int64_t)samples[i] - (int64_t)mean;
+
+		var += d * d;
+	}
+	var /= (int64_t)n;
+
+	/* Integer square root by Newton, so this file stays free of <math.h>
+	 * and of any rounding that differs between a host test and the
+	 * target. var fits int64 comfortably: 128 samples of a distance under
+	 * ~2^31 mm each. */
+	int64_t r = 0;
+	if (var > 0) {
+		r = var;
+		int64_t prev = 0;
+		while (r != prev) {
+			prev = r;
+			r = (r + var / r) / 2;
+		}
+		/* Newton can settle one below on a non-perfect square. */
+		while ((r + 1) * (r + 1) <= var) r++;
+		while (r * r > var) r--;
+	}
+
+	out->mean_mm = mean;
+	out->sd_mm   = (int32_t)r;
+	out->min_mm  = lo;
+	out->max_mm  = hi;
+	return true;
+}
+
+int32_t cal_rx_level_dbm_x10(uint32_t cir_power, uint16_t accum_count)
+{
+	if (cir_power == 0u || accum_count == 0u) {
+		return CAL_RX_LEVEL_INVALID;
+	}
+
+	double c = (double)cir_power * 2097152.0;          /* C * 2^21 */
+	double n = (double)accum_count * (double)accum_count;
+	double lvl = 10.0 * log10(c / n) - 121.7;          /* A at 64 MHz PRF */
+
+	return (int32_t)((lvl < 0.0) ? (lvl * 10.0 - 0.5) : (lvl * 10.0 + 0.5));
 }
