@@ -46,10 +46,12 @@ procedure — DWM3001CDK prerequisites, physical setup, per-anchor `cal ref`,
 the `cal peer` cross-check and its acceptance threshold, and troubleshooting —
 is written up in `docs/antenna-delay-calibration.md`.
 
-**What has not happened yet: end-to-end hardware verification, on any board.**
-The code was written and builds cleanly, but no board has actually been
-flashed and run through this procedure. The outstanding hardware gates, in the
-order a human would hit them running `docs/antenna-delay-calibration.md`:
+**Historical list below, kept for the gate order it documents — superseded by
+the "TX calibration is now done" paragraph just after it.** When this was
+written no board had been flashed through the procedure at all; that is no
+longer the state of the fleet (see below), but the gates themselves are still
+the right checklist for judging whether a given board's TX calibration is
+actually trustworthy:
 
 - The cal image is a working WAVE responder on real hardware (one board,
   sniffer-confirmed against `0xE0`/`0xE1`).
@@ -65,12 +67,36 @@ order a human would hit them running `docs/antenna-delay-calibration.md`:
   from the 0.48–2.0 m recorded above to under ~0.1 m, with `(x, y)` stable
   between consecutive fixes.
 
-**Partially run.** On 2026-08-25 one anchor was taken through `cal ref` at a
-2 m reference distance and reached **-8 mm**, inside the `|error_mm| < 15` gate.
-Everything else in the list above is still open on every board, including the
-repeat run, `kernel reboot cold` survival, and the whole `cal peer` cross-check.
-Treat the remaining two anchors as uncalibrated until a console reading says
-otherwise — `anchor show` reports the live values.
+**TX (`cal ref`) calibration is now done on all four deployed anchors
+(confirmed 2026-09-03).** Every board has passed `cal ref` and is running a
+trimmed `ant_tx` rather than the factory default — the earlier "partially run,
+treat the remaining two anchors as uncalibrated" state below is superseded.
+`anchor show` is still the source of truth for the live values on any given
+board, not this paragraph.
+
+**One anchor shows a ~200 mm deviation despite reporting itself as
+calibrated.** Not yet root-caused. Candidates to check, in the order this file's
+own hard-won facts suggest: whether that board's `cal ref` result actually
+survived a `kernel reboot cold` (the write-failure case §4 of
+`docs/antenna-delay-calibration.md` already warns about), whether it passed the
+`cal peer` cross-check against a pair it was never calibrated with (not just
+against the reference node), and whether the survey geometry it is being
+judged against was itself tape-validated. Do not assume this is a TX
+miscalibration without checking those first — see the next paragraph for why a
+"calibrated" board can still be metres wrong in TDoA for a completely different
+reason.
+
+**What TX calibration can never fix, and is the current priority: the RX half.**
+`cal ref`/`cal peer` only ever calibrate the **sum** `ant_tx + ant_rx` — that is
+all SS-TWR can observe, and it says nothing about the split. TDoA depends on
+the split (every anchor only receives; nothing cancels the RX-delay difference
+between anchors). Every anchor here still has `ant_rx` pinned at the factory
+16385. The procedure to calibrate that split — no new firmware needed, fit
+against the already-published `uwb/anchor/blink/<zone>` topic — is written up
+in `docs/rx-antenna-delay-calibration.md`; **status there: procedure written and
+the fitting tool (`tools/rx_cal.py`) verified against synthetic data, but not
+yet run on real hardware.** This is the next concrete step now that all four
+anchors have a TX calibration to hold constant while the RX split moves.
 
 A separate observation that is NOT calibration evidence, recorded so it is not
 mistaken for it: the first successful `apos run` (2026-08-26, §2 below) reported
@@ -1361,23 +1387,22 @@ sync master                    transmit half — CCP sent/dropped counts as
   `tests/tag_id/`.
 - `src/pos_json.{c,h}` — MQTT payload formatting. Pure C, host-tested in
   `tests/pos_json/`. The position payload is a **fixed contract** with the
-  downstream consumer:
-  `{"Tid":<decimal>,"x":...,"y":...,"z":0,"batt":<int>,"chg":<0|1>}`.
-  `batt` is 0..100 or **-1** when the tag sent no percentage (never 255,
-  which is a legal byte and reads as a real reading; never `null`, so the
-  column type never varies); `chg` is 1 in exactly that case. Both are
-  derived from the SAME sentinel (`UWB_FRAME_POS_SOC_CONNECTED`), so `chg`
-  carries no information of its own and **also reads 1 for a failed fuel
-  gauge** — the tag distinguishes the causes internally but the wire does
-  not. `Tid` is
+  downstream consumer: `{"Tid":<decimal>,"x":...,"y":...,"z":0}` — `Tid` is
   `fix->tag_id` (`src/tag_id.c`'s `tag_id_from_eui()` of the tag's EUI, a
   **stable per-physical-device id**, resolved from the gateway's seat table
   at dispatch time — see the "stable tag identity" entry below for why this
   is not `fix->src_addr`) as a **plain decimal number** (not hex, not a
   string; e.g. `0x1234` → `4660`), `z` is the integer `0`, there is no
   `zoneName` (the
-  consumer gets the zone from the anchors topic), and `residual`/`n_anchors`
-  are deliberately absent. `pos_json_anchors()` takes a
+  consumer gets the zone from the anchors topic), and the diagnostic fields
+  are deliberately absent. **A `batt`/`chg` pair (0..100 or -1 for "no
+  reading"; 1/0) was added 2026-09-03 and reverted the same day** — the
+  platform side was never updated to read it, so publishing it now would
+  just be two fields the consumer silently drops, which is worse than
+  leaving the schema alone. The implementation is kept, disabled behind
+  `#if 0` in `pos_json_fix()` (and the matching `test_battery_fields()` in
+  `tests/pos_json/test_pos_json.c`), ready to flip back on once the
+  platform's own change lands — do not re-derive it from scratch. `pos_json_anchors()` takes a
   `const struct apos_survey *` and publishes the **surveyed** geometry when one
   has been applied — one entry per surveyed anchor, `node[0]` (the gauge origin)
   carrying the `apos ref` lat/long and the rest local-only in metres relative to

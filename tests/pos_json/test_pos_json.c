@@ -18,21 +18,22 @@ static void test_fix_exact_contract(void)
     int n = pos_json_fix(buf, sizeof(buf), &f);
 
     CHECK(n > 0);
-    CHECK(strcmp(buf, "{\"Tid\":4660,\"x\":1.23,\"y\":4.56,\"z\":0,"
-                      "\"batt\":87,\"chg\":0}") == 0);
+    CHECK(strcmp(buf, "{\"Tid\":4660,\"x\":1.23,\"y\":4.56,\"z\":0}") == 0);
     CHECK(n == (int)strlen(buf));
 }
 
 static void test_fix_drops_diagnostics(void)
 {
-    /* residual and n_anchors must NOT reach the payload -- they stay on the
-     * console log line. zoneName is also gone: the consumer looks the zone up
-     * via the anchors topic instead. Changing this breaks the consumer
-     * contract.
+    /* residual, n_anchors and batt_soc must NOT reach the payload -- they stay
+     * on the console log line. zoneName is also gone: the consumer looks the
+     * zone up via the anchors topic instead. Changing this breaks the
+     * consumer contract.
      *
-     * batt_soc DOES reach the payload since 2026-09-03 (as "batt"/"chg"), so
-     * it is no longer part of what this test excludes -- see
-     * test_battery_fields(). The other three are unchanged. */
+     * batt/chg (src/pos_json.c, commit 2fa8579) were briefly published and
+     * reverted the same day: the platform side was never updated to read
+     * them, so a live batt/chg pair would just be two fields the consumer
+     * silently drops. See test_battery_fields() below, kept but disabled
+     * (#if 0) for when the platform integration lands. */
     struct pos_fix f = { .src_addr = 0x0001, .x = 0.0f, .y = 0.0f,
                          .residual_m = 9.99f, .n_anchors = 4, .batt_soc = 42 };
     char buf[POS_JSON_MAX_LEN];
@@ -42,10 +43,15 @@ static void test_fix_drops_diagnostics(void)
     CHECK(strstr(buf, "anchors")  == NULL);
     CHECK(strstr(buf, "battery")  == NULL);
     CHECK(strstr(buf, "zoneName") == NULL);
+    CHECK(strstr(buf, "42")       == NULL);
 }
 
+#if 0
 /*
- * "batt" and "chg", added to the payload 2026-09-03.
+ * "batt" and "chg", added to the payload 2026-09-03, reverted the same day
+ * pending the platform-side change to read them (see src/pos_json.c). Kept
+ * here disabled, not deleted, so it comes back in one piece alongside the
+ * #if 0 in pos_json_fix() once the platform is ready.
  *
  * The properties pinned here are the ones a downstream consumer's schema
  * depends on, not the formatting:
@@ -103,6 +109,7 @@ static void test_battery_fields(void)
 
     printf("  payload with battery: %s\n", buf);
 }
+#endif
 
 static void test_tid_is_plain_decimal_not_hex(void)
 {
@@ -147,7 +154,7 @@ static void test_z_is_an_integer_literal(void)
     char buf[POS_JSON_MAX_LEN];
 
     CHECK(pos_json_fix(buf, sizeof(buf), &f) > 0);
-    CHECK(strstr(buf, "\"z\":0,") != NULL);
+    CHECK(strstr(buf, "\"z\":0}") != NULL);
     CHECK(strstr(buf, "\"z\":0.00") == NULL);
 }
 
@@ -455,7 +462,6 @@ int main(void)
 {
     test_fix_exact_contract();
     test_fix_drops_diagnostics();
-    test_battery_fields();
     test_tid_is_plain_decimal_not_hex();
     test_tid_is_tag_id_not_src_addr();
     test_z_is_an_integer_literal();

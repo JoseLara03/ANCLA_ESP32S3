@@ -36,12 +36,25 @@ int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix)
 	 * z is the integer literal 0, not %.2f: the solver is 2D and there is
 	 * no z measurement yet.
 	 *
-	 * residual_m and n_anchors are deliberately absent. They stay on
-	 * pos_sink.c's console log line.
+	 * residual_m, n_anchors and batt_soc are deliberately absent. They stay
+	 * on pos_sink.c's console log line.
 	 *
-	 * ---- Battery, added 2026-09-03 -------------------------------------
+	 * ---- Battery, added 2026-09-03, REVERTED to base 2026-09-03 --------
 	 *
-	 * TWO fields, not one, and both are always present and always the same
+	 * A batt/chg pair was added here (see git history, commit 2fa8579) but
+	 * the platform side was never updated to read it, so publishing it now
+	 * would just add two fields the consumer silently drops. Reverted to
+	 * the base payload below so the platform keeps seeing the tag while
+	 * that integration work happens; the implementation is kept, disabled,
+	 * in the #if 0 block right underneath so re-enabling it is a one-line
+	 * flip once the platform is ready -- see that block for the field
+	 * semantics and the "chg" honesty note. */
+	n = snprintf(buf, len,
+		     "{\"Tid\":%u,\"x\":%.2f,\"y\":%.2f,\"z\":0}",
+		     (unsigned int)fix->tag_id,
+		     (double)fix->x, (double)fix->y);
+#if 0
+	/* TWO fields, not one, and both are always present and always the same
 	 * JSON type -- a schema that changes shape per message is what made the
 	 * Tid int32 truncation so slow to find (see CLAUDE.md): this consumer
 	 * drops what it cannot parse, silently.
@@ -77,6 +90,7 @@ int pos_json_fix(char *buf, size_t len, const struct pos_fix *fix)
 			     no_reading ? -1 : (int)fix->batt_soc,
 			     no_reading ? 1u : 0u);
 	}
+#endif
 
 	if (n < 0 || (size_t)n >= len) {
 		return -1;
