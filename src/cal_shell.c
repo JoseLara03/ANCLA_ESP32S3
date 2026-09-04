@@ -122,6 +122,24 @@ static int cmd_link(const struct shell *sh, size_t argc, char **argv)
 		shell_error(sh, "error: id must be 0..%u", UWB_MAX_ANCHORS - 1);
 		return -EINVAL;
 	}
+	/* Polling your own id is a self-poll: the responder that would answer
+	 * is this very board, whose receiver is off for the whole exchange
+	 * (ss_initiator_enter disables every interrupt and takes over the
+	 * radio). It comes back as 128 of 128 rx_timeout_or_err -- identical
+	 * to a peer that is out of range or powered off, and the survey-floor
+	 * warning below would then blame the LINK for what is an addressing
+	 * mistake. Caught on the bench 2026-09-03, where `cal link 1` run from
+	 * the board whose own `anchor id` is 1 read 0/128 and looked like a
+	 * dead peer. */
+	if (id == (long)uwb_config_get()->anchor_id) {
+		shell_error(sh,
+			    "error: id %ld is THIS board's own anchor id -- a "
+			    "board cannot range itself. `anchor show` reports "
+			    "the local id; pick a different peer",
+			    id);
+		return -EINVAL;
+	}
+
 	if (argc > 2 && (!parse_l(argv[2], &n) || n < 1 || n > 512)) {
 		shell_error(sh, "error: attempts must be 1..512");
 		return -EINVAL;
@@ -200,6 +218,24 @@ static int cmd_peer(const struct shell *sh, size_t argc, char **argv)
 		shell_error(sh, "error: id must be 0..%u", UWB_MAX_ANCHORS - 1);
 		return -EINVAL;
 	}
+	/* Polling your own id is a self-poll: the responder that would answer
+	 * is this very board, whose receiver is off for the whole exchange
+	 * (ss_initiator_enter disables every interrupt and takes over the
+	 * radio). It comes back as 128 of 128 rx_timeout_or_err -- identical
+	 * to a peer that is out of range or powered off, and the survey-floor
+	 * warning below would then blame the LINK for what is an addressing
+	 * mistake. Caught on the bench 2026-09-03, where `cal link 1` run from
+	 * the board whose own `anchor id` is 1 read 0/128 and looked like a
+	 * dead peer. */
+	if (id == (long)uwb_config_get()->anchor_id) {
+		shell_error(sh,
+			    "error: id %ld is THIS board's own anchor id -- a "
+			    "board cannot range itself. `anchor show` reports "
+			    "the local id; pick a different peer",
+			    id);
+		return -EINVAL;
+	}
+
 	if (!parse_l(argv[2], &mm) || mm <= 0) {
 		shell_error(sh, "error: distance must be a positive integer in mm");
 		return -EINVAL;

@@ -75,11 +75,41 @@ otherwise — `anchor show` reports the live values.
 A separate observation that is NOT calibration evidence, recorded so it is not
 mistaken for it: the first successful `apos run` (2026-08-26, §2 below) reported
 `max_reciprocal_mm: 5` across the whole mesh. That is the largest
-|d(A->B) - d(B->A)| and it bounds the antenna-delay **asymmetry** only.
-Averaging both directions is exactly what cancels asymmetry, so a small figure
-here says nothing about the common-mode bias every anchor shares — which is the
-part calibration fixes and the part that moves an absolute distance. A perfectly
-reciprocal mesh can be uniformly wrong by metres.
+|d(A->B) - d(B->A)|, and **it says nothing about antenna delay at all** — not
+even about its asymmetry. Writing out the observable with per-board delay
+errors `e`:
+
+```
+tof_measured = TOF_true - (e_tx_I + e_rx_I + e_tx_R + e_rx_R) / 2
+```
+
+which is **symmetric in initiator and responder**: swapping the roles gives
+the identical expression, so SS-TWR range is EXACTLY reciprocal in antenna
+delay and there is no antenna-delay asymmetry for reciprocity to bound or for
+averaging to cancel. An earlier version of this paragraph said reciprocity
+"bounds the antenna-delay asymmetry" and that averaging both directions
+cancels it; the conclusion below is right, the reason was not — the same shape
+as the `RX_ANT_DLY` bullet further down, which also reached a correct
+conclusion by the wrong route.
+
+What DOES flip sign between the two directions, and therefore what
+`max_reciprocal_mm` actually measures, is the **residual clock-offset error**.
+`dwt_readclockoffset()` is measured by whichever board is the initiator, so
+its estimation error enters with opposite sign each way, and averaging the two
+directions cancels it. The sensitivity is large: `d(range)/d(offset) =
+rtd_resp/2 x 4.69 mm`, which at this project's 2000 uus turnaround is
+**~307 mm per ppm** (consistent with the "5 ppm is ~1.5 m" figure in
+`ss_initiator.c`). Observed directly on the bench 2026-09-03: the same board
+pair read `clk_off = -3 ppm` one way and `+3 ppm` the other, with a 78 mm
+reciprocity gap — 0.25 ppm of residual, well above `dwt_readclockoffset()`'s
+own ~0.015 ppm (4.7 mm) quantisation, so estimator bias or thermal drift
+rather than resolution.
+
+The conclusion this paragraph existed for is unchanged and still the point: a
+small `max_reciprocal_mm` says nothing about the common-mode bias every anchor
+shares — which is the part calibration fixes and the part that moves an
+absolute distance. **A perfectly reciprocal mesh can be uniformly wrong by
+metres.**
 
 `docs/antenna-delay-calibration.md` is the
 document to execute them from; until they are done, the residuals recorded at
