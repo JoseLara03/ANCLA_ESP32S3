@@ -54,7 +54,7 @@ PEER_RE = re.compile(
     r'"apos_peer":\{[^}]*?"addr":"0x([0-9A-Fa-f]+)"[^}]*?'
     r'"x":(-?[0-9.]+),"y":(-?[0-9.]+)'
 )
-STATS_RE = re.compile(r'\{"(blink|tdoa|tdoa_ekf)":\{(.+?)\}\}')
+STATS_RE = re.compile(r'\{"(blink|tdoa|tdoa_abg)":\{(.+?)\}\}')
 
 
 def clean(path):
@@ -346,24 +346,29 @@ def main():
         seen = {}
         for kind, kv, _b, _t in stats:
             seen[kind] = kv
-        for kind in ("blink", "tdoa", "tdoa_ekf"):
+        for kind in ("blink", "tdoa", "tdoa_abg"):
             if kind in seen:
                 print("  %-9s %s" % (kind, seen[kind]))
-        e = seen.get("tdoa_ekf")
+        a = seen.get("tdoa_abg")
         t = seen.get("tdoa")
-        if e and t:
+        if a and t:
             try:
-                s, f, r = (int(e["seeded"]), int(e["filtered"]),
-                           int(e["reseed"]))
+                s, d, f, r = (int(a["seeded"]), int(a["dt_reseed"]),
+                              int(a["filtered"]), int(a["reseed"]))
+                g, st = int(a["gate_rejected"]), int(a["still"])
                 fx = int(t["fixes"])
-                print("  fixes(%d) vs seeded+filtered+reseed(%d): %s"
-                      % (fx, s + f + r,
-                         "balances" if fx == s + f + r
-                         else "MISMATCH -- stale republish, see tdoa_gw.c"))
-                if f and r == 0:
-                    print("  reseed is 0 over %d filtered cycles -- the "
-                          "divergence" % f)
-                    print("  recovery never fired. See Task 7.")
+                print("  fixes(%d) vs seeded+dt_reseed+filtered+reseed(%d): %s"
+                      % (fx, s + d + f + r,
+                         "balances" if fx == s + d + f + r
+                         else "MISMATCH -- a published fix with no filter "
+                              "step behind it, see tdoa_gw.c solve_one()"))
+                if f and st == f:
+                    print("  still == filtered (%d): the MOVING bit is not "
+                          "arriving -- proto-4 anchors?" % f)
+                if f and g > f // 4:
+                    print("  gate_rejected (%d) is over a quarter of filtered "
+                          "(%d): gate too tight or the solve is throwing "
+                          "outliers" % (g, f))
             except (KeyError, ValueError):
                 pass
 

@@ -1,0 +1,2 @@
+[00:01:00.000,000] <inf> gw: {"tdoa":{"role":"gateway","ingested":40,"rejected":0,"reject_dup":0,"reject_shed":0,"fixes":10,"no_anchor":0,"implausible":0,"solve_fail":0,"jump":0,"reorder":1}}
+[00:01:00.100,000] <inf> gw: {"tdoa_abg":{"role":"gateway","seeded":2,"dt_reseed":1,"filtered":6,"gate_rejected":3,"reseed":1,"still":4}}
