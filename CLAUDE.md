@@ -1405,10 +1405,10 @@ sync master                    transmit half — CCP sent/dropped counts as
   `blink stats`' `zupt` counter existed for that, and the shell warned when
   `zupt == filtered`. The gateway forwards the whole flags BYTE rather than a
   decoded boolean, so `BLINK_FLAG_ALERT` became visible for free and the next
-  flag needs no new field. **Since 2026-09-06 the gateway parses the bit and
-  consumes nothing** (the EKF and its `zupt` counter are gone); the planned
-  alpha-beta-gamma filter is its next consumer and inherits the same
-  absence-reads-as-still trap, which is why its spec keeps a `still` counter.
+  flag needs no new field. **Since 2026-09-06 the alpha-beta-gamma filter is
+  the bit's consumer** (the EKF and its `zupt` counter are gone) and inherits
+  the same absence-reads-as-still trap, which is why `blink stats`' `tdoa_abg`
+  line keeps a `still` counter and warns when `still == filtered`.
 
 - **The TDoA height model (`apos tagz`) is a PER-SITE number and nobody has
   measured one yet.** `tdoa_gw.c` sets each observation's `dz` to

@@ -68,9 +68,11 @@
  * flag does is put it on the air so the TDoA path can use it too.
  *
  * CONSUMER STATUS: the gateway's EKF used it from 2026-09-03 until that
- * filter was removed on 2026-09-06; the alpha-beta-gamma filter planned in
- * docs/superpowers/specs/2026-09-06-abg-position-filter-design.md uses it
- * the same way. Between the two, tdoa_gw.c parses it and consumes nothing.
+ * filter was removed on 2026-09-06; its replacement, the alpha-beta-gamma
+ * filter (docs/superpowers/specs/2026-09-06-abg-position-filter-design.md,
+ * src/pos_abg.h), is implemented and uses it the same way -- see
+ * tdoa_gw.c's ingest_one()/solve_one() (mm->tag_moving, the `still` arg to
+ * pos_abg_step()).
  *
  * WHAT IT DOES NOT MEAN: "not moving" is the accelerometer's opinion, not
  * ground truth. A tag carried slowly and smoothly can report still, which
