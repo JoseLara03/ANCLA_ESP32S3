@@ -254,6 +254,229 @@ static void test_long_dt_is_bounded(void)
 	CHECK(fabsf(f.ax) <= c.gamma / 1.0f * 1.0f + 1e-6f);
 }
 
+/* A single 3 m outlier is REJECTED: state equals the prediction (which for a
+ * stationary seeded filter is the seed), init still true, streak 1. */
+static void test_gate_rejects_outlier_and_holds_prediction(void)
+{
+	struct pos_abg_cfg c;
+	struct pos_abg f;
+
+	pos_abg_cfg_defaults(&c);
+	pos_abg_reset(&f);
+	pos_abg_seed(&f, 1.0f, 1.0f);
+	CHECK(pos_abg_step(&f, &c, 0.2f, 4.0f, 1.0f, false) == POS_ABG_REJECTED);
+	CHECK(f.init);
+	CHECK(f.x == 1.0f && f.y == 1.0f);
+	CHECK(f.vx == 0.0f && f.ax == 0.0f);
+	CHECK(f.reject_streak == 1u);
+
+	/* A moving filter coasts on its velocity while rejecting. */
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	f.vx = 1.0f;
+	CHECK(pos_abg_step(&f, &c, 0.2f, 10.0f, 0.0f, false) == POS_ABG_REJECTED);
+	CHECK(fabsf(f.x - 0.2f) < 1e-6f);
+	CHECK(f.vx == 1.0f);
+}
+
+/* Exactly at the gate is accepted (the test is `>`), just past it rejected. */
+static void test_gate_boundary(void)
+{
+	struct pos_abg_cfg c;
+	struct pos_abg f;
+
+	pos_abg_cfg_defaults(&c);
+	pos_abg_reset(&f);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 0.2f, 1.5f, 0.0f, false) == POS_ABG_ACCEPTED);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 0.2f, 1.5001f, 0.0f, false) == POS_ABG_REJECTED);
+	/* Euclidean, not per-axis: 1.2 in x and 1.2 in y is 1.70 m. */
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 0.2f, 1.2f, 1.2f, false) == POS_ABG_REJECTED);
+}
+
+/* The gate grows with dt: 2x at 0.4 s, capped at 3x (4.5 m) from 0.6 s up.
+ * Below nominal dt it stays at gate_m. */
+static void test_gate_scales_with_dt(void)
+{
+	struct pos_abg_cfg c;
+	struct pos_abg f;
+
+	pos_abg_cfg_defaults(&c);
+	pos_abg_reset(&f);
+
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 0.4f, 2.5f, 0.0f, false) == POS_ABG_ACCEPTED);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 0.4f, 3.1f, 0.0f, false) == POS_ABG_REJECTED);
+
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 1.0f, 4.4f, 0.0f, false) == POS_ABG_ACCEPTED);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 1.0f, 4.6f, 0.0f, false) == POS_ABG_REJECTED);
+
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 0.1f, 1.6f, 0.0f, false) == POS_ABG_REJECTED);
+}
+
+/* Five consecutive far measurements: RESEEDED on the fifth at the new spot,
+ * velocity zero, streak 0. Four then a return: no reseed, streak back to 0. */
+static void test_streak_reseeds_after_reset_after(void)
+{
+	struct pos_abg_cfg c;
+	struct pos_abg f;
+	int k;
+
+	pos_abg_cfg_defaults(&c);
+	CHECK(c.reset_after == 5u);
+	pos_abg_reset(&f);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	for (k = 0; k < 4; k++) {
+		CHECK(pos_abg_step(&f, &c, 0.2f, 5.0f, 5.0f, false) == POS_ABG_REJECTED);
+		CHECK(f.reject_streak == (uint8_t)(k + 1));
+	}
+	CHECK(pos_abg_step(&f, &c, 0.2f, 5.0f, 5.0f, false) == POS_ABG_RESEEDED);
+	CHECK(f.x == 5.0f && f.y == 5.0f);
+	CHECK(f.vx == 0.0f && f.vy == 0.0f && f.ax == 0.0f && f.ay == 0.0f);
+	CHECK(f.reject_streak == 0u);
+
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	for (k = 0; k < 4; k++) {
+		CHECK(pos_abg_step(&f, &c, 0.2f, 5.0f, 5.0f, false) == POS_ABG_REJECTED);
+	}
+	CHECK(pos_abg_step(&f, &c, 0.2f, 0.1f, 0.0f, false) == POS_ABG_ACCEPTED);
+	CHECK(f.reject_streak == 0u);
+	CHECK(f.x > 0.0f && f.x < 0.1f);
+}
+
+/* reset_after == 0 means never reseed on the streak; the streak saturates
+ * at 255 instead of wrapping to 0. */
+static void test_reset_after_zero_never_reseeds_and_streak_saturates(void)
+{
+	struct pos_abg_cfg c;
+	struct pos_abg f;
+
+	pos_abg_cfg_defaults(&c);
+	c.reset_after = 0u;
+	pos_abg_reset(&f);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	for (int k = 0; k < 300; k++) {
+		CHECK(pos_abg_step(&f, &c, 0.2f, 5.0f, 5.0f, false) == POS_ABG_REJECTED);
+	}
+	CHECK(f.reject_streak == 255u);
+	CHECK(f.x == 0.0f && f.y == 0.0f);
+}
+
+/* still: velocity and acceleration are exactly zero after the step, and the
+ * position moves by alpha_still * r, not alpha * r. */
+static void test_still_freezes_velocity_and_uses_alpha_still(void)
+{
+	struct pos_abg_cfg c;
+	struct pos_abg f;
+
+	pos_abg_cfg_defaults(&c);
+	pos_abg_reset(&f);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	f.vx = 0.5f; f.ax = 0.2f;   /* pretend it had been moving */
+	CHECK(pos_abg_step(&f, &c, 0.2f, 1.0f, 0.0f, true) == POS_ABG_ACCEPTED);
+	CHECK(f.vx == 0.0f && f.vy == 0.0f && f.ax == 0.0f && f.ay == 0.0f);
+	/* prediction was 0 + 0.5*0.2 + 0.5*0.2*0.04 = 0.104; correction 0.15*(1-0.104) */
+	CHECK(fabsf(f.x - (0.104f + 0.15f * (1.0f - 0.104f))) < 1e-5f);
+
+	/* A gated cycle while still still counts as rejected, not accepted. */
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	CHECK(pos_abg_step(&f, &c, 0.2f, 5.0f, 0.0f, true) == POS_ABG_REJECTED);
+}
+
+/* One-sample 1.4 m outlier (just under the gate) on a stationary tag at the
+ * default lambda: peak output deviation < 0.65 m and back within 5 cm in 30
+ * steps -- spec §3.3 table row for lambda 0.02 says 0.59 m. */
+static void test_sub_gate_outlier_is_attenuated(void)
+{
+	struct pos_abg_cfg c;
+	struct pos_abg f;
+	float peak = 0.0f;
+
+	pos_abg_cfg_defaults(&c);
+	pos_abg_reset(&f);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	for (int k = 0; k < 60; k++) {
+		float z = (k == 5) ? 1.4f : 0.0f;
+
+		CHECK(pos_abg_step(&f, &c, 0.2f, z, 0.0f, false) == POS_ABG_ACCEPTED);
+		if (fabsf(f.x) > peak) peak = fabsf(f.x);
+		if (k >= 35) CHECK(fabsf(f.x) < 0.05f);
+	}
+	CHECK(peak > 0.5f && peak < 0.65f);
+}
+
+/* The spec §3.3 "Finding" scenario: a stationary tag, 10^5 steps of random
+ * dt in [0.2, 1.0] s, sigma 0.35 m noise, a 4 m outlier every 997 cycles,
+ * never `still` (a worn tag). Returns the worst |estimate| and counts
+ * reseeds. Shared by the two tests below. */
+static float long_run(const struct pos_abg_cfg *c, uint32_t *reseeds_out)
+{
+	struct pos_abg f;
+	float worst = 0.0f;
+	uint32_t reseeds = 0u;
+
+	g_rng = 0xC0FFEE11u;   /* same draw for every caller */
+	pos_abg_reset(&f);
+	pos_abg_seed(&f, 0.0f, 0.0f);
+	for (int k = 0; k < 100000; k++) {
+		g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5;
+		float dt = 0.2f + 0.8f * (float)(g_rng & 0xFFu) / 255.0f;
+		float zx = noise(0.35f), zy = noise(0.35f);
+
+		if ((k % 997) == 0) { zx += 4.0f; }       /* gross outlier */
+		if (pos_abg_step(&f, c, dt, zx, zy, false) == POS_ABG_RESEEDED) {
+			reseeds++;
+		}
+		CHECK(isfinite(f.x) && isfinite(f.y) && isfinite(f.vx) &&
+		      isfinite(f.vy) && isfinite(f.ax) && isfinite(f.ay));
+		if (fabsf(f.x) > worst) worst = fabsf(f.x);
+		if (fabsf(f.y) > worst) worst = fabsf(f.y);
+	}
+	*reseeds_out = reseeds;
+	return worst;
+}
+
+/* Default config: finite throughout, streak reseeds under 1 % of cycles.
+ * NOTE the bound this test does NOT make: the estimate is not asserted to
+ * stay near the truth, because with the default gamma it does not (spec
+ * §3.3 table: worst 8.6 m). That is the finding the next test pins. */
+static void test_long_run_stays_finite(void)
+{
+	struct pos_abg_cfg c;
+	uint32_t reseeds = 0u;
+
+	pos_abg_cfg_defaults(&c);
+	(void)long_run(&c, &reseeds);
+	CHECK(reseeds < 1000u);
+}
+
+/* Spec §3.3 "Finding", pinned: under this dt spread the alpha-beta filter
+ * (gamma = 0) has a smaller worst excursion than the default alpha-beta-gamma,
+ * and no more reseeds. If this starts failing, the finding has been
+ * re-measured -- update spec §3.3 with the new numbers, do not delete this. */
+static void test_gamma_zero_is_more_robust_under_dt_jitter(void)
+{
+	struct pos_abg_cfg c_abg, c_ab;
+	uint32_t r_abg = 0u, r_ab = 0u;
+	float w_abg, w_ab;
+
+	pos_abg_cfg_defaults(&c_abg);
+	c_ab = c_abg;
+	c_ab.gamma = 0.0f;
+	w_abg = long_run(&c_abg, &r_abg);
+	w_ab  = long_run(&c_ab, &r_ab);
+	printf("  finding: worst |x| abg %.2f m (%u reseeds) vs ab %.2f m "
+	       "(%u reseeds)\n", (double)w_abg, r_abg, (double)w_ab, r_ab);
+	CHECK(w_ab < w_abg);
+	CHECK(r_ab <= r_abg);
+	CHECK(w_ab < 3.0f);   /* spec table: ~2.3 m */
+}
+
 int main(void)
 {
 	test_gains_match_steady_state_kalman();
@@ -265,6 +488,15 @@ int main(void)
 	test_constant_velocity_no_lag();
 	test_bad_input_leaves_state_untouched();
 	test_long_dt_is_bounded();
+	test_gate_rejects_outlier_and_holds_prediction();
+	test_gate_boundary();
+	test_gate_scales_with_dt();
+	test_streak_reseeds_after_reset_after();
+	test_reset_after_zero_never_reseeds_and_streak_saturates();
+	test_still_freezes_velocity_and_uses_alpha_still();
+	test_sub_gate_outlier_is_attenuated();
+	test_long_run_stays_finite();
+	test_gamma_zero_is_more_robust_under_dt_jitter();
 
 	if (g_fail) {
 		printf("pos_abg: %d FAILED\n", g_fail);

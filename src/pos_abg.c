@@ -73,13 +73,12 @@ bool pos_abg_get(const struct pos_abg *f, float *x, float *y,
 enum pos_abg_result pos_abg_step(struct pos_abg *f, const struct pos_abg_cfg *c,
 				 float dt_s, float zx, float zy, bool still)
 {
-	float T, T2, xp, yp, vxp, vyp, rx, ry;
+	float T, T2, xp, yp, vxp, vyp, rx, ry, gate;
 
 	if (!f->init || !(dt_s > 0.0f) || !isfinite(dt_s) ||
 	    !isfinite(zx) || !isfinite(zy)) {
 		return POS_ABG_BAD_INPUT;
 	}
-	(void)still;   /* Task 2 */
 
 	T  = dt_s;
 	T2 = T * T;
@@ -93,15 +92,61 @@ enum pos_abg_result pos_abg_step(struct pos_abg *f, const struct pos_abg_cfg *c,
 	rx = zx - xp;
 	ry = zy - yp;
 
+	/* Innovation gate: Euclidean, one threshold, grown with dt. Protection
+	 * against a gross outlier (mirror-branch solve, one badly stamped
+	 * anchor), not a statistical test -- gate_m sits ~4x the raw stationary
+	 * RMS at the nominal 200 ms, and the prediction it is measured against
+	 * is less certain the longer the interval it spans. */
+	{
+		float scale = T / POS_ABG_T_NOM_S;
+
+		if (scale < 1.0f) {
+			scale = 1.0f;
+		} else if (scale > POS_ABG_GATE_DT_CAP) {
+			scale = POS_ABG_GATE_DT_CAP;
+		}
+		gate = c->gate_m * scale;
+	}
+	if (sqrtf(rx * rx + ry * ry) > gate) {
+		/* Predict ALWAYS, correct only when accepted: the caller
+		 * advances the clock for this group whatever we return, so the
+		 * state has to be at this instant or the next accepted group's
+		 * dt covers time never integrated (the 2026-09-03 rewind
+		 * defect, from the other side). */
+		f->x = xp;  f->y = yp;
+		f->vx = vxp; f->vy = vyp;
+		if (f->reject_streak < 255u) {
+			f->reject_streak++;
+		}
+		/* reset_after == 0: never reseed on the streak. */
+		if (c->reset_after != 0u && f->reject_streak >= c->reset_after) {
+			pos_abg_seed(f, zx, zy);
+			return POS_ABG_RESEEDED;
+		}
+		return POS_ABG_REJECTED;
+	}
+
 	/* Correct. Fixed gains designed at POS_ABG_T_NOM_S, applied with the
 	 * actual dt: for dt longer than nominal the velocity and acceleration
 	 * corrections shrink, which is the conservative direction. */
-	f->x  = xp  + c->alpha * rx;
-	f->y  = yp  + c->alpha * ry;
-	f->vx = vxp + (c->beta / T) * rx;
-	f->vy = vyp + (c->beta / T) * ry;
-	f->ax = f->ax + (c->gamma / T2) * rx;
-	f->ay = f->ay + (c->gamma / T2) * ry;
+	{
+		float a = still ? c->alpha_still : c->alpha;
+
+		f->x = xp + a * rx;
+		f->y = yp + a * ry;
+	}
+	if (still) {
+		/* The ZUPT-equivalent: the tag's accelerometer says it is not
+		 * moving, so the next prediction is this point and alpha_still
+		 * turns the filter into a slow average of the solves. */
+		f->vx = 0.0f; f->vy = 0.0f;
+		f->ax = 0.0f; f->ay = 0.0f;
+	} else {
+		f->vx = vxp + (c->beta / T) * rx;
+		f->vy = vyp + (c->beta / T) * ry;
+		f->ax = f->ax + (c->gamma / T2) * rx;
+		f->ay = f->ay + (c->gamma / T2) * ry;
+	}
 	f->reject_streak = 0u;
 
 	return POS_ABG_ACCEPTED;
