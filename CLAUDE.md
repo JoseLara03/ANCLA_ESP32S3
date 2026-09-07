@@ -435,9 +435,10 @@ antenna delay (item 8, still untouched).
 
 **STATUS 2026-09-06: the EKF this section describes has been REMOVED.**
 `src/pos_ekf.{c,h}`, `tests/pos_ekf/`, the `tdoa_ekf` line of `blink stats`,
-`TDOA_DT_MAX_MS`, the temporary `CONFIG_ANCLA_TDOA_TRACE` ring and
-`trace.conf` are gone; every published TDoA fix is the raw `tdoa_solve()`
-result again, as it was before 2026-09-02. Decision, not a bug fix: with a
+the temporary `CONFIG_ANCLA_TDOA_TRACE` ring and `trace.conf` are gone;
+`TDOA_DT_MAX_MS` is reintroduced as a new constant (1000 ms) for the
+alpha-beta-gamma filter described below, unrelated to its old EKF meaning.
+Decision, not a bug fix: with a
 3-axis accelerometer and no gyroscope the tag gives the filter's motion model
 nothing to steer by, the visual result was not better than the raw solve,
 and on this site's thin 3-anchor geometry the range-difference update let it
@@ -454,8 +455,10 @@ closes.** What survived the removal and
 why: the per-tag dt reference (`last_ref_t_dtu`) and the out-of-order
 discard (`TDOA_DT_REORDER_MAX_MS`, `reorder` now on the `tdoa` stats line),
 because publish order does not depend on a filter and the next one needs
-them; `sigma_m` on `struct tdoa_meas` and `BLINK_FLAG_MOVING` on the wire,
-both now parsed and unconsumed on the gateway. The Task bullets below are
+them; `sigma_m` on `struct tdoa_meas`, still parsed and unconsumed on the
+gateway (see its own CLAUDE.md entry for why it's kept anyway);
+`BLINK_FLAG_MOVING` on the wire, which the new filter below DOES consume,
+driving its still-freeze branch. The Task bullets below are
 history: they record what was learned building the EKF, and several of those
 lessons (dt from the DTU clock, never from `now_ms`; never republish an
 unchanged estimate; the rewind defect) carry straight into the new filter.
@@ -850,7 +853,13 @@ sync master                    transmit half — CCP sent/dropped counts as
   to spend time. No host suite on purpose — everything it calls is already
   host-tested and the only thing a test could reach is the counters; its
   verification is on hardware.
-- `src/blink_shell.c` — the `blink` command tree (`blink stats`), the ONLY
+- `src/blink_shell.c` — the `blink` command tree: `blink stats` (read-only,
+  three JSON lines — the anchor/uplink counters, the solve half, and since
+  2026-09-06 the alpha-beta-gamma filter's own `tdoa_abg` line) and `blink
+  abg` (added by the same plan — a runtime-TUNABLE, GATEWAY-only command,
+  not just a read-only report: `lambda`/`gamma`/`gate`/`still`/`reset` can
+  each be set live for the visual λ sweep spec §4.5 calls for, NOT
+  persisted — a reboot returns to the compiled-in defaults). Still the ONLY
   console surface on the observation path. Registered unconditionally and
   prints a `role` field, same precedent and same reason as `src/sync_shell.c`.
   It exists because every failure on that path is otherwise invisible and
@@ -860,8 +869,12 @@ sync master                    transmit half — CCP sent/dropped counts as
   (`rx_drop_oversize`), and a gateway loop too slow to drain `obs_q`
   (`rx_drop_evict`). The receive drops are split three ways on purpose —
   conflated, a format incompatibility is indistinguishable from saturation,
-  and the two need opposite responses. It prints the two verdicts worth
-  stating rather than leaving them to be spotted.
+  and the two need opposite responses. `cmd_stats()` now prints NINE
+  conditional verdicts, not the two this entry used to count: the original
+  CCP-link-down and DEAF pair, plus the filter's own still-branch trap and
+  innovation-gate rejection rate, `reorder`, `no_anchor`, `rx_drop_evict`,
+  `reject_shed` and `implausible` — each one a condition an operator would
+  otherwise misread as "no tags" or "a healthy fleet" instead of what it is.
 - `src/blink_frame.{c,h}` — the BLINK wire format for Phase 3 TDoA: a tag
   emits this instead of running a ranging sweep, every anchor that hears it
   timestamps it, and the gateway solves. Function code `0xF0`, the first code
@@ -1004,7 +1017,10 @@ sync master                    transmit half — CCP sent/dropped counts as
   the record of how the EKF was wired, because the alpha-beta-gamma filter
   that replaces it (see the "Precisión y suavizado" status note) reuses the
   same dt source and the same per-tag memo. Removal verified: host suites on
-  the path pass and both firmware images build (figures in that status note).
+  the path pass and both firmware images build; production `dram0_0_seg`
+  moved from 272840 B (the last recorded figure, with the EKF and its
+  `sigma_m` weighting still in place) to 271944 B now that `pos_ekf` is gone
+  and `pos_abg` sits in its place.
 
   **Since 2026-09-06 (implemented per
   `docs/superpowers/plans/2026-09-06-abg-position-filter.md`), each tag's
@@ -2641,7 +2657,6 @@ gcc -Wall -Wextra -Isrc -o tests/tdoa_solve/test_tdoa_solve.exe tests/tdoa_solve
 
 gcc -Wall -Wextra -Isrc -o tests/pos_abg/test_pos_abg.exe tests/pos_abg/test_pos_abg.c src/pos_abg.c -lm
 ./tests/pos_abg/test_pos_abg.exe                # pos_abg: ALL TESTS PASSED, exits 0
-
 ```
 
 `tests/pos_ekf/` was removed with the EKF on 2026-09-06 (the tag's own copy
@@ -2650,10 +2665,11 @@ replacement's suite.
 
 `-lm` is required by the suites that link `apos_geom.c`, `pos_solver.c`,
 `pos_residual.c`, `tdoa_solve.c` or `pos_abg.c` — they call `sqrtf`/`fabsf`.
-The others do not need it. `tests/tdoa_solve/` links `pos_residual.c` only because its build
-line matches the sibling `pos_solver` suite's shape for consistency; the
-solver itself does not call into it — see the entry on `src/tdoa_solve.c`
-above for why it computes its own range-DIFFERENCE residual instead.
+The others do not need it. `tests/tdoa_solve/` links `pos_residual.c` only
+because its build line matches the sibling `pos_solver` suite's shape for
+consistency; the solver itself does not call into it — see the entry on
+`src/tdoa_solve.c` above for why it computes its own range-DIFFERENCE
+residual instead.
 
 `tests/mac_budget/test_uwb_mac_asserts.c` needs `-Itests/mac_budget/shim`, which
 supplies a `zephyr/sys/util.h` defining `BUILD_ASSERT` as `_Static_assert`. That

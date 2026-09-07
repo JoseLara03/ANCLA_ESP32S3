@@ -508,6 +508,11 @@ touched, so no reseed is needed.
 | NaN/inf from the solve | `tdoa_solve()` already reports invalid; `pos_abg_step()` additionally refuses non-finite z with `POS_ABG_BAD_INPUT`, state untouched, counted as `solve_fail` | `solve_fail` |
 | gateway reboot | all memos zeroed; every tag cold-starts | `seeded` |
 
+Note on the row above: because the clock reference advances but the filter
+does not, the NEXT successful cycle's dt can be inflated by however long the
+failure lasted — see the comment in `tdoa_gw.c` above the `resolve_one()` call
+for the full reasoning.
+
 Warnings follow the module's rule: once per boot per condition, counters
 carry magnitudes; the `K_PRIO_COOP(0)` loop and `CONFIG_LOG_MODE_OVERFLOW`
 are why.
