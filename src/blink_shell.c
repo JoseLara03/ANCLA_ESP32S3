@@ -39,14 +39,17 @@
 
 #include "blink_rx.h"
 #include "net_uplink.h"
+#include "pos_abg.h"
 #include "tdoa_gw.h"
 
-#include <string.h>
 #include "uwb_config.h"
 
 #include <zephyr/shell/shell.h>
 
+#include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef CONFIG_ANCLA_CAL_MODE
 /* The cal image runs cal_run()'s own loop, never uwb_slave_run() or
@@ -73,10 +76,9 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	uint32_t d_oversize = 0, d_parse = 0, d_evict = 0;
 	uint32_t s_obs = 0, s_reject = 0, s_fix = 0, s_no_anchor = 0;
 	uint32_t s_implaus = 0, s_solve_fail = 0, s_jump = 0;
-	uint32_t s_dup = 0, s_shed = 0;
-	uint32_t e_seeded = 0, e_reseed = 0, e_filtered = 0, e_dt_invalid = 0;
-	uint32_t e_gate_rejected = 0, e_no_update = 0, e_zupt = 0;
-	uint32_t e_reorder = 0;
+	uint32_t s_dup = 0, s_shed = 0, s_reorder = 0;
+	uint32_t a_seeded = 0, a_dt_reseed = 0, a_filtered = 0;
+	uint32_t a_gate = 0, a_reseed = 0, a_still = 0;
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
@@ -88,8 +90,9 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	tdoa_gw_stats(&s_obs, &s_reject, &s_fix, &s_no_anchor, &s_implaus,
 		      &s_solve_fail, &s_jump);
 	tdoa_gw_reject_detail(&s_dup, &s_shed);
-	tdoa_gw_ekf_stats(&e_seeded, &e_reseed, &e_filtered, &e_dt_invalid,
-			  &e_gate_rejected, &e_no_update, &e_zupt, &e_reorder);
+	s_reorder = tdoa_gw_reorder_count();
+	tdoa_gw_abg_stats(&a_seeded, &a_dt_reseed, &a_filtered, &a_gate,
+			  &a_reseed, &a_still);
 
 	shell_print(sh,
 		    "{\"blink\":{\"role\":\"%s\","
@@ -112,63 +115,58 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		    "{\"tdoa\":{\"role\":\"%s\","
 		    "\"ingested\":%u,\"rejected\":%u,\"reject_dup\":%u,"
 		    "\"reject_shed\":%u,\"fixes\":%u,\"no_anchor\":%u,"
-		    "\"implausible\":%u,\"solve_fail\":%u,\"jump\":%u}}",
+		    "\"implausible\":%u,\"solve_fail\":%u,\"jump\":%u,"
+		    "\"reorder\":%u}}",
 		    board_role(), s_obs, s_reject, s_dup, s_shed, s_fix,
-		    s_no_anchor, s_implaus, s_solve_fail, s_jump);
+		    s_no_anchor, s_implaus, s_solve_fail, s_jump, s_reorder);
 
-	/* The per-tag EKF's own counters (Task 4 of
-	 * docs/superpowers/plans/2026-09-02-tdoa-accuracy-filter.md), on their
-	 * own line for the same reason the solve half got its own line above:
-	 * without this there is no way to tell "no tags" from "the filter
-	 * rejects everything". Same role field, same reason. */
+	/* The filter's own counters (spec §4.4). Its own line for the same
+	 * reason the solve half got one: without it there is no way to tell
+	 * "no tags" from "the filter rejects everything". Publish identity:
+	 * fixes == seeded + dt_reseed + filtered + reseed. */
 	shell_print(sh,
-		    "{\"tdoa_ekf\":{\"role\":\"%s\","
-		    "\"seeded\":%u,\"reseed\":%u,\"filtered\":%u,"
-		    "\"dt_invalid\":%u,\"gate_rejected\":%u,"
-		    "\"no_update\":%u,\"zupt\":%u,\"reorder\":%u}}",
-		    board_role(), e_seeded, e_reseed, e_filtered,
-		    e_dt_invalid, e_gate_rejected, e_no_update, e_zupt,
-		    e_reorder);
+		    "{\"tdoa_abg\":{\"role\":\"%s\","
+		    "\"seeded\":%u,\"dt_reseed\":%u,\"filtered\":%u,"
+		    "\"gate_rejected\":%u,\"reseed\":%u,\"still\":%u}}",
+		    board_role(), a_seeded, a_dt_reseed, a_filtered,
+		    a_gate, a_reseed, a_still);
 
-	/* The one reading an operator cannot get from any other number here.
-	 * An anchor still on proto 4 sends no flags field, which parses as 0 =
-	 * "not moving", so EVERY filtered cycle applies a ZUPT. That looks like
-	 * a healthy stationary fleet and is actually a firmware version
-	 * mismatch, so it is called out rather than left to be spotted. */
-	if (e_filtered > 0u && e_zupt == e_filtered) {
+	/* The proto-4 trap: an anchor older than proto 5 sends no flags
+	 * field, which parses as 0 = "not moving", so EVERY filtered cycle
+	 * takes the still branch. That looks like a healthy stationary fleet
+	 * and is a firmware version mismatch. */
+	if (a_filtered > 0u && a_still == a_filtered) {
 		shell_warn(sh,
-			   "every filtered cycle (%u) applied a zero-velocity "
-			   "update. Either nothing is moving, or the anchors are "
-			   "older than proto 5 and send no MOVING bit at all - "
-			   "which parses as \"still\" and looks identical from "
-			   "here. Check the anchors' firmware before trusting a "
-			   "still fleet.", e_zupt);
+			   "every filtered cycle (%u) took the STILL branch. "
+			   "Either nothing is moving, or the anchors are older "
+			   "than proto 5 and send no MOVING bit - which parses "
+			   "as \"still\" and looks identical from here. Check "
+			   "the anchors' firmware before trusting a still "
+			   "fleet.", a_still);
+	}
+	if (a_filtered > 0u && a_gate > a_filtered / 4u) {
+		shell_warn(sh,
+			   "the innovation gate rejected %u cycle(s) against "
+			   "%u filtered - a quarter or more of the evidence. "
+			   "Either gate_m (%.2f m) is too tight for this "
+			   "site's raw dispersion, or the solve is producing "
+			   "outliers at a rate no filter should hide: read "
+			   "`implausible`, `jump` and `sync stats` before "
+			   "loosening the gate.", a_gate, a_filtered,
+			   (double)tdoa_gw_abg_cfg()->gate_m);
 	}
 
-	if (e_reorder > 0u) {
+	if (s_reorder > 0u) {
 		shell_print(sh,
 			    "%u group(s) arrived out of order and were "
-			    "discarded rather than stepping the filter "
-			    "backwards. Expected in small numbers: the "
-			    "collector orders releases by gateway ARRIVAL, "
-			    "which interleaved MQTT delivery can still "
-			    "invert. A count approaching `filtered` means "
-			    "the backhaul is reordering heavily and the "
-			    "filter is seeing far less of the data than "
-			    "`ingested` suggests.", e_reorder);
-	}
-
-	if (e_no_update > 0u) {
-		shell_warn(sh,
-			   "%u cycle(s) published NOTHING because dt was "
-			   "invalid and the solve+seed fallback also failed: "
-			   "no stale fix was republished in their place "
-			   "(fixed 2026-09-02 - an earlier build would have "
-			   "silently republished the filter's unchanged prior "
-			   "position as if it were a live fix). A high count "
-			   "here alongside a high dt_invalid means marginal "
-			   "anchor coverage for that tag, not a bug.",
-			   e_no_update);
+			    "discarded rather than published as a fix that "
+			    "steps backwards in time. Expected in small "
+			    "numbers: the collector orders releases by gateway "
+			    "ARRIVAL, which interleaved MQTT delivery can still "
+			    "invert. A count approaching `fixes` means the "
+			    "backhaul is reordering heavily and the published "
+			    "stream carries far less of the data than "
+			    "`ingested` suggests.", s_reorder);
 	}
 
 	if (s_no_anchor > 0u) {
@@ -241,84 +239,109 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
-#if defined(CONFIG_ANCLA_TDOA_TRACE)
-/*
- * TEMPORARY -- Task 7's instrumentation. DELETE with the rest of
- * CONFIG_ANCLA_TDOA_TRACE once the runaway is explained.
- *
- * shell_print and NOT LOG_INF, deliberately and for the same reason the data
- * lives in a ring: the console loses ~80 % of records at 2 fixes/s, and a
- * 128-line dump through the deferred log pool (8192 B in debug.conf) would
- * drop most of itself. Shell output is synchronous and flow-controlled.
- *
- * Read `gs` (gate_streak) first: it is the quantity pos_ekf_needs_reseed()
- * turns on, and the whole question is whether it ever reaches reset_after (3)
- * during an escape. `acc` is how many of the n-1 equations the gate let
- * through -- if that stays >= 1 while x,y walk away, the streak is being
- * reset every cycle and the recovery can never arm, which is the hypothesis.
- */
-static int cmd_trace(const struct shell *sh, size_t argc, char **argv)
+/* `blink abg [lambda|gamma|gate|still|reset <value>]` -- runtime tuning of the
+ * position filter for the visual lambda sweep (spec §4.5). NOT persisted: a
+ * reboot returns to pos_abg_cfg_defaults(), and a value the maintainer picks
+ * goes into those defaults, in source, where it can be seen. Refuses on a
+ * non-gateway role for the same reason `apos` does: the filter only runs
+ * there, and a setting on a SLAVE would be a value nobody can observe. */
+static int cmd_abg(const struct shell *sh, size_t argc, char **argv)
 {
-	const struct tdoa_trace_entry *ring = NULL;
-	uint32_t n = 0u, dropped = 0u, head = 0u;
+	const struct pos_abg_cfg *c = tdoa_gw_abg_cfg();
 
-	if (argc == 2 && strcmp(argv[1], "clear") == 0) {
-		tdoa_gw_trace_clear();
-		shell_print(sh, "trace cleared");
+	if (argc == 1) {
+		shell_print(sh,
+			    "{\"abg\":{\"role\":\"%s\",\"lambda\":%.4f,"
+			    "\"alpha\":%.4f,\"beta\":%.4f,\"gamma\":%.5f,"
+			    "\"alpha_still\":%.3f,\"gate_m\":%.2f,"
+			    "\"reset_after\":%u}}",
+			    board_role(), (double)tdoa_gw_abg_lambda(),
+			    (double)c->alpha, (double)c->beta,
+			    (double)c->gamma, (double)c->alpha_still,
+			    (double)c->gate_m, (unsigned int)c->reset_after);
 		return 0;
 	}
+	if (argc != 3) {
+		shell_error(sh, "usage: blink abg [lambda|gamma|gate|still|reset "
+				"<value>]");
+		return -EINVAL;
+	}
+#ifndef CONFIG_ANCLA_CAL_MODE
+	if (uwb_config_get()->mode != UWB_MODE_GATEWAY) {
+		shell_error(sh, "error: the position filter runs on the "
+				"GATEWAY - this board is a %s", board_role());
+		return -EPERM;
+	}
+#endif
 
-	tdoa_gw_trace_snapshot(&ring, &n, &dropped, &head);
-	if (ring == NULL || n == 0u) {
-		shell_print(sh, "trace empty (role %s -- only a GATEWAY fills "
-				"it)", board_role());
-		return 0;
+	char *end = NULL;
+	/* strtof, not strtod: same choice apos_shell.c's cmd_zoff() makes. */
+	float v = strtof(argv[2], &end);
+
+	if (end == argv[2] || *end != '\0') {
+		shell_error(sh, "error: \"%s\" is not a number", argv[2]);
+		return -EINVAL;
 	}
 
-	shell_print(sh, "%u entries, %u overwritten%s", n, dropped,
-		    dropped ? "  <-- WINDOW TOO SHORT, dump sooner" : "");
-	shell_print(sh, "     t_ms  tag  path  n acc gs z r    dt_s      x"
-			"      y     vx     vy  sigma");
-
-	/* Oldest first. Once the ring has wrapped, the oldest entry is at the
-	 * write cursor; before that it is at 0. Getting this wrong reorders a
-	 * trace whose entire value is the time evolution of gate_streak. */
-	uint32_t start = (n == TDOA_TRACE_SLOTS) ? head : 0u;
-	static const char *const pname[3] = {"filt", "seed", "none"};
-
-	for (uint32_t k = 0; k < n; k++) {
-		const struct tdoa_trace_entry *e =
-			&ring[(start + k) % TDOA_TRACE_SLOTS];
-
-		shell_print(sh, "%9u %04X  %-4s %2u %3u %2u %1u %1u %7.3f "
-				"%6.2f %6.2f %6.2f %6.2f %6.2f",
-			    e->t_ms, e->tag_addr,
-			    pname[(e->path < 3u) ? e->path : 2u],
-			    e->n, e->accepted, e->gate_streak, e->zupt,
-			    e->reseed, (double)e->dt_s, (double)e->x,
-			    (double)e->y, (double)e->vx, (double)e->vy,
-			    (double)e->sigma);
+	if (strcmp(argv[1], "lambda") == 0) {
+		if (!(v > 0.0f) || v > 1.0f) {
+			shell_error(sh, "error: lambda must be in (0, 1]; "
+					"0.005..0.5 is the sensible range");
+			return -EINVAL;
+		}
+		tdoa_gw_abg_set_lambda(v);
+	} else if (strcmp(argv[1], "gamma") == 0) {
+		if (v < 0.0f || v > 1.0f) {
+			shell_error(sh, "error: gamma must be in [0, 1]; 0 makes "
+					"the filter alpha-beta");
+			return -EINVAL;
+		}
+		tdoa_gw_abg_set_gamma(v);
+	} else if (strcmp(argv[1], "gate") == 0) {
+		if (!(v > 0.0f)) {
+			shell_error(sh, "error: gate must be > 0 m");
+			return -EINVAL;
+		}
+		tdoa_gw_abg_set_gate(v);
+	} else if (strcmp(argv[1], "still") == 0) {
+		if (!(v > 0.0f) || v > 1.0f) {
+			shell_error(sh, "error: still alpha must be in (0, 1]");
+			return -EINVAL;
+		}
+		tdoa_gw_abg_set_alpha_still(v);
+	} else if (strcmp(argv[1], "reset") == 0) {
+		if (v < 0.0f || v > 255.0f || v != (float)(int)v) {
+			shell_error(sh, "error: reset must be an integer "
+					"0..255 (0 = never reseed on the "
+					"streak)");
+			return -EINVAL;
+		}
+		tdoa_gw_abg_set_reset_after((uint8_t)v);
+	} else {
+		shell_error(sh, "error: unknown field \"%s\" (lambda|gamma|"
+				"gate|still|reset)", argv[1]);
+		return -EINVAL;
 	}
-	return 0;
+	shell_print(sh, "applied to every tag's filter on the next cycle. NOT "
+			"persisted: a reboot returns to the compiled-in "
+			"defaults");
+	return cmd_abg(sh, 1, argv);
 }
-#endif /* CONFIG_ANCLA_TDOA_TRACE */
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_blink,
 	SHELL_CMD_ARG(stats, NULL,
 		      "stats — the TDoA path as JSON, in three lines: the "
 		      "anchor's stamping counters plus the uplink's "
 		      "publish/subscribe counters, then the gateway's "
-		      "ingest/solve/publish counters, then the per-tag EKF's "
-		      "own counters. All three carry a role field",
+		      "ingest/solve/publish counters, then "
+		      "the position filter's own counters. All three carry a role field",
 		      cmd_stats, 1, 0),
-#if defined(CONFIG_ANCLA_TDOA_TRACE)
-	SHELL_CMD_ARG(trace, NULL,
-		      "trace [clear] — TEMPORARY per-cycle filter trace ring "
-		      "(Task 7). Read gate_streak (gs) against acc: a streak "
-		      "stuck at 0 while acc stays >= 1 is the runaway "
-		      "hypothesis",
-		      cmd_trace, 1, 1),
-#endif
+	SHELL_CMD_ARG(abg, NULL,
+		      "abg [lambda|gamma|gate|still|reset <value>] — read or "
+		      "tune the alpha-beta-gamma position filter at runtime "
+		      "(gamma 0 = alpha-beta). NOT persisted; GATEWAY only "
+		      "for the setters",
+		      cmd_abg, 1, 2),
 	SHELL_SUBCMD_SET_END
 );
 

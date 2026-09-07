@@ -104,37 +104,6 @@
 #define TDOA_GW_INGEST_MAX  32u
 #define TDOA_GW_SOLVE_MAX   8u
 
-/* ---- The per-tag EKF (2026-09-02 accuracy/smoothing work) -----------------
- *
- * Largest gap accepted between a tag's consecutive fixes before the filter's
- * dt is treated as meaningless and a fresh tdoa_solve()+pos_ekf_seed() runs
- * instead of a predict(). Same order as TDOA_GW_SEED_AGE_MS (ten blinks at
- * 5 Hz): a gateway reboot re-bases sync_model and the master clock jumps, and
- * a tag reappearing after minutes has no velocity worth extrapolating either
- * way. See docs/superpowers/specs/2026-09-02-tdoa-accuracy-filter-design.md
- * section 3.2.
- *
- * **Observed live on hardware, 2026-09-02, on this project's own deployed
- * gateway (real anchors, real MQTT broker, one real joined tag): `n_filtered`
- * stayed low against `n_dt_invalid`.** Diagnosed with temporary logging
- * (removed once root-caused, not left in-tree) rather than guessed at.
- * Two DISTINCT causes, both already correctly handled, neither a defect:
- * (1) a NEGATIVE raw_dt with no 40-bit wrap crossed -- two of the same tag's
- * groups draining out of blink-chronology order in one tdoa_gw_step() call,
- * because tdoa_collect_take_ready() scans slots in table order, not time
- * order, and a tag with patchy anchor coverage can have more than one of its
- * groups pending at once; (2) a raw_dt of several SECONDS, wrap-corrected --
- * long gaps between the RARE blinks that actually reached TDOA_MIN_ANCHORS
- * anchors for that tag, i.e. marginal RF coverage upstream in
- * tdoa_collect, not a timing bug here. Both are exactly the "dt <= 0
- * (reordering)" and "gap too large" cases this section already documents,
- * and the gate routing them to a fresh solve instead of a bogus predict is
- * the CORRECT behaviour, not the anomaly. Recorded here so nobody re-chases
- * this as a Task 4 defect: a dt_invalid-heavy site is a coverage/RF
- * observation about THAT deployment, not evidence against this constant or
- * the gate around it. */
-#define TDOA_DT_MAX_MS  2000
-
 /* The largest BACKWARDS dt that can still be genuine group reordering rather
  * than a forward gap that aliased through sdelta40()'s sign boundary.
  *
@@ -145,9 +114,11 @@
  *    EARLIER instant. tdoa_collect_take_ready() releases oldest-first
  *    precisely to make this rare, but it orders by gateway ARRIVAL and cannot
  *    make it impossible (see its own contract). Such a group is STALE: it must
- *    not step the filter, and above all it must not be allowed to rewind
- *    `last_ref_t_dtu`, or the next group's dt then covers time already
- *    integrated. Bounded by TDOA_COLLECT_WINDOW_MS (150 ms) plus the drain
+ *    not be published (the trace would step backwards in time), and above all
+ *    it must not be allowed to rewind `last_ref_t_dtu`, or a filter's next
+ *    dt then covers time already integrated -- the 2026-09-03 defect, found
+ *    with the EKF and just as real for the filter that replaces it. Bounded
+ *    by TDOA_COLLECT_WINDOW_MS (150 ms) plus the drain
  *    latency of one superframe -- the largest inversion actually measured on
  *    hardware 2026-09-03 was 800 ms.
  *
@@ -156,7 +127,7 @@
  *    blinks that reach TDOA_MIN_ANCHORS anchors. Those read NEGATIVE: a real
  *    10.2 s gap comes back as -7.007 s, which is exactly what the 2026-09-03
  *    trace shows. The group is genuinely NEW; its reference timestamp must
- *    advance, and the filter must reseed rather than predict through it.
+ *    advance, and a filter must reseed rather than predict through it.
  *    There is no un-wrapped clock available here to disambiguate these by
  *    arithmetic -- t_dtu wraps at 17.2 s, full stop -- so the discriminator is
  *    the magnitude, and it works only because the two populations are three
@@ -167,14 +138,26 @@
  * generous direction (too large) makes a real short gap look like reordering
  * and drops a valid fix; too small lets an aliased gap rewind the reference,
  * which is the defect this exists to close. */
+/* ---- The per-tag alpha-beta-gamma filter (2026-09-06) ----------------------
+ *
+ * Largest FORWARD dt the filter predicts through. Beyond it the tag's filter
+ * is reseeded on the fresh solve instead (counted `dt_reseed`): a gateway
+ * reboot re-bases sync_model and the master clock jumps, a tag in a slow
+ * reporting tier goes seconds between blinks, and a tag that vanished for
+ * that long has no velocity worth extrapolating. 1000 ms, not the EKF's 2000:
+ * the measured dt distribution (2026-09-03, tools/pos_trace.py) has p90 at
+ * 0.8 s, so 1 s keeps ~90 % of cycles on the filtered path while refusing
+ * to coast a walking tag more than ~1.5 m. The part-2 plan's 600 ms would
+ * reseed on >10 % of cycles -- reintroducing jumps at exactly the cadence the
+ * filter exists to hide. An aliased large-NEGATIVE dt (see the next constant)
+ * is treated the same way: genuinely new group, reseed. */
+#define TDOA_DT_MAX_MS  1000
+
 #define TDOA_DT_REORDER_MAX_MS  1000
 
-/* TDOA_GW_MOVING_ENTER_MPS / _EXIT_MPS lived here until 2026-09-03. They
- * scheduled the EKF's process noise from the FILTER'S OWN velocity estimate,
- * because at the time nothing on this path carried an accelerometer reading.
- * BLINK_FLAG_MOVING (proto 5) now does, so the closed loop is gone rather
- * than kept as a fallback -- see the removal note above solve_one() in
- * tdoa_gw.c for why having both would be worse than either. */
+/* The per-tag EKF that ran here 2026-09-02..06 is gone; its replacement is
+ * pos_abg (src/pos_abg.h), an alpha-beta-gamma filter on the SOLVED position.
+ * docs/superpowers/specs/2026-09-06-abg-position-filter-design.md. */
 
 /* Clear the collector and every cache. Call once, before the gateway loop. */
 void tdoa_gw_init(void);
@@ -234,100 +217,45 @@ void tdoa_gw_stats(uint32_t *n_obs, uint32_t *n_reject, uint32_t *n_fix,
  * Same split, and the same reason, as net_uplink_obs_rx_drops(). */
 void tdoa_gw_reject_detail(uint32_t *n_dup, uint32_t *n_shed);
 
-/* The per-tag EKF's own counters, distinct from the ingest/solve counters
- * above: those are about whether a GROUP made it to a solve attempt at all,
- * these are about what the FILTER did with it once solved. Without these
- * the filter is a black box on the bench -- no way to tell "no tags" from
- * "the filter rejects everything".
- *
- * `n_seeded` fixes produced by a COLD-START tdoa_solve()+pos_ekf_seed()
- * (no filter running yet for that tag); `n_reseed` fixes produced the same
- * way but recovering an ALREADY-seeded filter whose gate_streak reached
- * cfg.reset_after (pos_ekf_needs_reseed()); `n_filtered` fixes produced by
- * predict()+update_tdoa() with no solve at all -- the steady-state case;
- * `n_dt_invalid` cycles where an ALREADY-seeded filter could not get a
- * usable dt (forcing the reseed path instead of a predict -- a fresh
- * filter's first-ever group is NOT counted here, since it has no previous
- * dt to have been invalid); `n_gate_rejected` the cumulative count of
- * individual range-difference equations pos_ekf_update_tdoa() gated out
- * (out of n-1 attempted per filtered fix); `n_no_update` cycles where
- * NOTHING published -- dt was invalid AND the solve+seed fallback also
- * failed (solve_fail or the mirror-branch jump gate), so the filter's
- * state did not move and publishing its unchanged prior value would have
- * republished stale data as a live fix (found live on hardware
- * 2026-09-02: the same tag published the exact same (x, y) to two
- * decimals, minutes apart -- see solve_one()'s `state_changed` comment).
- * `n_no_update` is a SUBSET of `n_dt_invalid`, not additional to it: every
- * no-update cycle already incremented n_dt_invalid too.
- *
- * `n_zupt` counts zero-velocity updates applied, i.e. filtered cycles where
- * the tag's accelerometer reported still. A SUBSET of `n_filtered`. Read it
- * to tell "the MOVING bit never arrives" -- an anchor still on proto 4 sends
- * no flags field, which parses as 0, so n_zupt would equal n_filtered --
- * from "it arrives and says moving", which no other counter distinguishes. */
-void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
-		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
-		       uint32_t *n_gate_rejected, uint32_t *n_no_update,
-		       uint32_t *n_zupt, uint32_t *n_reorder);
 
+/* Groups discarded for arriving out of order (see TDOA_DT_REORDER_MAX_MS).
+ * Not a subset of any counter in tdoa_gw_stats(): such a group is never
+ * solved, so it is neither a fix nor a solve_fail. Expected in small numbers;
+ * a count approaching `fixes` means the backhaul is reordering heavily and the
+ * published stream carries far less of the data than `ingested` suggests. */
+uint32_t tdoa_gw_reorder_count(void);
 
-#if defined(CONFIG_ANCLA_TDOA_TRACE)
-
-/* ---- TEMPORARY: per-cycle filter trace (CONFIG_ANCLA_TDOA_TRACE) --------
+/* The filter's own counters, the third `blink stats` line. Publish identity
+ * that MUST hold, and that tools/pos_trace.py checks:
  *
- * Added 2026-09-03 for Task 7, to root-cause the filter runaway. DELETE ALL
- * OF THIS once the mechanism is explained -- `git grep ANCLA_TDOA_TRACE`
- * finds every line.
+ *     fixes == seeded + dt_reseed + filtered + reseed
  *
- * Why a ring rather than log lines: the runaway happens at ~2 fixes/s, and
- * that rate already loses 80 % of console records (1424 fixes counted, 291
- * delivered, no Zephyr drop report because the loss is below its
- * accounting). Per-cycle logging would destroy the very burst being chased.
- *
- * CONCURRENCY, stated because it is not airtight: the writer is the
- * K_PRIO_COOP(0) gateway loop and the reader is the preemptible shell, which
- * cannot preempt a cooperative thread -- so the shell only ever reads while
- * the loop is blocked. A tear is still possible if the loop yields between
- * filling an entry and advancing the head, and the worst case is one garbled
- * entry in a dump. Acceptable for instrumentation that is on its way out;
- * not a pattern to copy into anything that stays.
- */
-#define TDOA_TRACE_SLOTS  128u
+ * `seeded`: a tag's first group (fresh memo slot) -- solve, seed, publish.
+ * `dt_reseed`: an already-seeded filter whose dt exceeded TDOA_DT_MAX_MS or
+ * aliased negative -- seed on the fresh solve, publish. `filtered`: predict +
+ * accepted correction -- publish. `gate_rejected`: predict only, correction
+ * gated -- publish NOTHING (no evidence arrived; republishing the prediction
+ * would be the 2026-09-02 stale-republish bug by design). `reseed`: the
+ * rejection streak reached cfg.reset_after, state replaced by the solve --
+ * publish. `still`: filtered cycles that took the still branch; a SUBSET of
+ * `filtered`, and `still == filtered` on a live fleet means the MOVING bit is
+ * not arriving (proto-4 anchors), same trap the EKF's `zupt` counter caught. */
+void tdoa_gw_abg_stats(uint32_t *n_seeded, uint32_t *n_dt_reseed,
+		       uint32_t *n_filtered, uint32_t *n_gate_rejected,
+		       uint32_t *n_reseed, uint32_t *n_still);
 
-enum tdoa_trace_path {
-	TDOA_TRACE_FILTERED = 0,   /* predict + update_tdoa ran */
-	TDOA_TRACE_SEEDED,         /* dt invalid -> fresh solve + seed */
-	TDOA_TRACE_NO_UPDATE,      /* nothing changed; publish suppressed */
-};
-
-struct tdoa_trace_entry {
-	uint32_t t_ms;         /* the gateway loop's now_ms */
-	uint16_t tag_addr;
-	uint8_t  path;         /* enum tdoa_trace_path */
-	uint8_t  n;            /* anchors in the group */
-	uint8_t  accepted;     /* equations the gate let through, of n-1 */
-	uint8_t  gate_streak;  /* pos_ekf's own counter, AFTER the update */
-	uint8_t  zupt;         /* 1 when pos_ekf_zupt() was applied */
-	uint8_t  reseed;       /* 1 when needs_reseed() fired this cycle */
-	float    dt_s;
-	float    x, y, vx, vy;
-	float    sigma;        /* pos_ekf_pos_sigma() after the cycle */
-};
-
-/* Snapshot of the ring. `n_out` is how many entries are valid (up to
- * TDOA_TRACE_SLOTS) and `dropped` how many were overwritten since the last
- * clear -- a nonzero `dropped` means the window is shorter than the episode
- * and the dump has to be taken sooner.
- *
- * `head_out` is the write cursor, and the caller NEEDS it: once the ring has
- * wrapped (n_out == TDOA_TRACE_SLOTS) the OLDEST entry sits at head, not at
- * index 0. Reading from 0 unconditionally silently reorders the dump, which
- * on a trace whose whole point is the time evolution of gate_streak would be
- * worse than no dump at all. */
-void tdoa_gw_trace_snapshot(const struct tdoa_trace_entry **out,
-			    uint32_t *n_out, uint32_t *dropped,
-			    uint32_t *head_out);
-void tdoa_gw_trace_clear(void);
-#endif /* CONFIG_ANCLA_TDOA_TRACE */
+/* Runtime tuning, NOT persisted, for the visual lambda sweep (spec §4.5). A
+ * reboot returns to pos_abg_cfg_defaults(). The setters are fenced with
+ * k_sched_lock()/k_sched_unlock(): the shell thread writes while the
+ * K_PRIO_COOP(0) gateway loop reads field by field, and the loop CAN preempt
+ * the shell between two field stores. */
+struct pos_abg_cfg;
+const struct pos_abg_cfg *tdoa_gw_abg_cfg(void);
+float tdoa_gw_abg_lambda(void);
+void tdoa_gw_abg_set_lambda(float lambda);
+void tdoa_gw_abg_set_gamma(float gamma);       /* 0 makes it alpha-beta; spec §3.3 */
+void tdoa_gw_abg_set_gate(float gate_m);
+void tdoa_gw_abg_set_alpha_still(float alpha_still);
+void tdoa_gw_abg_set_reset_after(uint8_t n);
 
 #endif /* TDOA_GW_H */

@@ -9,7 +9,7 @@
 #include "apos_store.h"
 #include "blink_frame.h"   /* BLINK_FLAG_MOVING */
 #include "net_uplink.h"
-#include "pos_ekf.h"
+#include "pos_abg.h"
 #include "pos_json.h"
 #include "pos_sink.h"
 #include "pos_solver.h"
@@ -62,26 +62,28 @@ struct tag_memo {
 	bool     valid;
 	bool     has_pos;   /* x/y are a real previous fix, not zero-init */
 
-	/* ---- The per-tag EKF (2026-09-02 accuracy/smoothing work) ---------
-	 *
-	 * x/y/pos_ms/has_pos above are UNCHANGED in purpose: the last
-	 * PUBLISHED position, used only to seed a fresh tdoa_solve() and to
-	 * jump-gate it. `ekf` is a separate, independent piece of state: the
-	 * running filter. The two are synchronised only at publish time. */
-	struct pos_ekf ekf;
 	/* Reference anchor's ABSOLUTE 40-bit t_dtu from this tag's last
-	 * processed group, captured before tdoa_dtu_rebase() -- the filter's
-	 * dt clock, in hardware, at 15.65 ps. `has_ref_t` distinguishes "no
-	 * previous group yet" (fresh memo slot) from a genuine dt failure;
-	 * without it a freshly claimed slot would read as a dt anomaly rather
-	 * than a cold start. */
+	 * accepted group, captured before tdoa_dtu_rebase() -- the instant of
+	 * that fix, in hardware, at 15.65 ps. It is what the out-of-order
+	 * check in solve_one() measures against, and it is the clock any
+	 * per-tag filter on this path takes its dt from (the EKF did until
+	 * 2026-09-06; the planned alpha-beta-gamma filter will -- see
+	 * docs/superpowers/specs/2026-09-06-abg-position-filter-design.md).
+	 * `has_ref_t` distinguishes "no previous group yet" (fresh memo slot)
+	 * from a genuine dt anomaly; without it a freshly claimed slot would
+	 * read as an anomaly rather than a cold start. */
 	int64_t  last_ref_t_dtu;
 	bool     has_ref_t;
-	/* pos_ekf_predict()'s `moving` process-noise selector, and the gate on
-	 * pos_ekf_zupt(). Since proto 5 this is the TAG's own accelerometer
-	 * (BLINK_FLAG_MOVING), latched from the last group processed for this
-	 * tag -- not, as it was until 2026-09-03, an inference from the
-	 * filter's own velocity output. See the removal note above solve_one(). */
+
+	/* The filter (spec §4.1). x/y/pos_ms/has_pos above keep their meaning:
+	 * the last PUBLISHED position, which is what seeds tdoa_solve() and
+	 * jump-gates it; they follow the filter's output at publish time. */
+	struct pos_abg abg;
+	/* Latched from the last observation's BLINK_FLAG_MOVING in
+	 * ingest_one(). Every observation of one blink carries the same flags
+	 * byte (one frame, several anchors), so the last to arrive is as good
+	 * as any. Its ABSENCE (proto-4 anchor) reads as still -- see the
+	 * `still` counter. */
 	bool     tag_moving;
 };
 
@@ -96,69 +98,12 @@ struct tag_memo {
 static struct tdoa_collect collect;
 static struct tag_memo     memo[TDOA_GW_SEED_SLOTS];
 
-/* One shared config for every tag's filter -- there is no per-tag tuning,
- * so a per-tag copy would only cost memory (9 floats x TDOA_GW_SEED_SLOTS)
- * for nothing. Set once in tdoa_gw_init(). */
-static struct pos_ekf_cfg ekf_cfg;
-
-#if defined(CONFIG_ANCLA_TDOA_TRACE)
-/* TEMPORARY -- see the block on tdoa_gw.h's trace API. Static for the same
- * reason everything else here is: this thread's 4096-byte stack. */
-static struct tdoa_trace_entry trace_ring[TDOA_TRACE_SLOTS];
-static uint32_t trace_head;
-static uint32_t trace_n;
-static uint32_t trace_dropped;
-
-static void trace_put(uint32_t t_ms, uint16_t tag_addr,
-		      enum tdoa_trace_path path, const struct tag_memo *mm,
-		      float dt_s, size_t n, int accepted, bool zupt,
-		      bool reseed)
-{
-	struct tdoa_trace_entry *e = &trace_ring[trace_head];
-	float x = 0.0f, y = 0.0f, vx = 0.0f, vy = 0.0f;
-
-	(void)pos_ekf_get(&mm->ekf, &x, &y, &vx, &vy);
-
-	e->t_ms        = t_ms;
-	e->tag_addr    = tag_addr;
-	e->path        = (uint8_t)path;
-	e->n           = (uint8_t)n;
-	e->accepted    = (accepted < 0) ? 0u : (uint8_t)accepted;
-	/* Read straight off the filter rather than tracked here: gate_streak
-	 * is the quantity pos_ekf_needs_reseed() actually turns on, and the
-	 * whole question is whether it ever advances. */
-	e->gate_streak = mm->ekf.gate_streak;
-	e->zupt        = zupt ? 1u : 0u;
-	e->reseed      = reseed ? 1u : 0u;
-	e->dt_s        = dt_s;
-	e->x = x; e->y = y; e->vx = vx; e->vy = vy;
-	e->sigma       = pos_ekf_pos_sigma(&mm->ekf);
-
-	trace_head = (trace_head + 1u) % TDOA_TRACE_SLOTS;
-	if (trace_n < TDOA_TRACE_SLOTS) {
-		trace_n++;
-	} else {
-		trace_dropped++;
-	}
-}
-
-void tdoa_gw_trace_snapshot(const struct tdoa_trace_entry **out,
-			    uint32_t *n_out, uint32_t *dropped,
-			    uint32_t *head_out)
-{
-	if (out != NULL)      { *out = trace_ring; }
-	if (n_out != NULL)    { *n_out = trace_n; }
-	if (dropped != NULL)  { *dropped = trace_dropped; }
-	if (head_out != NULL) { *head_out = trace_head; }
-}
-
-void tdoa_gw_trace_clear(void)
-{
-	trace_head = 0u;
-	trace_n = 0u;
-	trace_dropped = 0u;
-}
-#endif /* CONFIG_ANCLA_TDOA_TRACE */
+/* One shared filter config for every tag -- there is no per-tag tuning.
+ * Written only by the shell setters below (k_sched_lock()-fenced) and read
+ * by solve_one(). abg_lambda is what the last set_lambda() was given, kept
+ * only so `blink abg` can print it back. */
+static struct pos_abg_cfg abg_cfg;
+static float abg_lambda = 0.02f;
 
 static uint32_t n_obs_in;
 static uint32_t n_dup;
@@ -169,24 +114,21 @@ static uint32_t n_implausible;
 static uint32_t n_solve_fail;
 static uint32_t n_jump;
 
-static uint32_t n_ekf_seeded;
-static uint32_t n_ekf_reseed;
-static uint32_t n_ekf_filtered;
-static uint32_t n_ekf_dt_invalid;
-static uint32_t n_ekf_gate_rejected;
-static uint32_t n_ekf_no_update;
-/* Zero-velocity updates applied, i.e. filtered cycles where the tag's own
- * accelerometer said it was still. Its own counter because without it there
- * is no way to tell "the MOVING bit never arrives" (an anchor still on
- * proto 4, or a tag that never reports still) from "it arrives and says
- * moving" -- the two look identical from every other number here. */
-static uint32_t n_ekf_zupt;
 /* Groups discarded because they were released out of order -- see
  * TDOA_DT_REORDER_MAX_MS. Not a subset of any other counter: such a group
- * never reaches the filter at all, so it appears in neither n_ekf_filtered
- * nor n_ekf_dt_invalid, and `tdoa.fixes` does not count it either. */
-static uint32_t n_ekf_reorder;
+ * is never solved, so `tdoa.fixes` does not count it, and it is not a
+ * solve_fail either. */
+static uint32_t n_reorder;
 static bool warned_reorder;
+
+static uint32_t n_abg_seeded;
+static uint32_t n_abg_dt_reseed;
+static uint32_t n_abg_filtered;
+static uint32_t n_abg_gate_rejected;
+static uint32_t n_abg_reseed;
+static uint32_t n_abg_still;
+static bool warned_gate;
+static bool warned_dt_reseed;
 
 /* Warn ONCE PER BOOT for each of these, and let the counters carry the rest.
  * All three conditions are per-observation or per-fix and all three persist for
@@ -209,22 +151,13 @@ static bool warned_shed;
 static bool warned_implausible;
 static bool warned_solve_fail;
 static bool warned_jump;
-/* A FILTERED fix (predict()+update_tdoa(), no solve this cycle) has no
- * least-squares residual to report at all, which is a different reason to
- * read 0.0f than warned_blind_residual's "residual is zero by construction
- * at 3 anchors" -- worth its own one-time note rather than being folded
- * into that warning, since after the first seed this is the STEADY STATE,
- * not a rare edge case. */
-static bool warned_filtered_residual;
 
 void tdoa_gw_init(void)
 {
-#if defined(CONFIG_ANCLA_TDOA_TRACE)
-	tdoa_gw_trace_clear();
-#endif
 	tdoa_collect_init(&collect);
 	memset(memo, 0, sizeof(memo));
-	pos_ekf_cfg_defaults(&ekf_cfg);
+	pos_abg_cfg_defaults(&abg_cfg);
+	abg_lambda = 0.02f;
 	n_obs_in      = 0u;
 	n_dup         = 0u;
 	n_shed        = 0u;
@@ -233,22 +166,22 @@ void tdoa_gw_init(void)
 	n_implausible = 0u;
 	n_solve_fail  = 0u;
 	n_jump        = 0u;
-	n_ekf_seeded        = 0u;
-	n_ekf_reseed        = 0u;
-	n_ekf_filtered      = 0u;
-	n_ekf_dt_invalid    = 0u;
-	n_ekf_gate_rejected = 0u;
-	n_ekf_no_update     = 0u;
-	n_ekf_zupt          = 0u;
-	n_ekf_reorder       = 0u;
-	warned_reorder      = false;
+	n_reorder     = 0u;
+	warned_reorder = false;
 	warned_blind_residual = false;
 	warned_no_anchor = false;
 	warned_shed = false;
 	warned_implausible = false;
 	warned_solve_fail = false;
 	warned_jump = false;
-	warned_filtered_residual = false;
+	n_abg_seeded        = 0u;
+	n_abg_dt_reseed     = 0u;
+	n_abg_filtered      = 0u;
+	n_abg_gate_rejected = 0u;
+	n_abg_reseed        = 0u;
+	n_abg_still         = 0u;
+	warned_gate         = false;
+	warned_dt_reseed    = false;
 }
 
 /* Where anchor `anchor_id` is, from the applied survey.
@@ -407,10 +340,11 @@ static bool ingest_one(uint32_t now_ms)
 
 	/* The publishing anchor's own measured timestamp jitter, DTU -> metres
 	 * of path. 0 means the anchor sent none (too few CCP residuals yet, or
-	 * firmware older than proto 5), and it is forwarded as 0.0f so
-	 * pos_ekf_update_tdoa() falls back to the flat r_tdoa FOR THAT ANCHOR
-	 * only -- never as a real sigma, which at 0 would read as infinite
-	 * confidence. */
+	 * firmware older than proto 5), forwarded as 0.0f, which every consumer
+	 * must read as UNKNOWN rather than as zero uncertainty. Since the EKF's
+	 * removal (2026-09-06) nothing on this path consumes it -- tdoa_solve()
+	 * is unweighted by design -- but it is on the wire regardless, and
+	 * carrying it costs nothing (see struct tdoa_meas). */
 	t.meas.sigma_m = (float)obs.sigma_dtu * TDOA_M_PER_DTU;
 	t.meas.t_dtu = obs.t_dtu;
 	t.tag_addr   = obs.tag_addr;
@@ -422,12 +356,9 @@ static bool ingest_one(uint32_t now_ms)
 	 * per tag and read back when the fix is built. */
 	mm = memo_claim(obs.tag_addr, now_ms);
 	mm->batt_soc = obs.batt_soc;
-	/* Same treatment, same reason: the collector carries only struct
-	 * tdoa_meas, so anything that rides on the OBSERVATION rather than on
-	 * the geometry is remembered here per tag and read back when the fix
-	 * is built. Every observation of one blink carries the same flags byte
-	 * (it is one frame, heard by several anchors), so latching the last
-	 * one to arrive is not a choice between disagreeing values. */
+	/* Anything that rides on the OBSERVATION rather than on the geometry
+	 * is remembered per tag here and read back when the fix is built --
+	 * the collector carries only struct tdoa_meas. */
 	mm->tag_moving = (obs.flags & BLINK_FLAG_MOVING) != 0u;
 
 	if (tdoa_collect_add(&collect, &t, now_ms)) {
@@ -475,17 +406,14 @@ static int64_t sdelta40(uint64_t a, uint64_t b)
  * conversion factor this module has no other use for. */
 #define TDOA_GW_S_PER_DTU  1.56498e-11f
 
-/* One fresh tdoa_solve() against the group, the mirror-branch jump gate
- * against the last PUBLISHED position, and a pos_ekf_seed() on success. Used
- * for both a filter's first-ever seed (cold start) and its
- * pos_ekf_needs_reseed() recovery -- the jump gate is what actually covers
- * this path, since the filter's own statistical innovation gate does not
- * exist until a seed does (see the design spec section 4.5). Returns false
- * (mm->ekf untouched; n_solve_fail or n_jump already counted and warned) on
- * a solve failure or a rejected jump; true (and *out filled in) on success. */
-static bool resolve_and_seed(struct tag_memo *mm, const struct tdoa_meas *m,
-			     size_t n, uint16_t tag_addr, uint32_t now_ms,
-			     struct pos_result *out)
+/* One fresh tdoa_solve() against the group, seeded from the last PUBLISHED
+ * position when that is recent, plus the mirror-branch jump gate against that
+ * same position. Returns false (n_solve_fail or n_jump already counted and
+ * warned) on a solve failure or a rejected jump; true, with *out filled in,
+ * on success. Touches nothing in `mm`: the caller decides what to publish. */
+static bool resolve_one(const struct tag_memo *mm, const struct tdoa_meas *m,
+			size_t n, uint16_t tag_addr, uint32_t now_ms,
+			struct pos_result *out)
 {
 	float seed_xy[2];
 	const float *seed = NULL;
@@ -536,31 +464,36 @@ static bool resolve_and_seed(struct tag_memo *mm, const struct tdoa_meas *m,
 		}
 	}
 
-	pos_ekf_seed(&mm->ekf, out->x, out->y);
 	return true;
 }
 
 /*
- * REMOVED 2026-09-03: update_moving_state(), which derived `moving` from the
- * filter's OWN velocity estimate with a hysteresis band.
+ * REMOVED 2026-09-06: the per-tag constant-velocity EKF (pos_ekf, added
+ * 2026-09-02 and extended 2026-09-03 with per-anchor weighting, the tag's
+ * MOVING bit as its ZUPT gate, and a temporary trace ring). Every fix this
+ * function publishes is now the RAW tdoa_solve() result again, exactly as it
+ * was before 2026-09-02.
  *
- * It was a deliberate stand-in, accepted in the 2026-09-02 design (its §4.6)
- * only because the alternative cost a wire change. That design also named its
- * flaw: a filter deciding "am I moving?" from its own output is a closed loop,
- * and under high noise it can stick on "moving" -- which is exactly the case
- * where a stationary tag most needs the still branch.
+ * Why: measured on hardware, the EKF's tightly-coupled range-difference
+ * update did not give a better-looking track than the raw solve. With only a
+ * 3-axis accelerometer on the tag (no gyroscope) its motion model has nothing
+ * to steer it, and on this site's thin 3-anchor geometry a single accepted
+ * equation per cycle was enough to keep its divergence recovery disarmed
+ * while it ran away (2026-09-03, 17 m outside a 2.4 m array). The decision
+ * (2026-09-06) is to smooth the solved POSITION instead, with an
+ * alpha-beta-gamma filter whose only job is to damp the jumps that bad
+ * anchor coordinates or a poorly synchronised CCP put into consecutive fixes:
+ * docs/superpowers/specs/2026-09-06-abg-position-filter-design.md and its
+ * plan. That filter is NOT yet implemented; this is the bare state in
+ * between.
  *
- * BLINK_FLAG_MOVING (proto 5) replaces it with the tag's own accelerometer.
- * The heuristic is DELETED rather than kept as a fallback: two criteria
- * competing for one process-noise parameter is worse than either alone, and a
- * fallback that only engages when the real signal is missing would be
- * exercised on precisely the boards nobody tested.
- *
- * An anchor still on proto 4 sends no flags field, which parses as 0 --
- * "not moving". That is the safe direction: the filter gets the still process
- * noise and a ZUPT it may not deserve, and pos_ekf's gate streak plus
- * pos_ekf_needs_reseed() is what recovers from that, exactly as it does for a
- * tag carried too smoothly for its accelerometer to notice.
+ * What survived the removal, and why: the per-tag dt reference
+ * (`last_ref_t_dtu`) and the out-of-order discard below, because publishing
+ * a group that describes an EARLIER instant than the last published fix
+ * makes the trace jump backwards whether or not a filter is running, and
+ * because the filter to come needs exactly that reference (the 2026-09-03
+ * rewind defect is documented on TDOA_DT_REORDER_MAX_MS and must not be
+ * re-learned).
  */
 
 /* One ready group into one published fix. Returns false when no group was
@@ -572,7 +505,6 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	struct pos_fix fix;
 	struct tag_memo *mm;
 	uint8_t eui[UWB_FRAME_EUI_LEN];
-	bool have_res = false;
 	int64_t fix_t_dtu;
 	size_t n = 0u;
 	uint16_t tag_addr = 0u;
@@ -583,7 +515,7 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 
 	/* The instant of this fix: the reference anchor's ABSOLUTE 40-bit
 	 * t_dtu, captured BEFORE tdoa_dtu_rebase() turns m[] into signed
-	 * differences. This is the filter's dt clock. */
+	 * differences. The out-of-order check below measures against it. */
 	fix_t_dtu = m[0].t_dtu;
 
 	/* Absolute 40-bit timestamps in, signed differences out. Must happen
@@ -604,168 +536,128 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 
 	mm = memo_claim(tag_addr, now_ms);
 
-	bool have_filter = pos_ekf_get(&mm->ekf, NULL, NULL, NULL, NULL);
-	float dt_s = 0.0f;
-	bool dt_ok = false;
+	/* dt classification. dt_ok means "predict through it"; anything else
+	 * that is not dropped outright reseeds. All from the DTU clock -- never
+	 * now_ms, which is quantized to the superframe and would fabricate
+	 * velocity. */
+	bool  dt_ok = false;
+	float dt_s  = 0.0f;
 
 	if (mm->has_ref_t) {
 		int64_t raw_dt = sdelta40((uint64_t)fix_t_dtu,
 					 (uint64_t)mm->last_ref_t_dtu);
 
 		dt_s = (float)raw_dt * TDOA_GW_S_PER_DTU;
-		dt_ok = dt_s > 0.0f && dt_s <= ((float)TDOA_DT_MAX_MS / 1000.0f);
 
 		/* A small NEGATIVE dt is a group released out of order -- it
-		 * describes an instant this tag's filter has already passed.
-		 * Discard it whole: do not step the filter, do not publish,
-		 * and above all do NOT advance last_ref_t_dtu. Letting it
-		 * advance (which is what this function did until 2026-09-03)
-		 * rewinds the reference, so the NEXT group's dt spans time
-		 * already integrated -- measured as three groups in one
-		 * gateway cycle predicting 0.400 + 0.200 + 0.600 s for 200 ms
-		 * of real elapsed time, with the filtered fixes coming out
-		 * noisier than the raw solve they smooth.
+		 * describes an instant EARLIER than this tag's last fix.
+		 * Discard it whole: do not publish it (the trace would
+		 * step backwards in time), do not step the filter, and do NOT
+		 * advance last_ref_t_dtu. Letting it advance rewinds the
+		 * reference, so the next group's dt spans time already
+		 * integrated -- measured 2026-09-03 as three groups in one
+		 * cycle predicting 1.2 s for 200 ms of real elapsed time.
 		 *
-		 * A LARGE negative dt is the opposite case and must fall
-		 * through: it is a forward gap that aliased through
-		 * sdelta40()'s sign boundary, the group is genuinely new, and
-		 * the reference has to advance so the reseed below measures
-		 * from the right instant. TDOA_DT_REORDER_MAX_MS carries the
-		 * full derivation of where the two populations separate. */
-		if (raw_dt <= 0 &&
-		    -dt_s <= ((float)TDOA_DT_REORDER_MAX_MS / 1000.0f)) {
-			n_ekf_reorder++;
+		 * A dt under POS_ABG_DT_MIN_S is the same case from the other
+		 * side: no two distinct blinks of one tag are that close, so it
+		 * is a duplicate group of one blink, and beta/dt would blow up
+		 * on it. Same treatment, same counter.
+		 *
+		 * A LARGE negative dt is a forward gap that aliased through
+		 * sdelta40()'s sign boundary: the group is genuinely new, the
+		 * reference must advance, and the filter reseeds rather than
+		 * predicting. TDOA_DT_REORDER_MAX_MS carries the derivation of
+		 * where the two populations separate. */
+		if ((raw_dt <= 0 &&
+		     -dt_s <= ((float)TDOA_DT_REORDER_MAX_MS / 1000.0f)) ||
+		    (raw_dt > 0 && dt_s < POS_ABG_DT_MIN_S)) {
+			n_reorder++;
 			if (!warned_reorder) {
 				warned_reorder = true;
 				LOG_WRN("blink from 0x%04X released out of "
 					"order (dt %d ms): group discarded, "
-					"filter reference held. Warned ONCE; "
+					"time reference held. Warned ONCE; "
 					"`blink stats` carries the count",
 					tag_addr, (int)(dt_s * 1000.0f));
 			}
 			return true;
 		}
+		dt_ok = (raw_dt > 0) &&
+			(dt_s <= ((float)TDOA_DT_MAX_MS / 1000.0f));
 	}
 	mm->last_ref_t_dtu = fix_t_dtu;
 	mm->has_ref_t      = true;
 
-	/* Whether mm->ekf's state actually moved this cycle. pos_ekf_get()
-	 * below succeeds as soon as a filter has EVER been seeded, whatever
-	 * cycle that happened on -- it says nothing about THIS cycle. Without
-	 * this flag, a cycle where dt is invalid AND the solve+seed fallback
-	 * also fails (solve_fail or the jump gate) falls straight through to
-	 * pos_ekf_get() succeeding on the filter's UNCHANGED prior state, and
-	 * that stale state gets published again as if it were a fresh fix --
-	 * found live on hardware 2026-09-02: the same tag published the exact
-	 * same (x, y) to two decimals, minutes apart, no update in between.
-	 * Confirmed independently by `blink stats`: total published fixes
-	 * exceeded seeded+filtered+reseed by exactly the number of these
-	 * silent stale republishes. */
-	bool state_changed = false;
-	int  accepted = -1;          /* -1 = no update ran this cycle */
-	bool zupt_done = false;
-
-	if (have_filter && dt_ok) {
-		pos_ekf_predict(&mm->ekf, &ekf_cfg, dt_s, mm->tag_moving);
-
-		accepted = pos_ekf_update_tdoa(&mm->ekf, &ekf_cfg, m, n);
-
-		if (n >= 1u) {
-			n_ekf_gate_rejected += (uint32_t)(n - 1u) -
-					      (uint32_t)accepted;
-		}
-
-		/* Zero-velocity update, gated on the TAG's accelerometer.
-		 * pos_ekf.h calls this the single largest visual improvement
-		 * available, because a stationary tag is the common case: it
-		 * pins vx/vy at 0 with two scalar pseudo-measurements, which
-		 * stops the constant-velocity model from integrating
-		 * measurement noise into a drift that does not exist.
-		 *
-		 * AFTER the measurement update, not before: the ZUPT is a
-		 * statement about the state this cycle produced, and applying
-		 * it first would let the very next update undo it.
-		 *
-		 * If the accelerometer is wrong -- a tag carried slowly and
-		 * smoothly enough to read still -- this feeds the filter a
-		 * constraint it does not deserve. The recovery is pos_ekf's
-		 * own gate streak reaching cfg->reset_after, which
-		 * resolve_and_seed() below already handles. Deliberately no
-		 * second defence here: two overlapping recovery paths for one
-		 * condition is how the one that never fires goes stale. */
-		if (!mm->tag_moving) {
-			pos_ekf_zupt(&mm->ekf, &ekf_cfg);
-			n_ekf_zupt++;
-			zupt_done = true;
-		}
-
-		n_ekf_filtered++;
-		state_changed = true;
-	} else {
-		/* A fresh memo slot's very first group has no previous dt to
-		 * have been invalid -- that is a cold start, not an anomaly,
-		 * so it is not counted here. */
-		if (have_filter) {
-			n_ekf_dt_invalid++;
-		}
-		if (resolve_and_seed(mm, m, n, tag_addr, now_ms, &res)) {
-			have_res = true;
-			n_ekf_seeded++;
-			state_changed = true;
-		}
-		/* On failure resolve_and_seed() already counted and warned;
-		 * fall through to the reseed check and final publish below,
-		 * both of which are safe on a filter that is still unseeded. */
-	}
-
-	bool reseed_asked = pos_ekf_needs_reseed(&mm->ekf, &ekf_cfg);
-
-#if defined(CONFIG_ANCLA_TDOA_TRACE)
-	/* Recorded BEFORE the reseed acts, so the entry shows the state that
-	 * triggered it rather than the state that replaced it. */
-	trace_put(now_ms, tag_addr,
-		  state_changed ? (accepted >= 0 ? TDOA_TRACE_FILTERED
-						 : TDOA_TRACE_SEEDED)
-				: TDOA_TRACE_NO_UPDATE,
-		  mm, dt_s, n, accepted, zupt_done, reseed_asked);
-#endif
-
-	if (reseed_asked) {
-		struct pos_result res2;
-
-		if (resolve_and_seed(mm, m, n, tag_addr, now_ms, &res2)) {
-			res      = res2;
-			have_res = true;
-			n_ekf_reseed++;
-			state_changed = true;
-		}
-	}
-
-	if (!state_changed) {
-		/* Nothing actually happened to this tag's estimate this cycle:
-		 * dt was invalid and the fallback solve+seed also failed (or
-		 * got jump-gated). Publishing pos_ekf_get()'s unchanged prior
-		 * value here would be republishing stale data as a live fix --
-		 * see the comment on `state_changed` above. Counted apart from
-		 * n_ekf_dt_invalid (which already fired above): this is the
-		 * subset of those cycles where the fallback ALSO produced
-		 * nothing to publish. */
-		n_ekf_no_update++;
+	if (!resolve_one(mm, m, n, tag_addr, now_ms, &res)) {
+		/* Already counted and warned (solve_fail or jump). Nothing is
+		 * published for this group and the filter is not stepped: a
+		 * republished previous fix would be the stale-republish bug of
+		 * 2026-09-02 all over again. */
 		return true;
 	}
 
-	float fx, fy;
+	/* The filter (spec §4.2). Every path that publishes goes through
+	 * pos_abg_get() below; every path that does not returns here. */
+	if (!pos_abg_get(&mm->abg, NULL, NULL, NULL, NULL)) {
+		pos_abg_seed(&mm->abg, res.x, res.y);
+		n_abg_seeded++;
+	} else if (!dt_ok) {
+		pos_abg_seed(&mm->abg, res.x, res.y);
+		n_abg_dt_reseed++;
+		if (!warned_dt_reseed) {
+			warned_dt_reseed = true;
+			LOG_WRN("blink from 0x%04X: dt %d ms outside "
+				"(%d..%d] ms, filter reseeded on the fresh "
+				"solve. Warned ONCE; `blink stats` carries "
+				"the count. A high count means slow-tier "
+				"tags or marginal coverage, not a bug",
+				tag_addr, (int)(dt_s * 1000.0f),
+				(int)(POS_ABG_DT_MIN_S * 1000.0f),
+				(int)TDOA_DT_MAX_MS);
+		}
+	} else {
+		bool still = !mm->tag_moving;
 
-	if (!pos_ekf_get(&mm->ekf, &fx, &fy, NULL, NULL)) {
-		/* Defensive only: state_changed being true already implies a
-		 * successful pos_ekf_seed() or pos_ekf_predict() happened this
-		 * cycle, either of which leaves the filter initialised. */
+		switch (pos_abg_step(&mm->abg, &abg_cfg, dt_s, res.x, res.y,
+				     still)) {
+		case POS_ABG_ACCEPTED:
+			n_abg_filtered++;
+			if (still) {
+				n_abg_still++;
+			}
+			break;
+		case POS_ABG_RESEEDED:
+			n_abg_reseed++;
+			break;
+		case POS_ABG_REJECTED:
+			n_abg_gate_rejected++;
+			if (!warned_gate) {
+				warned_gate = true;
+				LOG_WRN("blink from 0x%04X: solve (%.2f, "
+					"%.2f) is more than %.1f m from the "
+					"filter's prediction - not published. "
+					"Warned ONCE; `blink stats` carries "
+					"the count", tag_addr, (double)res.x,
+					(double)res.y,
+					(double)abg_cfg.gate_m);
+			}
+			return true;
+		case POS_ABG_BAD_INPUT:
+		default:
+			/* dt_ok guarantees dt > 0 and the solve guarantees a
+			 * finite (x, y), so this is unreachable; counted as a
+			 * solve failure rather than silently published. */
+			n_solve_fail++;
+			return true;
+		}
+	}
+
+	if (!pos_abg_get(&mm->abg, &fix.x, &fix.y, NULL, NULL)) {
+		/* Defensive only: every branch above leaves the filter seeded. */
 		return true;
 	}
 
 	fix.src_addr   = tag_addr;
-	fix.x          = fx;
-	fix.y          = fy;
 	fix.n_anchors  = (uint8_t)n;
 	fix.batt_soc   = mm->batt_soc;
 
@@ -775,41 +667,27 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	 * forwarded, so nothing downstream can read a near-zero float off
 	 * pos_sink's console line as evidence of a good fit. From n_used == 4
 	 * there is one spare equation and it carries (weak) information, so it
-	 * is forwarded. A FILTERED fix (no solve ran this cycle at all) has no
-	 * least-squares residual to report in the first place -- zeroed the
-	 * same way, but for a different reason, worth its own one-time note. */
-	if (have_res) {
-		if (res.n_used <= TDOA_MIN_ANCHORS) {
-			fix.residual_m = 0.0f;
-			if (!warned_blind_residual) {
-				warned_blind_residual = true;
-				LOG_WRN("TDoA fixes are being solved over %u "
-					"anchors: `residual` on the console "
-					"line is ZERO BY CONSTRUCTION at this "
-					"anchor count and is NOT a quality "
-					"signal - a fourth surveyed anchor is "
-					"what makes it one",
-					(unsigned int)res.n_used);
-			}
-		} else {
-			fix.residual_m = res.residual_m;
+	 * is forwarded. */
+	if (res.n_used <= TDOA_MIN_ANCHORS) {
+		fix.residual_m = 0.0f;
+		if (!warned_blind_residual) {
+			warned_blind_residual = true;
+			LOG_WRN("TDoA fixes are being solved over %u "
+				"anchors: `residual` on the console "
+				"line is ZERO BY CONSTRUCTION at this "
+				"anchor count and is NOT a quality "
+				"signal - a fourth surveyed anchor is "
+				"what makes it one",
+				(unsigned int)res.n_used);
 		}
 	} else {
-		fix.residual_m = 0.0f;
-		if (!warned_filtered_residual) {
-			warned_filtered_residual = true;
-			LOG_WRN("TDoA fixes are now smoothed by a per-tag "
-				"filter: `residual` on the console line reads "
-				"0 on every FILTERED fix (no least-squares "
-				"solve ran this cycle) - it is not a quality "
-				"signal there either. Warned ONCE.");
-		}
+		fix.residual_m = res.residual_m;
 	}
 
-	/* Synchronise the seed/jump-gate memo to the position actually
-	 * published -- whichever of the filter's or a fresh solve's it was. */
-	mm->x       = fx;
-	mm->y       = fy;
+	/* The seed/jump-gate memo follows the position actually PUBLISHED --
+	 * the filter's, not the raw solve's. */
+	mm->x       = fix.x;
+	mm->y       = fix.y;
 	mm->pos_ms  = now_ms;
 	mm->has_pos = true;
 
@@ -889,17 +767,75 @@ void tdoa_gw_reject_detail(uint32_t *dup, uint32_t *shed)
 	if (shed != NULL) { *shed = n_shed; }
 }
 
-void tdoa_gw_ekf_stats(uint32_t *n_seeded, uint32_t *n_reseed,
-		       uint32_t *n_filtered, uint32_t *n_dt_invalid,
-		       uint32_t *n_gate_rejected, uint32_t *n_no_update,
-		       uint32_t *n_zupt, uint32_t *n_reorder)
+uint32_t tdoa_gw_reorder_count(void)
 {
-	if (n_seeded != NULL)       { *n_seeded = n_ekf_seeded; }
-	if (n_reseed != NULL)       { *n_reseed = n_ekf_reseed; }
-	if (n_filtered != NULL)     { *n_filtered = n_ekf_filtered; }
-	if (n_dt_invalid != NULL)   { *n_dt_invalid = n_ekf_dt_invalid; }
-	if (n_gate_rejected != NULL) { *n_gate_rejected = n_ekf_gate_rejected; }
-	if (n_no_update != NULL)    { *n_no_update = n_ekf_no_update; }
-	if (n_zupt != NULL)         { *n_zupt = n_ekf_zupt; }
-	if (n_reorder != NULL)      { *n_reorder = n_ekf_reorder; }
+	return n_reorder;
+}
+
+void tdoa_gw_abg_stats(uint32_t *n_seeded, uint32_t *n_dt_reseed,
+		       uint32_t *n_filtered, uint32_t *n_gate_rejected,
+		       uint32_t *n_reseed, uint32_t *n_still)
+{
+	if (n_seeded != NULL)        { *n_seeded = n_abg_seeded; }
+	if (n_dt_reseed != NULL)     { *n_dt_reseed = n_abg_dt_reseed; }
+	if (n_filtered != NULL)      { *n_filtered = n_abg_filtered; }
+	if (n_gate_rejected != NULL) { *n_gate_rejected = n_abg_gate_rejected; }
+	if (n_reseed != NULL)        { *n_reseed = n_abg_reseed; }
+	if (n_still != NULL)         { *n_still = n_abg_still; }
+}
+
+const struct pos_abg_cfg *tdoa_gw_abg_cfg(void)
+{
+	return &abg_cfg;
+}
+
+float tdoa_gw_abg_lambda(void)
+{
+	return abg_lambda;
+}
+
+/* The shell (preemptible) writes; the K_PRIO_COOP(0) loop reads the fields
+ * one by one and CAN preempt the shell between two stores, so a three-field
+ * lambda change is fenced -- same fence, same reason as
+ * ccp_slave_residual_reset(). Single-field setters get the same fence for
+ * uniformity; it costs nothing. */
+void tdoa_gw_abg_set_lambda(float lambda)
+{
+	struct pos_abg_cfg tmp = abg_cfg;
+
+	pos_abg_cfg_from_index(&tmp, lambda);
+	k_sched_lock();
+	abg_cfg.alpha = tmp.alpha;
+	abg_cfg.beta  = tmp.beta;
+	abg_cfg.gamma = tmp.gamma;
+	abg_lambda    = lambda;
+	k_sched_unlock();
+}
+
+void tdoa_gw_abg_set_gamma(float gamma)
+{
+	k_sched_lock();
+	abg_cfg.gamma = gamma;
+	k_sched_unlock();
+}
+
+void tdoa_gw_abg_set_gate(float gate_m)
+{
+	k_sched_lock();
+	abg_cfg.gate_m = gate_m;
+	k_sched_unlock();
+}
+
+void tdoa_gw_abg_set_alpha_still(float alpha_still)
+{
+	k_sched_lock();
+	abg_cfg.alpha_still = alpha_still;
+	k_sched_unlock();
+}
+
+void tdoa_gw_abg_set_reset_after(uint8_t n)
+{
+	k_sched_lock();
+	abg_cfg.reset_after = n;
+	k_sched_unlock();
 }
