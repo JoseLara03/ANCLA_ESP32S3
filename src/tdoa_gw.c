@@ -67,7 +67,7 @@ struct tag_memo {
 	 * that fix, in hardware, at 15.65 ps. It is what the out-of-order
 	 * check in solve_one() measures against, and it is the clock any
 	 * per-tag filter on this path takes its dt from (the EKF did until
-	 * 2026-09-06; the planned alpha-beta-gamma filter will -- see
+	 * 2026-09-06; pos_abg does now -- see solve_one() and
 	 * docs/superpowers/specs/2026-09-06-abg-position-filter-design.md).
 	 * `has_ref_t` distinguishes "no previous group yet" (fresh memo slot)
 	 * from a genuine dt anomaly; without it a freshly claimed slot would
@@ -484,8 +484,8 @@ static bool resolve_one(const struct tag_memo *mm, const struct tdoa_meas *m,
  * alpha-beta-gamma filter whose only job is to damp the jumps that bad
  * anchor coordinates or a poorly synchronised CCP put into consecutive fixes:
  * docs/superpowers/specs/2026-09-06-abg-position-filter-design.md and its
- * plan. That filter is NOT yet implemented; this is the bare state in
- * between.
+ * plan. That filter (pos_abg, src/pos_abg.h) is now wired in below -- see
+ * solve_one()'s seed/step/get calls.
  *
  * What survived the removal, and why: the per-tag dt reference
  * (`last_ref_t_dtu`) and the out-of-order discard below, because publishing
