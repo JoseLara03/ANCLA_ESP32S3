@@ -104,6 +104,21 @@
 #define TDOA_GW_INGEST_MAX  32u
 #define TDOA_GW_SOLVE_MAX   8u
 
+/* ---- The per-tag alpha-beta-gamma filter (2026-09-06) ----------------------
+ *
+ * Largest FORWARD dt the filter predicts through. Beyond it the tag's filter
+ * is reseeded on the fresh solve instead (counted `dt_reseed`): a gateway
+ * reboot re-bases sync_model and the master clock jumps, a tag in a slow
+ * reporting tier goes seconds between blinks, and a tag that vanished for
+ * that long has no velocity worth extrapolating. 1000 ms, not the EKF's 2000:
+ * the measured dt distribution (2026-09-03, tools/pos_trace.py) has p90 at
+ * 0.8 s, so 1 s keeps ~90 % of cycles on the filtered path while refusing
+ * to coast a walking tag more than ~1.5 m. The part-2 plan's 600 ms would
+ * reseed on >10 % of cycles -- reintroducing jumps at exactly the cadence the
+ * filter exists to hide. An aliased large-NEGATIVE dt (see the next constant)
+ * is treated the same way: genuinely new group, reseed. */
+#define TDOA_DT_MAX_MS  1000
+
 /* The largest BACKWARDS dt that can still be genuine group reordering rather
  * than a forward gap that aliased through sdelta40()'s sign boundary.
  *
@@ -138,21 +153,6 @@
  * generous direction (too large) makes a real short gap look like reordering
  * and drops a valid fix; too small lets an aliased gap rewind the reference,
  * which is the defect this exists to close. */
-/* ---- The per-tag alpha-beta-gamma filter (2026-09-06) ----------------------
- *
- * Largest FORWARD dt the filter predicts through. Beyond it the tag's filter
- * is reseeded on the fresh solve instead (counted `dt_reseed`): a gateway
- * reboot re-bases sync_model and the master clock jumps, a tag in a slow
- * reporting tier goes seconds between blinks, and a tag that vanished for
- * that long has no velocity worth extrapolating. 1000 ms, not the EKF's 2000:
- * the measured dt distribution (2026-09-03, tools/pos_trace.py) has p90 at
- * 0.8 s, so 1 s keeps ~90 % of cycles on the filtered path while refusing
- * to coast a walking tag more than ~1.5 m. The part-2 plan's 600 ms would
- * reseed on >10 % of cycles -- reintroducing jumps at exactly the cadence the
- * filter exists to hide. An aliased large-NEGATIVE dt (see the next constant)
- * is treated the same way: genuinely new group, reseed. */
-#define TDOA_DT_MAX_MS  1000
-
 #define TDOA_DT_REORDER_MAX_MS  1000
 
 /* The per-tag EKF that ran here 2026-09-02..06 is gone; its replacement is

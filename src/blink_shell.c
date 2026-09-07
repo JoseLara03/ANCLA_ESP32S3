@@ -47,6 +47,7 @@
 #include <zephyr/shell/shell.h>
 
 #include <errno.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -280,6 +281,10 @@ static int cmd_abg(const struct shell *sh, size_t argc, char **argv)
 
 	if (end == argv[2] || *end != '\0') {
 		shell_error(sh, "error: \"%s\" is not a number", argv[2]);
+		return -EINVAL;
+	}
+	if (!isfinite(v)) {
+		shell_error(sh, "error: \"%s\" is not a finite number", argv[2]);
 		return -EINVAL;
 	}
 

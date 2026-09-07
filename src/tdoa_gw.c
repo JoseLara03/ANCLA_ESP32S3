@@ -103,7 +103,7 @@ static struct tag_memo     memo[TDOA_GW_SEED_SLOTS];
  * by solve_one(). abg_lambda is what the last set_lambda() was given, kept
  * only so `blink abg` can print it back. */
 static struct pos_abg_cfg abg_cfg;
-static float abg_lambda = 0.02f;
+static float abg_lambda;
 
 static uint32_t n_obs_in;
 static uint32_t n_dup;
@@ -588,6 +588,16 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	mm->last_ref_t_dtu = fix_t_dtu;
 	mm->has_ref_t      = true;
 
+	/* NOTE: if resolve_one() fails below, the clock reference above has
+	 * already advanced but mm->abg (the filter) has not -- the next
+	 * successful cycle's dt will therefore span MORE real time than the
+	 * filter actually predicts through, an under-propagation. This is the
+	 * documented tradeoff in spec §5's edge table ("filter untouched,
+	 * clock reference advanced"); it can produce a spurious gate_rejected
+	 * or reseed shortly after a solve_fail/jump on a fast-moving tag.
+	 * Not a bug -- there is no filter state to correctly advance to
+	 * without a solved position to predict against -- but worth knowing
+	 * before chasing an unexplained gate_rejected as its own defect. */
 	if (!resolve_one(mm, m, n, tag_addr, now_ms, &res)) {
 		/* Already counted and warned (solve_fail or jump). Nothing is
 		 * published for this group and the filter is not stepped: a
@@ -607,7 +617,7 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 		if (!warned_dt_reseed) {
 			warned_dt_reseed = true;
 			LOG_WRN("blink from 0x%04X: dt %d ms outside "
-				"(%d..%d] ms, filter reseeded on the fresh "
+				"[%d..%d] ms, filter reseeded on the fresh "
 				"solve. Warned ONCE; `blink stats` carries "
 				"the count. A high count means slow-tier "
 				"tags or marginal coverage, not a bug",
