@@ -433,6 +433,33 @@ target. **Suavidad no es exactitud** — nothing here can move that number,
 which is still bounded by the array's 1.2-2.5 m GDOP and the uncalibrated RX
 antenna delay (item 8, still untouched).
 
+**STATUS 2026-09-06: the EKF this section describes has been REMOVED.**
+`src/pos_ekf.{c,h}`, `tests/pos_ekf/`, the `tdoa_ekf` line of `blink stats`,
+`TDOA_DT_MAX_MS`, the temporary `CONFIG_ANCLA_TDOA_TRACE` ring and
+`trace.conf` are gone; every published TDoA fix is the raw `tdoa_solve()`
+result again, as it was before 2026-09-02. Decision, not a bug fix: with a
+3-axis accelerometer and no gyroscope the tag gives the filter's motion model
+nothing to steer by, the visual result was not better than the raw solve,
+and on this site's thin 3-anchor geometry the range-difference update let it
+run 17 m outside a 2.4 m array with its divergence recovery never arming
+(Task 7 of the part-2 plan; the release-order half of that defect was fixed
+in `tdoa_collect` and STAYS fixed). What replaces it is an **alpha-beta-gamma
+filter on the solved (x, y) only** — smoothing and jump-damping, no
+measurement model — specified in
+`docs/superpowers/specs/2026-09-06-abg-position-filter-design.md` and planned
+in `docs/superpowers/plans/2026-09-06-abg-position-filter.md`. **The new
+filter is implemented and build-verified (Tasks 1-4 of the plan); Task 6, the
+bench evaluation and the λ pick, is open — update this sentence when it
+closes.** What survived the removal and
+why: the per-tag dt reference (`last_ref_t_dtu`) and the out-of-order
+discard (`TDOA_DT_REORDER_MAX_MS`, `reorder` now on the `tdoa` stats line),
+because publish order does not depend on a filter and the next one needs
+them; `sigma_m` on `struct tdoa_meas` and `BLINK_FLAG_MOVING` on the wire,
+both now parsed and unconsumed on the gateway. The Task bullets below are
+history: they record what was learned building the EKF, and several of those
+lessons (dt from the DTU clock, never from `now_ms`; never republish an
+unchanged estimate; the rewind defect) carry straight into the new filter.
+
 - **Task 1** (`src/sync_model.h`, host-tested): a `SYNC_PHASE_EMA_SHIFT`
   sweep, {3,4,5,6} x seven jitter levels x 12 seeds, is a NEGATIVE finding,
   recorded with its real numbers next to the constant — worst cell across
@@ -570,6 +597,14 @@ west espressif monitor -p COM5
 
 `$env:ZEPHYR_BASE` is **required** — this project lives outside the
 `zephyrproject` west workspace. Zephyr 4.4.x.
+
+**The paths above are one machine's (user `Menay`).** On the `jolap` machine
+(2026-09-06) the workspace is `C:\Users\jolap\zephyrproject\zephyr` and the SDK
+is `C:\Users\jolap\zephyr-sdk-1.0.1` — OUTSIDE the workspace, contradicting the
+next paragraph, which is also machine-specific. `build/CMakeCache.txt`'s
+`ZEPHYR_BASE` and `ZEPHYR_SDK_INSTALL_DIR` entries are the source of truth for
+whichever machine the checkout is on; read them before trusting either set of
+paths.
 
 **The SDK is INSIDE the workspace, at
 `C:\Users\Menay\zephyrproject\zephyr-sdk-1.0.1`** — NOT at
@@ -720,6 +755,14 @@ blink stats                    the TDoA observation path as JSON — the
                                read `sync stats` and check the gateway is on
                                USB-C. `sub_fail` climbing means the gateway
                                is DEAF: check the broker ACL.
+blink abg [lambda|gamma|gate|still|reset <v>]
+                               read or tune the position filter at runtime
+                               (gamma 0 = alpha-beta, see the spec's §3.3
+                               finding).
+                               NOT persisted — a reboot returns to
+                               pos_abg_cfg_defaults(); a chosen value goes
+                               into those defaults, in source. Setters are
+                               GATEWAY-only
 ```
 
 The `sync` tree reports the CCP sync gate. It is registered unconditionally —
@@ -949,8 +992,33 @@ sync master                    transmit half — CCP sent/dropped counts as
   very records an operator is reading.
   Counters read from the console with `blink stats` (second JSON line).
 
-  **Since 2026-09-02 (`docs/superpowers/plans/2026-09-02-tdoa-accuracy-filter.md`),
-  every tag also carries a `pos_ekf` in its seed memo** — the same struct
+  **REMOVED 2026-09-06: the per-tag EKF described in the next paragraph.**
+  `solve_one()` is back to solve-and-publish: reorder check, `resolve_one()`
+  (a fresh `tdoa_solve()` seeded from the last published position plus the
+  `TDOA_GW_MAX_JUMP_M` mirror-branch gate), publish the RAW result, and
+  publish NOTHING when the solve fails or is jump-gated (no filter state to
+  fall back on, and a republished previous fix would be the 2026-09-02
+  stale-republish bug again). `reorder` moved onto the `tdoa` line
+  (`tdoa_gw_reorder_count()`); the third `tdoa_ekf` line is gone, and
+  `tools/pos_trace.py` tolerates its absence. The paragraph below is kept as
+  the record of how the EKF was wired, because the alpha-beta-gamma filter
+  that replaces it (see the "Precisión y suavizado" status note) reuses the
+  same dt source and the same per-tag memo. Removal verified: host suites on
+  the path pass and both firmware images build (figures in that status note).
+
+  **Since 2026-09-06 (implemented per
+  `docs/superpowers/plans/2026-09-06-abg-position-filter.md`), each tag's
+  memo carries a `struct pos_abg`** and `solve_one()` runs solve → dt
+  classification → `pos_abg_step()` → publish `pos_abg_get()`. Publish
+  identity `fixes == seeded + dt_reseed + filtered + reseed` (third
+  `blink stats` line, `tdoa_abg`; `tools/pos_trace.py` checks it). A
+  gate-rejected cycle publishes NOTHING. `TDOA_DT_MAX_MS` is 1000 (p90 of
+  the measured dt is 0.8 s); a dt under `POS_ABG_DT_MIN_S` (50 ms) is a
+  duplicate group and counts as `reorder`. `blink abg` tunes the shared cfg
+  at runtime, not persisted, `k_sched_lock()`-fenced.
+
+  **From 2026-09-02 to 2026-09-06 (`docs/superpowers/plans/2026-09-02-tdoa-accuracy-filter.md`),
+  every tag also carried a `pos_ekf` in its seed memo** — the same struct
   `tag_testting/src/uwb_net_runner.c` runs for TWR, moved here for TDoA use
   (see `src/pos_ekf.{c,h}`'s own entry for why this is a verbatim copy, not
   a full ownership move, contradicting what the design spec assumed). The
@@ -1299,7 +1367,13 @@ sync master                    transmit half — CCP sent/dropped counts as
   arrives (it broke a host test on the way in). Weighting by `quality`
   (`ipatovAccumCount`) is deliberately NOT done: whether it carries any
   information at fixed PLEN is unmeasured, and measuring it needs a real
-  capture nobody has taken yet.
+  capture nobody has taken yet. **Since 2026-09-06 `sigma_m` has NO consumer**:
+  `pos_ekf_update_tdoa()` was its only reader and the EKF is removed. The
+  wire field (`sigma_dtu`, proto 5) and the `struct tdoa_meas` field stay,
+  because the anchors publish it regardless and a weighted `tdoa_solve()` is
+  its natural next consumer; the ~3x overconfidence recorded in the part-2
+  plan (Task 7 notes: `jitter_est` measures the CCP's noise, not the BLINK
+  timestamp's) is what any such consumer has to correct first.
 
 - **`BLINK_FLAG_MOVING` is the tag's accelerometer, and its ABSENCE is
   indistinguishable from "still".** Proto 5 (2026-09-03) puts the LIS2HH12's
@@ -1312,10 +1386,13 @@ sync master                    transmit half — CCP sent/dropped counts as
   alone. The trap: an anchor still on proto 4 sends no `f` field, the parser
   leaves it 0, and 0 reads as "not moving" -- so a version-skewed fleet applies
   a ZUPT on EVERY cycle and looks exactly like a healthy stationary one.
-  `blink stats`' `zupt` counter exists for that, and the shell warns when
+  `blink stats`' `zupt` counter existed for that, and the shell warned when
   `zupt == filtered`. The gateway forwards the whole flags BYTE rather than a
   decoded boolean, so `BLINK_FLAG_ALERT` became visible for free and the next
-  flag needs no new field.
+  flag needs no new field. **Since 2026-09-06 the gateway parses the bit and
+  consumes nothing** (the EKF and its `zupt` counter are gone); the planned
+  alpha-beta-gamma filter is its next consumer and inherits the same
+  absence-reads-as-still trap, which is why its spec keeps a `still` counter.
 
 - **The TDoA height model (`apos tagz`) is a PER-SITE number and nobody has
   measured one yet.** `tdoa_gw.c` sets each observation's `dz` to
@@ -1352,36 +1429,30 @@ sync master                    transmit half — CCP sent/dropped counts as
   (`<math.h>`, `sqrtf`/`fabsf` — the deliberate float exception to the "no
   float on time/scheduling paths" rule, since this is geometry, not a clock),
   host-tested in `tests/pos_solver/` and `tests/pos_residual/`.
-- `src/pos_ekf.{c,h}` — constant-velocity EKF (state `[x,y,vx,vy]`, sequential
-  scalar updates, no matrix inverse), copied verbatim from
-  `tag_testting/src/` for the 2026-09-02 TDoA accuracy/smoothing work, same
-  rule and same reason as `pos_solver.c`/`pos_residual.c` just above:
-  **the design spec that authorised this copy assumed the tag's own copy was
-  dead (Phase 3 having moved solving to the gateway), and that assumption is
-  WRONG** — `tag_testting/src/uwb_net_runner.c` still runs the full
-  `pos_ekf_seed()`/`predict()`/`update_ranges()`/`zupt()`/`needs_reseed()`
-  sequence on its TWR-ranging path; Phase 3 added a blink-only path
-  alongside it, it did not replace it. So this follows the identical
-  precedent to `pos_solver.c`: the tag owns the range-based half of this
-  file while it still solves its own TWR fix, ownership has not moved, and
-  `tag_testting/CLAUDE.md` was deliberately left untouched. `pos_ekf_seed()`,
-  `predict()`, `update_ranges()`, `zupt()`, `needs_reseed()`, `get()`,
-  `pos_sigma()` and `cfg_defaults()`'s range-related fields must not drift
-  from the tag's copy; diff both files before ever re-copying, same
-  discipline the `cal_math.c` drift incident above exists to enforce.
-  `pos_ekf_update_tdoa()` and `struct pos_ekf_cfg`'s `r_tdoa` field are new,
-  added only here: a range-DIFFERENCE update over `struct tdoa_meas` with the
-  same sequential-scalar mechanics as `update_ranges()`, `r_tdoa` defaulted
-  to 0.6 m (derived from the Fase 2 hardware sync jitter via sqrt(2), since a
-  range difference is two independent noisy timestamps rather than one — see
-  the field's own comment in `pos_ekf.h`), and the same int64-before-float
-  timestamp-subtraction discipline `tdoa_solve.c` documents twice, applied
-  here as its own trap since it does not inherit automatically to a second
-  consumer of `struct tdoa_meas`. Pure C (`<math.h>`, no CMSIS-DSP, no
-  Zephyr), host-tested in `tests/pos_ekf/` — the tag's original suite,
-  migrated unchanged, plus new tests for the TDoA update, the int64
-  subtraction-order trap, and a direct RMS comparison against `tdoa_solve()`
-  on the same noisy synthetic data (the actual point of adding this filter).
+- `src/pos_ekf.{c,h}` — **REMOVED 2026-09-06.** From 2026-09-02 it was the
+  tag's constant-velocity EKF copied verbatim from `tag_testting/src/` (the
+  tag still runs its own copy on its TWR path, so nothing changed there and
+  `tag_testting/CLAUDE.md` still owns it), plus a gateway-only
+  `pos_ekf_update_tdoa()` range-difference update. Gone with it:
+  `tests/pos_ekf/` and the `r_tdoa`/per-anchor-`sigma_m` weighting that only
+  it consumed. Why, and what replaces it, is in the "Precisión y suavizado"
+  status note above; the replacement is `src/pos_abg.{c,h}`, an
+  alpha-beta-gamma filter on the solved position, now implemented — see its
+  own entry just below (spec:
+  `docs/superpowers/specs/2026-09-06-abg-position-filter-design.md`).
+  One lesson from the EKF that the new filter's spec carries forward
+  explicitly: the int64-before-float timestamp subtraction and the "dt from
+  the DTU clock, never from `now_ms`" rule both live in `tdoa_gw.c`, not in
+  the filter, and survive the swap untouched.
+- `src/pos_abg.{c,h}` — alpha-beta-gamma filter on a SOLVED position, state
+  `[x,y,vx,vy,ax,ay]`, fixed gains from ONE tracking index via Gray-Murray
+  (`pos_abg_cfg_from_index()`), Euclidean innovation gate, streak reseed,
+  still-freeze. **Gain convention: `a += (gamma/dt^2)·r`** — the other
+  common form doubles gamma; `tests/pos_abg/` pins the closed form against a
+  steady-state Kalman recursion so the trap cannot come back silently. Pure
+  C, `<math.h>` only (`double` in the one-shot index conversion, `float`
+  everywhere else), host-tested in `tests/pos_abg/`. Spec:
+  `docs/superpowers/specs/2026-09-06-abg-position-filter-design.md`.
 - `src/tag_id.{c,h}` — FNV-1a 32-bit hash used to derive a tag's stable
   platform identity (`Tid`) from its EUI. Pure C, host-tested in
   `tests/tag_id/`.
@@ -2568,13 +2639,18 @@ gcc -Wall -Wextra -Isrc -o tests/tdoa_dtu/test_tdoa_dtu.exe tests/tdoa_dtu/test_
 gcc -Wall -Wextra -Isrc -o tests/tdoa_solve/test_tdoa_solve.exe tests/tdoa_solve/test_tdoa_solve.c src/tdoa_solve.c src/pos_residual.c -lm
 ./tests/tdoa_solve/test_tdoa_solve.exe          # tdoa_solve: ALL TESTS PASSED, exits 0
 
-gcc -Wall -Wextra -Isrc -o tests/pos_ekf/test_pos_ekf.exe tests/pos_ekf/test_pos_ekf.c src/pos_ekf.c src/pos_solver.c src/pos_residual.c src/tdoa_solve.c -lm
-./tests/pos_ekf/test_pos_ekf.exe                # ALL TESTS PASSED, exits 0
+gcc -Wall -Wextra -Isrc -o tests/pos_abg/test_pos_abg.exe tests/pos_abg/test_pos_abg.c src/pos_abg.c -lm
+./tests/pos_abg/test_pos_abg.exe                # pos_abg: ALL TESTS PASSED, exits 0
+
 ```
 
+`tests/pos_ekf/` was removed with the EKF on 2026-09-06 (the tag's own copy
+lives on in `tag_testting/tests/pos_ekf/`); `tests/pos_abg/` above is its
+replacement's suite.
+
 `-lm` is required by the suites that link `apos_geom.c`, `pos_solver.c`,
-`pos_residual.c` or `tdoa_solve.c` — they call `sqrtf`/`fabsf`. The others do
-not need it. `tests/tdoa_solve/` links `pos_residual.c` only because its build
+`pos_residual.c`, `tdoa_solve.c` or `pos_abg.c` — they call `sqrtf`/`fabsf`.
+The others do not need it. `tests/tdoa_solve/` links `pos_residual.c` only because its build
 line matches the sibling `pos_solver` suite's shape for consistency; the
 solver itself does not call into it — see the entry on `src/tdoa_solve.c`
 above for why it computes its own range-DIFFERENCE residual instead.
