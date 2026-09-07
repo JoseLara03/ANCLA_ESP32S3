@@ -34,8 +34,8 @@
  *     from a stationary point the gradient here is about twice as large.
  *   - pos_solver's residual is a RANGE residual against a range sigma of
  *     ~0.12 m (POS_RANGE_SIGMA_M); ours is a range-DIFFERENCE residual
- *     against ~0.6 m (pos_ekf.h's r_tdoa, itself derived from the Fase 2
- *     sync jitter via sqrt(2)).
+ *     against ~0.6 m (the Fase 2 sync jitter's ~0.45 m per anchor, times
+ *     sqrt(2) because a difference is two independent timestamps).
  *
  * So: 5e-3 / 0.12 ~= 4% of sigma, kept as the fraction; 0.04 * 0.6 * 2 =
  * 0.048, rounded to 5e-2. Tight against a 0.6 m measurement sigma and loose

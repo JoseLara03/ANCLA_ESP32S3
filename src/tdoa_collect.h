@@ -55,10 +55,9 @@
  * ---- The reference anchor is meas[0], and it must be DETERMINISTIC -------
  *
  * Everything downstream treats meas[0] as the reference: tdoa_dtu_rebase()
- * differences against it, tdoa_solve() linearises against it, and
- * pos_ekf_update_tdoa() writes its n-1 scalar equations against it. Since
- * 2026-09-02 tdoa_gw.c ALSO takes the filter's dt from meas[0]'s absolute
- * t_dtu.
+ * differences against it and tdoa_solve() linearises against it. Since
+ * 2026-09-02 tdoa_gw.c ALSO takes each fix's instant -- for its out-of-order
+ * check, and for any per-tag filter's dt -- from meas[0]'s absolute t_dtu.
  *
  * A first revision appended observations in arrival order, so meas[0] was
  * whichever anchor's MQTT message happened to land first -- different between

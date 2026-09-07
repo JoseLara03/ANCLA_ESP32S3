@@ -1,5 +1,14 @@
 # TDoA Accuracy/Smoothing Filter — Session Summary (2026-09-02)
 
+> **Status 2026-09-06: the EKF this summary describes has been REMOVED from the
+> gateway.** Decision by the maintainer: with only a 3-axis accelerometer on
+> the tag the filter's motion model had nothing to steer by and the visual
+> result was not better than the raw solve. It is replaced by an
+> alpha-beta-gamma filter on the solved position only — see
+> `docs/superpowers/specs/2026-09-06-abg-position-filter-design.md`. Items 1
+> (`SYNC_PHASE_EMA_SHIFT`, negative finding) and 2 (`tdoa_collect_set_expected()`)
+> below are unaffected and remain in the tree. The rest is history.
+
 **Branch:** `feat/tdoa-accuracy-filter` (from `feat/rtls-scale-tdoa`)
 **Plan/spec:** `docs/superpowers/plans/2026-09-02-tdoa-accuracy-filter.md`,
 `docs/superpowers/specs/2026-09-02-tdoa-accuracy-filter-design.md`

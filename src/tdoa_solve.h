@@ -39,10 +39,13 @@ struct tdoa_meas {
 	 * yet, or one still on proto 4, sends nothing here.
 	 *
 	 * tdoa_solve() IGNORES this field -- it is an unweighted least-squares
-	 * fit and stays one; weighting the seed solve is separate work with
-	 * its own validation. Only pos_ekf_update_tdoa() reads it. Costs
-	 * nothing to carry: it lands in padding the struct already had, so
-	 * sizeof(struct tdoa_meas) is 24 either way. */
+	 * fit and stays one; weighting the solve is separate work with its own
+	 * validation. Its only consumer was the per-tag EKF's range-difference
+	 * update, removed 2026-09-06, so at present NOTHING reads it; it is
+	 * kept because it is on the wire (proto 5 `sigma_dtu`) and a weighted
+	 * solve is its natural next consumer. Costs nothing to carry: it lands
+	 * in padding the struct already had, so sizeof(struct tdoa_meas) is 24
+	 * either way. */
 	float   sigma_m;
 	int64_t t_dtu;
 };

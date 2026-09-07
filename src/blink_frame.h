@@ -56,22 +56,27 @@
  * BLINK_FLAG_MOVING (proto 5): the tag's accelerometer says it is in motion.
  *
  * The gateway needs this because a stationary tag is the common case and the
- * single largest visual improvement available to the position filter is a
- * zero-velocity update -- pos_ekf_zupt(), whose own header says exactly that.
+ * single largest visual improvement available to any position filter that
+ * carries a velocity is to hold that velocity at zero while the tag is still.
  * Without a real motion signal the gateway can only infer "still" from the
  * filter's OWN velocity estimate, which is a closed loop on its own output and
  * can stick on "moving" under high noise.
  *
  * The tag already has this bit and already uses it: motion.c sets
- * motion_moving from the LIS2HH12 activity interrupt, and the tag's own TWR
- * path already drives pos_ekf_predict()/pos_ekf_zupt() from it. All this flag
- * does is put it on the air so the TDoA path can use it too.
+ * motion_moving from the LIS2HH12 activity interrupt, and the tag's own
+ * TWR-path filter (its pos_ekf) already drives its ZUPT from it. All this
+ * flag does is put it on the air so the TDoA path can use it too.
+ *
+ * CONSUMER STATUS: the gateway's EKF used it from 2026-09-03 until that
+ * filter was removed on 2026-09-06; the alpha-beta-gamma filter planned in
+ * docs/superpowers/specs/2026-09-06-abg-position-filter-design.md uses it
+ * the same way. Between the two, tdoa_gw.c parses it and consumes nothing.
  *
  * WHAT IT DOES NOT MEAN: "not moving" is the accelerometer's opinion, not
  * ground truth. A tag carried slowly and smoothly can report still, which
- * would feed the filter a zero-velocity update it does not deserve. The
- * defence against that is not in this frame -- it is pos_ekf's gate streak and
- * pos_ekf_needs_reseed(), which the gateway already honours.
+ * would feed a filter a zero-velocity update it does not deserve. The
+ * defence against that is not in this frame -- it belongs to the consuming
+ * filter's own divergence recovery.
  *
  * Adding this bit is why UWB_PROTO_VER moves to 5: blink_frame_parse()
  * rejects any reserved bit, so a proto-4 receiver drops a BLINK carrying it
