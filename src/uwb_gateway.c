@@ -93,6 +93,20 @@ static uint8_t rx_buf[RX_BUF_LEN];
 static uint8_t beacon_buf[UWB_FRAME_MAX_LEN];
 static uint8_t gw_seq;
 
+/* The seat table, at FILE SCOPE rather than a local inside uwb_gateway_run(),
+ * same reasoning and same pattern as apos_gw.c's edges[]/survey_rec statics.
+ * sizeof(struct gw_core_ctx) grew from 164 B (seats[GW_N_CFP], a flat
+ * 11-entry table) to 2472 B once seats[] became [GW_CYCLE_C][GW_N_CFP] =
+ * [16][11] for phase support -- against CONFIG_MAIN_STACK_SIZE (4096 B),
+ * a stack local that size is the exact overflow hazard this codebase's
+ * CLAUDE.md repeatedly warns is fatal on this K_PRIO_COOP(0) loop, where an
+ * overflow corrupts whatever called uwb_gateway_run() with no lower-priority
+ * thread able to preempt and report it. Touched only from uwb_gateway_run(),
+ * which main() calls exactly once and which never returns (see main.c), so
+ * file scope costs nothing but the .bss -- and gw_core_init() still resets it
+ * explicitly on entry, same as before. */
+static struct gw_core_ctx ctx;
+
 static void cb_rx_ok(const dwt_cb_data_t *cb_data)
 {
 	if (rx_pending) {
@@ -122,7 +136,18 @@ static uint64_t tx_beacon(struct gw_core_ctx *ctx, bool delayed, uint32_t tx_at)
 {
 	uint16_t slot_map[GW_N_CFP];
 
-	gw_core_build_slotmap(ctx, slot_map);
+	/* Which of the GW_CYCLE_C phases this beacon's slot map publishes.
+	 * frame_counter is the only counter in gw_core_ctx and is already what
+	 * this same function embeds in the beacon frame below, so it is the
+	 * right (and only) source to derive phase from too -- there is no
+	 * separate "current phase" field to drift out of sync with it. For the
+	 * very first, non-delayed beacon (called before the main loop's first
+	 * gw_core_superframe_tick()) frame_counter is still 0 from
+	 * gw_core_init(), so phase is 0, which is correct: nothing has been
+	 * granted into any other phase yet. */
+	uint8_t phase = (uint8_t)(ctx->frame_counter % GW_CYCLE_C);
+
+	gw_core_build_slotmap(ctx, phase, slot_map);
 
 	/* GW_N_CFP == UWB_FRAME_N_CFP == 11, so need = 15 + 22 = 37 =
 	 * UWB_FRAME_MAX_LEN and beacon_buf is exactly large enough.
@@ -295,8 +320,6 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 	 * poll for it, and an ISR that cleared it first would make both wait
 	 * out their full timeout on every single transmission. */
 	dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
-
-	struct gw_core_ctx ctx;
 
 	gw_core_init(&ctx);
 	apos_gw_init();
