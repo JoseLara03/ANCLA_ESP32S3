@@ -17,8 +17,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Anchors in the deployment; valid ids are 0..UWB_MAX_ANCHORS-1. */
-#define UWB_MAX_ANCHORS 4
+/* Anchors in the deployment; valid ids are 0..UWB_MAX_ANCHORS-1.
+ * 32 is the supported number for production. The wire cap is 254: short
+ * addresses are UWB_ANCHOR_ADDR_BASE + id, which must stay below 0x0100 to
+ * keep the low-byte poll id unique.
+ *
+ * WARNING: ids beyond 3 are not yet safe to use on air. The DISCOVERY
+ * responder's per-id stagger (src/disc_schedule.c:disc_resp_delay_uus)
+ * grows as 2000 + id*3500 uus, and every response at or above ~18 ms is lost
+ * because it exceeds TX_COMPLETE_TIMEOUT_MS in anchor_respond.c. This code
+ * change removes the compile-time cap; a separate grouped-DISCOVERY-response
+ * overhaul is needed to make ids 4..31 actually work on air. Until then,
+ * deploying with anchor id > 3 will silently drop DISCOVERY responses for
+ * that id, leaving it unreachable to tags. */
+#define UWB_MAX_ANCHORS 32
 
 /* Factory-reference seed for an uncalibrated unit, in DWT units. */
 #define UWB_ANT_DELAY_DEFAULT 16385u

@@ -221,7 +221,7 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_anchor,
 	SHELL_CMD_ARG(show,  NULL, "Print the active configuration as JSON",
 		      cmd_show,  1, 0),
-	SHELL_CMD_ARG(id,    NULL, "id <0..3> — set the ranging id",
+	SHELL_CMD_ARG(id,    NULL, "id <0..31> — set the ranging id",
 		      cmd_id,    2, 0),
 	SHELL_CMD_ARG(mode,  NULL, "mode <slave|gateway> — set the boot mode",
 		      cmd_mode,  2, 0),
