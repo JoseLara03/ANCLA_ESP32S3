@@ -45,6 +45,20 @@ static uint16_t window_session;
  * new session opens; see enum_slot(). */
 static uint8_t begin_seen;
 
+/* Peers whose ENUM_RSP this board has received during the CURRENT session, as a
+ * bitmap of anchor ids. Reported in every subsequent ENUM_RSP and unioned at
+ * the gateway (apos_table_add_peer), where it becomes the adjacency evidence
+ * the candidate-pair filter runs on.
+ *
+ * Accumulates across rounds and is cleared only when a new session opens or the
+ * survey ends -- the point is the union, since each round is an independent
+ * stagger draw and a board only ever hears peers whose slot came AFTER its own
+ * (it sleeps through its own slot delay with the receiver off; see
+ * handle_survey_begin). Round 0's reply therefore carries an empty bitmap and
+ * the last round's observations are never reported at all, so
+ * APOS_GW_ENUM_ROUNDS rounds yield ROUNDS-1 rounds of usable evidence. */
+static uint32_t heard_ids;
+
 static uint8_t eui[APOS_EUI_LEN];
 static bool eui_ready;
 
@@ -55,6 +69,7 @@ void apos_node_init(void)
 	window_deadline_ms = 0;
 	window_session = 0;
 	begin_seen = 0;
+	heard_ids = 0;
 
 	/* hwinfo may return fewer than 8 bytes. Zero-pad rather than leaving
 	 * the tail uninitialised: the tail is hashed for the stagger and
@@ -205,9 +220,16 @@ static void handle_survey_begin(const uint8_t *buf, uint16_t plen,
 	/* Round counter for the stagger salt. Observed BEFORE window_open()
 	 * overwrites window_session: a SURVEY_BEGIN for a session we are not
 	 * already in starts the count over, so round 0 of every survey is a
-	 * fresh draw and the counter cannot creep across runs. */
+	 * fresh draw and the counter cannot creep across runs.
+	 *
+	 * The neighbour bitmap resets on the same condition and for the same
+	 * reason: adjacency observed during an ABANDONED survey is stale
+	 * evidence about a deployment that may have been re-cabled since, and
+	 * carrying it into a new session would report links this board has not
+	 * seen in that session. It must NOT reset per round -- see heard_ids. */
 	if (session != window_session) {
 		begin_seen = 0;
+		heard_ids = 0;
 	}
 
 	uint8_t round = begin_seen;
@@ -231,7 +253,7 @@ static void handle_survey_begin(const uint8_t *buf, uint16_t plen,
 					 uwb_config_short_addr(cfg),
 					 UWB_ADDR_GATEWAY_RESERVED, session,
 					 eui, cfg->position_valid,
-					 cfg->x, cfg->y, cfg->z);
+					 cfg->x, cfg->y, cfg->z, heard_ids);
 
 	if (n < 0) {
 		LOG_ERR("ENUM_RSP build failed (%d)", n);
@@ -328,7 +350,56 @@ static void handle_survey_end(const uint8_t *buf, uint16_t plen)
 	}
 	window_session = 0;
 	begin_seen = 0;
+	heard_ids = 0;
 	LOG_INF("{\"apos\":\"window closed\",\"reason\":\"survey end\"}");
+}
+
+/* Record a peer anchor's ENUM_RSP as adjacency evidence. OBSERVE ONLY: it sets
+ * one bit and nothing else -- no window is opened or refreshed, no coordinate
+ * moves, nothing is transmitted. That is what makes it safe to run on a frame
+ * whose src is NOT the gateway, which every other APOS path refuses outright.
+ *
+ * Gated on the session so a straggler from an abandoned survey cannot claim a
+ * link in the current one. A board that has not yet seen SURVEY_BEGIN has
+ * window_session == 0, which no gateway ever issues, so it records nothing --
+ * correct, since it has no reply of its own to report it in either. */
+static void observe_peer_enum_rsp(const uint8_t *buf, uint16_t plen)
+{
+	uint16_t session = 0;
+	uint8_t peer_eui[APOS_EUI_LEN];
+	bool pv = false;
+	float x = 0.0f, y = 0.0f, z = 0.0f;
+	uint32_t peer_heard = 0;
+
+	/* Only `session` and the frame's src are used. The peer's own EUI,
+	 * position and neighbour bitmap are parsed because the codec fills every
+	 * field or none, and then discarded: what THIS board can hear is the only
+	 * thing it may report, and adjacency is not transitive -- "the peer heard
+	 * X" says nothing about whether we can. The gateway learns the peer's own
+	 * bitmap from the peer's own reply. */
+	if (apos_frame_parse_enum_rsp(buf, plen, &session, peer_eui, &pv, &x, &y,
+				      &z, &peer_heard) != 0) {
+		return;
+	}
+	if (session == 0u || session != window_session) {
+		return;
+	}
+
+	uint16_t addr = apos_frame_src(buf);
+
+	if (addr < UWB_ANCHOR_ADDR_BASE) {
+		return; /* 0x0000 is the gateway and cannot be a survey node */
+	}
+
+	uint16_t id = (uint16_t)(addr - UWB_ANCHOR_ADDR_BASE);
+
+	if (id >= UWB_MAX_ANCHORS) {
+		/* Outside the id space the bitmap can express. The gateway
+		 * refuses such an address at enumeration too, so this is a
+		 * misconfigured board rather than a link worth recording. */
+		return;
+	}
+	heard_ids |= (uint32_t)1u << id;
 }
 
 /* Static, not on the stack: CONFIG_MAIN_STACK_SIZE is 4096 and this is 256 B. */
@@ -563,8 +634,19 @@ bool apos_node_on_rx(const uint8_t *buf, uint16_t plen, uwb_config_t *cfg,
 
 	/* Only the gateway issues survey traffic. Filtering here rather than
 	 * per-subtype means a stray or spoofed APOS frame from another anchor
-	 * cannot open a window or move this board's coordinates. */
+	 * cannot open a window or move this board's coordinates.
+	 *
+	 * The ONE exception, and it is deliberately not a hole in that gate: a
+	 * peer anchor's ENUM_RSP is the only way this board can learn which of
+	 * its peers it can actually hear, which is the evidence the gateway's
+	 * candidate-pair filter needs to avoid ranging all 992 ordered pairs of
+	 * a 32-anchor array. observe_peer_enum_rsp() sets one bit in a bitmap
+	 * this board reports later; it opens nothing, refreshes nothing, moves
+	 * nothing and transmits nothing. */
 	if (apos_frame_src(buf) != UWB_ADDR_GATEWAY_RESERVED) {
+		if (apos_frame_subtype(buf) == APOS_SUB_ENUM_RSP) {
+			observe_peer_enum_rsp(buf, plen);
+		}
 		return true;
 	}
 

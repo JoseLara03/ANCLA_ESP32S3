@@ -192,7 +192,7 @@ int apos_frame_parse_survey_begin(const uint8_t *buf, size_t len,
 int apos_frame_enum_rsp_build(uint8_t *buf, size_t buf_len, uint16_t src,
 			      uint16_t dest, uint16_t session,
 			      const uint8_t eui[APOS_EUI_LEN], bool pos_valid,
-			      float x, float y, float z)
+			      float x, float y, float z, uint32_t heard_ids)
 {
 	int rc;
 
@@ -210,25 +210,32 @@ int apos_frame_enum_rsp_build(uint8_t *buf, size_t buf_len, uint16_t src,
 	memcpy(&buf[OFF_PAYLOAD + 2], eui, APOS_EUI_LEN);
 	buf[OFF_PAYLOAD + 10] = pos_valid ? 1u : 0u;
 	put_xyz(&buf[OFF_PAYLOAD + 11], x, y, z);
+	/* Appended AFTER xyz rather than inserted next to pos_valid: keeping
+	 * every pre-existing field at its old offset means the raw-byte test
+	 * vectors in tests/apos_frame/ still assert the same positions, so a
+	 * byte-order regression in the older fields stays covered. */
+	put_u32(&buf[OFF_PAYLOAD + 23], heard_ids);
 	return (int)APOS_LEN_ENUM_RSP;
 }
 
 int apos_frame_parse_enum_rsp(const uint8_t *buf, size_t len, uint16_t *session,
 			      uint8_t eui_out[APOS_EUI_LEN], bool *pos_valid,
-			      float *x, float *y, float *z)
+			      float *x, float *y, float *z,
+			      uint32_t *heard_ids)
 {
 	int rc = parse_check(buf, len, APOS_SUB_ENUM_RSP, APOS_LEN_ENUM_RSP);
 
 	if (rc) {
 		return rc;
 	}
-	if (!session || !eui_out || !pos_valid || !x || !y || !z) {
+	if (!session || !eui_out || !pos_valid || !x || !y || !z || !heard_ids) {
 		return -EINVAL;
 	}
 	*session = get_u16(&buf[OFF_PAYLOAD]);
 	memcpy(eui_out, &buf[OFF_PAYLOAD + 2], APOS_EUI_LEN);
 	*pos_valid = buf[OFF_PAYLOAD + 10] != 0u;
 	get_xyz(&buf[OFF_PAYLOAD + 11], x, y, z);
+	*heard_ids = get_u32(&buf[OFF_PAYLOAD + 23]);
 	return 0;
 }
 

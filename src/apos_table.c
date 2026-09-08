@@ -49,7 +49,7 @@ int apos_table_find_addr(const struct apos_table *t, uint16_t short_addr)
 
 int apos_table_add_peer(struct apos_table *t, const uint8_t eui[APOS_EUI_LEN],
 			uint16_t short_addr, bool pos_valid,
-			float x, float y, float z)
+			float x, float y, float z, uint32_t heard_ids)
 {
 	if (!t || !eui) {
 		return -EINVAL;
@@ -84,6 +84,12 @@ int apos_table_add_peer(struct apos_table *t, const uint8_t eui[APOS_EUI_LEN],
 	t->peer[slot].x = x;
 	t->peer[slot].y = y;
 	t->peer[slot].z = z;
+	/* Unioned, not assigned: every other field is a current fact this board
+	 * re-reports each round, but the neighbour set is an OBSERVATION whose
+	 * coverage grows round by round. Assigning would throw away everything
+	 * the earlier rounds saw and leave only the last round's slice, which is
+	 * exactly the direction that loses candidate pairs. */
+	t->peer[slot].heard_ids |= heard_ids;
 
 	return slot;
 }
@@ -246,6 +252,59 @@ out:
 	}
 }
 
+/* Did peer `a` report hearing peer `b`? heard_ids is keyed by anchor id, so the
+ * peer's short address has to be mapped back through UWB_ANCHOR_ADDR_BASE --
+ * which is why apos_table.h includes uwb_config.h rather than re-deriving the
+ * base from the address's low byte. */
+static bool heard_peer(const struct apos_table *t, uint8_t a, uint8_t b)
+{
+	uint16_t addr = t->peer[b].short_addr;
+
+	if (addr < UWB_ANCHOR_ADDR_BASE) {
+		return false;
+	}
+
+	uint16_t id = (uint16_t)(addr - UWB_ANCHOR_ADDR_BASE);
+
+	if (id >= APOS_HEARD_BITS) {
+		/* Outside the bitmap the anchor can express, so no evidence can
+		 * exist for it either way. Only reachable from a misconfigured
+		 * or malicious address; apos_node.c already refuses to range a
+		 * peer at or past UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS. */
+		return false;
+	}
+	return ((t->peer[a].heard_ids >> id) & 1u) != 0u;
+}
+
+bool apos_table_is_candidate(const struct apos_table *t, uint8_t i, uint8_t j)
+{
+	if (!t || i == j || i >= t->n_peers || j >= t->n_peers) {
+		return false;
+	}
+	/* Absence of evidence, not evidence of isolation -- see apos_table.h. */
+	if (t->peer[i].heard_ids == 0u || t->peer[j].heard_ids == 0u) {
+		return true;
+	}
+	return heard_peer(t, i, j) || heard_peer(t, j, i);
+}
+
+uint16_t apos_table_candidate_pairs(const struct apos_table *t)
+{
+	uint16_t n = 0;
+
+	if (!t) {
+		return 0;
+	}
+	for (uint8_t i = 0; i < t->n_peers; i++) {
+		for (uint8_t j = 0; j < t->n_peers; j++) {
+			if (apos_table_is_candidate(t, i, j)) {
+				n++;
+			}
+		}
+	}
+	return n;
+}
+
 uint16_t apos_table_missing_pairs(const struct apos_table *t, uint8_t min_n_ok)
 {
 	uint16_t missing = 0;
@@ -255,6 +314,9 @@ uint16_t apos_table_missing_pairs(const struct apos_table *t, uint8_t min_n_ok)
 	}
 	for (uint8_t i = 0; i < t->n_peers; i++) {
 		for (uint8_t j = (uint8_t)(i + 1); j < t->n_peers; j++) {
+			if (!apos_table_is_candidate(t, i, j)) {
+				continue; /* never commanded; not a hole */
+			}
 			if (!find_meas(t, i, j, min_n_ok) &&
 			    !find_meas(t, j, i, min_n_ok)) {
 				missing++;

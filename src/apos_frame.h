@@ -45,7 +45,8 @@
 /* Payload lengths, excluding the FCS -- callers add FCS_LEN in
  * dwt_writetxfctrl() exactly as the module frames do. */
 #define APOS_LEN_SURVEY_BEGIN (APOS_HDR_LEN + 4u)  /* session, window_s     */
-#define APOS_LEN_ENUM_RSP     (APOS_HDR_LEN + 23u) /* session, eui, pv, xyz */
+#define APOS_LEN_ENUM_RSP     (APOS_HDR_LEN + 27u) /* session, eui, pv, xyz,
+						    * heard_ids            */
 #define APOS_LEN_RANGE_CMD    (APOS_HDR_LEN + 5u)  /* session, peer, n_exch */
 #define APOS_LEN_RANGE_RSP    (APOS_HDR_LEN + 11u) /* session, peer, mean,
 						    * sd, n_ok             */
@@ -53,7 +54,17 @@
 #define APOS_LEN_SETPOS_ACK   (APOS_HDR_LEN + 15u) /* session, xyz, ok      */
 #define APOS_LEN_SURVEY_END   (APOS_HDR_LEN + 2u)  /* session               */
 
-/* Largest of the above, for RX buffer sizing. */
+/* Largest of the above, for RX buffer sizing. 38 bytes + FCS, comfortably
+ * inside uwb_slave.c's RX_BUF_LEN (64).
+ *
+ * ENUM_RSP grew by 4 bytes when the survey scaled to 32 anchors, for the
+ * neighbour bitmap below. That is a WIRE CHANGE and the parsers match lengths
+ * exactly, so a gateway on this firmware and an anchor on an older one will not
+ * enumerate each other at all -- the anchor's reply is refused with a
+ * "parse failed" LOG_WRN naming the expected length. Survey traffic is
+ * commissioning-only and the whole array is reflashed together, so this is a
+ * flag-day change by design rather than an accident; it costs nothing to the
+ * tag, which never parses 0xEB. */
 #define APOS_LEN_MAX APOS_LEN_ENUM_RSP
 
 /* Broadcast destination, matching UWB_FRAME_ADDR_BCAST. Redeclared rather than
@@ -73,10 +84,15 @@ void    apos_frame_set_seq(uint8_t *buf, uint8_t seq);
  * errno: -EINVAL on a NULL pointer, -EMSGSIZE when buf_len is too small. */
 int apos_frame_survey_begin_build(uint8_t *buf, size_t buf_len, uint16_t src,
 				  uint16_t session, uint16_t window_s);
+/* heard_ids is a bitmap of ANCHOR IDS (bit k = short address
+ * UWB_ANCHOR_ADDR_BASE + k) this board received an ENUM_RSP from during the
+ * current survey -- the adjacency evidence the gateway's candidate-pair filter
+ * runs on (apos_table_is_candidate()). Zero is legal and means "heard nobody",
+ * which the gateway reads as no evidence rather than as isolation. */
 int apos_frame_enum_rsp_build(uint8_t *buf, size_t buf_len, uint16_t src,
 			      uint16_t dest, uint16_t session,
 			      const uint8_t eui[APOS_EUI_LEN], bool pos_valid,
-			      float x, float y, float z);
+			      float x, float y, float z, uint32_t heard_ids);
 int apos_frame_range_cmd_build(uint8_t *buf, size_t buf_len, uint16_t src,
 			       uint16_t dest, uint16_t session,
 			       uint16_t peer_addr, uint8_t n_exchanges);
@@ -100,7 +116,8 @@ int apos_frame_parse_survey_begin(const uint8_t *buf, size_t len,
 				  uint16_t *session, uint16_t *window_s);
 int apos_frame_parse_enum_rsp(const uint8_t *buf, size_t len, uint16_t *session,
 			      uint8_t eui_out[APOS_EUI_LEN], bool *pos_valid,
-			      float *x, float *y, float *z);
+			      float *x, float *y, float *z,
+			      uint32_t *heard_ids);
 int apos_frame_parse_range_cmd(const uint8_t *buf, size_t len, uint16_t *session,
 			       uint16_t *peer_addr, uint8_t *n_exchanges);
 int apos_frame_parse_range_rsp(const uint8_t *buf, size_t len, uint16_t *session,

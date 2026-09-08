@@ -28,7 +28,28 @@ static int add(struct apos_table *t, uint8_t tail, uint16_t addr)
     uint8_t eui[APOS_EUI_LEN];
 
     mk_eui(eui, tail);
-    return apos_table_add_peer(t, eui, addr, false, 0.0f, 0.0f, 0.0f);
+    /* heard_ids 0: "this board reported hearing nobody", which
+     * apos_table_is_candidate() treats as no evidence, so every pair stays a
+     * candidate and the tests below keep their pre-candidate-filter meaning. */
+    return apos_table_add_peer(t, eui, addr, false, 0.0f, 0.0f, 0.0f, 0u);
+}
+
+/* Same, with an explicit adjacency bitmap. Kept separate so the plain add()
+ * above stays the "no evidence" case every other test relies on. */
+static int add_heard(struct apos_table *t, uint8_t tail, uint16_t addr,
+                     uint32_t heard_ids)
+{
+    uint8_t eui[APOS_EUI_LEN];
+
+    mk_eui(eui, tail);
+    return apos_table_add_peer(t, eui, addr, false, 0.0f, 0.0f, 0.0f,
+                               heard_ids);
+}
+
+/* The bit an anchor with this short address occupies in a heard_ids bitmap. */
+static uint32_t bit_of(uint16_t addr)
+{
+    return (uint32_t)1u << (addr - UWB_ANCHOR_ADDR_BASE);
 }
 
 static void test_peers_get_sequential_indices(void)
@@ -241,15 +262,15 @@ static void test_symmetrise_respects_out_cap(void)
     CHECK(apos_table_symmetrise(&t, e, 2, 10) == 2);
 }
 
-/* APOS_MAX_MEAS = 56 = 8*7 is hit exactly by a fully-surveyed 8-node
- * deployment, with zero headroom. A `>` -vs- `>=` slip in the capacity
- * check would silently drop the last real measurement of a full survey, so
- * the boundary is asserted explicitly: fill every ordered pair except
- * (6, 7), confirm the 56th add (the last new pair, reaching capacity
- * exactly) still SUCCEEDS, confirm a genuinely new 57th pair is impossible
- * to request at APOS_MAX_NODES peers so -ENOSPC is exercised by shrinking
- * the peer set instead, and confirm replace-on-repeat still succeeds at
- * full capacity since it consumes no new slot. */
+/* APOS_MAX_MEAS = N*(N-1) = 992 at APOS_MAX_NODES (32) is hit exactly by a
+ * fully-surveyed maximum deployment, with zero headroom. A `>` -vs- `>=` slip
+ * in the capacity check would silently drop the last real measurement of a
+ * full survey, so the boundary is asserted explicitly: fill every ordered pair
+ * except (6, 7), confirm the last add (the last new pair, reaching capacity
+ * exactly) still SUCCEEDS, and confirm replace-on-repeat still succeeds at
+ * full capacity since it consumes no new slot. A genuinely new pair past
+ * capacity is impossible to request at APOS_MAX_NODES peers -- see the note
+ * after this test. */
 static void test_measurement_table_fills_to_exact_capacity(void)
 {
     struct apos_table t;
@@ -274,7 +295,7 @@ static void test_measurement_table_fills_to_exact_capacity(void)
     CHECK(n == APOS_MAX_MEAS - 1);
     CHECK(t.n_meas == APOS_MAX_MEAS - 1);
 
-    /* The 56th row: the last remaining new (from, to) pair, reaching
+    /* The last row: the final remaining new (from, to) pair, reaching
      * capacity exactly. This is the boundary a `>` -vs- `>=` slip would
      * break -- it must still SUCCEED. */
     CHECK(apos_table_add_meas(&t, 6, 7, 1234, 10, 40) == 0);
@@ -289,16 +310,18 @@ static void test_measurement_table_fills_to_exact_capacity(void)
     CHECK(t.meas[APOS_MAX_MEAS - 1].n_ok == 41);
 }
 
-/* NOTE on the -ENOSPC branch of apos_table_add_meas: a true 57th-add-returns
- * -ENOSPC test is not constructible with legal indices. apos_table_add_meas
- * rejects from/to >= t->n_peers, and t->n_peers <= APOS_MAX_NODES, so the
- * maximum number of distinct valid (from, to) pairs is
- * APOS_MAX_NODES*(APOS_MAX_NODES-1) = APOS_MAX_MEAS exactly -- the array is
- * sized so that a fully-surveyed maximum deployment lands precisely on the
- * capacity boundary with no legal index combination left over to overflow
- * it. The -ENOSPC branch in apos_table_add_meas is therefore unreachable
- * through the function's own bounds contract; see the fix report for this
- * disclosed as a finding rather than a fabricated test. */
+/* NOTE on the -ENOSPC branch of apos_table_add_meas: a
+ * one-past-capacity-returns-ENOSPC test is not constructible with legal
+ * indices. apos_table_add_meas rejects from/to >= t->n_peers, and
+ * t->n_peers <= APOS_MAX_NODES, so the maximum number of distinct valid
+ * (from, to) pairs is APOS_MAX_NODES*(APOS_MAX_NODES-1) = APOS_MAX_MEAS
+ * exactly -- the array is sized so that a fully-surveyed maximum deployment
+ * lands precisely on the capacity boundary with no legal index combination
+ * left over to overflow it. That identity is what APOS_MAX_MEAS's derivation
+ * from APOS_MAX_NODES preserves, and it held at 8 nodes as it does at 32. The
+ * -ENOSPC branch in apos_table_add_meas is therefore unreachable through the
+ * function's own bounds contract; see the fix report for this disclosed as a
+ * finding rather than a fabricated test. */
 
 /* A freshly-initialised table has no peers at all. symmetrise and
  * missing_pairs must both no-op cleanly rather than reading past n_peers. */
@@ -384,8 +407,140 @@ static void test_non_positive_mean_is_not_an_edge(void)
     CHECK(apos_table_missing_pairs(&t, 10) == 1);
 }
 
+/* ---- Candidate pairs ---- */
+
+/* THE core safety property of the filter: a pair one endpoint was observed to
+ * hear must never be dropped, whichever direction the observation came from.
+ * The enumeration stagger only ever yields ONE direction per round (a board
+ * sleeps through its own slot with the receiver off, so it hears only later
+ * slots), so a filter that demanded both directions would discard most real
+ * links. */
+static void test_candidate_keeps_every_observed_link(void)
+{
+    struct apos_table t;
+
+    apos_table_init(&t);
+    /* 0 heard 1 only. 1 heard nothing of 0 (asymmetric, the normal case).
+     * 2 heard 1 only. So: 0-1 observed one way, 1-2 observed one way, and 0-2
+     * observed in NEITHER direction while both endpoints have evidence. */
+    add_heard(&t, 1, 0x0001, bit_of(0x0002));
+    add_heard(&t, 2, 0x0002, bit_of(0x0003));
+    add_heard(&t, 3, 0x0003, bit_of(0x0002));
+
+    CHECK(apos_table_is_candidate(&t, 0, 1));   /* 0 heard 1 */
+    CHECK(apos_table_is_candidate(&t, 1, 0));   /* symmetric */
+    CHECK(apos_table_is_candidate(&t, 1, 2));   /* 1 heard 2, and 2 heard 1 */
+    CHECK(apos_table_is_candidate(&t, 2, 1));
+    /* The one pair nobody observed: dropped, which is the whole point. */
+    CHECK(!apos_table_is_candidate(&t, 0, 2));
+    CHECK(!apos_table_is_candidate(&t, 2, 0));
+
+    /* 2 unordered candidate pairs -> 4 ordered. */
+    CHECK(apos_table_candidate_pairs(&t) == 4);
+}
+
+/* Absence of evidence is not evidence of isolation. A board that reported
+ * hearing nobody -- a deaf receiver, or one that drew the last stagger slot in
+ * every round -- must keep ALL of its pairs, or the survey silently writes off
+ * the very anchor it is meant to place. */
+static void test_peer_that_heard_nobody_keeps_every_pair(void)
+{
+    struct apos_table t;
+
+    apos_table_init(&t);
+    add_heard(&t, 1, 0x0001, bit_of(0x0002));
+    add_heard(&t, 2, 0x0002, bit_of(0x0001));
+    add_heard(&t, 3, 0x0003, 0u); /* heard nothing */
+
+    /* 0-1 was observed. 0-2 and 1-2 were not, but node 2 has no evidence at
+     * all, so nothing about it may be concluded. */
+    CHECK(apos_table_is_candidate(&t, 0, 1));
+    CHECK(apos_table_is_candidate(&t, 0, 2));
+    CHECK(apos_table_is_candidate(&t, 2, 0));
+    CHECK(apos_table_is_candidate(&t, 1, 2));
+    CHECK(apos_table_candidate_pairs(&t) == 6); /* all 3 pairs, both ways */
+}
+
+/* A self-pair and an out-of-range index are refused rather than defaulting to
+ * the permissive branch: a caller walking the ordered-pair space must not be
+ * able to talk itself into commanding a self-range. */
+static void test_candidate_refuses_degenerate_indices(void)
+{
+    struct apos_table t;
+
+    apos_table_init(&t);
+    add_heard(&t, 1, 0x0001, 0u);
+    add_heard(&t, 2, 0x0002, 0u);
+
+    CHECK(!apos_table_is_candidate(&t, 0, 0));
+    CHECK(!apos_table_is_candidate(&t, 0, 5));
+    CHECK(!apos_table_is_candidate(&t, 5, 0));
+    CHECK(!apos_table_is_candidate(NULL, 0, 1));
+    CHECK(apos_table_candidate_pairs(NULL) == 0);
+}
+
+/* Each enumeration round is an independent stagger draw and hears a different
+ * subset, so re-adding a peer must UNION its bitmap. Assigning instead would
+ * keep only the last round's slice -- and round counting means the last round's
+ * reply carries the OLDEST evidence, so assignment would lose almost
+ * everything. */
+static void test_readding_a_peer_unions_the_neighbour_bitmap(void)
+{
+    struct apos_table t;
+
+    apos_table_init(&t);
+    CHECK(add_heard(&t, 1, 0x0001, bit_of(0x0002)) == 0);
+    CHECK(add_heard(&t, 1, 0x0001, bit_of(0x0004)) == 0);
+    CHECK(t.n_peers == 1);
+    CHECK(t.peer[0].heard_ids == (bit_of(0x0002) | bit_of(0x0004)));
+
+    /* And a later round reporting nothing must not erase what was learnt. */
+    CHECK(add_heard(&t, 1, 0x0001, 0u) == 0);
+    CHECK(t.peer[0].heard_ids == (bit_of(0x0002) | bit_of(0x0004)));
+}
+
+/* missing_pairs must count only pairs that were COMMANDED and produced
+ * nothing. A non-candidate pair was never asked, so counting it as a hole would
+ * bury the real failures under hundreds of deliberate omissions. */
+static void test_missing_pairs_ignores_non_candidates(void)
+{
+    struct apos_table t;
+
+    apos_table_init(&t);
+    /* 0-1 and 1-2 are candidates; 0-2 is not. */
+    add_heard(&t, 1, 0x0001, bit_of(0x0002));
+    add_heard(&t, 2, 0x0002, bit_of(0x0003));
+    add_heard(&t, 3, 0x0003, bit_of(0x0002));
+
+    /* Measure 0-1 only. 1-2 is a candidate that failed -> one hole. 0-2 was
+     * never a candidate -> not a hole. */
+    apos_table_add_meas(&t, 0, 1, 1000, 10, 40);
+    CHECK(apos_table_missing_pairs(&t, 10) == 1);
+}
+
+/* At full capacity the filter must still walk the whole table -- an ordered
+ * count that overflowed a uint8_t or stopped early would silently shrink the
+ * survey. 32 peers with no evidence is 32*31 = 992 ordered candidate pairs. */
+static void test_candidate_pairs_at_full_capacity(void)
+{
+    struct apos_table t;
+
+    apos_table_init(&t);
+    for (uint8_t k = 0; k < APOS_MAX_NODES; k++) {
+        add(&t, (uint8_t)(k + 1), (uint16_t)(UWB_ANCHOR_ADDR_BASE + k));
+    }
+    CHECK(t.n_peers == APOS_MAX_NODES);
+    CHECK(apos_table_candidate_pairs(&t) == APOS_MAX_MEAS);
+}
+
 int main(void)
 {
+    test_candidate_keeps_every_observed_link();
+    test_peer_that_heard_nobody_keeps_every_pair();
+    test_candidate_refuses_degenerate_indices();
+    test_readding_a_peer_unions_the_neighbour_bitmap();
+    test_missing_pairs_ignores_non_candidates();
+    test_candidate_pairs_at_full_capacity();
     test_peers_get_sequential_indices();
     test_readding_the_same_eui_is_idempotent();
     test_same_addr_from_a_different_eui_is_reported();

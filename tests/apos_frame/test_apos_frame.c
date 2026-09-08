@@ -65,13 +65,18 @@ static void test_enum_rsp_round_trip(void)
     uint8_t eui[APOS_EUI_LEN] = {0};
     bool pv = false;
     float x = 0.0f, y = 0.0f, z = 0.0f;
+    uint32_t heard = 0;
+    /* Both the top and the bottom bit set, so a bitmap truncated to 8 or 16
+     * bits somewhere in the codec is caught: anchor id 31 is a legal id at
+     * UWB_MAX_ANCHORS = 32 and is exactly the one a narrow field would lose. */
+    const uint32_t heard_ref = 0x80000001u;
     int n = apos_frame_enum_rsp_build(buf, sizeof(buf), 0x0003, 0x0000,
                                       0xBEEF, eui_ref, true,
-                                      1.25f, -2.5f, 3.75f);
+                                      1.25f, -2.5f, 3.75f, heard_ref);
 
     CHECK(n == (int)APOS_LEN_ENUM_RSP);
     CHECK(apos_frame_parse_enum_rsp(buf, (size_t)n, &session, eui, &pv,
-                                    &x, &y, &z) == 0);
+                                    &x, &y, &z, &heard) == 0);
     CHECK(session == 0xBEEF);
     CHECK(memcmp(eui, eui_ref, APOS_EUI_LEN) == 0);
     CHECK(pv == true);
@@ -80,6 +85,49 @@ static void test_enum_rsp_round_trip(void)
     CHECK(x == 1.25f);
     CHECK(y == -2.5f);
     CHECK(z == 3.75f);
+    CHECK(heard == heard_ref);
+}
+
+/* The neighbour bitmap's raw bytes, little-endian like every other multi-byte
+ * field. Asserted independently of get_u32() for the same reason the mean_mm
+ * and xyz vectors below are: a byte swap confined to put_u32/get_u32 cancels
+ * out in a round trip and would be invisible above. */
+static void test_enum_rsp_heard_ids_raw_bytes(void)
+{
+    int n = apos_frame_enum_rsp_build(buf, sizeof(buf), 0x0003, 0x0000,
+                                      0xBEEF, eui_ref, true,
+                                      1.25f, -2.5f, 3.75f, 0x04030201u);
+
+    CHECK(n == (int)APOS_LEN_ENUM_RSP);
+    /* payload starts at 11: session(2) eui(8) pos_valid(1) xyz(12) -> 34 */
+    CHECK(buf[34] == 0x01);
+    CHECK(buf[35] == 0x02);
+    CHECK(buf[36] == 0x03);
+    CHECK(buf[37] == 0x04);
+}
+
+/* Appending the field grew the frame, so the old 34-byte length must now be
+ * REFUSED rather than parsed with the bitmap read out of uninitialised memory.
+ * That refusal is what makes a mixed-firmware array diagnosable instead of
+ * silently mis-enumerated -- see APOS_LEN_MAX in apos_frame.h. */
+static void test_previous_enum_rsp_length_is_refused(void)
+{
+    uint16_t session = 0;
+    uint8_t eui[APOS_EUI_LEN] = {0};
+    bool pv = false;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    uint32_t heard = 0;
+    int n = apos_frame_enum_rsp_build(buf, sizeof(buf), 0x0003, 0x0000,
+                                      0xBEEF, eui_ref, true,
+                                      1.25f, -2.5f, 3.75f, 0u);
+
+    CHECK(n == (int)APOS_LEN_ENUM_RSP);
+    CHECK(apos_frame_parse_enum_rsp(buf, APOS_LEN_ENUM_RSP - 4u, &session, eui,
+                                    &pv, &x, &y, &z, &heard) == -EINVAL);
+    /* And a NULL bitmap output is a bad argument, not a silently skipped
+     * field. */
+    CHECK(apos_frame_parse_enum_rsp(buf, (size_t)n, &session, eui, &pv,
+                                    &x, &y, &z, NULL) == -EINVAL);
 }
 
 static void test_range_cmd_round_trip(void)
@@ -220,11 +268,11 @@ static void test_parser_rejects_the_wrong_subtype(void)
 static void test_builders_reject_a_short_buffer(void)
 {
     CHECK(apos_frame_enum_rsp_build(buf, 4, 0x0003, 0x0000, 1, eui_ref,
-                                    true, 0.0f, 0.0f, 0.0f) == -EMSGSIZE);
+                                    true, 0.0f, 0.0f, 0.0f, 0u) == -EMSGSIZE);
     CHECK(apos_frame_survey_begin_build(NULL, sizeof(buf), 0x0000, 1,
                                         1) == -EINVAL);
     CHECK(apos_frame_enum_rsp_build(buf, sizeof(buf), 0x0003, 0x0000, 1, NULL,
-                                    true, 0.0f, 0.0f, 0.0f) == -EINVAL);
+                                    true, 0.0f, 0.0f, 0.0f, 0u) == -EINVAL);
 }
 
 /* Raw-byte vectors, independent of any get_*() accessor: a byte swap confined
@@ -308,10 +356,12 @@ static void test_enum_rsp_eui_raw_bytes(void)
 {
     int n = apos_frame_enum_rsp_build(buf, sizeof(buf), 0x0003, 0x0000,
                                       0xBEEF, eui_ref, true,
-                                      1.25f, -2.5f, 3.75f);
+                                      1.25f, -2.5f, 3.75f, 0u);
 
     CHECK(n == (int)APOS_LEN_ENUM_RSP);
-    /* payload: session(2) eui(8) pos_valid(1) xyz(12) */
+    /* payload: session(2) eui(8) pos_valid(1) xyz(12) heard_ids(4) -- the
+     * offsets asserted here are deliberately unchanged by the heard_ids
+     * append, which went on the END for exactly that reason. */
     CHECK(buf[13] == 0xDE);
     CHECK(buf[14] == 0xCA);
     CHECK(buf[15] == 0x01);
@@ -341,6 +391,8 @@ int main(void)
     test_addresses_are_little_endian();
     test_survey_begin_round_trip();
     test_enum_rsp_round_trip();
+    test_enum_rsp_heard_ids_raw_bytes();
+    test_previous_enum_rsp_length_is_refused();
     test_range_cmd_round_trip();
     test_range_rsp_round_trip_including_negative_mean();
     test_setpos_round_trip();
