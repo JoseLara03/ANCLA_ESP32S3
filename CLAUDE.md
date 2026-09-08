@@ -152,6 +152,39 @@ hit them running `docs/anchor-auto-positioning.md`:
 
 None of these have been run.
 
+### Anchor cap and survey scaling to 32 (this session, no hardware)
+
+`UWB_MAX_ANCHORS` is now 32 (`src/uwb_config.h`, up from 4), against a wire cap
+of 254 (short addresses are `UWB_ANCHOR_ADDR_BASE + id` and must stay below
+`0x0100`). `anchor id` accepts `<0..31>`. **This is a compile-time cap change
+only — ids beyond 3 are not yet deployment-safe.** `disc_schedule.c`'s
+per-anchor DISCOVERY stagger (`disc_resp_delay_uus`) still grows linearly with
+id, and `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS` (18 ms) is sized only for
+id 3's worst case (~12.5 ms); an id at or past 4 would need a longer timeout
+and, at scale, a grouped-DISCOVERY-response redesign so 31 anchors don't each
+get their own linearly-growing slot. That overhaul is parked — nothing has
+changed in `disc_schedule.c` or `anchor_respond.c` this session. Deploying with
+`anchor id` > 3 today will silently drop DISCOVERY responses for that id.
+
+The anchor survey (`apos_*`) scales alongside it: `APOS_MAX_NODES` is now 32
+(`src/apos_geom.h`, up from 8), with a new `apos_geom_rigidity()` check
+(connectivity, minimum degree, edge count vs. free parameters) that makes
+`rms_mm` a real acceptance signal at redundant node counts, candidate-pairs-
+only ranging driven by what `apos enum` actually observed (not a full mesh),
+an 8-round enumeration stagger (`APOS_GW_ENUM_ROUNDS`, up from 3), a bigger
+MQTT anchors-topic buffer, and a mid-survey `SURVEY_BEGIN` refresh
+(`APOS_GW_WINDOW_REFRESH_MS`, 30 s) so a long survey doesn't let anchors'
+response windows lapse mid-run. Read `src/apos_geom.h`'s and `src/apos_gw.h`'s
+file comments for the current, accurate account of what this subsystem can and
+can't verify — both were rewritten this session. One open, documented gap: the
+solver's LM refinement is O(n³) in the free-parameter count (3400x the
+4-anchor cost at 32 nodes), and nothing bounds it against the gateway's beacon
+timing — flagged loudly in `apos_gw.h`/`.c` (`APOS_GW_SOLVE_BUDGET_UUS`'s
+comment, and a new `solve_ms` field in the `apos_solve` JSON so this becomes a
+measured number on the first real run) but not resolved. **None of this — the
+32-anchor cap, the rigidity check, or the scaled survey — has been run on any
+board.**
+
 ## Build & flash
 
 ```powershell
@@ -268,6 +301,18 @@ cal peer <id> <mm>              range anchor <id> at a known distance;
 See `docs/antenna-delay-calibration.md` for the full procedure and acceptance
 thresholds.
 
+The gateway also has a `gw` tree for load-testing (`src/gw_shell.c`,
+gateway-only, same refusal style as `apos`):
+
+```
+gw seed <n>                    fill n FAKE tag seats (n up to GW_MAX_SEATS)
+                                for beacon-timing load testing, no RF needed.
+                                Assumes a freshly booted, otherwise-empty
+                                gateway — the shell only records the request;
+                                the gateway loop performs the fill on its own
+                                thread, chunked, and logs "SYNTHETIC SEED".
+```
+
 ## Layout
 
 - `boards/innovaforce/ancla_esp32s3/` — out-of-tree board definition, added to
@@ -298,8 +343,26 @@ thresholds.
   (`T_SUPERFRAME_UUS`, `BEACON_OCCUPANCY_UUS`, `BEACON_GUARD_UUS`) that the
   gateway schedules the beacon from and the slaves predict it against; no
   header, no code file.
-- `src/gw_core.{c,h}` — CFP seat table, leases and the tag address pool. Pure
-  C, ported unchanged from the nRF5 gateway, host-tested in `tests/gw_core/`.
+- `src/gw_core.{c,h}` — CFP seat table, leases and the tag address pool. The
+  single-phase table was ported unchanged from the nRF5 gateway; a
+  `[GW_CYCLE_C][GW_N_CFP]` phase dimension is new this session (network-scaling-v3
+  Task 12), letting a tag hold up to `GW_PHASES_MAX_FAST` (4) phases instead of
+  exactly one. Also new this session: `gw_core_release()` frees every phase-cell
+  a tag holds (Task 13), `gw_core_pos_seen()` refreshes a multi-phase tag's
+  lease on every cell without touching tier or phase (Task 15), and a 64-entry
+  EUI→short-address map (`GW_ADDR_MAP_SIZE`) so a tag rejoining after full
+  lease expiry gets its old short address back instead of a fresh, permanently
+  higher one (Task 16). **The multi-phase grant is not yet safe to exercise on
+  real tag firmware** — see the hard-won fact below; nothing about the phase
+  table's own logic is unsafe to land, only granting a tag fewer than
+  `GW_CYCLE_C` phases and expecting it to keep ranging. Still pure C, no radio
+  dependency, host-tested in `tests/gw_core/`.
+- `src/gw_shell.c` — the `gw` console command tree: `gw seed <n>`
+  (gateway-only), which fills the live seat table with fabricated,
+  visibly-prefixed EUIs for beacon-timing load-testing without real tag RF.
+  Chunked across gateway-loop iterations (`GW_SEED_CHUNK`, `GW_SEED_CHUNK_BUDGET_UUS`
+  in `gw_core.h`) because a whole-table fill was reasoned to cost single-digit
+  milliseconds — the same order as `BEACON_ARM_MARGIN_UUS` — if done inline.
 - `src/beacon_guard.{c,h}` — predicts the next beacon and refuses any delayed
   TX that would land on it. Pure C, host-tested in `tests/beacon_guard/`.
 - `src/anchor_respond.{c,h}` — the WAVE/0xE1 and DISCOVERY/0xE4 responders.
@@ -365,8 +428,13 @@ thresholds.
   reflection-ambiguity diagnostics. `enum apos_geom_dim` (`APOS_GEOM_3D`,
   the zero value for backward compatibility, or `APOS_GEOM_2D`) selects a
   4-node (origin/xaxis/plane/up) or 3-node (origin/xaxis/plane) gauge; z stays
-  pinned at 0 for every node in 2D mode. Pure C, host-tested in
-  `tests/apos_geom/`. `APOS_MAX_NODES` is 8, not `UWB_MAX_ANCHORS`.
+  pinned at 0 for every node in 2D mode. Also gained `apos_geom_rigidity()`
+  this session: a connectivity/minimum-degree/edge-count check that is
+  necessary but not sufficient for true rigidity (a "hinge" between two
+  densely-meshed clusters passes it and still isn't rigid) — see the file's own
+  comment for the full derivation. Pure C, host-tested in `tests/apos_geom/`.
+  `APOS_MAX_NODES` is now 32, matching `UWB_MAX_ANCHORS` in value (deliberately
+  still a separate constant — see the file's own comment on why).
 - `src/apos_table.{c,h}` — the gateway's working set for one survey: peers keyed
   by **EUI-64** (an `anchor id` swap must not strand a coordinate again),
   directed measurements, and their symmetrisation into inverse-variance-weighted
@@ -687,15 +755,19 @@ thresholds.
   again at apply, and a `shell_warn` under the operator's own `apos apply`);
   the check that actually validates the geometry is a **tape measure**. Do not
   "fix" this by loosening a threshold — the thresholds are not the problem,
-  the edge count is. **There is no fifth-anchor option to suggest to an
-  operator** for growing the 3D case: `UWB_MAX_ANCHORS` is 4, `anchor id` is
-  bounded 0..3, and `apos_node.c` refuses a `RANGE_CMD` naming a peer at or
-  beyond `UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS`, so `APOS_MAX_NODES` (8) is
-  structural headroom, not a way to add a 5th ranging anchor. Growing past
-  four ranging anchors is engineering work — `UWB_MAX_ANCHORS`,
-  `disc_schedule`'s stagger, `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS`
-  re-derived from that stagger, and the tag's `UWB_FRAME_MAX_ANCHORS` behind a
-  frozen wire format. What the operator CAN read on the array they have is
+  the edge count is. **UPDATE (this session): "there is no fifth-anchor option"
+  is now superseded — `UWB_MAX_ANCHORS` is 32, not 4, and `apos_geom.h`'s
+  `APOS_MAX_NODES` matches it — but a fifth ranging anchor is still NOT
+  actually usable today.** `anchor id` accepts 0..31 and `apos_node.c` will
+  range a peer up to that bound, but `disc_schedule.c`'s per-id DISCOVERY
+  stagger and `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS` (18 ms, sized only
+  for id 3's ~12.5 ms worst case) were not touched this session: an id at or
+  past 4 will silently lose its DISCOVERY responses on air, whatever the
+  survey solver can now compute. Growing the array past four ranging anchors
+  in PRACTICE still needs the grouped-DISCOVERY-response overhaul (parked),
+  plus the tag's `UWB_FRAME_MAX_ANCHORS` behind a frozen wire format — the
+  compile-time cap moved, the deployment ceiling did not. What the operator
+  CAN read on the array they have is
   `max_reciprocal_mm` (largest `|d(A→B) − d(B→A)|`, computed by
   `apos_table_quality()` before `symmetrise()` averages it away) and
   `max_sd_mm`, both in the `apos_solve` JSON and in `apos show`. Those make the
@@ -743,17 +815,19 @@ thresholds.
   beacon can satisfy it), and `apos ref` refuses outright while a survey is
   running. Neither is a hard bound and no in-loop gate can be one; the real fix,
   if this ever hurts, is to stop writing flash from this thread at all.
-- **`APOS_MAX_NODES` (8) is not `UWB_MAX_ANCHORS` (4), deliberately — and
-  surveying eight does not make eight rangeable.** The solver and table handle
-  eight nodes so the survey does not inherit the tag-facing ranging MAC's limit,
-  but an anchor refuses a `RANGE_CMD` naming a peer outside
-  `UWB_ANCHOR_ADDR_BASE .. +UWB_MAX_ANCHORS` (`apos_node.c`), because anything
-  above that would silently alias onto another anchor's wire id once truncated
-  to a byte. Growing the deployment past four ranging anchors needs
-  `disc_schedule.h`'s stagger and `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS`
-  re-derived (18 ms is sized for `disc_resp_delay_uus(3)` = 12500 uus; an id 5
-  would need ~19.5 ms and would silently lose every DISCOVERY response), plus
-  `UWB_MAX_ANCHORS` and the tag's `UWB_FRAME_MAX_ANCHORS`.
+- **`APOS_MAX_NODES` and `UWB_MAX_ANCHORS` are now both 32, but they remain
+  deliberately separate constants, and surveying up to 32 does not make all 32
+  rangeable today.** `apos_geom.h` sizes `APOS_MAX_NODES` on its own solver
+  storage, not on the tag-facing ranging MAC, and the two values agreeing is a
+  fact about this session's numbers, not a coupling — do not collapse one into
+  the other. An anchor still refuses a `RANGE_CMD` naming a peer outside
+  `UWB_ANCHOR_ADDR_BASE .. +UWB_MAX_ANCHORS` (`apos_node.c`). And raising
+  `UWB_MAX_ANCHORS` to 32 this session did NOT also re-derive
+  `disc_schedule.h`'s stagger or `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS`
+  (18 ms is sized for `disc_resp_delay_uus(3)` = 12500 uus; id 4 and up would
+  need a longer timeout and, at real scale, the parked grouped-DISCOVERY
+  overhaul) — so ids past 3 are compile-time legal but silently non-functional
+  on air, plus the tag's `UWB_FRAME_MAX_ANCHORS` behind a frozen wire format.
 - **An unpositioned anchor is now silent to tags, not `(0, 0)` — but it still
   answers DISCOVERY.** `anchor_respond_wave_poll()` refuses unless
   `position_valid` or a survey window is open; `anchor_respond_discovery()` is
@@ -839,6 +913,65 @@ thresholds.
   every such tag — not a new hole this fix introduces (the old code had
   the identical issue via `src_addr` for that scenario), but still true
   under the new scheme.
+- **Short-address reuse by EUI (Task 16) guards against address-pool
+  wraparound, not two EUIs colliding.** `gw_core.c`'s 64-entry `addr_map`
+  remembers a tag's short address after its seat is fully reclaimed (lease hit
+  zero, `gw_seat` memset), so a rejoining tag gets its old address back instead
+  of a fresh, permanently-higher one from `alloc_short_addr()`'s monotonic
+  counter. The defensive `find_seat_by_addr()` re-check before handing that
+  remembered address back exists for `alloc_short_addr()` wrapping at `0xFFFE`
+  back to `GW_TAG_ADDR_BASE` after enough JOIN churn — an old EUI's map entry
+  can survive a full lease expiry while the wrapped counter is independently
+  about to reassign that same numeric address to a brand-new EUI. The check
+  turns "stale map entry meets wrapped counter" into "provably never assigned
+  twice at the same time." This does NOT change `Tid` (already stable via
+  EUI-hash, per the fact above) — it is a separate, lower-layer fix to
+  short-address churn, not a second fix for the same bug.
+- **A tag holding fewer than `GW_CYCLE_C` (16) phases is NOT yet safe to grant
+  on real tag firmware — this is the single most important caveat from this
+  session's `gw_core.h` phase-table work, and an earlier draft of that file's
+  comment briefly had it backwards before being caught in review.** The
+  allocator (`src/gw_core.{c,h}`, network-scaling-v3 Task 12) can hand a FAST
+  tag up to `GW_PHASES_MAX_FAST` (4) evenly-spread phases out of the 16-phase
+  cycle, spreading its fixes more smoothly than one seat per full cycle. But a
+  beacon carries only ONE phase's row per superframe
+  (`uwb_gateway.c`'s `tx_beacon()`: `frame_counter % GW_CYCLE_C`), and today's
+  tag firmware (`tag_testting/src/uwb_net.c`) treats absence from any beacon it
+  actually receives as lease loss — `if (!ev->in_map)` drops straight to
+  `UWB_ST_SCAN` on the first such beacon, in both `UWB_ST_DISCOVER` and
+  `UWB_ST_RANGING`, with no miss tolerance. A tag holding `n < GW_CYCLE_C`
+  phases is therefore absent from `GW_CYCLE_C - n` beacons per cycle and loses
+  its seat on the first of those — a multi-phase grant bounces a real tag to
+  SCAN rather than merely costing it power. Two genuine prerequisites, both
+  parked, before a grant smaller than the full cycle can be exercised on air:
+  (a) the GRANT frame growing to carry `phase_mask`, so a tag is told which
+  phases are its own, and (b) a tag-side firmware change deriving its
+  beacon-miss tolerance from that mask instead of from raw absence. Nothing
+  about the allocator itself is unsafe to land — it is self-contained,
+  gateway-side bookkeeping with its own host tests — but until (a) and (b)
+  both exist, do not grant, test, or demo a tag holding fewer than
+  `GW_CYCLE_C` phases against real tag firmware. See `src/gw_core.h`'s full
+  file-header comment for the derivation.
+- **`GW_MAX_SEATS` is `GW_CYCLE_C * GW_N_CFP` — 176 today, not 224.** `GW_N_CFP`
+  is still `UWB_FRAME_N_CFP` (11); it becomes 14, and `GW_MAX_SEATS` 224, only
+  once a separate, still-parked task grows it to match a hardware
+  slot-occupancy measurement that has not been taken. Every arithmetic site
+  this session's phase table touches derives from the macro rather than
+  hardcoding either number, specifically so that future task lands
+  automatically — do not hardcode 176 or 224 anywhere new either.
+- **A synthetic `gw seed` fill is chunked, not a single inline loop, because one
+  `gw_core_join()` on a never-before-seen EUI is not cheap.** It is four
+  exhaustive table walks (seat-by-EUI, seat-by-address, phase-candidate scan,
+  and the 64-entry address-reuse map), each up to `GW_MAX_SEATS` or
+  `GW_ADDR_MAP_SIZE` iterations — reasoned at single-digit MILLISECONDS for a
+  full 176-seat fill on this XIP-from-flash part, the same order as
+  `BEACON_ARM_MARGIN_UUS` (~5.1 ms), not the microseconds an earlier revision
+  of the code assumed. `src/gw_shell.c`'s `gw seed <n>` therefore only records
+  a request; `uwb_gateway.c`'s loop performs it in `GW_SEED_CHUNK` (8)
+  `gw_core_join()` calls per iteration, reserving `GW_SEED_CHUNK_BUDGET_UUS`
+  (2000 uus) on top of `BEACON_ARM_MARGIN_UUS` before starting a chunk and
+  re-checking `to_beacon` after every one — the same step-budget discipline
+  the anchor survey already uses. Not yet run on hardware.
 
 ## System context
 
