@@ -156,15 +156,25 @@ None of these have been run.
 
 `UWB_MAX_ANCHORS` is now 32 (`src/uwb_config.h`, up from 4), against a wire cap
 of 254 (short addresses are `UWB_ANCHOR_ADDR_BASE + id` and must stay below
-`0x0100`). `anchor id` accepts `<0..31>`. **This is a compile-time cap change
-only — ids beyond 3 are not yet deployment-safe.** `disc_schedule.c`'s
-per-anchor DISCOVERY stagger (`disc_resp_delay_uus`) still grows linearly with
-id, and `anchor_respond.c`'s `TX_COMPLETE_TIMEOUT_MS` (18 ms) is sized only for
-id 3's worst case (~12.5 ms); an id at or past 4 would need a longer timeout
-and, at scale, a grouped-DISCOVERY-response redesign so 31 anchors don't each
-get their own linearly-growing slot. That overhaul is parked — nothing has
-changed in `disc_schedule.c` or `anchor_respond.c` this session. Deploying with
-`anchor id` > 3 today will silently drop DISCOVERY responses for that id.
+`0x0100`). `anchor id` accepts `<0..31>`.
+
+**UPDATE (2026-09-08 session): the grouped-DISCOVERY-response redesign flagged
+as parked below has now landed in code.** `disc_schedule.{c,h}` gained
+`disc_group_match()` and `disc_resp_delay_uus_grouped()`: a DISCOVERY broadcast
+now carries `group`/`n_groups` (the tag chooses `n_groups`, cycling
+`group = round % n_groups`), an anchor answers only when
+`anchor_id % n_groups == group`, and its stagger is by **rank inside the
+group** (`rank = anchor_id / n_groups`), not by raw id — so the collection
+window stays bounded (max rank 3 at `n_groups = 8` for 32 anchors, the exact
+value `TX_COMPLETE_TIMEOUT_MS` (18 ms, `anchor_respond.c`) was already sized
+for) regardless of deployment size. `anchor_respond.c`'s discovery handler
+refuses (rather than transmits late) when a badly-sized `n_groups` would push
+`rank` past `DISC_MAX_RANK` (3). **Still true: this has not been run on any
+board**, and the old ungrouped `disc_resp_delay_uus()` stays only for
+`n_groups == 1` callers (kept deliberately, not dead code — see the function's
+own comment). See `docs/superpowers/plans/2026-09-07-network-scaling-anchor.md`
+Task 4 for the full account and `tests/disc_schedule/` for the host-test
+coverage (32-anchor partition, max-delay bound, the `rank > 3` refusal).
 
 The anchor survey (`apos_*`) scales alongside it: `APOS_MAX_NODES` is now 32
 (`src/apos_geom.h`, up from 8), with a new `apos_geom_rigidity()` check
@@ -184,6 +194,75 @@ comment, and a new `solve_ms` field in the `apos_solve` JSON so this becomes a
 measured number on the first real run) but not resolved. **None of this — the
 32-anchor cap, the rigidity check, or the scaled survey — has been run on any
 board.**
+
+### 4. Network scaling v3 (100 tags, 32 anchors) — code landed, no hardware
+    (2026-09-08 session)
+
+Beyond §3's grouped DISCOVERY, this session landed the rest of the
+`tag_testting`/`spec/2026-09-07-network-scaling-design.md` protocol v3 changes
+that fall on the anchor/gateway side
+(`docs/superpowers/plans/2026-09-07-network-scaling-anchor.md`, Tasks 4-6, 8-9,
+14, and the JOIN-backoff bullet of Task 15). `src/uwb_frame_802_15_4z.{c,h}`
+were re-copied from the tag repo first, as always, and both repos'
+`tests/uwb_frame/` re-run. Same status as everything else in this section:
+**host-tested and the production image builds clean (`west build`, zero
+warnings), never run on a board.**
+
+- **Passive ANNOUNCE (`0xEC`).** `anchor_respond_announce()`
+  (`src/anchor_respond.c`), called from `uwb_slave.c`'s `observe_beacon()` on
+  every parsed beacon, transmits one `0xEC` — this anchor's short address,
+  `(x, y, z)`, and the beacon's own CIR quality — when
+  `frame_counter % ANNOUNCE_CYCLE_A == anchor_id`. Gated on
+  `position_valid` (no survey-window relaxation, unlike WAVE: an unsurveyed
+  board simply never announces) and routed through `beacon_guard` like every
+  other delayed TX. **`announce_id` is not a wire field.** The design doc
+  proposed growing the beacon by one byte for it; since the gateway already
+  transmits `frame_counter` and every anchor already parses it back out, both
+  sides derive `announce_id` locally from a shared constant instead —
+  `ANNOUNCE_CYCLE_A` (37, `src/uwb_mac.h`), which **must stay coprime with**
+  the gateway's phase-cycle length `GW_CYCLE_C` (16, `src/gw_core.h`), see
+  `ANNOUNCE_CYCLE_A`'s own comment for the CRT argument and
+  `tests/gw_core/test_announce_cycle_coprime_with_gw_cycle` for the proof
+  against the actual compiled-in constants. This is cheaper than the spec (no
+  wire growth) and functionally equivalent.
+- **Addressed multi-poll ranging (`0xE3` -> `0xED`).** `anchor_respond_multipoll()`
+  (`src/anchor_respond.c`), wired into `uwb_slave.c`'s main RX dispatch
+  alongside the WAVE and DISCOVERY responders, answers a MULTI-POLL naming
+  this anchor's short address among its slots with one delayed, addressed
+  `MPOL_RESP/0xED` at the **tag-assigned** `delay_us` — not a value the
+  anchor computes — so up to four anchors' responses land staggered inside
+  one tag RX window. Same `position_valid` gating and `beacon_guard` routing
+  as every other responder; the legacy single-poll WAVE responder stays
+  compiled and untouched (the calibration image and the DWM3001CDK bench
+  path still depend on it). `TX_COMPLETE_TIMEOUT_MS` (18 ms) needed no
+  change — the worst-case multi-poll delay
+  (`MPOL_BASE_UUS + 3*MPOL_SLOT_UUS` = 7300 uus, tag-side constants) plus
+  airtime stays well inside the bound DISCOVERY already sized it against.
+- **GRANT carries the phase mask.** `send_grant()` (`src/uwb_gateway.c`) now
+  fills the 26-byte GRANT's `phase_mask` field from the allocator instead of
+  deliberately omitting it. The tag already parses it and derives
+  `listen_skip`/`in_map` from it (`tag_testting/src/uwb_net.c`,
+  `uwb_net_phase_active()`) — see
+  `docs/superpowers/plans/2026-09-08-task-13-phase-allocation-status.md` §3
+  (corrected this session) for the full multi-phase-grant safety story: both
+  code-side prerequisites now exist, hardware verification does not.
+- **JOIN backoff landed, but in the tag repo, not here.** The plan's own text
+  proposed a gateway-side signal (GRANT or beacon field) telling a refused
+  tag when to retry. Tracing the actual failure — a bulk gateway restart, 100
+  tags all entering `UWB_ST_JOINING` off the same beacon and retrying on
+  every subsequent one with zero jitter (`tag_testting/src/uwb_net.c`) —
+  showed most colliding JOINs never reach the gateway at all, so there is
+  nothing for a gateway-side mechanism to respond to. Fixed tag-side instead:
+  `uwb_net_join_backoff(eui)` delays a joining episode's first JOIN by an
+  EUI-seeded 0..63 superframes before anything transmits. No ANCLA code
+  changed for this bullet.
+- **`proto_ver` is already 3 in this repo's copy of the frame module** (it
+  arrived with the Task 4 copy; the tag repo bumped it in its own Task 12).
+  Nothing on the anchor/gateway side gates on `proto_ver` — every frame this
+  repo builds is stamped with it automatically by `write_hdr()`, and only the
+  tag refuses a mismatched beacon. Fleet-wide reflash and the "a v2 tag stays
+  deaf against a v3 beacon" confirmation are still outstanding, hardware-only
+  work (plan Task 20).
 
 ## Build & flash
 
@@ -337,12 +416,17 @@ gw seed <n>                    fill n FAKE tag seats (n up to GW_MAX_SEATS)
   module does not carry, plus `UUS_TO_DWT_TIME`, `FCS_LEN`, the `UUS_TO_HI32`
   macro, the TX-timestamp helper (`uwb_get_tx_timestamp_u64()`), and the
   bounded `uwb_wait_for_sysstatus_lo()` TXFRS wait.
-- `src/disc_schedule.{c,h}` — per-anchor discovery response stagger. Host-tested
+- `src/disc_schedule.{c,h}` — per-anchor discovery response stagger, now grouped
+  (network-scaling-v3 Task 4): `disc_group_match()` / `disc_resp_delay_uus_grouped()`
+  stagger by rank-within-group rather than raw id, keeping the collection window
+  bounded past 4 anchors; the old ungrouped `disc_resp_delay_uus()` stays for
+  `n_groups == 1` callers. Host-tested
   in `tests/disc_schedule/`.
 - `src/uwb_mac.h` — the single source of truth for the superframe constants
   (`T_SUPERFRAME_UUS`, `BEACON_OCCUPANCY_UUS`, `BEACON_GUARD_UUS`) that the
   gateway schedules the beacon from and the slaves predict it against; no
-  header, no code file.
+  header, no code file. Also `ANNOUNCE_CYCLE_A` and `T_ANNOUNCE_TX_DELAY_UUS`
+  (network-scaling-v3 Task 6) — see CLAUDE.md §4 above.
 - `src/gw_core.{c,h}` — CFP seat table, leases and the tag address pool. The
   single-phase table was ported unchanged from the nRF5 gateway; a
   `[GW_CYCLE_C][GW_N_CFP]` phase dimension is new this session (network-scaling-v3
@@ -365,7 +449,9 @@ gw seed <n>                    fill n FAKE tag seats (n up to GW_MAX_SEATS)
   milliseconds — the same order as `BEACON_ARM_MARGIN_UUS` — if done inline.
 - `src/beacon_guard.{c,h}` — predicts the next beacon and refuses any delayed
   TX that would land on it. Pure C, host-tested in `tests/beacon_guard/`.
-- `src/anchor_respond.{c,h}` — the WAVE/0xE1 and DISCOVERY/0xE4 responders.
+- `src/anchor_respond.{c,h}` — the WAVE/0xE1, DISCOVERY/0xE4, ANNOUNCE/0xEC
+  (`anchor_respond_announce()`) and MULTI-POLL/`0xED` (`anchor_respond_multipoll()`)
+  responders (the latter two, network-scaling-v3 Tasks 5 and 9 this session).
 - `src/uwb_phy.h` — the fixed PHY contract. Not runtime-configurable.
 - `src/anchor_shell.c` — the `anchor` console command tree.
 - `src/uwb_slave.c` — SLAVE mode: interrupt-driven SS-TWR responder, beacon

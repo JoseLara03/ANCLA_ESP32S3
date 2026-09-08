@@ -3,8 +3,10 @@
 **Date:** 2026-09-08
 **Plan:** `docs/superpowers/plans/2026-09-07-network-scaling-anchor.md`, Task 13
 **Commits:** `a63b17e` (implementation) + `bff1207` (fix round 1)
-**Status:** Landed and pushed to `origin/docs/network-scaling-v3`. **Not yet safe to exercise on real
-tag firmware** — see §3.
+**Status:** Landed and pushed to `origin/docs/network-scaling-v3`. **UPDATE 2026-09-08:** both of §3's
+prerequisites for a multi-phase grant are now done in code (Task 14 landed this session; the tag-side
+half already existed and this doc's original text was stale about it) — **not yet exercised on real
+tag firmware**, which is a hardware gap now, not a code one. See §3.
 
 ---
 
@@ -77,23 +79,31 @@ clean under `gcc -Wall -Wextra`.
 
 ---
 
-## 3. What is still missing — read this before trusting a multi-phase grant on air
+## 3. What was missing — **UPDATE 2026-09-08: both prerequisites are now landed in code**
 
-**Multi-phase grants are not yet safe to exercise against real tag firmware.** Two things are genuine
-functional prerequisites, both still outstanding:
+**Correction to this section's original text.** It listed two functional prerequisites for a multi-phase
+grant to be safe on real tag firmware and described both as outstanding. That was already half wrong when
+written: the second prerequisite existed in `tag_testting` at the time (see below) and the note claiming
+otherwise was stale. Left uncorrected, a reader would conclude twice the actual remaining work was needed.
+As of this session, both are done in code:
 
-1. **Task 14 ("GRANT carries the phase mask")** — currently parked, because it requires a coordinated
-   change to the shared `uwb_frame_802_15_4z.c` codec that must land in the tag repo first. Without it,
-   a tag is never told which phases it owns.
-2. **A tag-side firmware change** deriving `listen_skip` and the `in_map` check from that mask, so a tag
-   only checks the beacons of the phases it actually owns — instead of reading absence from *any* beacon
-   as lease loss. This does not exist in `tag_testting` today and is not part of this plan's ANCLA-side
-   work; it belongs to the tag repo's own implementation plan.
+1. **Task 14 ("GRANT carries the phase mask")** — **done, this session.** `send_grant()`
+   (`src/uwb_gateway.c`) now fills `g->phase_mask` into the 26-byte GRANT instead of deliberately omitting
+   it; the frame module already carried the field (copied from the tag repo alongside this session's other
+   frame-module updates). A tag is now actually told which phases it owns.
+2. **The tag-side firmware change** deriving `listen_skip` and the `in_map` check from that mask —
+   **already existed**, landed in `tag_testting`'s own Task 11/12 before this session:
+   `uwb_net_phase_active()` (`tag_testting/src/uwb_net.c`) requires BOTH `phase_mask` bit AND `in_map`
+   before treating a superframe as the tag's own, and `uwb_net_phase_skip_to_next()`
+   (`tag_testting/src/uwb_net_runner.c:740`) plans the wake for the next set phase bit rather than a fixed
+   skip. This repo's `gw_core.h` file comment (written before this correction) undersold what already
+   existed on the other side — it has not yet been re-edited to drop the "not part of this plan's
+   ANCLA-side work" framing; treat this file as the current source of truth over that comment until it is.
 
-Until both land, granting a tag more than one phase will cause it to drop to `SCAN` on real hardware,
-not range faster. This is now stated plainly in `src/gw_core.h`'s file comment and
-`src/uwb_gateway.c`'s `send_grant()` comment — read those before anyone is tempted to flash this and test
-multi-phase ranging early.
+**What remains is hardware, not code.** Neither side's phase-mask handling has been exercised on an actual
+tag against an actual gateway — a multi-phase grant has never gone out on air and never been observed to
+either work or bounce a tag to `SCAN`. Flash both sides and watch a FAST-tier tag hold a 4-phase grant
+without dropping to `SCAN` before trusting this in the field.
 
 **This is not a defect in what shipped.** The gateway-side seat bookkeeping (Tasks 12+13) is correct,
 tested, self-contained, and safe to have landed — it simply isn't the *complete* feature by itself. The
@@ -135,8 +145,8 @@ findings are logged for the final whole-branch review rather than entering the p
 ## 4. Where this fits
 
 This is one task inside a larger plan (`docs/superpowers/plans/2026-09-07-network-scaling-anchor.md`)
-targeting 100 tags over 32 anchors. Of that plan's 21 tasks, this session executed the subset that is
-self-contained within `ANCLA_ESP32S3` and needs no tag-repo or hardware changes: Tasks 3, 7, 12, 13 (this
-one), with 15/16/17/21 still to go. Eight tasks (4, 5, 6, 8, 9, 10, 14, 20) are parked pending
-coordinated work in `tag_testting`; five more (1, 2, 11, 18, 19) are parked pending bench access. The
-full ledger has the complete task-by-task record, every ruling made, and every deferred finding.
+targeting 100 tags over 32 anchors. As of the 2026-09-08 network-scaling-v3 session, Tasks 3, 4, 5, 6, 7,
+8, 9, 12, 13 (this one), 14, 16, 17 and 20's code half are done; Task 15's JOIN-backoff bullet is done on
+the tag side. Tasks 1, 2, 10, 11, 18, 19 remain parked on bench access; Task 21 (documentation) is
+partial. See the main plan's own status ledger note for why `git log` is the source of truth over any
+SDD progress file.
