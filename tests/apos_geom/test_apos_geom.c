@@ -746,6 +746,333 @@ static void test_free_params_matches_each_dimensionality(void)
     CHECK(apos_geom_free_params(APOS_GEOM_2D, 4) == 5);
 }
 
+/* apos_geom_dims() must NOT be `(int)dim`: APOS_GEOM_3D is the zero value and
+ * APOS_GEOM_2D is 1, so the enum reads exactly backwards as a dimension count
+ * and every rigidity bound derived from it would be wrong in a way that still
+ * looked plausible. */
+static void test_dims_is_not_the_enum_value(void)
+{
+    CHECK(apos_geom_dims(APOS_GEOM_2D) == 2);
+    CHECK(apos_geom_dims(APOS_GEOM_3D) == 3);
+    CHECK((int)APOS_GEOM_3D == 0);
+    CHECK((int)APOS_GEOM_2D == 1);
+}
+
+/* ---- Rigidity ---- */
+
+/* Add an undirected edge with an arbitrary distance. The rigidity check reads
+ * only the graph, never a length, so these helpers do not need real geometry. */
+static uint16_t add_edge(struct apos_edge *e, uint16_t n, uint8_t i, uint8_t j)
+{
+    e[n].i = i;
+    e[n].j = j;
+    e[n].d_m = 1.0f;
+    e[n].sd_m = 0.001f;
+    return (uint16_t)(n + 1u);
+}
+
+/* Every pair within [lo, hi). */
+static uint16_t add_clique(struct apos_edge *e, uint16_t n, uint8_t lo, uint8_t hi)
+{
+    for (uint8_t i = lo; i < hi; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < hi; j++) {
+            n = add_edge(e, n, i, j);
+        }
+    }
+    return n;
+}
+
+/* The three conditions must be independently observable, or a caller cannot
+ * tell an operator WHICH one to fix. Start from the case everything else is
+ * measured against: a 4-node 3D full mesh, rigid and exactly isostatic. */
+static void test_rigidity_accepts_the_isostatic_four_node_mesh(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_rigidity r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    CHECK(apos_geom_rigidity(e, n, 4, APOS_GEOM_3D, &r) == 0);
+    CHECK(r.n_edges == 6);
+    CHECK(r.n_components == 1);
+    CHECK(r.connected);
+    CHECK(r.min_degree == 3);
+    CHECK(r.degree_ok);
+    CHECK(r.free_params == 6);
+    CHECK(r.spare_edges == 0);
+    /* Rigid, but with nothing spare -- so rms_m proves nothing here. That
+     * pairing is exactly what apos_gw_result_unverified() reports. */
+    CHECK(r.rigid);
+    CHECK(!r.redundant);
+}
+
+/* FAILURE MODE 1: disconnected. Deliberately built so the EDGE COUNT PASSES,
+ * proving connectivity is a separate gate rather than something the DOF count
+ * happens to catch: two 5-cliques in 2D are 20 edges against 2*10-3 = 17 free
+ * parameters, i.e. 3 spare -- and still two pieces that can slide and rotate
+ * freely relative to each other. */
+static void test_rigidity_rejects_a_disconnected_mesh(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_rigidity r;
+    uint16_t n = add_clique(e, 0, 0, 5);
+
+    n = add_clique(e, n, 5, 10);
+    CHECK(n == 20);
+
+    CHECK(apos_geom_rigidity(e, n, 10, APOS_GEOM_2D, &r) == 0);
+    CHECK(r.n_components == 2);
+    CHECK(!r.connected);
+    /* The count and the degree are both fine -- only connectivity is not. */
+    CHECK(r.spare_edges == 3);
+    CHECK(r.degree_ok);
+    CHECK(r.min_degree == 4);
+    CHECK(!r.rigid);
+    CHECK(!r.redundant);
+
+    /* Same story in 3D, where the count needs bigger pieces to pass: two
+     * 7-cliques are 42 edges against 3*14-6 = 36. */
+    n = add_clique(e, 0, 0, 7);
+    n = add_clique(e, n, 7, 14);
+    CHECK(n == 42);
+    CHECK(apos_geom_rigidity(e, n, 14, APOS_GEOM_3D, &r) == 0);
+    CHECK(r.n_components == 2);
+    CHECK(r.spare_edges == 6);
+    CHECK(r.degree_ok);
+    CHECK(!r.rigid);
+}
+
+/* FAILURE MODE 2: flexible for want of edges. A 12-node ring in 2D is
+ * connected, has min degree 2 (enough to pin a vertex), and is still a
+ * mechanism -- 12 edges against 2*12-3 = 21 free parameters. It must be FLAGGED
+ * rather than accepted, because LM will still return coordinates for it. */
+static void test_rigidity_rejects_an_under_constrained_ring(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_rigidity r;
+    uint16_t n = 0;
+
+    for (uint8_t k = 0; k < 12; k++) {
+        n = add_edge(e, n, k, (uint8_t)((k + 1u) % 12u));
+    }
+    CHECK(n == 12);
+
+    CHECK(apos_geom_rigidity(e, n, 12, APOS_GEOM_2D, &r) == 0);
+    CHECK(r.connected);          /* not this one */
+    CHECK(r.degree_ok);          /* nor this one */
+    CHECK(r.min_degree == 2);
+    CHECK(r.free_params == 21);
+    CHECK(r.spare_edges == -9);  /* THIS one */
+    CHECK(!r.rigid);
+    CHECK(!r.redundant);
+}
+
+/* FAILURE MODE 3: a node with fewer edges than the solve has dimensions. Built
+ * so the EDGE COUNT PASSES, again proving the gates are independent: a 5-node
+ * 2D clique plus a 6th node hanging off a single edge is 11 edges against
+ * 2*6-3 = 9, i.e. 2 spare, connected -- and that 6th node swings on a circle. */
+static void test_rigidity_rejects_an_under_degree_node(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_rigidity r;
+    uint16_t n = add_clique(e, 0, 0, 5);
+
+    n = add_edge(e, n, 0, 5);
+    CHECK(n == 11);
+
+    CHECK(apos_geom_rigidity(e, n, 6, APOS_GEOM_2D, &r) == 0);
+    CHECK(r.connected);
+    CHECK(r.spare_edges == 2);
+    CHECK(r.min_degree == 1);
+    CHECK(r.min_degree_node == 5);
+    CHECK(!r.degree_ok);
+    CHECK(!r.rigid);
+    CHECK(!r.redundant);
+
+    /* Degree 2 is enough in 2D and NOT enough in 3D -- the same graph gives
+     * opposite verdicts, which is the whole reason apos_geom_dims() exists. */
+    n = add_edge(e, n, 1, 5);
+    CHECK(apos_geom_rigidity(e, n, 6, APOS_GEOM_2D, &r) == 0);
+    CHECK(r.min_degree == 2);
+    CHECK(r.degree_ok);
+    CHECK(apos_geom_rigidity(e, n, 6, APOS_GEOM_3D, &r) == 0);
+    CHECK(r.min_degree == 2);
+    CHECK(!r.degree_ok);
+}
+
+/* A repeated pair must count ONCE. Otherwise a duplicated edge inflates
+ * n_edges, turns an isostatic mesh into an apparently redundant one, and makes
+ * rms_mm look trustworthy when nothing has changed about the measurements. */
+static void test_rigidity_counts_a_duplicate_edge_once(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_rigidity r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    /* The 0-1 edge again, and again with the endpoints swapped. */
+    n = add_edge(e, n, 0, 1);
+    n = add_edge(e, n, 1, 0);
+
+    CHECK(apos_geom_rigidity(e, n, 4, APOS_GEOM_3D, &r) == 0);
+    CHECK(r.n_edges == 6);       /* not 8 */
+    CHECK(r.spare_edges == 0);
+    CHECK(!r.redundant);
+}
+
+/* Edges naming a node past n_nodes, or joining a node to itself, are ignored --
+ * exactly as apos_geom_refine() ignores them, so the graph the check reasons
+ * about is the graph the fit uses. An isolated node then shows up as a second
+ * component, which is the honest report: it cannot be placed. */
+static void test_rigidity_ignores_structurally_invalid_edges(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_rigidity r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    n = add_edge(e, n, 2, 2);   /* self-loop */
+    n = add_edge(e, n, 3, 9);   /* node 9 is past n_nodes = 5 */
+
+    CHECK(apos_geom_rigidity(e, n, 5, APOS_GEOM_3D, &r) == 0);
+    CHECK(r.n_edges == 6);
+    CHECK(r.n_components == 2); /* node 4 is isolated */
+    CHECK(!r.connected);
+    CHECK(r.min_degree == 0);
+    CHECK(r.min_degree_node == 4);
+    CHECK(!r.rigid);
+}
+
+static void test_rigidity_rejects_bad_arguments(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_rigidity r;
+    uint16_t n = build_full_mesh(e, 4);
+
+    CHECK(apos_geom_rigidity(e, n, 4, APOS_GEOM_3D, NULL) == -EINVAL);
+    CHECK(apos_geom_rigidity(NULL, n, 4, APOS_GEOM_3D, &r) == -EINVAL);
+    CHECK(apos_geom_rigidity(e, n, 0, APOS_GEOM_3D, &r) == -EINVAL);
+    CHECK(apos_geom_rigidity(e, n, APOS_MAX_NODES + 1, APOS_GEOM_3D, &r)
+          == -EINVAL);
+    /* A rejected call must leave a NON-rigid verdict, never stale data: a
+     * caller that ignores the return code has to fail safe. */
+    memset(&r, 0xFF, sizeof(r));
+    CHECK(apos_geom_rigidity(e, n, 0, APOS_GEOM_3D, &r) == -EINVAL);
+    CHECK(!r.rigid);
+    CHECK(!r.redundant);
+    CHECK(!r.connected);
+    /* An empty edge list with a NULL pointer is fine -- nothing to read. */
+    CHECK(apos_geom_rigidity(NULL, 0, 4, APOS_GEOM_3D, &r) == 0);
+    CHECK(r.n_edges == 0);
+    CHECK(!r.rigid);
+}
+
+/* The point of the whole exercise: at 32 anchors a SPARSE mesh has real
+ * redundancy, so rms_mm stops being vacuous. A 12-node sparse 3D layout --
+ * every pair within a 16 m radius of a ~20 m x 20 m site, so well under the
+ * 66-edge full mesh -- must solve, place every node unambiguously, and come
+ * back rigid AND redundant. This is the 4-anchor isostatic floor being left
+ * behind, and it is the case the acceptance thresholds finally mean something
+ * on. */
+static const float twelve[12][3] = {
+    { 0.0f,  0.0f, 0.0f},  /* origin */
+    {10.0f,  0.0f, 0.0f},  /* xaxis  */
+    { 0.0f, 10.0f, 0.0f},  /* plane  */
+    { 3.0f,  3.0f, 4.0f},  /* up     */
+    {10.0f, 10.0f, 0.0f},
+    { 5.0f,  5.0f, 0.0f},
+    {20.0f,  0.0f, 1.0f},
+    {20.0f, 10.0f, 1.0f},
+    {15.0f,  5.0f, 4.0f},
+    {10.0f, 20.0f, 0.0f},
+    { 0.0f, 20.0f, 1.0f},
+    { 5.0f, 15.0f, 4.0f},
+};
+
+/* Edges only between nodes within `radius` of each other -- the shape a real
+ * 100 m site produces, where distant pairs simply never range. */
+static uint16_t build_radius_mesh(struct apos_edge *out, uint8_t n, float radius,
+                                  float sd)
+{
+    uint16_t k = 0;
+
+    for (uint8_t i = 0; i < n; i++) {
+        for (uint8_t j = (uint8_t)(i + 1); j < n; j++) {
+            if (dist3(twelve[i], twelve[j]) > radius) {
+                continue;
+            }
+            out[k].i = i;
+            out[k].j = j;
+            out[k].d_m = dist3(twelve[i], twelve[j]);
+            out[k].sd_m = sd;
+            k++;
+        }
+    }
+    return k;
+}
+
+static void test_sparse_twelve_node_mesh_solves(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result r;
+    struct apos_rigidity rg;
+    uint16_t n = build_radius_mesh(e, 12, 16.0f, 0.010f);
+
+    /* Genuinely sparse: fewer edges than the 66 a full 12-node mesh has, and
+     * more than the 30 free parameters 3*12-6 leaves. */
+    CHECK(n < 66);
+    CHECK(n > 30);
+
+    CHECK(apos_geom_rigidity(e, n, 12, APOS_GEOM_3D, &rg) == 0);
+    CHECK(rg.connected);
+    CHECK(rg.degree_ok);
+    CHECK(rg.free_params == 30);
+    CHECK(rg.spare_edges > 0);
+    CHECK(rg.rigid);
+    /* THE claim: a sparse mesh at this size is redundant, so rms_mm carries
+     * information -- unlike the 4-node isostatic case above. */
+    CHECK(rg.redundant);
+
+    CHECK(apos_geom_solve(e, n, 12, &g_ref, &r) == 0);
+    CHECK(r.n_placed == 12);
+    CHECK(r.n_ambiguous == 0);
+    CHECK(r.rms_m < 0.01f);
+    for (int i = 0; i < 12; i++) {
+        CHECK(r.node[i].state == APOS_NODE_PLACED);
+        CLOSE(r.node[i].x, twelve[i][0], 0.02f);
+        CLOSE(r.node[i].y, twelve[i][1], 0.02f);
+        CLOSE(r.node[i].z, twelve[i][2], 0.02f);
+    }
+}
+
+/* And rms_m on that same sparse mesh must actually MOVE when a range is wrong
+ * -- otherwise "redundant" would be a label with nothing behind it. This is the
+ * property that is identically false on a 4-node 3D full mesh. */
+static void test_sparse_twelve_node_mesh_reports_a_bad_edge(void)
+{
+    struct apos_edge e[APOS_MAX_EDGES];
+    struct apos_result clean, bad;
+    uint16_t n = build_radius_mesh(e, 12, 16.0f, 0.010f);
+
+    CHECK(apos_geom_solve(e, n, 12, &g_ref, &clean) == 0);
+    CHECK(clean.rms_m < 0.01f);
+
+    /* Corrupt one edge between two non-gauge nodes by 300 mm. */
+    for (uint16_t k = 0; k < n; k++) {
+        if (e[k].i == 4 && e[k].j == 5) {
+            e[k].d_m += 0.300f;
+        }
+    }
+
+    CHECK(apos_geom_solve(e, n, 12, &g_ref, &bad) == 0);
+    CHECK(bad.rms_m > clean.rms_m);
+    CHECK(bad.rms_m > 0.02f);
+    CHECK(bad.worst_edge_m > 0.05f);
+    /* With 13 spare edges the fit cannot mask the culprit onto a neighbour --
+     * the "least-squares masking" the existing 5..7-node note describes needs
+     * a mesh close to isostatic. Observed: rms 36.5 mm, worst 191 mm on
+     * exactly the corrupted pair. */
+    CHECK((bad.worst_i == 4 && bad.worst_j == 5) ||
+          (bad.worst_i == 5 && bad.worst_j == 4));
+}
+
 int main(void)
 {
     test_gauge_requires_four_distinct_nodes();
@@ -760,6 +1087,16 @@ int main(void)
     test_gauge_collinearity_is_zero_in_3d_mode();
     test_refine_stamps_dim_without_seed();
     test_free_params_matches_each_dimensionality();
+    test_dims_is_not_the_enum_value();
+    test_rigidity_accepts_the_isostatic_four_node_mesh();
+    test_rigidity_rejects_a_disconnected_mesh();
+    test_rigidity_rejects_an_under_constrained_ring();
+    test_rigidity_rejects_an_under_degree_node();
+    test_rigidity_counts_a_duplicate_edge_once();
+    test_rigidity_ignores_structurally_invalid_edges();
+    test_rigidity_rejects_bad_arguments();
+    test_sparse_twelve_node_mesh_solves();
+    test_sparse_twelve_node_mesh_reports_a_bad_edge();
     test_seed_reproduces_the_exact_layout();
     test_gauge_constraints_hold_exactly();
     test_node_with_two_edges_is_unplaced_not_an_error();

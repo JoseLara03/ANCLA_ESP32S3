@@ -25,13 +25,53 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Survey capacity. Deliberately NOT UWB_MAX_ANCHORS (4): the survey has no
- * reason to inherit the tag-facing ranging MAC's limit. Growing the deployment
- * past 4 RANGING anchors is separate work needing disc_schedule.h's stagger and
- * anchor_respond.c's TX_COMPLETE_TIMEOUT_MS re-derived, plus the tag's
- * UWB_FRAME_MAX_ANCHORS -- see the design doc section 7.1. */
-#define APOS_MAX_NODES 8
+/* Survey capacity: the full 32-anchor deployment UWB_MAX_ANCHORS now supports.
+ *
+ * Deliberately still a SEPARATE constant rather than `#define APOS_MAX_NODES
+ * UWB_MAX_ANCHORS`, even though the two values now agree. Nothing in this file
+ * may depend on the tag-facing ranging MAC: this module is pure C, host-tested
+ * with synthetic geometry, and its node count is a property of the solver's
+ * storage, not of how many anchors a tag can poll. The values being equal is a
+ * fact about today's deployment, not a coupling.
+ *
+ * Sized structures at 32 nodes, all of which are deliberately kept OFF the
+ * gateway loop's 4 kB stack (CONFIG_MAIN_STACK_SIZE) -- see the .bss note on
+ * apos_geom_refine()'s working matrices below, and apos_gw.c's file-scope
+ * `edges`/`survey_rec`:
+ *   APOS_MAX_EDGES  = 32*31/2 = 496 edges  -> struct apos_edge[496]  ~5.8 kB
+ *   APOS_MAX_MEAS   = 32*31   = 992 rows   -> struct apos_table      ~12.7 kB
+ *   APOS_MAX_PARAMS = 3*32-6  = 90 params  -> one 90x90 float matrix ~32 kB
+ *
+ * Measured with xtensa-...-size on the objects: apos_geom.c 33792 B of .bss,
+ * apos_gw.c 20361, net_uplink.c 11311 -- about +52 kB over the 8-node sizing,
+ * against 127164 B free in dram0_0_seg (0x61704 = 389 kB, of which the last
+ * pre-change image left 0x1F0BC unused after .dram0.bss). It fits with ~73 kB
+ * to spare, and it is now the single largest RAM item in the firmware. Check
+ * the map before adding another node-count-squared array here. NOTE: those
+ * are per-object figures, not a linked image -- the vendored decadriver
+ * currently fails to compile against this Zephyr checkout
+ * (platform/dw3000_spi.c's `#include "version.h"`, unrelated to the survey),
+ * so a whole-image RAM report has not been produced.
+ */
+#define APOS_MAX_NODES 32
 #define APOS_MAX_EDGES ((APOS_MAX_NODES * (APOS_MAX_NODES - 1)) / 2)
+
+/* Free parameters at full capacity, i.e. the largest value
+ * apos_geom_free_params() can return: 3N-6 in 3D, which dominates 2N-3.
+ * apos_geom_refine()'s normal-equation matrices are sized on this, and its
+ * column indices are int8_t -- so this must stay under 128. */
+#define APOS_MAX_PARAMS (3 * APOS_MAX_NODES - 6)
+
+/* The rigidity check and apos_table's enumeration-adjacency bitmap both key a
+ * uint32_t by node index / anchor id, so 32 is a hard ceiling rather than a
+ * tuning choice. Raising APOS_MAX_NODES past it must widen those bitmaps
+ * first; fail the build rather than silently losing the high nodes. */
+_Static_assert(APOS_MAX_NODES <= 32,
+	       "APOS_MAX_NODES > 32 needs the uint32_t adjacency bitmaps in "
+	       "apos_geom.c and apos_table.h widened first");
+_Static_assert(APOS_MAX_PARAMS < 128,
+	       "APOS_MAX_PARAMS >= 128 overflows struct pmap's int8_t column "
+	       "indices in apos_geom.c");
 
 /* APOS_GEOM_3D is deliberately the zero value, not APOS_GEOM_2D: every
  * struct apos_gauge literal that predates this field (in apos_gw.c and in
@@ -147,9 +187,97 @@ void apos_geom_zoff(struct apos_result *r, float dz);
 /* Free parameters for a solve of this dimensionality: translation +
  * rotation only, the gauge having already fixed the rest. 2N-3 in 2D (2
  * translation + 1 rotation), 3N-6 in 3D (3 translation + 3 rotation).
- * Centralizes the formula apos_gw.c otherwise duplicates as a literal
- * expression. */
+ * The one place the formula lives -- apos_geom_rigidity() below reports it as
+ * struct apos_rigidity.free_params, which is what apos_gw.c and apos_shell.c
+ * read rather than each re-deriving the expression. */
 int apos_geom_free_params(enum apos_geom_dim dim, uint8_t n_placed);
+
+/* Spatial dimensions the mode solves in: 2 or 3.
+ *
+ * NOT the enum value. APOS_GEOM_3D is 0 and APOS_GEOM_2D is 1 (see the note on
+ * enum apos_geom_dim above), so `(int)dim` is exactly backwards and using it as
+ * a dimension count is the obvious way to get every rigidity bound wrong by a
+ * factor that still looks plausible. Every place that needs `d` goes through
+ * here. */
+int apos_geom_dims(enum apos_geom_dim dim);
+
+/* ---- Rigidity ---- */
+
+/* Whether the framework the edge list describes CAN determine a shape at all,
+ * independently of what any particular fit produced.
+ *
+ * Three NECESSARY conditions for generic rigidity in R^d, checked over the
+ * graph alone -- no coordinates, so this is valid before or after a solve:
+ *
+ *   1. CONNECTED. A framework in two or more pieces has a relative motion
+ *      between them by construction, whatever each piece measures.
+ *   2. MINIMUM DEGREE >= d. A vertex with fewer than d edges is not pinned: in
+ *      2D a degree-1 vertex swings on a circle, in 3D a degree-2 vertex swings
+ *      about the axis through its two neighbours. (Exactly d edges pins it up
+ *      to a REFLECTION through its neighbours' (d-1)-flat -- a discrete
+ *      ambiguity, not a flex, and already reported separately as
+ *      APOS_NODE_AMBIGUOUS. d+1 edges is what removes that.)
+ *   3. EDGE COUNT >= apos_geom_free_params(dim, n_nodes). Fewer independent
+ *      distance constraints than free parameters leaves the fit
+ *      under-determined however good the ranging was.
+ *
+ * NOT SUFFICIENT, and the gap is real rather than theoretical. None of the
+ * three sees a HINGE: two densely-meshed clusters joined at a single shared
+ * anchor (two K5s sharing a vertex, say -- 9 nodes, 20 edges against 2N-3 = 15
+ * in 2D) is connected, has min degree 4, passes the count, and still rotates
+ * freely about the shared node. The general statement is that d-connectivity is
+ * necessary -- removing d-1 vertices must not disconnect the graph, since the
+ * pieces could then rotate about the (d-2)-flat those vertices span -- and only
+ * 1-cuts would be cheap to detect here (Tarjan lowlink); 2-cuts, which is what
+ * 3D needs, are not. Beyond that, no purely combinatorial characterisation of
+ * generic rigidity in R^3 exists at all (Laman's theorem does not extend past
+ * 2D; the "double banana" satisfies every subgraph count and is still
+ * flexible), so the rigorous test is numerical -- the rank of the rigidity
+ * matrix, i.e. of the undamped JtJ apos_geom_refine() already assembles. That
+ * was deliberately NOT implemented: it needs a singular-value tolerance, and
+ * every candidate threshold is a guess until a real 32-anchor array has been
+ * measured. These three conditions are what can be stated as facts today.
+ *
+ * So: `rigid` false is a definite verdict -- the framework really is flexible.
+ * `rigid` true means "nothing here contradicts rigidity", which is weaker.
+ * That asymmetry is why `redundant` gates rms_mm rather than replacing the
+ * tape measure (see apos_gw_result_unverified()).
+ *
+ * Duplicate edges for one pair are counted ONCE. A repeated pair would
+ * otherwise inflate n_edges and turn an isostatic mesh into an apparently
+ * redundant one -- i.e. make rms_mm look trustworthy when it is not.
+ * apos_table_symmetrise() never emits duplicates, but a caller building an
+ * edge list by hand can. */
+struct apos_rigidity {
+	uint8_t  n_nodes;
+	uint16_t n_edges;         /* DISTINCT structurally valid undirected pairs */
+	uint8_t  n_components;    /* connected components over all n_nodes */
+	uint8_t  min_degree;
+	uint8_t  min_degree_node; /* which node had it; 0 when n_nodes == 0 */
+	int16_t  free_params;     /* apos_geom_free_params(dim, n_nodes) */
+	int16_t  spare_edges;     /* n_edges - free_params; may be negative */
+	bool     connected;       /* n_components == 1 */
+	bool     degree_ok;       /* min_degree >= apos_geom_dims(dim) */
+	bool     rigid;           /* connected && degree_ok && spare_edges >= 0 */
+	bool     redundant;       /* rigid && spare_edges > 0 -- rms_mm has
+				   * something to disagree with */
+};
+
+/* Fill *out for the framework (e, n_edges) over n_nodes in `dim`. Edges naming
+ * a node index at or past n_nodes, or joining a node to itself, are ignored
+ * exactly as apos_geom_refine() ignores them.
+ *
+ * Returns 0, or -EINVAL on a NULL out, a NULL edge list with n_edges > 0, or
+ * n_nodes outside 1..APOS_MAX_NODES. *out is zeroed first, so a rejected call
+ * leaves an all-false (non-rigid) verdict rather than stale data.
+ *
+ * n_nodes below the gauge's minimum (APOS_MIN_NODES_2D / _3D) comes back
+ * non-rigid via condition 2 rather than via a special case: the 2N-3 / 3N-6
+ * count only means anything from N = d+1 upward, and a gauge that small is
+ * already refused by apos_geom_gauge_valid(). */
+int apos_geom_rigidity(const struct apos_edge *e, uint16_t n_edges,
+		       uint8_t n_nodes, enum apos_geom_dim dim,
+		       struct apos_rigidity *out);
 
 /* LM iteration cap. Reached only on a pathological input; a clean full mesh
  * converges in well under ten. */
@@ -169,27 +297,40 @@ int apos_geom_free_params(enum apos_geom_dim dim, uint8_t n_placed);
  * is what acceptance is defined against.
  *
  * IMPORTANT: rms_m and worst_edge_m are only meaningful once the usable edge
- * count exceeds 3N-6 (N = usable nodes). At N = 4 with a full mesh, 6 edges
- * exactly match the 6 free parameters -- an isostatic system with no spare
- * equation for a bad range to disagree with -- so LM finds an exact
- * re-embedding of whatever distances it is given and rms_m/worst_edge_m come
- * back identically zero regardless of the input's quality. From N = 5 to 7
+ * count exceeds 3N-6 (N = usable nodes), AND the framework passes
+ * apos_geom_rigidity() -- a flexible mesh can have edges to spare in a region
+ * that is over-measured while another region is unconstrained, and the fit will
+ * happily report a small rms_m for a shape it never determined. At N = 4 with a
+ * full mesh, 6 edges exactly match the 6 free parameters -- an isostatic system
+ * with no spare equation for a bad range to disagree with -- so LM finds an
+ * exact re-embedding of whatever distances it is given and rms_m/worst_edge_m
+ * come back identically zero regardless of the input's quality. From N = 5 to 7
  * there is enough redundancy for rms_m to read nonzero, but not always enough
  * to keep worst_i/worst_j pointing at the actual bad pair: least-squares
  * "masking" can let the fit shift two good nodes just enough to spread the
  * disagreement onto a different, merely-correlated edge instead. Both were
  * hit and confirmed while writing this module's own tests (see
  * tests/apos_geom/test_apos_geom.c); only a mesh with real edge redundancy
- * well past 3N-6 is a trustworthy witness. The real deployment (4 ranging
- * slaves + 1 gateway) sits right in this under-determined regime, so an
- * acceptance check against rms_m alone can pass on a badly-ranged pair that a
- * richer mesh would have caught.
+ * well past 3N-6 is a trustworthy witness. A four-anchor array solved in 3D
+ * sits exactly in that under-determined regime; a 32-anchor sparse mesh
+ * normally does not, which is what makes rms_m an acceptance signal at scale --
+ * but only once apos_geom_rigidity() says the framework is rigid AND redundant.
  *
- * NOT REENTRANT: the LM working matrices are function-local `static` storage
- * (too large for a comfortable stack frame), so only one call -- across
- * apos_geom_refine() and apos_geom_solve() below, which calls it -- may be in
- * flight at a time. Fine for the single-threaded gateway loop this is written
- * for; do not call either from more than one thread. */
+ * NOT REENTRANT: the LM working matrix and its trial result are function-local
+ * `static` storage -- at APOS_MAX_PARAMS (90) the normal-equation matrix alone
+ * is 90*90*4 ~= 32 kB of .bss, far past any stack this runs on -- so only one
+ * call, across apos_geom_refine() and
+ * apos_geom_solve() below which calls it, may be in flight at a time. Fine for
+ * the single-threaded gateway loop this is written for; do not call either from
+ * more than one thread.
+ *
+ * COST GROWS AS THE CUBE OF THE NODE COUNT. Each iteration runs a dense
+ * Gaussian elimination over m.n_params = 3N-6 unknowns, so going from the
+ * 4-anchor case (6 params) to a full 32-anchor 3D survey (90 params) is a
+ * ~3400x increase in the elimination alone. APOS_GW_SOLVE_BUDGET_UUS was
+ * estimated against the small case and has never been timed on hardware at
+ * either size; read its comment in apos_gw.h before trusting it at 32
+ * nodes. */
 int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 		     const struct apos_gauge *g, struct apos_result *io);
 

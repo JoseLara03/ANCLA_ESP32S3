@@ -29,9 +29,137 @@ int apos_geom_free_params(enum apos_geom_dim dim, uint8_t n_placed)
 				      : (3 * (int)n_placed - 6);
 }
 
+int apos_geom_dims(enum apos_geom_dim dim)
+{
+	return (dim == APOS_GEOM_2D) ? 2 : 3;
+}
+
+/* ---- Rigidity ---- */
+
+/* Union-find with path halving. Iterative on purpose: this runs on the gateway
+ * loop, whose stack is 4 kB, and a recursive find over 32 nodes is a needless
+ * frame chain there. */
+static uint8_t uf_find(uint8_t *parent, uint8_t x)
+{
+	while (parent[x] != x) {
+		parent[x] = parent[parent[x]];
+		x = parent[x];
+	}
+	return x;
+}
+
+static void uf_union(uint8_t *parent, uint8_t a, uint8_t b)
+{
+	uint8_t ra = uf_find(parent, a);
+	uint8_t rb = uf_find(parent, b);
+
+	if (ra != rb) {
+		parent[rb] = ra;
+	}
+}
+
+/* Set bits in a 32-bit word. A plain loop rather than __builtin_popcount: this
+ * file is compiled by both the Zephyr toolchain and plain host gcc for the unit
+ * tests, and 32 iterations over at most 32 nodes is not worth a builtin. */
+static uint8_t popcount32(uint32_t v)
+{
+	uint8_t n = 0;
+
+	while (v) {
+		v &= v - 1u;
+		n++;
+	}
+	return n;
+}
+
+int apos_geom_rigidity(const struct apos_edge *e, uint16_t n_edges,
+		       uint8_t n_nodes, enum apos_geom_dim dim,
+		       struct apos_rigidity *out)
+{
+	if (!out) {
+		return -EINVAL;
+	}
+
+	/* Zeroed before any early return, so a rejected call leaves an
+	 * all-false verdict -- "not rigid" -- rather than whatever the caller's
+	 * struct happened to contain. */
+	memset(out, 0, sizeof(*out));
+
+	if (n_nodes == 0u || n_nodes > APOS_MAX_NODES) {
+		return -EINVAL;
+	}
+	if (!e && n_edges > 0u) {
+		return -EINVAL;
+	}
+
+	/* One bit per node: dedup, degree and the union-find input all come off
+	 * this, so a repeated pair is counted once by construction rather than
+	 * by an O(E^2) scan. Bounded by the _Static_assert in apos_geom.h. */
+	uint32_t adj[APOS_MAX_NODES] = {0};
+	uint8_t parent[APOS_MAX_NODES];
+	uint16_t distinct = 0;
+
+	for (uint8_t n = 0; n < n_nodes; n++) {
+		parent[n] = n;
+	}
+
+	for (uint16_t k = 0; k < n_edges; k++) {
+		uint8_t i = e[k].i;
+		uint8_t j = e[k].j;
+
+		/* Same structural filter as edge_usable(), minus the placement
+		 * test: this is a question about the GRAPH, so it must give the
+		 * same answer before a solve as after one. */
+		if (i >= n_nodes || j >= n_nodes || i == j) {
+			continue;
+		}
+		if (adj[i] & (1u << j)) {
+			continue; /* already counted this pair */
+		}
+		adj[i] |= 1u << j;
+		adj[j] |= 1u << i;
+		distinct++;
+		uf_union(parent, i, j);
+	}
+
+	uint8_t min_deg = UINT8_MAX;
+	uint8_t min_node = 0;
+	uint8_t comps = 0;
+
+	for (uint8_t n = 0; n < n_nodes; n++) {
+		uint8_t deg = popcount32(adj[n]);
+
+		if (deg < min_deg) {
+			min_deg = deg;
+			min_node = n;
+		}
+		if (uf_find(parent, n) == n) {
+			comps++;
+		}
+	}
+
+	int d = apos_geom_dims(dim);
+
+	out->n_nodes = n_nodes;
+	out->n_edges = distinct;
+	out->n_components = comps;
+	out->min_degree = min_deg;
+	out->min_degree_node = min_node;
+	out->free_params = (int16_t)apos_geom_free_params(dim, n_nodes);
+	out->spare_edges = (int16_t)((int)distinct - (int)out->free_params);
+	out->connected = (comps == 1u);
+	out->degree_ok = (min_deg >= (uint8_t)d);
+	out->rigid = out->connected && out->degree_ok && out->spare_edges >= 0;
+	out->redundant = out->rigid && out->spare_edges > 0;
+
+	return 0;
+}
+
 /* Find the edge joining a and b in either order. Returns its distance, or a
  * negative value if the pair was not measured. The linear scan is deliberate:
- * n_edges is at most 28, and an index would cost more code than it saves. */
+ * it runs once per gauge edge in the seed, so at most a few hundred
+ * comparisons even at APOS_MAX_EDGES, and an index would cost more code than
+ * it saves. */
 static float edge_d(const struct apos_edge *e, uint16_t n, uint8_t a, uint8_t b)
 {
 	for (uint16_t k = 0; k < n; k++) {
@@ -593,11 +721,15 @@ static float cost(const struct apos_edge *e, uint16_t n_edges,
 	return c;
 }
 
-/* Solve A x = b in place, Gauss elimination with partial pivoting. n <= 18
- * here (3*8-6), so a dense O(n^3) solve is trivial and a sparse one would be
- * pure complexity. False on a singular system, which LM answers by raising
- * lambda. */
-static bool solve_dense(float A[][3 * APOS_MAX_NODES], float *b, uint8_t n)
+/* Solve A x = b in place, Gauss elimination with partial pivoting. n is
+ * m.n_params, bounded by APOS_MAX_PARAMS (90 at 32 nodes). Dense and O(n^3):
+ * trivial at the 6 parameters a four-anchor 3D survey needs, ~3400x more work
+ * at 90, and still only ~7e5 float operations per iteration -- but see the cost
+ * note on apos_geom_refine() in the header, because APOS_LM_MAX_ITER multiplies
+ * it by up to 200. A sparse factorisation would be the fix if that ever bites;
+ * it is not worth the complexity until the solve has actually been timed on
+ * hardware. False on a singular system, which LM answers by raising lambda. */
+static bool solve_dense(float A[][APOS_MAX_PARAMS], float *b, uint8_t n)
 {
 	for (uint8_t c = 0; c < n; c++) {
 		uint8_t piv = c;
@@ -883,19 +1015,40 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 	io->iterations = 0;
 
 	for (uint16_t it = 0; it < APOS_LM_MAX_ITER; it++) {
-		static float JtJ[3 * APOS_MAX_NODES][3 * APOS_MAX_NODES];
-		static float A[3 * APOS_MAX_NODES][3 * APOS_MAX_NODES];
-		float Jtr[3 * APOS_MAX_NODES] = {0};
-		float bvec[3 * APOS_MAX_NODES];
+		/* All static, none automatic. At APOS_MAX_PARAMS (90) the
+		 * matrix alone is 90*90*4 ~= 32 kB against a
+		 * CONFIG_MAIN_STACK_SIZE of 4096 -- on the stack it would
+		 * overflow the gateway loop's thread outright rather than merely
+		 * crowd it. Sized on APOS_MAX_PARAMS rather than
+		 * 3*APOS_MAX_NODES because m.n_params can never exceed 3N-6
+		 * (pmap_build gives origin no parameters, xaxis only x, plane
+		 * only x and y), which saves ~9 kB over the square-of-3N form
+		 * this used to carry.
+		 *
+		 * ONE matrix, not the separate JtJ and damped copy A this used
+		 * to keep. JtJ was never read after A was built from it: a
+		 * lambda-increase retry `continue`s to the next `it`, which
+		 * memsets and re-assembles from scratch, so nothing ever needed
+		 * the undamped copy to survive. The damping is applied in place
+		 * below instead, which is exactly equivalent because each
+		 * diagonal entry is read once and written once. That is 32 kB of
+		 * .bss saved on a part whose whole dram0_0_seg is 389 kB and
+		 * which also has to fit the WiFi stack -- worth more than the
+		 * symmetry of having both.
+		 *
+		 * The cost of these being static is that apos_geom_refine() is
+		 * not reentrant; that is documented in the header and holds
+		 * anyway, since the DW3220's SPI bus already forbids two
+		 * threads in this path. */
+		static float A[APOS_MAX_PARAMS][APOS_MAX_PARAMS];
+		static float Jtr[APOS_MAX_PARAMS];
+		static float bvec[APOS_MAX_PARAMS];
 
-		/* static, not automatic: declared [3*APOS_MAX_NODES][3*APOS_MAX_NODES]
-		 * = 24x24 for indexing convenience, so the two of them are
-		 * 2 * 24*24*4 = 4.6 kB of .bss (only the 18x18 corner --
-		 * 3*APOS_MAX_NODES-6 free parameters -- is ever read or
-		 * written), against a CONFIG_MAIN_STACK_SIZE of 4096. This
-		 * runs only from the gateway loop, single-threaded, so there
-		 * is no reentrancy. */
-		memset(JtJ, 0, sizeof(JtJ));
+		memset(A, 0, sizeof(A));
+		/* Explicit, because Jtr is static now: the `= {0}` initialiser
+		 * it used to carry re-zeroed it on every iteration and dropping
+		 * that silently would accumulate gradients across iterations. */
+		memset(Jtr, 0, sizeof(Jtr));
 
 		for (uint16_t k = 0; k < n_edges; k++) {
 			if (!edge_usable(io, &e[k])) {
@@ -938,19 +1091,18 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 			for (uint8_t p = 0; p < nc; p++) {
 				Jtr[col[p]] -= grad[p] * res;
 				for (uint8_t q = 0; q < nc; q++) {
-					JtJ[col[p]][col[q]] += grad[p] * grad[q];
+					A[col[p]][col[q]] += grad[p] * grad[q];
 				}
 			}
 		}
 
 		/* Damping scaled per parameter, so the step is invariant to how
-		 * differently conditioned the axes are. */
+		 * differently conditioned the axes are. Applied IN PLACE on the
+		 * assembled Jt*J: each diagonal entry is read exactly once, so
+		 * reading A[p][p] here yields the same undamped value the
+		 * separate JtJ copy used to hold. */
 		for (uint8_t p = 0; p < m.n_params; p++) {
-			for (uint8_t q = 0; q < m.n_params; q++) {
-				A[p][q] = JtJ[p][q];
-			}
-			A[p][p] += lambda *
-				   (JtJ[p][p] > 0.0f ? JtJ[p][p] : 1.0f);
+			A[p][p] += lambda * (A[p][p] > 0.0f ? A[p][p] : 1.0f);
 			bvec[p] = Jtr[p];
 		}
 
@@ -962,8 +1114,12 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 			continue;
 		}
 
-		struct apos_result trial = *io;
+		/* Static for the same reason as the matrices above: at 32 nodes
+		 * struct apos_result is ~670 B, and this is inside the loop of
+		 * a function already holding a struct pmap on a 4 kB stack. */
+		static struct apos_result trial;
 
+		trial = *io;
 		apply_step(&trial, &m, bvec);
 
 		float c_new = cost(e, n_edges, &trial);
