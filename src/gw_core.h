@@ -179,10 +179,43 @@ struct gw_seat {
     uint16_t lease_remaining;            /* superframes until reclaim */
 };
 
+/* Size of the EUI -> short-address memory below (Task 16). 64 is the plan's
+ * own number, not derived from GW_MAX_SEATS: this map's job is letting a tag
+ * that fully lost its seat (lease reclaimed, gw_seat memset) come back to the
+ * SAME address rather than drawing a fresh one from the monotonic pool
+ * forever, and 64 remembered EUIs is plenty for that without sizing it to
+ * every seat the table could ever hold. */
+#define GW_ADDR_MAP_SIZE  64
+
+/* One remembered EUI -> short-address pairing. `touch` is a monotonic counter
+ * stamped on insertion/update, used only to find the OLDEST entry when the
+ * map is full and a new EUI needs a slot -- not wall-clock time, not a real
+ * LRU (a lookup never bumps it; only alloc_short_addr()'s caller does, via
+ * addr_map_put()). That is deliberately simpler than true LRU: the brief only
+ * requires "oldest evicted first" and a plain insertion-order counter gives
+ * that with a trivial, bounded (GW_ADDR_MAP_SIZE-iteration) linear scan. */
+struct gw_addr_map_entry {
+    uint8_t  used;
+    uint8_t  eui[UWB_FRAME_EUI_LEN];
+    uint16_t short_addr;
+    uint32_t touch;
+};
+
 struct gw_core_ctx {
     struct gw_seat seats[GW_CYCLE_C][GW_N_CFP];  /* [phase][CFP slot] */
     uint32_t frame_counter;
     uint16_t next_short_addr;                    /* monotonic pool */
+
+    /* EUI -> short-address memory (Task 16). Deliberately NOT inside
+     * seats[][]/struct gw_seat: a seat is memset to zero the instant its
+     * lease ages to zero (gw_core_superframe_tick()), and the whole point of
+     * this map is to survive exactly that reclamation so a later rejoin can
+     * recover the address. In-RAM only, reset on reboot with the rest of this
+     * struct -- never written to NVS, per the flash-write-budget rule that
+     * governs everything else reachable from the gateway's K_PRIO_COOP(0)
+     * loop. */
+    struct gw_addr_map_entry addr_map[GW_ADDR_MAP_SIZE];
+    uint32_t addr_map_touch_ctr;
 };
 
 struct gw_grant {

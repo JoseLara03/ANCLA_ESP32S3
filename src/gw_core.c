@@ -117,6 +117,77 @@ static uint16_t alloc_short_addr(struct gw_core_ctx *c)
     return GW_TAG_ADDR_BASE; /* unreachable with < GW_MAX_SEATS live seats */
 }
 
+/* ---- EUI -> short-address memory (Task 16) ------------------------------
+ *
+ * Lets a tag whose seat was fully reclaimed (lease hit zero, gw_seat memset
+ * by gw_core_superframe_tick()) come back to the SAME short address on a
+ * later rejoin, instead of alloc_short_addr()'s monotonic pool handing out a
+ * permanently-higher one forever. Deliberately separate from the seat table
+ * (see the struct gw_core_ctx comment in gw_core.h) and deliberately simple:
+ * a bounded linear scan over GW_ADDR_MAP_SIZE entries, evicting whichever one
+ * has the smallest `touch` when the map is full. Both loops below are capped
+ * at GW_ADDR_MAP_SIZE iterations, the same bounded-scan class as every other
+ * gateway-loop-reachable helper in this file.
+ */
+
+/* Look up a remembered address for `eui`. Returns false (leaves *addr_out
+ * untouched) if this EUI has never been recorded, or was recorded and then
+ * evicted to make room for a more recent one. */
+static bool addr_map_find(const struct gw_core_ctx *c,
+                           const uint8_t eui[UWB_FRAME_EUI_LEN],
+                           uint16_t *addr_out)
+{
+    for (int i = 0; i < GW_ADDR_MAP_SIZE; i++) {
+        const struct gw_addr_map_entry *e = &c->addr_map[i];
+
+        if (e->used && memcmp(e->eui, eui, UWB_FRAME_EUI_LEN) == 0) {
+            *addr_out = e->short_addr;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Record (or refresh) the pairing eui -> addr. An existing entry for this EUI
+ * is updated in place; otherwise a free slot is used if one exists, and
+ * failing that the entry with the smallest `touch` (the oldest one, since
+ * `touch` is a monotonic counter stamped here) is evicted and reused. Either
+ * way the winning entry's `touch` is stamped with a freshly incremented
+ * counter value, so the next eviction -- if the map is already full -- always
+ * takes the genuinely oldest survivor. */
+static void addr_map_put(struct gw_core_ctx *c,
+                          const uint8_t eui[UWB_FRAME_EUI_LEN], uint16_t addr)
+{
+    int free_idx = -1;
+    int oldest_idx = 0;
+    uint32_t oldest_touch = 0xFFFFFFFFu;
+
+    for (int i = 0; i < GW_ADDR_MAP_SIZE; i++) {
+        struct gw_addr_map_entry *e = &c->addr_map[i];
+
+        if (e->used && memcmp(e->eui, eui, UWB_FRAME_EUI_LEN) == 0) {
+            e->short_addr = addr;
+            e->touch = ++c->addr_map_touch_ctr;
+            return;
+        }
+        if (!e->used && free_idx < 0) {
+            free_idx = i;
+        }
+        if (e->used && e->touch < oldest_touch) {
+            oldest_touch = e->touch;
+            oldest_idx = i;
+        }
+    }
+
+    int idx = (free_idx >= 0) ? free_idx : oldest_idx;
+    struct gw_addr_map_entry *e = &c->addr_map[idx];
+
+    e->used = 1;
+    memcpy(e->eui, eui, UWB_FRAME_EUI_LEN);
+    e->short_addr = addr;
+    e->touch = ++c->addr_map_touch_ctr;
+}
+
 /* ---- multi-phase bookkeeping -------------------------------------------
  *
  * One tag owns one cell per phase it holds, all carrying its short address.
@@ -447,7 +518,30 @@ bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
         return false;                                  /* network full */
     }
 
-    uint16_t addr = alloc_short_addr(c);
+    /* Task 16: an EUI whose seat was fully reclaimed (lease hit zero, memset
+     * by gw_core_superframe_tick()) is no longer found by find_seat_by_eui()
+     * above, so it reaches here as if brand-new -- but if this EUI's old
+     * address is still remembered in addr_map, hand it back instead of
+     * drawing a fresh one from the monotonic pool. The defensive
+     * find_seat_by_addr() check guards against that remembered address
+     * somehow being live under a DIFFERENT EUI right now; this should be
+     * unreachable in practice, since alloc_short_addr() never hands out an
+     * address find_seat_by_addr() reports live, and addr_map only ever
+     * records addresses this function itself allocated -- but the check costs
+     * one bounded scan and turns "should never happen" into "provably never
+     * assigned twice" rather than trusting the invariant silently. */
+    uint16_t addr;
+    uint16_t remembered;
+    int live_p, live_s;
+
+    if (addr_map_find(c, eui, &remembered) &&
+        !find_seat_by_addr(c, remembered, &live_p, &live_s)) {
+        addr = remembered;
+    } else {
+        addr = alloc_short_addr(c);
+    }
+    addr_map_put(c, eui, addr);
+
     uint16_t mask = claim(c, addr, eui, base, n, slot, req_tier);
 
     out->short_addr = addr;

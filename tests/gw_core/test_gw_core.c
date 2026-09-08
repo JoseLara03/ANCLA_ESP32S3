@@ -1247,6 +1247,104 @@ static void test_slotmap_reflects_the_whole_phase_mask(void)
     }
 }
 
+/* ---- Task 16: EUI -> short-address memory ------------------------------- */
+
+/* A tag whose lease is ticked all the way to zero (not merely released --
+ * that is a different code path, see gw_core_release()) has its seat memset
+ * by gw_core_superframe_tick(), so find_seat_by_eui() finds nothing on
+ * rejoin and gw_core_join() takes the "genuinely new seat" branch. This
+ * confirms that branch still hands back the SAME short address, drawn from
+ * addr_map rather than alloc_short_addr()'s monotonic pool. */
+static void test_rejoin_after_lease_expiry_reuses_address(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g1, g2;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x10);
+    CHECK(gw_core_join(&c, eui, 1, &g1));
+
+    for (unsigned i = 0; i < GW_LEASE_SF; i++) gw_core_superframe_tick(&c);
+    CHECK(c.seats[g1.phase][g1.slot_index].short_addr == 0);   /* reclaimed */
+
+    CHECK(gw_core_join(&c, eui, 1, &g2));
+    CHECK(g2.short_addr == g1.short_addr);
+}
+
+/* Fills addr_map past its GW_ADDR_MAP_SIZE capacity with distinct EUIs, each
+ * occupying exactly a map slot (joined, then lease-expired so it does NOT
+ * also tie up a seat), then checks the very first EUI inserted -- which must
+ * be the oldest, and therefore the one evicted once the map filled up -- gets
+ * a NEW address on rejoin, not its original one. Also confirms the address it
+ * gets back is a value alloc_short_addr() has not handed out before, i.e. the
+ * eviction genuinely made room rather than silently reusing a stale slot. */
+static void test_addr_map_evicts_oldest_first(void)
+{
+    struct gw_core_ctx c;
+    struct gw_grant g;
+    uint16_t first_addr = 0;
+    uint16_t seen[GW_ADDR_MAP_SIZE + 1];
+
+    gw_core_init(&c);
+
+    for (int i = 0; i < GW_ADDR_MAP_SIZE + 1; i++) {
+        uint8_t eui[UWB_FRAME_EUI_LEN];
+
+        mk_eui(eui, (uint8_t)i);
+        CHECK(gw_core_join(&c, eui, 1, &g));
+        seen[i] = g.short_addr;
+        if (i == 0) first_addr = g.short_addr;
+
+        /* Reclaim the seat (not addr_map) before the next insert, so every
+         * iteration occupies exactly one map slot and never a seat. */
+        for (unsigned t = 0; t < GW_LEASE_SF; t++) gw_core_superframe_tick(&c);
+    }
+
+    /* addr_map now holds the LAST GW_ADDR_MAP_SIZE EUIs (i = 1..64); EUI 0,
+     * inserted first, was the oldest entry and was evicted to make room for
+     * EUI 64's insert. Check EUI 1 -- the oldest SURVIVING entry -- first,
+     * proving the earlier eviction picked EUI 0 specifically and left EUI 1
+     * untouched, before EUI 0's own rejoin below evicts EUI 1 in turn (it is
+     * now the new oldest) and would otherwise mask this check. */
+    uint8_t eui1[UWB_FRAME_EUI_LEN];
+
+    mk_eui(eui1, 1);
+    CHECK(gw_core_join(&c, eui1, 1, &g));
+    CHECK(g.short_addr == seen[1]);
+    for (unsigned t = 0; t < GW_LEASE_SF; t++) gw_core_superframe_tick(&c);
+
+    /* Rejoining EUI 0 must draw a fresh address, not recover first_addr. */
+    uint8_t eui0[UWB_FRAME_EUI_LEN];
+
+    mk_eui(eui0, 0);
+    CHECK(gw_core_join(&c, eui0, 1, &g));
+    CHECK(g.short_addr != first_addr);
+}
+
+/* A full addr_map must never block a JOIN: eviction plus the monotonic-pool
+ * fallback has to keep producing addresses for as long as the seat table
+ * itself has room. Runs GW_ADDR_MAP_SIZE + 4 fresh EUIs through join/expire
+ * (well past the map's capacity) and confirms every single JOIN still
+ * succeeds with a distinct, nonzero address. */
+static void test_addr_map_full_still_grants_fresh_address(void)
+{
+    struct gw_core_ctx c;
+
+    gw_core_init(&c);
+
+    for (int i = 0; i < GW_ADDR_MAP_SIZE + 4; i++) {
+        uint8_t eui[UWB_FRAME_EUI_LEN];
+        struct gw_grant g;
+
+        mk_eui(eui, (uint8_t)i);
+        CHECK(gw_core_join(&c, eui, 1, &g));
+        CHECK(g.short_addr != 0);
+
+        for (unsigned t = 0; t < GW_LEASE_SF; t++) gw_core_superframe_tick(&c);
+    }
+}
+
 int main(void)
 {
     test_init();
@@ -1289,6 +1387,11 @@ int main(void)
     test_rejoin_preserves_a_multiphase_grant();
     test_one_slot_per_tag();
     test_slotmap_reflects_the_whole_phase_mask();
+
+    /* Task 16: EUI -> short-address memory. */
+    test_rejoin_after_lease_expiry_reuses_address();
+    test_addr_map_evicts_oldest_first();
+    test_addr_map_full_still_grants_fresh_address();
 
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;
