@@ -95,13 +95,13 @@
                                               * tag can eventually hold several
                                               * and range faster than once per
                                               * full 16-superframe cycle. Also
-                                              * the modulus a later task's
-                                              * ANNOUNCE rotation must stay
+                                              * the modulus uwb_mac.h's
+                                              * ANNOUNCE_CYCLE_A must stay
                                               * coprime with (gcd(A, C) == 1) --
                                               * unrelated to seat allocation,
                                               * noted here only so this isn't
-                                              * shrunk without checking that
-                                              * task if/when it lands.
+                                              * shrunk without re-checking
+                                              * that constant.
                                               *
                                               * Deliberately no 'u' suffix,
                                               * unlike GW_LEASE_SF/
@@ -114,6 +114,16 @@
                                               * make every one of those a
                                               * signed/unsigned comparison
                                               * warning under -Wextra. */
+/* ANNOUNCE (0xEC) rotation length ANNOUNCE_CYCLE_A, and the coprimality
+ * requirement against GW_CYCLE_C, live in uwb_mac.h -- not here. Both the
+ * gateway (which never computes announce_id, only frame_counter) and every
+ * SLAVE anchor (which does, to know when it is its own turn to announce)
+ * need the constant, while GW_CYCLE_C stays a gateway-internal seat-table
+ * dimension no slave has any reason to include. uwb_mac.h's own comment on
+ * ANNOUNCE_CYCLE_A carries the full gcd(A, C) derivation; tests/gw_core/
+ * proves the coprimality property against THIS constant, so a future change
+ * to either one that breaks it fails a host test, not a bench session. */
+
 #define GW_LEASE_SF       50u               /* lease length, superframes */
 #define GW_TAG_ADDR_BASE  0x0100u           /* tag short-addr pool base */
 

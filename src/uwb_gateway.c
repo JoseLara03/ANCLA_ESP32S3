@@ -345,25 +345,18 @@ static void send_grant(const uint8_t eui[UWB_FRAME_EUI_LEN],
 	 * pointer -- another known frame-module defect left unfixed for
 	 * byte-identity with the tag -- which cannot fire on this path.
 	 *
-	 * g->phase_mask is deliberately NOT sent: the GRANT frame has no field
-	 * for it until a separate, deferred task grows it (and that change has
-	 * to land in the tag's copy of uwb_frame_802_15_4z.c first, since this
-	 * project's copy is kept byte-identical to it).
-	 *
-	 * That omission is a FUNCTIONAL gap, not a power one. The tag does pick
-	 * its CFP SLOT up from each beacon's slot map rather than from the
-	 * GRANT, which is why a one-phase grant needs no wire change -- but it
-	 * also reads absence from a beacon it RECEIVED as a lost lease and
-	 * drops to UWB_ST_SCAN on the first one, with no miss tolerance
-	 * (tag_testting/src/uwb_net.c:282-284 and :320-322). A beacon publishes
-	 * one phase's row (tx_beacon() above), so until the mask reaches the
-	 * tag AND the tag derives its listen_skip/in_map check from it, a grant
-	 * of more than one phase does not buy a faster fix rate -- it bounces
-	 * the tag back to SCAN. gw_core.h's file comment carries the full
-	 * derivation, including why this is a property of the phase table
-	 * rather than of the tier ladder. */
+	 * g->phase_mask now goes out on the wire (network-scaling-v3 Task 14):
+	 * the GRANT frame grew 24 -> 26 bytes for it, matching the tag's own
+	 * copy of uwb_frame_802_15_4z.c, which already parses this field and
+	 * derives listen_skip/in_map from it (tag_testting/src/uwb_net.c). A
+	 * beacon still publishes only ONE phase's row per superframe
+	 * (tx_beacon() above) -- see gw_core.h's file comment for why a grant
+	 * of more than GW_PHASES_MAX_IDLE (1) phase still is not safe to
+	 * exercise against real tag firmware until the tag also tolerates
+	 * absence from the other phases' beacons, not just parses the mask. */
 	int n = uwb_frame_grant_build(buf, sizeof(buf), eui, g->short_addr,
-				      g->slot_index, g->tier, g->lease);
+				      g->slot_index, g->tier, g->lease,
+				      g->phase_mask);
 	if (n < 0) {
 		LOG_WRN("grant build failed (%d)", n);
 		return;

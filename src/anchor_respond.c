@@ -16,6 +16,7 @@
 #include "uwb_dwtime.h"
 #include "uwb_debug.h"
 #include "uwb_frame_802_15_4z.h"
+#include "uwb_mac.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -34,16 +35,23 @@ LOG_MODULE_REGISTER(anchor_respond, ANCLA_LOG_LEVEL);
  * WORST-CASE scheduled delay across both responders, not just a frame's
  * airtime -- dwt_starttx() returns almost immediately after arming a
  * delayed TX; the transmission itself doesn't happen until the full
- * scheduled delay has elapsed. Worst case today is DISCOVERY at anchor id 3:
- * disc_resp_delay_uus(3) = DISC_BASE_UUS + 3*DISC_SLOT_UUS = 2000 + 3*3500 =
+ * scheduled delay has elapsed. Worst case today is DISCOVERY at
+ * rank = DISC_MAX_RANK (3) inside its group -- not anchor id 3 specifically:
+ * network-scaling-v3's grouped DISCOVERY (disc_schedule.h) staggers by
+ * rank = anchor_id / n_groups, and disc_resp_delay_uus_grouped() refuses to
+ * schedule anything past DISC_MAX_RANK, so the worst case a grouped response
+ * can ever reach is unchanged regardless of how many anchors or groups exist:
+ * DISC_BASE_UUS + DISC_MAX_RANK*DISC_SLOT_UUS = 2000 + 3*3500 =
  * 12500 uus (~12.5 ms). Re-derived after DISC_BASE_UUS dropped from 6000 to
  * 2000 on the fast (26.67 MHz) SPI bus:
  *   ceil(12500 * 1.0256 / 1000) + 5 = ceil(12.82) + 5 = 13 + 5 = 18.
  * An earlier version of this bound (10 ms) was shorter than the scheduled
  * delay for any anchor id >= 2, so it force-cancelled transmissions that
  * hadn't had a chance to fire yet, on every single attempt for those ids.
- * Revisit this constant if DISC_BASE_UUS/DISC_SLOT_UUS/
- * POLL_RX_TO_RESP_TX_DLY_UUS are ever tuned further. */
+ * ANNOUNCE (anchor_respond_announce(), T_ANNOUNCE_TX_DELAY_UUS in uwb_mac.h,
+ * ~2500 uus) is comfortably inside this same bound and needs no separate
+ * timeout. Revisit this constant if DISC_BASE_UUS/DISC_SLOT_UUS/
+ * POLL_RX_TO_RESP_TX_DLY_UUS/T_ANNOUNCE_TX_DELAY_UUS are ever tuned further. */
 #define TX_COMPLETE_TIMEOUT_MS 18
 
 /* Minimum gap between two "WAVE poll refused" lines. A tag polls at superframe
@@ -284,7 +292,39 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 		return;
 	}
 
-	uint16_t tag_addr = uwb_frame_get_src_addr(buf);
+	uint16_t tag_addr;
+	uint32_t tag_tx_ts;
+	uint8_t group, n_groups;
+
+	if (uwb_frame_parse_discovery(buf, len, &tag_addr, &tag_tx_ts,
+				      &group, &n_groups) != 0) {
+		return;
+	}
+
+	if (!disc_group_match(cfg->anchor_id, group, n_groups)) {
+		/* Not our round -- silent, not a fault. Every other anchor in
+		 * a different group sees the same broadcast and says nothing
+		 * either; this is not the DISCOVERY-for-a-different-id case
+		 * anchor_respond_wave_poll() logs, because a group miss is the
+		 * expected common case for n_groups-1 out of every n_groups
+		 * broadcasts, not a diagnostic signal. */
+		return;
+	}
+
+	uint32_t delay_uus;
+
+	if (!disc_resp_delay_uus_grouped(cfg->anchor_id, n_groups, &delay_uus)) {
+		/* n_groups too small for this anchor's id -- our rank would
+		 * land past DISC_MAX_RANK and therefore past
+		 * TX_COMPLETE_TIMEOUT_MS. Refusing is the same policy as an
+		 * unpositioned anchor refusing WAVE: silent-wrong is worse
+		 * than silent-absent, and a missing anchor is visible on the
+		 * tag's side while a late response is not. */
+		LOG_WRN("DISCOVERY refused — rank exceeds DISC_MAX_RANK "
+			"(id=%u, n_groups=%u)", cfg->anchor_id, n_groups);
+		return;
+	}
+
 	uint8_t out[UWB_FRAME_LEN_RESP];
 
 	int n = uwb_frame_response_build(out, sizeof(out),
@@ -299,7 +339,6 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 
 	uwb_frame_set_seq_num(out, used_seq);
 
-	uint32_t delay_uus = disc_resp_delay_uus(cfg->anchor_id);
 	uint32_t resp_tx_time = (uint32_t)((disc_rx_ts +
 		((uint64_t)delay_uus * UUS_TO_DWT_TIME)) >> 8);
 
@@ -355,4 +394,200 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 		bg ? hi32_delta_uus(beacon_guard_next(bg), resp_tx_time) : 0,
 		(bg && beacon_guard_locked(bg)) ? 1u : 0u,
 		cir_power, cir_quality);
+}
+
+void anchor_respond_announce(uint32_t frame_counter, const uwb_config_t *cfg,
+			     uint8_t *seq, uint64_t beacon_rx_ts,
+			     int32_t cir_power, uint16_t cir_quality,
+			     struct beacon_guard *bg)
+{
+	if ((frame_counter % ANNOUNCE_CYCLE_A) != cfg->anchor_id) {
+		/* Not our rotation slot -- the expected case on
+		 * (ANNOUNCE_CYCLE_A - 1) out of every ANNOUNCE_CYCLE_A
+		 * beacons for any given anchor. Silent, same policy as a
+		 * DISCOVERY group miss: this is routine scheduling, not a
+		 * diagnostic signal. */
+		return;
+	}
+
+	if (!cfg->position_valid) {
+		/* Unlike anchor_respond_wave_poll(), there is no
+		 * allow_unpositioned relaxation here: ANNOUNCE exists to
+		 * advertise a real surveyed position to tags building their
+		 * anchor pool, and there is no bootstrap case (analogous to
+		 * the anchor survey's own window) where advertising a
+		 * placeholder coordinate is useful. An unsurveyed anchor
+		 * simply never announces; it still answers DISCOVERY, so it
+		 * is not invisible, just silent on this one path. */
+		return;
+	}
+
+	uint32_t resp_tx_time = (uint32_t)((beacon_rx_ts +
+		((uint64_t)T_ANNOUNCE_TX_DELAY_UUS * UUS_TO_DWT_TIME)) >> 8);
+
+	if (bg && !beacon_guard_tx_allowed(bg, resp_tx_time)) {
+		LOG_DBG("{\"announce\":{\"id\":%u,\"verdict\":\"suppressed\","
+			"\"to_beacon_uus\":%d,\"misses\":%u}}",
+			cfg->anchor_id,
+			hi32_delta_uus(beacon_guard_next(bg), resp_tx_time),
+			beacon_guard_misses(bg));
+		return;
+	}
+
+	/* a.addr duplicates the header's src_addr (uwb_frame_announce_build()
+	 * writes both) -- payload convention shared with the other module
+	 * frames, not a redundancy bug.
+	 *
+	 * z is cfg->z as configured (by `anchor pos` or a 2D/3D `apos apply`)
+	 * rather than NaN-when-unset: this codebase has no state distinguishing
+	 * "no height known" from "height is 0", since position_valid gates
+	 * (x, y, z) atomically and a 2D survey's z = 0 is a real floor-relative
+	 * value, not a placeholder. The design doc's NaN fallback exists for a
+	 * per-anchor-height distinction this project does not currently model;
+	 * pos_solver's dz fallback for NaN z simply never triggers via this
+	 * path until/unless that state is added. */
+	struct uwb_announce a = {
+		.addr = uwb_config_short_addr(cfg),
+		.x = cfg->x,
+		.y = cfg->y,
+		.z = cfg->z,
+		.cir_power = cir_power,
+		.cir_quality = cir_quality,
+	};
+	uint8_t out[UWB_FRAME_LEN_ANNOUNCE];
+	int n = uwb_frame_announce_build(out, sizeof(out),
+					 uwb_config_short_addr(cfg), &a);
+	if (n < 0) {
+		LOG_WRN("announce build failed (%d)", n);
+		return;
+	}
+	uwb_frame_set_seq_num(out, (*seq)++);
+
+	enum tx_verdict verdict = tx_delayed(out, (uint16_t)n, resp_tx_time, 0);
+
+	LOG_DBG("{\"announce\":{\"id\":%u,\"verdict\":\"%s\","
+		"\"to_beacon_uus\":%d,\"locked\":%u}}",
+		cfg->anchor_id, tx_verdict_name(verdict),
+		bg ? hi32_delta_uus(beacon_guard_next(bg), resp_tx_time) : 0,
+		(bg && beacon_guard_locked(bg)) ? 1u : 0u);
+}
+
+void anchor_respond_multipoll(const uint8_t *buf, uint16_t len,
+			      uint64_t poll_rx_ts, const uwb_config_t *cfg,
+			      uint8_t *seq, struct beacon_guard *bg)
+{
+	if (!uwb_frame_is_multipoll(buf, len)) {
+		return;
+	}
+
+	struct uwb_anchor_slot slots[UWB_FRAME_MAX_ANCHORS];
+	uint8_t num_slots = 0;
+	uint32_t tag_tx_ts; /* the tag's own bookkeeping -- unused here */
+
+	if (uwb_frame_parse_multipoll(buf, len, slots, &num_slots, &tag_tx_ts) != 0) {
+		return;
+	}
+
+	const uint16_t our_addr = uwb_config_short_addr(cfg);
+	uint16_t delay_us = 0;
+	bool found = false;
+
+	for (uint8_t i = 0; i < num_slots; i++) {
+		if (slots[i].addr == our_addr) {
+			delay_us = slots[i].delay_us;
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		/* Not named in this poll -- the expected case whenever a tag
+		 * selects fewer than UWB_MAX_ANCHORS anchors or picks a
+		 * different four. Same "proves the receiver works, fault is
+		 * downstream" value as wave_other in
+		 * anchor_respond_wave_poll(). */
+		LOG_DBG("{\"mpol_other\":{\"our_addr\":\"0x%04X\"}}", our_addr);
+		return;
+	}
+
+	if (!cfg->position_valid) {
+		/* Same policy as anchor_respond_wave_poll(): a wrong-but-valid-
+		 * looking (x, y, z) is undebuggable from the tag's side, so an
+		 * unsurveyed anchor must stay silent rather than answer with a
+		 * placeholder. Rate-limited for the identical reason -- a cold
+		 * deployment makes this the common case, not the rare one. */
+		static int64_t last_ms;
+		static uint32_t suppressed;
+		int64_t now = k_uptime_get();
+
+		if (last_ms == 0 || now - last_ms >= UNPOSITIONED_LOG_GAP_MS) {
+			LOG_WRN("MULTI-POLL refused — no surveyed position"
+				"%s. Run `apos run` + `apos apply` on the "
+				"gateway, or set `anchor pos`.",
+				suppressed ? " (repeats suppressed)" : "");
+			last_ms = now;
+			suppressed = 0;
+		} else {
+			suppressed++;
+		}
+		return;
+	}
+
+	uint16_t tag_addr = uwb_frame_get_src_addr(buf);
+	uint32_t resp_tx_time = (uint32_t)((poll_rx_ts +
+		((uint64_t)delay_us * UUS_TO_DWT_TIME)) >> 8);
+
+	if (bg && !beacon_guard_tx_allowed(bg, resp_tx_time)) {
+		LOG_DBG("{\"mpol\":{\"tag\":\"0x%04X\",\"delay_uus\":%u,"
+			"\"verdict\":\"suppressed\",\"to_beacon_uus\":%d,"
+			"\"misses\":%u}}",
+			tag_addr, delay_us,
+			hi32_delta_uus(beacon_guard_next(bg), resp_tx_time),
+			beacon_guard_misses(bg));
+		return;
+	}
+
+	/* Same delayed-TX timestamp identity the legacy WAVE responder uses
+	 * (tx_resp_msg's resp_tx_ts, POS_RESP_TX_TS_IDX above): the DW3000's
+	 * actual TX instant for a delayed transmission is deterministically
+	 * (scheduled_time & ~1) << 8 + antenna delay, so this can be computed
+	 * before the transmission happens rather than read back after. Written
+	 * as the frame module's own uint32_t (low 32 bits, matching
+	 * uwb_resp_msg_set_ts()'s byte-for-byte convention), NOT the hi32
+	 * (>>8) view resp_tx_time uses for scheduling -- the tag's ToF formula
+	 * (uwb_ss_initiator.c) expects the same low-32 view for both
+	 * poll_rx_ts and resp_tx_ts, matching the legacy WAVE path exactly. */
+	uint64_t resp_tx_ts = (((uint64_t)(resp_tx_time & 0xFFFFFFFEUL)) << 8) +
+			      cfg->ant_delay_tx;
+	uint8_t wire_id = (uint8_t)(our_addr & 0xFFu);
+	uint8_t out[UWB_FRAME_LEN_MPOL_RESP];
+
+	/* z is cfg->z as configured, not NaN-when-unset -- same reasoning as
+	 * anchor_respond_announce() above: this codebase has no state
+	 * distinguishing "no height known" from "height is 0". */
+	int n = uwb_frame_mpol_resp_build(out, sizeof(out), our_addr, tag_addr,
+					  wire_id, (uint32_t)poll_rx_ts,
+					  (uint32_t)resp_tx_ts,
+					  cfg->x, cfg->y, cfg->z);
+	if (n < 0) {
+		LOG_WRN("mpol_resp build failed (%d)", n);
+		return;
+	}
+	uwb_frame_set_seq_num(out, (*seq)++);
+
+	/* TX_COMPLETE_TIMEOUT_MS (18 ms, above) already covers this path's
+	 * worst case without adjustment: the largest delay_us a tag can
+	 * assign is MPOL_BASE_UUS + (UWB_FRAME_MAX_ANCHORS-1)*MPOL_SLOT_UUS =
+	 * 2200 + 3*1700 = 7300 uus (tag_testting/src/uwb_ss_initiator.c),
+	 * plus one MPOL_RESP's airtime (31 B, ~1.35 ms) -- under 9 ms total,
+	 * comfortably inside the 12.5 ms DISCOVERY worst case this bound was
+	 * already sized for. Do not confuse MPOL_BASE_UUS/MPOL_SLOT_UUS with
+	 * DISC_BASE_UUS/DISC_SLOT_UUS above -- unrelated schedules that only
+	 * happen to share one timeout. */
+	enum tx_verdict verdict = tx_delayed(out, (uint16_t)n, resp_tx_time, 0);
+
+	LOG_DBG("{\"mpol\":{\"tag\":\"0x%04X\",\"delay_uus\":%u,"
+		"\"verdict\":\"%s\",\"to_beacon_uus\":%d,\"locked\":%u}}",
+		tag_addr, delay_us, tx_verdict_name(verdict),
+		bg ? hi32_delta_uus(beacon_guard_next(bg), resp_tx_time) : 0,
+		(bg && beacon_guard_locked(bg)) ? 1u : 0u);
 }

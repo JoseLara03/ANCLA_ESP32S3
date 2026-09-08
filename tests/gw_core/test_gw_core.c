@@ -1,4 +1,5 @@
 #include "gw_core.h"
+#include "uwb_mac.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -1451,6 +1452,56 @@ static void test_seed_fills_table_exactly_at_idle_tier(void)
     }
 }
 
+/* Task 6: ANNOUNCE rotation, gcd(ANNOUNCE_CYCLE_A, GW_CYCLE_C) == 1.
+ *
+ * A tag awake only on frame_counter % GW_CYCLE_C == p advances
+ * frame_counter by exactly GW_CYCLE_C between every beacon it actually
+ * receives, so as frame_counter walks p, p+C, p+2C, ..., the announce id it
+ * observes is (p + k*C) mod A for k = 0, 1, 2, ... -- which visits every
+ * residue mod A, for every starting phase p, iff gcd(A, C) == 1. This test
+ * proves that property directly against the constants actually compiled in,
+ * rather than trusting the arithmetic in uwb_mac.h's comment: a future
+ * change to either constant that breaks coprimality fails here. */
+static void test_announce_cycle_coprime_with_gw_cycle(void)
+{
+    for (uint32_t p = 0; p < (uint32_t)GW_CYCLE_C; p++) {
+        bool seen[ANNOUNCE_CYCLE_A];
+
+        memset(seen, 0, sizeof(seen));
+        for (uint32_t k = 0; k < ANNOUNCE_CYCLE_A; k++) {
+            uint32_t frame_counter = p + k * (uint32_t)GW_CYCLE_C;
+
+            seen[frame_counter % ANNOUNCE_CYCLE_A] = true;
+        }
+        for (uint32_t id = 0; id < ANNOUNCE_CYCLE_A; id++) {
+            CHECK(seen[id]);
+        }
+    }
+}
+
+/* A same-value sanity check, independent of the CRT argument above: at
+ * ANNOUNCE_CYCLE_A == GW_CYCLE_C (the mistake the design doc explicitly
+ * warns against), a single-phase tag would see exactly one announce id
+ * forever. Proves the test itself can fail, not just that today's constants
+ * happen to pass. */
+static void test_announce_cycle_equal_to_gw_cycle_would_fail(void)
+{
+    uint32_t bogus_a = (uint32_t)GW_CYCLE_C;
+    uint32_t p = 0;
+    uint32_t distinct = 0;
+    bool seen[64] = { 0 };
+
+    for (uint32_t k = 0; k < bogus_a; k++) {
+        uint32_t id = (p + k * (uint32_t)GW_CYCLE_C) % bogus_a;
+
+        if (!seen[id]) {
+            seen[id] = true;
+            distinct++;
+        }
+    }
+    CHECK(distinct == 1);
+}
+
 int main(void)
 {
     test_init();
@@ -1505,6 +1556,10 @@ int main(void)
     test_seed_make_eui_is_tagged_and_distinct();
     test_seed_make_eui_deterministic();
     test_seed_fills_table_exactly_at_idle_tier();
+
+    /* Task 6: ANNOUNCE rotation. */
+    test_announce_cycle_coprime_with_gw_cycle();
+    test_announce_cycle_equal_to_gw_cycle_would_fail();
 
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;

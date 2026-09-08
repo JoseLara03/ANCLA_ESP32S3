@@ -60,4 +60,48 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 			      int32_t cir_power, uint16_t cir_quality,
 			      struct beacon_guard *bg);
 
+/* Called once for every successfully parsed beacon (frame_counter is the
+ * counter that beacon carried). Checks internally whether it is this
+ * anchor's turn in the ANNOUNCE rotation --
+ * frame_counter % GW_ANNOUNCE_A == cfg->anchor_id (GW_ANNOUNCE_A in
+ * gw_core.h) -- and if so, schedules a delayed ANNOUNCE/0xEC carrying our
+ * short address, (x, y, z) and the CIR quality of that beacon, timed to land
+ * inside the tag's T_ANNOUNCE_MS listen window (tag_testting's
+ * uwb_net_runner.c). Otherwise no-op -- most anchors on most superframes.
+ *
+ * beacon_rx_ts is the RMARKER timestamp of the beacon just parsed, same units
+ * as every other responder's *_rx_ts here.
+ *
+ * Gated on cfg->position_valid exactly like anchor_respond_wave_poll() with
+ * allow_unpositioned == false -- unlike the survey path, there is no window
+ * during which an unpositioned board should advertise coordinates it does
+ * not have; an unsurveyed anchor simply does not announce.
+ *
+ * bg may be NULL, which disables suppression, same convention as the other
+ * two responders. */
+void anchor_respond_announce(uint32_t frame_counter, const uwb_config_t *cfg,
+			     uint8_t *seq, uint64_t beacon_rx_ts,
+			     int32_t cir_power, uint16_t cir_quality,
+			     struct beacon_guard *bg);
+
+/* If buf is a MULTI-POLL/0xE3 naming this anchor's short address among its
+ * slots, schedule a delayed, addressed MPOL_RESP/0xED carrying our (x, y, z)
+ * at the per-anchor delay the TAG assigned (slots[i].delay_us) -- not one we
+ * compute -- so up to four anchors' responses land staggered inside the
+ * tag's single multi-poll RX window without colliding. Otherwise no-op: the
+ * poll did not name us.
+ *
+ * poll_rx_ts is this anchor's own RX timestamp of the multipoll, same
+ * convention as every other responder's *_rx_ts here -- NOT a value read out
+ * of the frame (the frame's own tx_ts field is the tag's bookkeeping, unused
+ * on this path).
+ *
+ * bg may be NULL, which disables suppression, same convention as the other
+ * responders. Gated on cfg->position_valid exactly like
+ * anchor_respond_wave_poll() -- no allow_unpositioned relaxation, same
+ * reasoning as anchor_respond_announce(). */
+void anchor_respond_multipoll(const uint8_t *buf, uint16_t len,
+			      uint64_t poll_rx_ts, const uwb_config_t *cfg,
+			      uint8_t *seq, struct beacon_guard *bg);
+
 #endif /* ANCHOR_RESPOND_H */

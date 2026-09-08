@@ -119,7 +119,9 @@ static void read_cir(uint32_t status, int32_t *cir_power, uint16_t *cir_quality)
 }
 
 static void observe_beacon(const uint8_t *buf, uint16_t len,
-			   const uwb_config_t *cfg, uint64_t rx_ts)
+			   const uwb_config_t *cfg, uint64_t rx_ts,
+			   uint8_t *seq, int32_t cir_power,
+			   uint16_t cir_quality, struct beacon_guard *bg)
 {
 	if (!uwb_frame_is_beacon(buf, len)) {
 		return;
@@ -167,6 +169,9 @@ static void observe_beacon(const uint8_t *buf, uint16_t len,
 	LOG_DBG("BEACON ver=%u counter=%u slots=%u our_slot=%d locked=%d",
 		proto_ver, frame_counter, n_slots, slot,
 		beacon_guard_locked(&bguard));
+
+	anchor_respond_announce(frame_counter, cfg, seq, rx_ts, cir_power,
+				cir_quality, bg);
 }
 
 #ifdef CONFIG_ANCLA_RANGING_DEBUG
@@ -181,10 +186,12 @@ static void observe_beacon(const uint8_t *buf, uint16_t len,
 static struct {
 	uint32_t rx_ok;
 	uint32_t rx_err;
-	uint32_t wave;   /* 0xE0 legacy poll, addressed to any anchor */
-	uint32_t disc;   /* 0xE2 DISCOVERY broadcast */
-	uint32_t beacon; /* 0xE5 */
-	uint32_t apos;   /* 0xEB survey traffic */
+	uint32_t wave;     /* 0xE0 legacy poll, addressed to any anchor */
+	uint32_t disc;     /* 0xE2 DISCOVERY broadcast */
+	uint32_t mpol;     /* 0xE3 MULTI-POLL broadcast */
+	uint32_t beacon;   /* 0xE5 */
+	uint32_t apos;     /* 0xEB survey traffic */
+	uint32_t announce; /* 0xEC -- another anchor's ANNOUNCE, not our own TX */
 	uint32_t other;
 } dbg;
 
@@ -196,10 +203,12 @@ static void dbg_count(const uint8_t *buf, uint16_t plen)
 		return;
 	}
 	switch (buf[DBG_OFF_TYPE]) {
-	case 0xE0: dbg.wave++;   break;
-	case 0xE2: dbg.disc++;   break;
-	case 0xE5: dbg.beacon++; break;
-	case 0xEB: dbg.apos++;   break;
+	case 0xE0: dbg.wave++;     break;
+	case 0xE2: dbg.disc++;     break;
+	case 0xE3: dbg.mpol++;     break;
+	case 0xE5: dbg.beacon++;   break;
+	case 0xEB: dbg.apos++;     break;
+	case 0xEC: dbg.announce++; break;
 	default:
 		dbg.other++;
 		/* Type and length of anything the responders will not claim. A
@@ -233,12 +242,14 @@ static void dbg_heartbeat(const uwb_config_t *cfg, struct beacon_guard *bg)
 {
 	LOG_INF("{\"slave_hb\":{\"id\":%u,\"addr\":\"0x%04X\","
 		"\"pos_valid\":%u,\"rx_ok\":%u,\"rx_err\":%u,\"wave\":%u,"
-		"\"disc\":%u,\"beacon\":%u,\"apos\":%u,\"other\":%u,"
+		"\"disc\":%u,\"mpol\":%u,\"beacon\":%u,\"apos\":%u,"
+		"\"announce\":%u,\"other\":%u,"
 		"\"sys\":\"0x%08X\",\"locked\":%u,\"misses\":%u}}",
 		cfg->anchor_id, uwb_config_short_addr(cfg),
 		cfg->position_valid ? 1u : 0u,
-		dbg.rx_ok, dbg.rx_err, dbg.wave, dbg.disc, dbg.beacon,
-		dbg.apos, dbg.other, dwt_readsysstatuslo(),
+		dbg.rx_ok, dbg.rx_err, dbg.wave, dbg.disc, dbg.mpol,
+		dbg.beacon, dbg.apos, dbg.announce, dbg.other,
+		dwt_readsysstatuslo(),
 		beacon_guard_locked(bg) ? 1u : 0u, beacon_guard_misses(bg));
 	memset(&dbg, 0, sizeof(dbg));
 }
@@ -364,7 +375,10 @@ void uwb_slave_run(const uwb_config_t *cfg)
 			anchor_respond_discovery(rx_buf, plen, rx_ts, cfg,
 						 &frame_seq_nb, cir_power,
 						 cir_quality, &bguard);
-			observe_beacon(rx_buf, plen, cfg, rx_ts);
+			anchor_respond_multipoll(rx_buf, plen, rx_ts, cfg,
+						 &frame_seq_nb, &bguard);
+			observe_beacon(rx_buf, plen, cfg, rx_ts, &frame_seq_nb,
+				       cir_power, cir_quality, &bguard);
 		}
 
 		rx_arm();
