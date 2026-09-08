@@ -201,15 +201,37 @@ enum apos_gw_phase {
  * loop offers a qualifying step every 200 ms.
  *
  * THIS IS AN ESTIMATE, not a measurement -- neither this value nor the solve it
- * guards has ever been timed on hardware. If a bench run ever shows a late
- * beacon at the instant `{"apos_solve":...}` is logged, measure the solve
- * first. Do NOT lower APOS_LM_MAX_ITER, which would change what is reported.
+ * guards has ever been timed on hardware. The solve now REPORTS its own wall
+ * clock: `solve_ms` in the `{"apos_solve":...}` line is the measurement this
+ * comment could not make, so a bench run that shows a late beacon at the instant
+ * that line is logged has the duration that caused it on the same line. Do NOT
+ * lower APOS_LM_MAX_ITER, which would change what is reported.
  * The only genuinely HARD bound is to stop running the solve on this thread at
  * all -- hand it to a preemptible worker that touches no SPI and let the
  * gateway loop poll for its completion. That is the real fix if this ever hurts;
  * it is deliberately out of scope here, because deferring to the top of a
  * superframe removes the risk for every plausible solve duration. */
 #define APOS_GW_SOLVE_BUDGET_UUS 150000u
+
+/* Largest peer count the solve above is believed to fit inside
+ * APOS_GW_SOLVE_BUDGET_UUS. Past it, do_solve() logs a warning naming the size
+ * BEFORE it starts solving, and the `apos_solve` line reports the measured
+ * `solve_ms` after. Together those are the only runtime signal that exists for
+ * the blocking risk the comment above describes.
+ *
+ * A ROUND NUMBER, and honest about what it is: NO mesh of ANY size has been
+ * timed on hardware yet, so this is not a measurement either. Eight is chosen
+ * because it is the largest array this feature's hardware step covers (an
+ * 8-anchor survey checked against a tape measure), and because the same O(n^3)
+ * scaling used above puts an 8-node solve two orders of magnitude inside the
+ * budget: n = 3*8-6 = 18 free parameters against n = 90 at 32 nodes is 1/125 of
+ * the per-iteration cost, so even APOS_LM_MAX_ITER iterations of it land in the
+ * tens of milliseconds against ~195 ms of clear air.
+ *
+ * Move it when someone MEASURES a larger array -- a `solve_ms` comfortably
+ * inside the budget from a real mesh of that size -- not when a solve merely
+ * looks fine. */
+#define APOS_GW_SOLVE_TIMED_NODES 8u
 
 /* Exchanges per commanded pair. The gateway owns this tradeoff, which is why it
  * is a RANGE_CMD field and not a constant on the anchor. 40 at ~5 ms is the

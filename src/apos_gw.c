@@ -89,6 +89,13 @@ static bool apply_reopen;   /* SURVEY_BEGIN still to re-broadcast, see step_appl
 static bool accepted;
 static struct apos_rigidity rig;
 static bool solve_unverified;
+/* Wall-clock milliseconds the last apos_geom_solve() took, reported as
+ * `solve_ms` in the apos_solve line. The solve runs to completion on the
+ * K_PRIO_COOP(0) gateway loop, so this is the number that says whether it fits
+ * the clear air APOS_GW_SOLVE_BUDGET_UUS bought it -- see
+ * APOS_GW_SOLVE_TIMED_NODES. Measured around the call rather than inferred from
+ * `iters`, because per-iteration cost grows with the node and edge counts. */
+static uint32_t solve_ms;
 /* Unordered pairs the candidate filter excluded, i.e. never commanded. Reported
  * next to missing_pairs so "not asked" and "asked and failed" stay distinct. */
 static uint16_t solve_skipped_pairs;
@@ -141,6 +148,7 @@ void apos_gw_init(void)
 	memset(&rig, 0, sizeof(rig));
 	solve_unverified = false;
 	solve_skipped_pairs = 0;
+	solve_ms = 0;
 	apply_idx = 0;
 	apply_retries = 0;
 	applied_ok = 0;
@@ -274,7 +282,27 @@ static void send_survey_begin(uint8_t *seq)
 		LOG_ERR("SURVEY_BEGIN build failed (%d)", n);
 		return;
 	}
-	tx_now((uint16_t)n, seq);
+	if (!tx_now((uint16_t)n, seq)) {
+		/* Not retried, and it does not need to be: every caller
+		 * re-broadcasts on its own schedule -- the next ENUM round, the
+		 * next APOS_GW_WINDOW_REFRESH_MS tick (30 s, against a 60 s
+		 * APOS_NODE_REFRESH_S, so one lost refresh cannot lapse a
+		 * window) -- and APPLY's one-shot reopen is followed by per-anchor
+		 * SETPOS retries that report a closed window loudly.
+		 *
+		 * What it must not be is SILENT. tx_now() names the radio fault
+		 * but not the frame, so without this line a broadcast that never
+		 * left is indistinguishable from one every anchor heard, and the
+		 * symptoms differ by caller: a missing ENUM round looks like
+		 * anchors that are not there, and a missing mid-RANGE refresh
+		 * looks like the exact fault it exists to prevent -- windows
+		 * lapsing partway through the pair walk, every late pair
+		 * returning as a hole with the radio looking fine. */
+		LOG_WRN("{\"apos_warn\":\"SURVEY_BEGIN did not transmit — the "
+			"anchors' survey windows were not opened or refreshed by "
+			"this broadcast; repeated failures lapse them and later "
+			"pairs come back as holes\"}");
+	}
 }
 
 int apos_gw_start_enum(void)
@@ -303,6 +331,7 @@ int apos_gw_start_enum(void)
 	accepted = false;
 	solve_unverified = false;
 	solve_skipped_pairs = 0;
+	solve_ms = 0;
 	memset(&rig, 0, sizeof(rig));
 
 	phase = APOS_GW_ENUM;
@@ -578,7 +607,7 @@ static void judge_result(void)
 	LOG_INF("{\"apos_solve\":{\"nodes\":%u,\"placed\":%u,\"ambiguous\":%u,"
 		"\"rms_mm\":%d,\"worst_mm\":%d,\"worst_pair\":[%u,%u],"
 		"\"planarity_mm\":%d,\"gauge_collinearity_permille\":%d,"
-		"\"iters\":%u,\"spare_edges\":%d,"
+		"\"iters\":%u,\"solve_ms\":%u,\"spare_edges\":%d,"
 		"\"rms_meaningful\":%u,\"max_reciprocal_mm\":%d,"
 		"\"max_sd_mm\":%u,\"accepted\":%u}}",
 		res.n_nodes, res.n_placed, res.n_ambiguous,
@@ -586,7 +615,7 @@ static void judge_result(void)
 		res.worst_i, res.worst_j,
 		(int)(res.planarity_m * 1000.0f),
 		(int)(res.gauge_collinearity_ratio * 1000.0f), res.iterations,
-		rig.spare_edges, solve_unverified ? 0u : 1u,
+		solve_ms, rig.spare_edges, solve_unverified ? 0u : 1u,
 		max_recip_mm, max_sd_mm, accepted ? 1u : 0u);
 
 	for (uint8_t k = 0; k < res.n_nodes; k++) {
@@ -768,7 +797,35 @@ static void do_solve(void)
 		rig.free_params, rig.spare_edges,
 		(g.dim == APOS_GEOM_2D) ? "2N-3" : "3N-6");
 
+	/* The blocking risk, given a runtime voice. apos_geom_solve() runs to
+	 * completion on the K_PRIO_COOP(0) gateway loop; APOS_GW_SOLVE_BUDGET_UUS
+	 * decides only WHEN it starts, never how long it runs, so a solve that
+	 * outlasts the ~195 ms of clear air it was deferred into arms the beacon
+	 * late -- and that costs every node in the network its time base, not one
+	 * frame. Warned BEFORE the call so a console that then shows a late beacon
+	 * carries the size that caused it on the line above; the duration itself
+	 * lands in the apos_solve line as `solve_ms`. */
+	if (tbl.n_peers > APOS_GW_SOLVE_TIMED_NODES) {
+		LOG_WRN("{\"apos_warn\":\"about to solve %u nodes (%d free "
+			"parameters) on the gateway loop — no mesh larger than %u "
+			"has ever been timed on hardware. If the beacon goes late "
+			"here, read solve_ms below and move the solve off this "
+			"thread.\"}", tbl.n_peers, rig.free_params,
+			APOS_GW_SOLVE_TIMED_NODES);
+	}
+
+	int64_t solve_t0 = k_uptime_get();
 	int rc = apos_geom_solve(edges, n_edges, tbl.n_peers, &g, &res);
+
+	/* Recorded before the error returns below, so even a solve that fails has
+	 * its cost on record. Only the success path reports it (the apos_solve
+	 * line), and that is where it matters: every non-zero return reachable
+	 * here is a refusal from apos_geom_seed() or from apos_geom_refine()'s
+	 * argument and edge-usability checks, all of which are cheap and return
+	 * before the LM loop runs at all -- whereas the expensive case this exists
+	 * to expose, running to APOS_LM_MAX_ITER without converging, returns 0 and
+	 * is reported. */
+	solve_ms = (uint32_t)(k_uptime_get() - solve_t0);
 
 	if (rc == -ENODATA) {
 		LOG_ERR("{\"apos_error\":\"the gauge anchors are not mutually "
@@ -929,6 +986,15 @@ static void step_range(uint32_t avail_uus, uint8_t *seq)
 	 * Checked here, between pairs, rather than while awaiting_rsp -- so it
 	 * never interrupts a batch in flight. See APOS_GW_WINDOW_REFRESH_MS. */
 	if (now >= next_window_ms) {
+		/* Logged, not silent: this pauses ranging for a settle interval
+		 * every APOS_GW_WINDOW_REFRESH_MS, and an operator watching a
+		 * long run needs the pause accounted for rather than reading it
+		 * as a stall. The pair counters say where in the walk it
+		 * happened, which is what makes a hole reported afterwards
+		 * relatable to a refresh that failed (send_survey_begin() warns
+		 * on that). */
+		LOG_INF("{\"apos\":\"window refresh\",\"session\":%u,"
+			"\"pair\":%u,\"of\":%u}", session, pair_idx, pair_total);
 		send_survey_begin(seq);
 		next_window_ms = now + APOS_GW_WINDOW_REFRESH_MS;
 		next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
