@@ -301,4 +301,14 @@ void gw_core_build_slotmap(const struct gw_core_ctx *c, uint8_t phase,
 bool gw_core_find_eui(const struct gw_core_ctx *c, uint16_t short_addr,
                       uint8_t eui_out[UWB_FRAME_EUI_LEN]);
 
+/* POS renews the lease, nothing else. POS carries no tier field
+ * (uwb_frame_pos_build()/_parse_pos()), so unlike a KEEPALIVE this can never
+ * re-allocate phases -- it refreshes lease_remaining to GW_LEASE_SF on every
+ * cell `short_addr` holds and leaves the tier, phase set and slot untouched.
+ * A no-op for short_addr == 0 or any address matching no live seat: it never
+ * creates or resurrects a seat, matching uwb_gateway.c's "POS is not gated on
+ * seat state" rule -- a straggler after lease expiry is still published, it
+ * just finds nothing here to refresh. */
+void gw_core_pos_seen(struct gw_core_ctx *c, uint16_t short_addr);
+
 #endif /* GW_CORE_H */

@@ -942,6 +942,93 @@ static void test_release_frees_every_phase(void)
     CHECK(!gw_core_find_eui(&c, g.short_addr, out));
 }
 
+/* gw_core_pos_seen() must refresh lease_remaining on the matching seat and
+ * touch nothing else -- not tier, not the phase set, not the slot. */
+static void test_pos_seen_refreshes_lease(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x10);
+    CHECK(gw_core_join(&c, eui, GW_TIER_SLOW, &g));
+
+    for (unsigned i = 0; i < 10; i++) gw_core_superframe_tick(&c);
+    CHECK(c.seats[g.phase][g.slot_index].lease_remaining == GW_LEASE_SF - 10);
+    CHECK(c.seats[g.phase][g.slot_index].tier == GW_TIER_SLOW);
+
+    gw_core_pos_seen(&c, g.short_addr);
+    CHECK(c.seats[g.phase][g.slot_index].lease_remaining == GW_LEASE_SF);
+    CHECK(c.seats[g.phase][g.slot_index].tier == GW_TIER_SLOW);   /* untouched */
+    CHECK(c.seats[g.phase][g.slot_index].short_addr == g.short_addr);
+}
+
+/* An unknown address, and short_addr == 0 (the "free" marker), must be true
+ * no-ops: no seat created, occupied_cells() unchanged. */
+static void test_pos_seen_unknown_addr_is_noop(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g;
+    int before;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x10);
+    CHECK(gw_core_join(&c, eui, GW_TIER_IDLE, &g));
+    before = occupied_cells(&c);
+
+    gw_core_pos_seen(&c, 0xBEEF);
+    CHECK(occupied_cells(&c) == before);
+
+    gw_core_pos_seen(&c, 0);
+    CHECK(occupied_cells(&c) == before);
+}
+
+/* gw_core_pos_seen() must refresh EVERY cell of a multi-phase tag, not just
+ * the first found -- a naive single-cell refresh would let the un-refreshed
+ * cells expire out from under a tag that is still very much alive, exactly
+ * the hazard test_release_frees_every_phase() covers for gw_core_release(). */
+static void test_pos_seen_refreshes_every_phase(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g, k;
+    int cells = -1;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x10);
+    CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
+    CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
+          == GW_KEEPALIVE_REPHASED);
+    CHECK(gw_phase_count(k.phase_mask) == 4);
+
+    /* Tick to just short of expiry, then let POS refresh all four cells. */
+    for (unsigned i = 0; i < GW_LEASE_SF - 1; i++) gw_core_superframe_tick(&c);
+    CHECK(mask_of(&c, g.short_addr, NULL, &cells) == k.phase_mask);
+    CHECK(cells == 4);
+
+    gw_core_pos_seen(&c, g.short_addr);
+
+    /* Without the refresh, one more tick would reclaim all four cells (as
+     * test_multiphase_lease_expires_as_one_unit() confirms); with it, every
+     * cell must still be at full lease. */
+    for (int p = 0; p < GW_CYCLE_C; p++) {
+        for (int s = 0; s < GW_N_CFP; s++) {
+            if (c.seats[p][s].short_addr == g.short_addr) {
+                CHECK(c.seats[p][s].lease_remaining == GW_LEASE_SF);
+            }
+        }
+    }
+
+    /* Tick GW_LEASE_SF - 1 more times: a naive single-cell refresh would have
+     * let the other three cells expire by now, GW_LEASE_SF - 1 ticks after
+     * they were last (not) refreshed. All four must still be held. */
+    for (unsigned i = 0; i < GW_LEASE_SF - 1; i++) gw_core_superframe_tick(&c);
+    CHECK(mask_of(&c, g.short_addr, NULL, &cells) == k.phase_mask);
+    CHECK(cells == 4);
+}
+
 /* A multi-phase tag's lease must expire as ONE unit after exactly GW_LEASE_SF
  * ticks -- gw_core_superframe_tick() ages each of its 4 cells independently
  * and they stay in step only because claim() set them all in the same call. A
@@ -1192,6 +1279,9 @@ int main(void)
     test_regrant_moves_slot_rather_than_shrink();
     test_tier_drop_returns_phases_to_the_pool();
     test_release_frees_every_phase();
+    test_pos_seen_refreshes_lease();
+    test_pos_seen_unknown_addr_is_noop();
+    test_pos_seen_refreshes_every_phase();
     test_multiphase_lease_expires_as_one_unit();
     test_keepalive_is_stable_once_at_tier();
     test_keepalive_unknown_addr_is_reported();

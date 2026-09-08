@@ -319,6 +319,14 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 				    &fix.residual_m, &fix.n_anchors,
 				    &fix.batt_soc);
 
+		/* Renew the lease this address holds, if any. Independent of
+		 * the EUI lookup just below -- both are lookups against the
+		 * same address, and this one is a pure no-op for a straggler
+		 * whose seat already expired: it never resurrects or creates
+		 * one. POS carries no tier, so unlike a KEEPALIVE this can
+		 * never re-grant phases; see gw_core_pos_seen(). */
+		gw_core_pos_seen(ctx, fix.src_addr);
+
 		/* Tid must be the tag's stable EUI-derived id, not its
 		 * reallocatable short address (see pos_json.h). The seat table
 		 * is the only place that EUI lives -- look it up by the

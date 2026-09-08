@@ -168,6 +168,26 @@ static void free_all_cells(struct gw_core_ctx *c, uint16_t addr)
     }
 }
 
+/* Refresh lease_remaining to GW_LEASE_SF on every cell holding `addr`,
+ * touching nothing else -- not tier, not the phase set, not the slot. Shared
+ * by gw_core_keepalive()'s "regrant is unreachable" fallback (which also
+ * refreshes tier, since a KEEPALIVE carries one) and gw_core_pos_seen() below
+ * (which must NOT touch tier -- POS carries no tier field at all). addr == 0
+ * is refused, same "0 means free" convention as free_all_cells() and
+ * tag_footprint(). Bounded at GW_MAX_SEATS iterations, same class of bound as
+ * every other loop on this gateway-loop-reachable path. */
+static void refresh_all_leases(struct gw_core_ctx *c, uint16_t addr)
+{
+    if (addr == 0) return;
+    for (int p = 0; p < GW_CYCLE_C; p++) {
+        for (int s = 0; s < GW_N_CFP; s++) {
+            if (c->seats[p][s].short_addr == addr) {
+                c->seats[p][s].lease_remaining = GW_LEASE_SF;
+            }
+        }
+    }
+}
+
 /* Is the evenly spread set { base, base+stride, ..., base+(n-1)*stride } at
  * CFP slot `slot` claimable by `addr`? A cell qualifies only when it is free
  * or ALREADY THIS TAG'S.
@@ -469,11 +489,11 @@ static enum gw_keepalive_result keepalive_with_max(struct gw_core_ctx *c,
         for (int p = 0; p < GW_CYCLE_C; p++) {
             for (int s = 0; s < GW_N_CFP; s++) {
                 if (c->seats[p][s].short_addr == short_addr) {
-                    c->seats[p][s].tier            = req_tier;
-                    c->seats[p][s].lease_remaining = GW_LEASE_SF;
+                    c->seats[p][s].tier = req_tier;
                 }
             }
         }
+        refresh_all_leases(c, short_addr);
         return GW_KEEPALIVE_SAME;
     }
     return changed ? GW_KEEPALIVE_REPHASED : GW_KEEPALIVE_SAME;
@@ -500,6 +520,20 @@ enum gw_keepalive_result gw_core_keepalive_max_for_test(struct gw_core_ctx *c,
                                                         struct gw_grant *out)
 {
     return keepalive_with_max(c, short_addr, req_tier, max_phases, out);
+}
+
+/* POS carries no tier field at all (uwb_frame_pos_build()/_parse_pos() --
+ * src_addr, x, y, residual_m, n_anchors, batt_soc, nothing else), so a POS
+ * frame can only ever be a "this address is still alive" signal, never a
+ * re-grant. Refreshes lease_remaining on every cell `short_addr` holds and
+ * changes nothing else -- not tier, not the phase set, not the slot. A no-op,
+ * not an error, when no live seat holds that address (a straggler POS after
+ * lease expiry, or any other unknown address): it never resurrects or creates
+ * a seat, matching uwb_gateway.c's existing rule that POS is not gated on
+ * seat state. */
+void gw_core_pos_seen(struct gw_core_ctx *c, uint16_t short_addr)
+{
+    refresh_all_leases(c, short_addr);
 }
 
 void gw_core_release(struct gw_core_ctx *c, uint16_t short_addr)
