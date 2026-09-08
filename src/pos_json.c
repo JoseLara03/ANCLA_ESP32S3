@@ -87,7 +87,12 @@ int pos_json_anchors(char *buf, size_t len, const struct apos_survey *s)
 	 * truncation below is refused rather than published partially.
 	 * APOS_MIN_NODES_3D (4) is isostatic (6 edges == 3N-6 free parameters), so
 	 * a degenerate/near-collinear solve can be accepted by the solver with
-	 * a non-finite coordinate in it -- this is the last check before MQTT. */
+	 * a non-finite coordinate in it -- this is the last check before MQTT.
+	 * It is a finiteness check only, not a magnitude one: a finite but
+	 * absurd coordinate formats to more characters than POS_JSON_MAX_LEN's
+	 * per-anchor budget allows, and the bounds checks below then refuse the
+	 * whole document. That is the right outcome (nothing published, error
+	 * logged) rather than a reason to clamp values here. */
 	if (s->ref_valid && (!isfinite(s->ref_lat) || !isfinite(s->ref_lon))) {
 		return -1;
 	}

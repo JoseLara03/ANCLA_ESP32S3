@@ -23,6 +23,8 @@
 #define APOS_GW_H
 
 #include "apos_geom.h"
+#include "apos_node.h"  /* APOS_ENUM_WINDOW_MS -- the settle interval below is
+			 * derived from it rather than repeated as a literal */
 #include "apos_table.h"
 
 #include <stdbool.h>
@@ -36,29 +38,89 @@ enum apos_gw_phase {
 	APOS_GW_APPLY = 3,
 };
 
-/* How long a survey window anchors are told to hold open. Generously longer
- * than the ranging phase for the largest supported deployment: 56 ordered pairs
- * at ~300 ms each is under 20 s, and every APOS frame refreshes the window
- * anyway (APOS_NODE_REFRESH_S). */
+/* How long a survey window anchors are told to hold open.
+ *
+ * At 32 anchors this can no longer cover a whole run: even with candidate-pair
+ * filtering the ranging phase is minutes, and its true worst case -- every pair
+ * timing out at APOS_GW_RANGE_TIMEOUT_MS twice -- is over an hour, which no
+ * fixed window could cover. A window is therefore no longer expected to outlive
+ * the run; APOS_GW_WINDOW_REFRESH_MS below is what keeps it alive.
+ *
+ * 120 s is kept as the per-broadcast lifetime because it is the SAFETY bound:
+ * it is how long an anchor stays willing to initiate polls after the gateway
+ * goes quiet. Lengthening it to span a whole run would weaken exactly the
+ * property the window exists for. */
 #define APOS_GW_WINDOW_S 120u
 
-/* SURVEY_BEGIN is broadcast this many times, spaced this far apart, and the
- * replies are unioned (apos_table_add_peer() is idempotent on EUI).
+/* SURVEY_BEGIN is broadcast this many times during ENUM and the replies are
+ * unioned (apos_table_add_peer() is idempotent on EUI and unions heard_ids).
  *
- * Three rounds only help because apos_node.c salts its stagger hash with the
- * round counter, so each round is an INDEPENDENT slot draw: two anchors that
- * collide in one round are very unlikely to collide in the next, and the union
- * still enumerates both. With an unsalted hash the same pair would collide in
- * every round and the extra broadcasts would buy nothing at all -- see
- * enum_slot() in apos_node.c. With 8 slots, 4 anchors and 3 independent draws,
- * the chance an anchor is lost in all three is under 2 %.
+ * Repeating the broadcast only helps because apos_node.c salts its stagger hash
+ * with the round counter, so each round is an INDEPENDENT slot draw: two
+ * anchors that collide in one round are unlikely to collide in the next, and
+ * the union still enumerates both. With an unsalted hash the same pair would
+ * collide in every round and the extra broadcasts would buy nothing at all --
+ * see enum_slot() in apos_node.c.
  *
- * The gap must exceed the worst-case stagger
- * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 8 * 30 = 240 ms) plus reply airtime;
- * 400 ms clears 240 ms with ~160 ms to spare, which is ample for a ~1.5 ms
- * ENUM_RSP. */
-#define APOS_GW_ENUM_ROUNDS  3u
-#define APOS_GW_ENUM_GAP_MS  400u
+ * EIGHT rounds, not the three that served four anchors. Two independent reasons,
+ * and the second is the binding one:
+ *
+ *   - Enumeration coverage. With APOS_ENUM_SLOTS (64) and 32 anchors a given
+ *     anchor collides with probability 1 - (63/64)^31 = 38.6 % per round, so
+ *     0.386^8 = 4.9e-4 -- about 0.016 anchors expected missing from a 32-anchor
+ *     array. Three rounds would leave 0.386^3 = 5.8 %, i.e. ~1.8 anchors
+ *     missing on a typical run. See apos_node.h for the full derivation.
+ *   - Adjacency coverage, which needs MORE rounds than enumeration does. A
+ *     board sleeps through its own stagger slot with the receiver off, so it can
+ *     only hear peers whose slot fell later, and its reply carries what it heard
+ *     in EARLIER rounds -- round 0 reports nothing and the final round's
+ *     observations are never reported at all. Eight rounds therefore yield seven
+ *     rounds of usable evidence for apos_table_is_candidate(): per pair,
+ *     0.386^7 = 1.3e-3 of never being observed, so under one pair of a full
+ *     496-pair mesh (far fewer on a real sparse site) is missed. A missed pair
+ *     costs one edge, is counted in the apos_edges log line and is caught by
+ *     apos_geom_rigidity() downstream -- it is not silent.
+ *
+ * Eight rounds at APOS_GW_ENUM_SETTLE_MS is ~6.6 s of enumeration, once per
+ * run, against a ranging phase measured in minutes. */
+#define APOS_GW_ENUM_ROUNDS  8u
+
+/* Long enough for a whole enumeration reply window to drain before the next
+ * frame competes with it on the air: APOS_ENUM_WINDOW_MS (768 ms) plus the last
+ * slot's reply airtime and TX path.
+ *
+ * DERIVED, not a literal. The value it has to clear is
+ * APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS in apos_node.h, and an earlier version of
+ * this header carried the product as a hand-copied number in two places -- both
+ * of which silently became wrong the moment the slot count moved.
+ *
+ * One constant serves all three call sites, because all three are the same
+ * question: the gap between ENUM rounds, the settle after APPLY's one-shot
+ * re-broadcast, and the settle after a mid-RANGE window refresh. */
+#define APOS_GW_ENUM_SETTLE_MS (APOS_ENUM_WINDOW_MS + 60u)
+
+/* How often the gateway re-broadcasts SURVEY_BEGIN during the RANGE phase to
+ * keep every anchor's survey window alive.
+ *
+ * NOT optional at 32 anchors, and the failure it prevents is silent. A node's
+ * window is refreshed only by an in-session frame ADDRESSED TO IT
+ * (window_refresh() in apos_node.c), and the only such frame during ranging is
+ * a RANGE_CMD naming it as the INITIATOR -- all of which sit in one contiguous
+ * run of the pair walk. After its own run finishes, a node is never addressed
+ * again until APPLY, yet it must keep ANSWERING the SS-TWR polls that later
+ * initiators aim at it, and on a cold deployment
+ * anchor_respond_wave_poll() will only do that while the window is open. With
+ * 12 ordered pairs the whole run fitted inside one window and this never
+ * mattered; with hundreds it does, and the symptom would be every late pair
+ * coming back as a hole with the radio looking dead.
+ *
+ * 30 s, comfortably inside APOS_NODE_REFRESH_S (60 s) and APOS_GW_WINDOW_S
+ * (120 s), so a single dropped or suppressed broadcast cannot lapse a window.
+ * Each refresh costs one frame plus APOS_GW_ENUM_SETTLE_MS of paused ranging --
+ * ~2.7 % overhead -- because the broadcast provokes a full staggered ENUM_RSP
+ * storm, which on_enum_rsp()'s `phase != APOS_GW_ENUM` guard discards but which
+ * must still be off the air before the next RANGE_CMD. */
+#define APOS_GW_WINDOW_REFRESH_MS 30000u
 
 /* Worst-case cost of one apos_gw_step() transmission. The gateway loop refuses
  * to enter a step unless BEACON_ARM_MARGIN_UUS + this much time remains before
@@ -76,7 +138,9 @@ enum apos_gw_phase {
  *     15-byte SURVEY_BEGIN -- sized for the largest so the constant does not
  *     need revisiting. At PLEN_1024 the preamble alone is ~1.05 ms and 27
  *     bytes at 850 kbps with 4z overhead is ~0.4 ms: ~1.45 ms -> ~1420 uus,
- *     rounded to 1500.
+ *     rounded to 1500. Deliberately NOT APOS_LEN_MAX: that is ENUM_RSP (38
+ *     bytes since the neighbour bitmap was added), which only ANCHORS
+ *     transmit -- this budget covers what the GATEWAY puts on the air.
  *   - 700 uus of margin for the SPI register writes around the TX and for
  *     rounding.
  * 7800 + 1500 + 700 = 10000 uus (~10.3 ms), against a 200 ms superframe.
@@ -91,15 +155,33 @@ enum apos_gw_phase {
 /* Reserved separately for the ONE step that does not transmit: the solve.
  *
  * apos_geom_solve() is a Levenberg-Marquardt fit, up to APOS_LM_MAX_ITER (200)
- * iterations, each rebuilding an 18x18 normal-equation matrix over every usable
- * edge and running a dense Gaussian elimination with partial pivoting on it. It
- * is bounded, but bounded in ITERATIONS, not in microseconds, and its bound is
- * nowhere near APOS_GW_STEP_BUDGET_UUS: a rough count is ~15k float operations
- * plus ~5 kB of matrix traffic per iteration, which at 240 MHz through the
- * instruction cache is tens of microseconds per iteration at best and 200 of
- * them is comfortably past BEACON_ARM_MARGIN_UUS (5000 uus). Running it in a
- * step sized for one transmission would mean a beacon armed late -- and the
- * beacon is the whole network's time base.
+ * iterations, each rebuilding an n x n normal-equation matrix over every usable
+ * edge -- n = 3N-6 free parameters -- and running a dense Gaussian elimination
+ * with partial pivoting on it. It is bounded, but bounded in ITERATIONS, not in
+ * microseconds, and its bound is nowhere near APOS_GW_STEP_BUDGET_UUS: on a
+ * four-anchor array (n = 6, an 18x18 matrix in the old 8-node sizing) a rough
+ * count is ~15k float operations plus ~5 kB of matrix traffic per iteration,
+ * which at 240 MHz through the instruction cache is tens of microseconds per
+ * iteration at best and 200 of them is comfortably past BEACON_ARM_MARGIN_UUS
+ * (5000 uus). Running it in a step sized for one transmission would mean a
+ * beacon armed late -- and the beacon is the whole network's time base.
+ *
+ * AT 32 NODES THAT ARITHMETIC NO LONGER FITS IN THIS BUDGET, AND THE BUDGET WAS
+ * NEVER A HARD BOUND ANYWAY. The elimination is O(n^3), so n = 90 (a full
+ * 32-anchor 3D survey) is ~3400x the 6-parameter case per iteration, and the
+ * Jacobian assembly grows with the edge count on top of that. If a solve at
+ * n = 6 really is "tens of microseconds" per iteration, then at n = 90 a single
+ * iteration is already into the tens of milliseconds and 200 of them is
+ * seconds -- far past the ~195000 uus of clear air deferring to the top of a
+ * superframe can buy. Nothing about that is caught by this gate: the gate only
+ * decides WHEN the solve starts, never how long it runs, so a 32-node solve
+ * that overruns arms the beacon late no matter what this number says.
+ *
+ * Left as-is rather than raised, because raising it cannot help -- there is no
+ * value that fits a multi-second computation into a 200 ms superframe. The real
+ * fix is the one already named below: get the solve off this thread. Treat that
+ * as the FIRST thing to do if a bench run at more than a handful of anchors
+ * shows a late beacon, and do not read the numbers below as covering it.
  *
  * It cannot be split across steps (apos_geom_refine() is one call and keeps its
  * working matrices in function-local static storage), so instead the solve step
@@ -157,13 +239,6 @@ enum apos_gw_phase {
  * tight compared with APOS_GW_RANGE_TIMEOUT_MS. */
 #define APOS_GW_APPLY_TIMEOUT_MS 1500u
 
-/* Settle time between APPLY's one-shot SURVEY_BEGIN re-broadcast and the first
- * SETPOS. Must clear the anchors' worst-case enumeration stagger
- * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 240 ms) so the ENUM_RSPs that
- * re-broadcast provokes -- harmless, and discarded by the gateway's phase
- * guard -- are off the air before the first SETPOS needs an acknowledgement. */
-#define APOS_GW_APPLY_SETTLE_MS 400u
-
 /* Three attempts per anchor. Unlike a failed range, a failed SETPOS cannot be
  * shrugged off as a hole: an anchor left on its old coordinates while its peers
  * move to new ones is a silently inconsistent deployment, so this retries hard
@@ -179,11 +254,13 @@ enum apos_gw_phase {
  * bench run. They are thresholds on a REPORTED result, so raising one never
  * changes what was measured -- only whether `apos apply` will proceed.
  *
- * THEY ARE ALSO ONLY MEANINGFUL WHERE THE MESH HAS SPARE EDGES. See
- * apos_gw_result_unverified() below and the long note in apos_geom.h: with
- * n_edges <= 3N-6 the fit reproduces any input exactly and rms_m comes back
- * zero however bad the ranges were, so passing these thresholds proves nothing.
- * The real deployment (four ranging slaves, full mesh) is exactly that case. */
+ * THEY ARE ALSO ONLY MEANINGFUL WHERE THE FRAMEWORK IS RIGID AND HAS SPARE
+ * EDGES. See apos_gw_result_unverified() below and the long note in
+ * apos_geom.h: with n_edges <= 3N-6 the fit reproduces any input exactly and
+ * rms_m comes back zero however bad the ranges were, and a flexible mesh can
+ * report a small rms_m for a shape it never determined. A four-anchor array
+ * solved in 3D is always that case; a sparse 32-anchor mesh usually is not,
+ * which is what makes these thresholds a real acceptance test at scale. */
 #define APOS_ACCEPT_RMS_MM       50u
 #define APOS_ACCEPT_WORST_FACTOR 3.0f
 /* Below this, the array is too close to coplanar for the solved z values to
@@ -270,33 +347,58 @@ const struct apos_result *apos_gw_result(void);
 bool apos_gw_accepted(void);
 
 /* True when the last result's rms_m / worst_edge_m CANNOT be read as a quality
- * check, because the mesh had no spare edges: usable edges <= 3 * n_placed - 6.
- * In that regime LM re-embeds whatever distances it was handed exactly and both
- * numbers come back at (or near) zero regardless of how bad the ranging was, so
- * apos_gw_accepted() means only "nothing contradicted the ranges", never "the
- * ranges are good".
+ * check on the ranging.
  *
- * This is not a corner case, it is EVERY case. UWB_MAX_ANCHORS is 4, `anchor
- * id` is bounded 0..3, and apos_node.c refuses any peer_addr at or above
- * UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS -- so a four-node full mesh, with
- * exactly 6 edges against exactly 6 free parameters, is the only deployment the
- * firmware supports and this flag is true on every real run. APOS_MAX_NODES (8)
- * is headroom in the data structures, not a supported configuration.
+ * Exactly the negation of apos_geom_rigidity()'s `redundant` over the edge list
+ * the solve ran on, so it is true for any of THREE distinct reasons and the
+ * `apos_solve` JSON says which:
  *
- * Raising the anchor count is NOT an operator action and must never be
- * suggested as one. It is engineering work touching UWB_MAX_ANCHORS,
- * disc_schedule's response stagger, anchor_respond.c's TX_COMPLETE_TIMEOUT_MS
- * (which is derived from that stagger's worst case), and the tag project's
- * UWB_FRAME_MAX_ANCHORS on the far side of a frozen wire format.
+ *   - the framework is DISCONNECTED (rigidity.n_components > 1) -- two groups of
+ *     anchors that cannot hear each other have no measured relationship, so
+ *     their relative placement is invented whatever rms_m says;
+ *   - some node has FEWER THAN d EDGES (rigidity.degree_ok false) -- it is not
+ *     pinned at all, and the fit will still place it somewhere;
+ *   - the mesh has NO SPARE EDGE (rigidity.spare_edges <= 0) -- with usable
+ *     edges <= 2N-3 in 2D or 3N-6 in 3D, LM re-embeds whatever distances it was
+ *     handed exactly and both numbers come back at (or near) zero regardless of
+ *     how bad the ranging was.
  *
- * What an operator CAN read on the array they have is
- * apos_gw_result_quality(): reciprocal disagreement and per-pair sd. Those make
- * the RANGING observable. They do not make the GEOMETRY over-determined --
- * a rigid 4-node framework stays isostatic either way -- so they are a check on
- * the measurements, not a substitute for the tape measure.
+ * When it is true, apos_gw_accepted() means only "nothing contradicted the
+ * ranges", never "the ranges are good".
  *
- * See the long note on apos_geom_refine(). */
+ * THE SIZE OF THE DEPLOYMENT DECIDES WHICH REGIME YOU ARE IN. A four-anchor
+ * array solved in 3D is a full mesh of exactly 6 edges against exactly 6 free
+ * parameters -- isostatic, no spare equation, so this flag is true on every such
+ * run and no threshold can change that. The same four anchors solved in 2D have
+ * one spare edge (2*4-3 = 5 against 6), and a sparse-but-redundant 32-anchor
+ * mesh normally has dozens, so at scale this flag is FALSE on a healthy run and
+ * rms_m becomes a real acceptance signal for the first time. That is the whole
+ * point of scaling the survey; it is no longer "not a corner case, it is every
+ * case".
+ *
+ * What it is NOT is a rigidity proof. apos_geom_rigidity()'s three conditions
+ * are necessary, not sufficient -- a hinge between two densely-meshed clusters
+ * passes all of them -- so a false here means "nothing detectable contradicts
+ * the geometry either", which is still weaker than a measurement. Read
+ * apos_gw_result_quality() (reciprocal disagreement and per-pair sd) for the
+ * RANGING, and confirm the solved node-to-node distances against a tape measure
+ * before committing a survey the site depends on. That advice does not expire
+ * with the anchor count.
+ *
+ * See the long notes on apos_geom_rigidity() and apos_geom_refine(). */
 bool apos_gw_result_unverified(void);
+
+/* The rigidity verdict behind the last solve, over the symmetrised edge list
+ * and all enumerated peers. Never NULL; meaningful only when have_result.
+ *
+ * Computed over ALL enumerated nodes, not only the placed ones, so it answers
+ * "is the framework this array can measure rigid" rather than "did this
+ * particular fit have spare equations". The two coincide exactly when the result
+ * is accepted, since apos_gw_accepted() already requires every node placed and
+ * none ambiguous; where they differ -- some node unplaced -- the whole-mesh
+ * answer is the conservative one, because an unplaced node either leaves the
+ * graph disconnected or leaves it short of degree d. */
+const struct apos_rigidity *apos_gw_result_rigidity(void);
 
 /* Ranging-quality maxima behind the last solve, straight from the directed
  * measurements rather than from the fit: the largest |d(A->B) - d(B->A)| over
@@ -305,8 +407,10 @@ bool apos_gw_result_unverified(void);
  * have_result. See apos_table_quality(). */
 void apos_gw_result_quality(int32_t *max_recip_mm, uint16_t *max_sd_mm);
 
-/* Spare edges in the last solve: usable_edges - (3 * n_placed - 6). <= 0 is the
- * unverified regime above. Meaningful only when have_result. */
+/* Spare edges in the last solve: usable_edges - (2N-3 in 2D, 3N-6 in 3D).
+ * Shorthand for apos_gw_result_rigidity()->spare_edges. <= 0 is one of the three
+ * unverified reasons above -- but not the only one, so do not read a positive
+ * value here as "verified" on its own. Meaningful only when have_result. */
 int apos_gw_result_redundancy(void);
 
 /* Push the last solved result to every anchor, persist it locally, and close the

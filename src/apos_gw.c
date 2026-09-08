@@ -50,10 +50,18 @@ static int64_t next_action_ms;
  * phase now running should fall through into RANGE when it completes. */
 static bool is_run;
 
-/* RANGE phase cursor. `pair_idx` walks every ORDERED pair in a fixed row-major
- * order: for from = 0..n-1, for to = 0..n-1, skipping from == to. A single
- * index rather than two counters, so the phase state is one number to reason
- * about and meas_done/meas_total are trivially derived. */
+/* RANGE phase cursor.
+ *
+ * `pair_cursor` walks every ORDERED pair in a fixed row-major order: for
+ * from = 0..n-1, for to = 0..n-1, skipping from == to. A single index rather
+ * than two counters, so the phase state is one number to reason about.
+ *
+ * `pair_idx` / `pair_total` count only the CANDIDATE pairs -- the ones actually
+ * commanded -- so the progress an operator reads is progress through the work
+ * that will really happen, not through a 992-slot raw index space most of which
+ * is skipped. `pair_raw_total` is the end of the cursor's space. */
+static uint16_t pair_cursor;
+static uint16_t pair_raw_total;
 static uint16_t pair_idx;
 static uint16_t pair_total;
 static uint8_t pair_retries;
@@ -61,6 +69,11 @@ static uint8_t tx_fails;
 static bool awaiting_rsp;
 static uint16_t await_from_addr;
 static uint16_t await_peer_addr;
+
+/* When the next mid-RANGE SURVEY_BEGIN re-broadcast is due, in kernel uptime.
+ * See APOS_GW_WINDOW_REFRESH_MS -- without this every anchor's window lapses
+ * partway through a 32-anchor ranging phase. */
+static int64_t next_window_ms;
 
 /* APPLY phase cursor. */
 static uint8_t apply_idx;
@@ -74,23 +87,36 @@ static bool apply_reopen;   /* SURVEY_BEGIN still to re-broadcast, see step_appl
 
 /* Result judgement, filled by do_solve()/judge_result(). */
 static bool accepted;
-static int16_t solve_redundancy; /* see apos_gw_result_redundancy() */
-static uint16_t solve_n_edges;
+static struct apos_rigidity rig;
 static bool solve_unverified;
+/* Unordered pairs the candidate filter excluded, i.e. never commanded. Reported
+ * next to missing_pairs so "not asked" and "asked and failed" stay distinct. */
+static uint16_t solve_skipped_pairs;
 
 /* Ranging-quality numbers derived from the raw directed measurements, not from
- * the fit. On a 3D gauge over the real four-anchor array the fit's rms_m is
- * vacuous (see apos_gw_result_unverified()) -- a rigid 4-node framework stays
- * isostatic regardless of how good its edges are -- so these are the only
- * quality signals that actually carry information about the RANGING there.
- * A 2D (3-anchor) gauge run over the same four anchors is NOT that case: it
- * has one spare edge (2*4-3 = 5 free parameters against 6 edges), so rms_m
- * becomes a real, if weak, signal for the first time. Either way these two
- * numbers say nothing about whether the GEOMETRY is over-determined. */
+ * the fit. On a 3D gauge over a four-anchor array the fit's rms_m is vacuous
+ * (see apos_gw_result_unverified()) -- a rigid 4-node framework stays isostatic
+ * regardless of how good its edges are -- so these are the only quality signals
+ * that carry information about the RANGING there. A 2D (3-anchor) gauge run
+ * over the same four anchors is NOT that case: it has one spare edge (2*4-3 = 5
+ * free parameters against 6 edges), and a sparse 32-anchor mesh normally has
+ * dozens, so rms_m becomes a real signal as the array grows. Either way these
+ * two numbers say nothing about whether the GEOMETRY is over-determined. */
 static int32_t max_recip_mm;
 static uint16_t max_sd_mm;
 
 static uint8_t tx_buf[APOS_LEN_MAX];
+
+/* Working buffers for the solve and the persist, at FILE SCOPE on purpose.
+ *
+ * At APOS_MAX_NODES (32) these are ~5.8 kB and ~800 B respectively, against a
+ * CONFIG_MAIN_STACK_SIZE of 4096 -- the edge list alone would overflow the
+ * gateway loop's thread outright if it stayed the stack local it used to be at
+ * 8 nodes, and apos_store_save() puts another ~800 B struct on the stack under
+ * persist_survey(). Both are touched only from apos_gw_step(), single-threaded
+ * on the gateway loop, so file scope costs nothing but the .bss. */
+static struct apos_edge edges[APOS_MAX_EDGES];
+static struct apos_survey survey_rec;
 
 void apos_gw_init(void)
 {
@@ -103,15 +129,18 @@ void apos_gw_init(void)
 	session = 0;
 	zoff_m = 0.0f;
 	is_run = false;
+	pair_cursor = 0;
+	pair_raw_total = 0;
 	pair_idx = 0;
 	pair_total = 0;
 	pair_retries = 0;
 	tx_fails = 0;
 	awaiting_rsp = false;
+	next_window_ms = 0;
 	accepted = false;
-	solve_redundancy = 0;
-	solve_n_edges = 0;
+	memset(&rig, 0, sizeof(rig));
 	solve_unverified = false;
+	solve_skipped_pairs = 0;
 	apply_idx = 0;
 	apply_retries = 0;
 	applied_ok = 0;
@@ -263,15 +292,18 @@ int apos_gw_start_enum(void)
 
 	/* Clear the run cursor too, so a bare `apos enum` after an aborted run
 	 * cannot inherit stale RANGE state. */
+	pair_cursor = 0;
+	pair_raw_total = 0;
 	pair_idx = 0;
 	pair_total = 0;
 	pair_retries = 0;
 	tx_fails = 0;
 	awaiting_rsp = false;
+	next_window_ms = 0;
 	accepted = false;
 	solve_unverified = false;
-	solve_redundancy = 0;
-	solve_n_edges = 0;
+	solve_skipped_pairs = 0;
+	memset(&rig, 0, sizeof(rig));
 
 	phase = APOS_GW_ENUM;
 
@@ -287,9 +319,10 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 	uint8_t eui[APOS_EUI_LEN];
 	bool pv = false;
 	float x = 0.0f, y = 0.0f, z = 0.0f;
+	uint32_t heard = 0;
 
-	if (apos_frame_parse_enum_rsp(buf, plen, &sess, eui, &pv, &x, &y, &z)
-	    != 0) {
+	if (apos_frame_parse_enum_rsp(buf, plen, &sess, eui, &pv, &x, &y, &z,
+				      &heard) != 0) {
 		return;
 	}
 	if (sess != session) {
@@ -322,7 +355,7 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 		return;
 	}
 
-	int idx = apos_table_add_peer(&tbl, eui, addr, pv, x, y, z);
+	int idx = apos_table_add_peer(&tbl, eui, addr, pv, x, y, z, heard);
 
 	if (idx == -EADDRINUSE) {
 		/* Two distinct boards claiming one short address: both are
@@ -345,12 +378,18 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 		return;
 	}
 
+	/* `heard` is the UNION across rounds as the table now holds it, not just
+	 * this frame's bitmap: it is the only visibility an operator has into
+	 * why a pair was or was not commanded, and the per-frame value on its own
+	 * is misleading (round 0's is always empty). Printed as a hex bitmap of
+	 * anchor ids. */
 	LOG_INF("{\"apos_peer\":{\"idx\":%d,\"id\":%d,\"addr\":\"0x%04X\","
 		"\"eui\":\"%02X%02X%02X%02X%02X%02X%02X%02X\",\"pos_valid\":%u,"
-		"\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}}",
+		"\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"heard_ids\":\"0x%08X\"}}",
 		idx, (int)(addr - UWB_ANCHOR_ADDR_BASE), addr, eui[0], eui[1],
 		eui[2], eui[3], eui[4], eui[5], eui[6], eui[7],
-		pv ? 1u : 0u, (double)x, (double)y, (double)z);
+		pv ? 1u : 0u, (double)x, (double)y, (double)z,
+		tbl.peer[idx].heard_ids);
 }
 
 /* ---- RANGE phase ---- */
@@ -365,6 +404,28 @@ static void pair_of(uint16_t idx, uint8_t n, uint8_t *from, uint8_t *to)
 	uint8_t col = (uint8_t)(idx % per_row);
 
 	*to = (col >= *from) ? (uint8_t)(col + 1u) : col;
+}
+
+/* Advance pair_cursor to the next CANDIDATE ordered pair and decompose it.
+ * Returns false when the cursor has run off the end.
+ *
+ * The skipping loop runs inside one step rather than costing a step per skipped
+ * pair. That matters: at 32 anchors the raw space is 992 pairs and a sparse site
+ * leaves most of them non-candidates, so a step-per-skip would spend a whole
+ * superframe (200 ms) per rejected pair -- minutes of transmitting nothing. It
+ * does not break the one-frame-per-step rule either, because skipping emits no
+ * frame at all; the loop is bounded by pair_raw_total iterations of two bitmap
+ * tests, i.e. microseconds. */
+static bool next_candidate_pair(uint8_t *from, uint8_t *to)
+{
+	while (pair_cursor < pair_raw_total) {
+		pair_of(pair_cursor, tbl.n_peers, from, to);
+		if (apos_table_is_candidate(&tbl, *from, *to)) {
+			return true;
+		}
+		pair_cursor++;
+	}
+	return false;
 }
 
 void apos_gw_set_zoff(float dz)
@@ -400,9 +461,14 @@ bool apos_gw_result_unverified(void)
 	return solve_unverified;
 }
 
+const struct apos_rigidity *apos_gw_result_rigidity(void)
+{
+	return &rig;
+}
+
 int apos_gw_result_redundancy(void)
 {
-	return solve_redundancy;
+	return rig.spare_edges;
 }
 
 void apos_gw_result_quality(int32_t *out_recip_mm, uint16_t *out_sd_mm)
@@ -429,16 +495,19 @@ int apos_gw_start_run(void)
 	have_result = false;
 	accepted = false;
 	solve_unverified = false;
-	solve_redundancy = 0;
-	solve_n_edges = 0;
+	solve_skipped_pairs = 0;
+	memset(&rig, 0, sizeof(rig));
 	session = new_session();
 	enum_round = 0;
 	next_action_ms = 0;
+	pair_cursor = 0;
+	pair_raw_total = 0;
 	pair_idx = 0;
 	pair_total = 0;
 	pair_retries = 0;
 	tx_fails = 0;
 	awaiting_rsp = false;
+	next_window_ms = 0;
 	is_run = true;
 
 	/* Starts in ENUM: a run always re-enumerates rather than trusting a
@@ -517,7 +586,7 @@ static void judge_result(void)
 		res.worst_i, res.worst_j,
 		(int)(res.planarity_m * 1000.0f),
 		(int)(res.gauge_collinearity_ratio * 1000.0f), res.iterations,
-		solve_redundancy, solve_unverified ? 0u : 1u,
+		rig.spare_edges, solve_unverified ? 0u : 1u,
 		max_recip_mm, max_sd_mm, accepted ? 1u : 0u);
 
 	for (uint8_t k = 0; k < res.n_nodes; k++) {
@@ -543,16 +612,34 @@ static void judge_result(void)
 		 * message is both the most droppable in this file under a burst
 		 * and the one an operator least tolerates losing. Two ~280-byte
 		 * messages fit far more comfortably, and if the second is ever
-		 * dropped the first still carries the finding. */
+		 * dropped the first still carries the finding. The
+		 * `apos_rigidity` line in do_solve() is split out for the same
+		 * reason.
+		 *
+		 * The first message names WHICH of the three conditions failed,
+		 * because the remedy differs completely: a disconnected mesh
+		 * needs an anchor moved into line of sight, an under-degree node
+		 * needs more peers in range of it, and a merely isostatic mesh
+		 * needs more anchors or a 2D gauge. */
 		LOG_WRN("{\"apos_warn\":\"rms_mm and worst_mm are NOT a quality "
-			"check on this array: %u usable edge(s) against %d free "
-			"parameters (%s) leaves %d spare. With no spare edge "
-			"the fit reproduces ANY set of ranges exactly, so "
-			"rms_mm is ~0 however bad the ranging was.\"}",
-			solve_n_edges,
-			apos_geom_free_params(res.dim, res.n_placed),
+			"check on this survey — %s. Edges %u against %d free "
+			"parameters (%s), %d spare; components %u; min degree "
+			"%u at node %u.\"}",
+			!rig.connected
+				? "the mesh is DISCONNECTED, so the pieces have "
+				  "no measured relationship to each other"
+				: (!rig.degree_ok
+					   ? "a node has fewer edges than the "
+					     "solve has dimensions, so it is "
+					     "not pinned at all"
+					   : "the mesh has no SPARE edge, so the "
+					     "fit reproduces ANY set of ranges "
+					     "exactly and rms_mm is ~0 however "
+					     "bad the ranging was"),
+			rig.n_edges, rig.free_params,
 			(res.dim == APOS_GEOM_2D) ? "2N-3" : "3N-6",
-			solve_redundancy);
+			rig.spare_edges, rig.n_components, rig.min_degree,
+			rig.min_degree_node);
 		LOG_WRN("{\"apos_warn\":\"\\\"accepted\\\":%u above therefore "
 			"means only that nothing contradicted the ranges — it "
 			"does NOT mean they are correct. Read max_reciprocal_mm "
@@ -593,7 +680,6 @@ static void judge_result(void)
 static void do_solve(void)
 {
 	struct apos_gauge g;
-	struct apos_edge edges[APOS_MAX_EDGES];
 
 	if (resolve_gauge(&g) != 0) {
 		phase = APOS_GW_IDLE;
@@ -604,6 +690,13 @@ static void do_solve(void)
 						(uint8_t)APOS_MIN_N_OK);
 	uint16_t missing = apos_table_missing_pairs(&tbl,
 						   (uint8_t)APOS_MIN_N_OK);
+	uint16_t all_pairs = (uint16_t)((uint16_t)tbl.n_peers *
+					(uint16_t)(tbl.n_peers - 1u) / 2u);
+
+	/* Halved because apos_table_is_candidate() is symmetric, so the ordered
+	 * count it reports is exactly twice the unordered one. */
+	solve_skipped_pairs = (uint16_t)(all_pairs -
+					 apos_table_candidate_pairs(&tbl) / 2u);
 
 	/* Computed from the raw directed measurements, before the fit gets a
 	 * say. On this array the fit cannot judge the ranging, so these two are
@@ -612,9 +705,68 @@ static void do_solve(void)
 			   &max_sd_mm);
 
 	/* Logged, never silent: a hole changes what the fit rests on, and
-	 * "covered everything" is exactly the wrong impression to leave. */
-	LOG_INF("{\"apos_edges\":{\"usable\":%u,\"missing_pairs\":%u}}",
-		n_edges, missing);
+	 * "covered everything" is exactly the wrong impression to leave.
+	 *
+	 * `missing_pairs` counts pairs that WERE commanded and produced nothing;
+	 * `skipped_pairs` counts pairs the candidate filter never commanded
+	 * because enumeration saw no evidence either endpoint could hear the
+	 * other. Two different problems -- the first is a link that failed, the
+	 * second is a link that was written off -- so they are two numbers. A
+	 * high skipped count on an array whose anchors really can all see each
+	 * other means enumeration lost adjacency replies, not that the links are
+	 * bad; re-run and compare. */
+	LOG_INF("{\"apos_edges\":{\"usable\":%u,\"missing_pairs\":%u,"
+		"\"skipped_pairs\":%u,\"all_pairs\":%u}}",
+		n_edges, missing, solve_skipped_pairs, all_pairs);
+
+	/* Can this framework determine a shape at all, and does it have anything
+	 * spare for rms_m to disagree with? Three necessary conditions --
+	 * connectivity, minimum degree d, and edges >= 2N-3 / 3N-6 -- computed
+	 * from the graph alone; see apos_geom_rigidity().
+	 *
+	 * BEFORE the solve, and reported whether or not the solve then succeeds.
+	 * The verdict is most useful exactly where the solve fails: a mesh in
+	 * three pieces whose gauge edges are among the missing ones currently gets
+	 * "the gauge anchors are not mutually ranged" below, which sends the
+	 * operator to inspect three boxes when the real finding is about the whole
+	 * array. Taking g.dim rather than res.dim is what makes this possible --
+	 * g.dim is the authoritative source anyway (apos_geom_refine() stamps
+	 * res.dim from it).
+	 *
+	 * Over ALL enumerated peers, not just the placed ones, and deliberately:
+	 * the question is whether the array the operator built is rigid, which
+	 * is what tells them to move an anchor. It also removes an OPTIMISM the
+	 * old inline count had -- it compared every edge, including ones
+	 * touching unplaced nodes, against a free-parameter count over placed
+	 * nodes only, so it could report spare edges the fit never had. The two
+	 * node sets coincide exactly when the result is accepted (judge_result()
+	 * requires every node placed and none ambiguous); where they differ, an
+	 * unplaced node necessarily leaves the graph either disconnected or
+	 * short of degree d, so the whole-mesh answer is the conservative one. */
+	if (apos_geom_rigidity(edges, n_edges, tbl.n_peers, g.dim, &rig) != 0) {
+		/* Only reachable on a bad argument, which cannot happen here --
+		 * tbl.n_peers is already bounded by APOS_MAX_NODES and the gauge
+		 * resolved. The zeroed struct apos_geom_rigidity() leaves behind
+		 * reads as "not rigid", which is the safe verdict, but say so
+		 * rather than reporting it as a measured finding. */
+		LOG_ERR("{\"apos_error\":\"rigidity check refused its own input "
+			"(peers %u, edges %u) — treating the survey as "
+			"unverified\"}", tbl.n_peers, n_edges);
+	}
+	solve_unverified = !rig.redundant;
+
+	/* On its own line next to the fit's own numbers: `rms_meaningful` in the
+	 * apos_solve line below is a single bit and these are the three separate
+	 * reasons it can be 0. A deliberately second message rather than more
+	 * fields on the first, for the CONFIG_LOG_BUFFER_SIZE reason spelt out in
+	 * judge_result(). */
+	LOG_INF("{\"apos_rigidity\":{\"rigid\":%u,\"redundant\":%u,"
+		"\"components\":%u,\"min_degree\":%u,\"min_degree_node\":%u,"
+		"\"edges\":%u,\"free_params\":%d,\"spare_edges\":%d,\"dof\":\"%s\"}}",
+		rig.rigid ? 1u : 0u, rig.redundant ? 1u : 0u, rig.n_components,
+		rig.min_degree, rig.min_degree_node, rig.n_edges,
+		rig.free_params, rig.spare_edges,
+		(g.dim == APOS_GEOM_2D) ? "2N-3" : "3N-6");
 
 	int rc = apos_geom_solve(edges, n_edges, tbl.n_peers, &g, &res);
 
@@ -634,22 +786,6 @@ static void do_solve(void)
 	if (zoff_m != 0.0f) {
 		apos_geom_zoff(&res, zoff_m);
 	}
-
-	/* Redundancy of the fit that just ran: the gauge fixes 6 of the 3N
-	 * degrees of freedom in 3D (3 of the 2N in 2D), so n_edges must EXCEED
-	 * apos_geom_free_params(res.dim, res.n_placed) before rms_m can
-	 * disagree with anything. n_edges is an upper bound on the
-	 * edges the fit actually used (edges touching an unplaced node are
-	 * dropped), so this is an OPTIMISTIC estimate of the spare count: the
-	 * fit may have had fewer spare edges than this says, never more. That is
-	 * why the flag below triggers on <= 0 rather than < 0 -- an optimistic
-	 * count of exactly zero spare edges is already the degenerate case, and
-	 * anything this overestimates only moves further into it. */
-	solve_n_edges = n_edges;
-	solve_redundancy = (int16_t)((int)n_edges -
-				     apos_geom_free_params(res.dim,
-							   res.n_placed));
-	solve_unverified = solve_redundancy <= 0;
 
 	have_result = true;
 	judge_result();
@@ -720,6 +856,7 @@ static void on_range_rsp(const uint8_t *buf, uint16_t plen)
 	awaiting_rsp = false;
 	pair_retries = 0;
 	tx_fails = 0;
+	pair_cursor++;
 	pair_idx++;
 	next_action_ms = 0; /* next pair on the very next step */
 }
@@ -734,6 +871,7 @@ static void retire_pair(const char *why)
 	awaiting_rsp = false;
 	pair_retries = 0;
 	tx_fails = 0;
+	pair_cursor++;
 	pair_idx++;
 }
 
@@ -758,13 +896,25 @@ static void step_range(uint32_t avail_uus, uint8_t *seq)
 		return;
 	}
 
-	if (pair_idx >= pair_total) {
+	/* Settle interval after a mid-RANGE window re-broadcast below. Every
+	 * other path through this function leaves next_action_ms at 0 or already
+	 * past, so this is a no-op outside that window -- the same shape
+	 * step_apply() uses after ITS one-shot re-broadcast. */
+	if (now < next_action_ms) {
+		return;
+	}
+
+	uint8_t from, to;
+	bool have_pair = next_candidate_pair(&from, &to);
+
+	if (!have_pair) {
 		/* The one step that transmits nothing and cannot be bounded in
 		 * microseconds. APOS_GW_SOLVE_BUDGET_UUS is sized so only the
 		 * first step after a beacon can satisfy this test, giving the
 		 * solve most of a superframe to run in. Waiting for that costs
 		 * up to 200 ms of latency once per run, and protects the
-		 * beacon. */
+		 * beacon. Read its comment in apos_gw.h before trusting it at
+		 * 32 nodes -- the solve is O(n^3) in the free-parameter count. */
 		if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
 			return;
 		}
@@ -772,9 +922,19 @@ static void step_range(uint32_t avail_uus, uint8_t *seq)
 		return;
 	}
 
-	uint8_t from, to;
+	/* Keep every anchor's survey window alive across a ranging phase that is
+	 * now far longer than one window. One frame, then return: the
+	 * one-frame-per-step rule holds, and the settle interval keeps the
+	 * ENUM_RSP storm this provokes off the air before the next RANGE_CMD.
+	 * Checked here, between pairs, rather than while awaiting_rsp -- so it
+	 * never interrupts a batch in flight. See APOS_GW_WINDOW_REFRESH_MS. */
+	if (now >= next_window_ms) {
+		send_survey_begin(seq);
+		next_window_ms = now + APOS_GW_WINDOW_REFRESH_MS;
+		next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
+		return;
+	}
 
-	pair_of(pair_idx, tbl.n_peers, &from, &to);
 	await_from_addr = tbl.peer[from].short_addr;
 	await_peer_addr = tbl.peer[to].short_addr;
 
@@ -843,13 +1003,14 @@ int apos_gw_start_apply(bool force)
 	 * of the mesh, not a decision, and it is loudest precisely when the
 	 * result looks best. */
 	if (solve_unverified) {
-		LOG_WRN("{\"apos_warn\":\"COMMITTING AN UNVERIFIED SURVEY: %u "
-			"usable edge(s) against %d free parameters (%s), "
-			"leaving %d spare edge(s), so rms_mm was ~0 however bad "
-			"the ranging was.\"}", solve_n_edges,
-			apos_geom_free_params(res.dim, res.n_placed),
+		LOG_WRN("{\"apos_warn\":\"COMMITTING AN UNVERIFIED SURVEY: "
+			"connected=%u, min degree %u at node %u, %u edge(s) "
+			"against %d free parameters (%s) leaving %d spare — so "
+			"rms_mm was not a check on the ranging.\"}",
+			rig.connected ? 1u : 0u, rig.min_degree,
+			rig.min_degree_node, rig.n_edges, rig.free_params,
 			(res.dim == APOS_GEOM_2D) ? "2N-3" : "3N-6",
-			solve_redundancy);
+			rig.spare_edges);
 		LOG_WRN("{\"apos_warn\":\"on this array \\\"accepted\\\" means "
 			"only that nothing contradicted the ranges — it does "
 			"NOT mean they are correct. Read max_reciprocal_mm (%d) "
@@ -872,10 +1033,10 @@ int apos_gw_start_apply(bool force)
  * so the origin is moved to the front here rather than being assumed. */
 static bool persist_survey(void)
 {
-	struct apos_survey s;
+	struct apos_survey *s = &survey_rec;
 	struct apos_gauge g;
 
-	memset(&s, 0, sizeof(s));
+	memset(s, 0, sizeof(*s));
 
 	if (resolve_gauge(&g) != 0) {
 		LOG_ERR("{\"apos_error\":\"cannot persist — gauge no longer "
@@ -909,20 +1070,20 @@ static bool persist_survey(void)
 			if (res.node[k].state == APOS_NODE_UNPLACED) {
 				continue;
 			}
-			memcpy(s.node[w].eui, tbl.peer[k].eui, APOS_EUI_LEN);
-			s.node[w].short_addr = tbl.peer[k].short_addr;
-			s.node[w].x = res.node[k].x;
-			s.node[w].y = res.node[k].y;
-			s.node[w].z = res.node[k].z;
+			memcpy(s->node[w].eui, tbl.peer[k].eui, APOS_EUI_LEN);
+			s->node[w].short_addr = tbl.peer[k].short_addr;
+			s->node[w].x = res.node[k].x;
+			s->node[w].y = res.node[k].y;
+			s->node[w].z = res.node[k].z;
 			w++;
 		}
 	}
 
-	s.n_nodes = w;
-	s.dim = res.dim;
-	s.valid = w > 0u;
+	s->n_nodes = w;
+	s->dim = res.dim;
+	s->valid = w > 0u;
 
-	int rc = apos_store_save(&s);
+	int rc = apos_store_save(s);
 
 	if (rc) {
 		LOG_ERR("{\"apos_error\":\"survey applied to the anchors but NOT "
@@ -1015,17 +1176,15 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 	 * SETPOS goes out.
 	 *
 	 * Without this the whole apply fails, on every anchor, for a reason that
-	 * looks like a dead radio. A node's window is refreshed only by an
-	 * in-session SETPOS or RANGE_CMD addressed to it, and a node's LAST
-	 * RANGE_CMD is in its own row of the row-major pair walk -- node 0's row
-	 * is the first three of twelve pairs. Nothing between the end of RANGE
-	 * and the start of APPLY refreshes anything, and the operator is
-	 * deliberately told (docs/anchor-auto-positioning.md §5) to tape-measure
-	 * the solved distances before applying, which takes minutes against a
-	 * 60 s APOS_NODE_REFRESH_S. handle_setpos() would then refuse every
-	 * SETPOS (its session check compares against a window_session that has
-	 * been lazily zeroed by an expiring window) and apply would end
-	 * `failed:4`.
+	 * looks like a dead radio. Nothing between the end of RANGE and the
+	 * start of APPLY refreshes anything -- RANGE's own periodic re-broadcast
+	 * (APOS_GW_WINDOW_REFRESH_MS) stops when RANGE does -- and the operator
+	 * is deliberately told (docs/anchor-auto-positioning.md §5) to
+	 * tape-measure the solved distances before applying, which takes minutes
+	 * against a 60 s APOS_NODE_REFRESH_S and a 120 s APOS_GW_WINDOW_S.
+	 * handle_setpos() would then refuse every SETPOS (its session check
+	 * compares against a window_session that has been lazily zeroed by an
+	 * expiring window) and apply would end with every anchor failed.
 	 *
 	 * Sent with the SAME session, so handle_survey_begin() re-opens on it
 	 * and every later SETPOS matches. It costs one extra frame and one
@@ -1039,11 +1198,11 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 		apply_reopen = false;
 		send_survey_begin(seq);
 		/* Enough for the worst-case enumeration stagger
-		 * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 240 ms) to drain
-		 * before the first SETPOS competes with it on the air. Not
-		 * retried on TX failure: a SETPOS refused for a closed window is
-		 * already reported per anchor, loudly, by the retry path below. */
-		next_action_ms = now + APOS_GW_APPLY_SETTLE_MS;
+		 * (APOS_ENUM_WINDOW_MS) to drain before the first SETPOS
+		 * competes with it on the air. Not retried on TX failure: a
+		 * SETPOS refused for a closed window is already reported per
+		 * anchor, loudly, by the retry path below. */
+		next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
 		return;
 	}
 
@@ -1253,22 +1412,32 @@ static void step_enum(uint8_t *seq)
 			return;
 		}
 
-		pair_total = (uint16_t)tbl.n_peers *
-			     (uint16_t)(tbl.n_peers - 1u);
+		pair_raw_total = (uint16_t)tbl.n_peers *
+				 (uint16_t)(tbl.n_peers - 1u);
+		/* Only the CANDIDATE pairs are commanded, so that -- not the
+		 * raw 992 at 32 anchors -- is the work this run will actually
+		 * do, and the number `apos show` reports progress against. */
+		pair_total = apos_table_candidate_pairs(&tbl);
+		pair_cursor = 0;
 		pair_idx = 0;
 		pair_retries = 0;
 		tx_fails = 0;
 		awaiting_rsp = false;
 		next_action_ms = 0;
+		/* Full interval, not 0: ENUM has just broadcast SURVEY_BEGIN
+		 * APOS_GW_ENUM_ROUNDS times, so every window is as fresh as it
+		 * gets and an immediate re-broadcast would only cost a settle
+		 * interval. */
+		next_window_ms = now + APOS_GW_WINDOW_REFRESH_MS;
 		phase = APOS_GW_RANGE;
-		LOG_INF("{\"apos\":\"ranging\",\"ordered_pairs\":%u}",
-			pair_total);
+		LOG_INF("{\"apos\":\"ranging\",\"ordered_pairs\":%u,"
+			"\"of_possible\":%u}", pair_total, pair_raw_total);
 		return;
 	}
 
 	send_survey_begin(seq);
 	enum_round++;
-	next_action_ms = now + APOS_GW_ENUM_GAP_MS;
+	next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
 }
 
 void apos_gw_step(uint32_t avail_uus, uint8_t *seq)

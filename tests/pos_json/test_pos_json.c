@@ -238,9 +238,12 @@ static void test_anchors_emits_the_surveyed_geometry(void)
         "]}") == 0);
 }
 
-/* Node counts APOS_MIN_NODES_3D-1 (1, 3, 8) are exercised elsewhere; fill in the
- * untested middle of the range (4..8) so the comma logic isn't only proven at
- * the edges. */
+/* Node counts 1, 2, 3 and APOS_MAX_NODES are exercised elsewhere; sweep the
+ * whole middle of the range (4..APOS_MAX_NODES) so the comma logic isn't only
+ * proven at the edges. At APOS_MAX_NODES = 32 that is a 32-iteration sweep
+ * rather than the 5 it used to be, which is also the cheapest way to catch a
+ * POS_JSON_MAX_LEN that is short for some node count but not for the largest --
+ * every iteration asserts n > 0. */
 static void test_anchors_well_formed_across_node_counts(void)
 {
     for (uint8_t count = 4; count <= APOS_MAX_NODES; count++) {
@@ -345,8 +348,16 @@ static void test_anchors_without_a_geo_reference(void)
     CHECK(strstr(buf, "\"isReferenceAxis\":true") != NULL);
 }
 
-/* POS_JSON_MAX_LEN must still hold the largest real document, which is now a
- * full APOS_MAX_NODES survey rather than the four-anchor stub. */
+/* POS_JSON_MAX_LEN must hold the largest real document, which at
+ * APOS_MAX_NODES = 32 is ~4.9 kB rather than the 1.5 kB an 8-node survey
+ * needed. Every field is set to the widest value it can legitimately hold:
+ * five-digit short addresses (a uint16_t on the wire), "false" for both flags
+ * on every non-reference node, the extreme lat/long `apos ref` still accepts
+ * (-90 / -180), and coordinates well past any real site.
+ *
+ * The margin is asserted too, not just "it fit". POS_JSON_MAX_LEN is derived
+ * per-anchor in pos_json.h and a buffer that fits with two bytes to spare is
+ * one coordinate digit away from refusing the whole retained document. */
 static void test_full_survey_fits_the_buffer(void)
 {
     char buf[POS_JSON_MAX_LEN];
@@ -356,17 +367,27 @@ static void test_full_survey_fits_the_buffer(void)
     s.valid = true;
     s.n_nodes = APOS_MAX_NODES;
     for (uint8_t k = 0; k < APOS_MAX_NODES; k++) {
-        s.node[k].short_addr = (uint16_t)(0x0001 + k);
-        /* Widest plausible values, so the check is on the real worst case. */
-        s.node[k].x = -123.456f;
-        s.node[k].y = -123.456f;
-        s.node[k].z = -123.456f;
+        /* Not 0x0001 + k: the format is "%03u" of a uint16_t, so the widest
+         * an address can print is five digits, and a real deployment's
+         * 0x0001..0x0020 would only ever exercise three. */
+        s.node[k].short_addr = (uint16_t)(60000u + k);
+        s.node[k].x = -98765.43f;
+        s.node[k].y = -98765.43f;
+        s.node[k].z = -98765.43f;
     }
-    s.ref_lat = -89.123456;
-    s.ref_lon = -179.123456;
+    s.ref_lat = -90.0;
+    s.ref_lon = -180.0;
     s.ref_valid = true;
 
-    CHECK(pos_json_anchors(buf, sizeof(buf), &s) > 0);
+    int n = pos_json_anchors(buf, sizeof(buf), &s);
+
+    CHECK(n > 0);
+    CHECK(n == (int)strlen(buf));
+    /* At least 5 % of the buffer still free at the documented worst case. */
+    CHECK(n < (int)(POS_JSON_MAX_LEN - POS_JSON_MAX_LEN / 20));
+    /* And it really is the big document, not an early return. */
+    CHECK(strstr(buf, "\"latitude\":-90.00000000") != NULL);
+    CHECK(strstr(buf, "\"longitude\":-180.00000000") != NULL);
 }
 
 /* A survey too large for the buffer must be REFUSED, not truncated: half a JSON

@@ -191,9 +191,14 @@ below appear in the monitor rather than under your prompt.
 apos enum
 ```
 
-`SURVEY_BEGIN` is broadcast `APOS_GW_ENUM_ROUNDS` (3) times, 400 ms apart, and
-each anchor replies in an EUI-64-hashed stagger slot. Expect one line per anchor
-and then the summary:
+`SURVEY_BEGIN` is broadcast `APOS_GW_ENUM_ROUNDS` (8) times,
+`APOS_GW_ENUM_SETTLE_MS` (828 ms) apart, and each anchor replies in an
+EUI-64-hashed stagger slot drawn from `APOS_ENUM_SLOTS` (64). Enumeration
+therefore takes ~6.6 s; see `apos_node.h` for why the slot and round counts are
+what they are at 32 anchors. Each reply also carries the peers that anchor
+*heard*, which is what the gateway's candidate-pair filter runs on — a `run`
+ranges only pairs with adjacency evidence, not all `N*(N-1)`. Expect one line
+per anchor and then the summary:
 
 ```
 {"apos":"enumerating","session":41337}
@@ -292,12 +297,14 @@ apos apply
 ```
 
 Apply first re-broadcasts one `SURVEY_BEGIN` on the **same session**, then
-settles for `APOS_GW_APPLY_SETTLE_MS` (400 ms) before the first `SETPOS`. That
+settles for `APOS_GW_ENUM_SETTLE_MS` (828 ms) before the first `SETPOS`. That
 re-opens every anchor's survey window: a window is refreshed only by an
 in-session `SETPOS` or `RANGE_CMD` addressed to that anchor, the last
 `RANGE_CMD` an anchor sees can be near the *start* of the ranging phase, and
 `APOS_NODE_REFRESH_S` is 60 s — far less than the time §4.4 tells you to spend
-with a tape measure. Without the re-broadcast every `SETPOS` in the array would
+with a tape measure. (During the ranging phase itself the gateway keeps every
+window alive with its own periodic re-broadcast, `APOS_GW_WINDOW_REFRESH_MS`;
+that stops when ranging does.) Without the re-broadcast every `SETPOS` would
 be refused. The staggered `ENUM_RSP` replies the re-broadcast provokes are
 discarded by the gateway (its enumeration handler is phase-guarded).
 

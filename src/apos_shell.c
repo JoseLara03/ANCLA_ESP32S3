@@ -198,15 +198,24 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 	if (st.have_result) {
 		int32_t recip = -1;
 		uint16_t sd = 0;
+		const struct apos_rigidity *rg = apos_gw_result_rigidity();
 
 		apos_gw_result_quality(&recip, &sd);
 		/* The ranging-quality pair, printed unconditionally alongside
-		 * the result: on a four-anchor array these are the only numbers
-		 * that say anything about the measurements. */
+		 * the result: where the fit cannot judge the ranging these are
+		 * the only numbers that say anything about the measurements. */
 		shell_print(sh, "{\"max_reciprocal_mm\":%d,\"max_sd_mm\":%u,"
 				"\"spare_edges\":%d,\"rms_meaningful\":%u}",
 			    recip, sd, apos_gw_result_redundancy(),
 			    apos_gw_result_unverified() ? 0u : 1u);
+		/* The three conditions behind that one bit, so an operator can
+		 * see WHICH is failing without going back to the run's log. */
+		shell_print(sh, "{\"rigid\":%u,\"connected\":%u,\"components\":%u,"
+				"\"min_degree\":%u,\"min_degree_node\":%u,"
+				"\"edges\":%u,\"free_params\":%d}",
+			    rg->rigid ? 1u : 0u, rg->connected ? 1u : 0u,
+			    rg->n_components, rg->min_degree,
+			    rg->min_degree_node, rg->n_edges, rg->free_params);
 	}
 
 	shell_print(sh, "enumerated (%u):", t->n_peers);
@@ -318,6 +327,7 @@ static void warn_unverified(const struct shell *sh)
 {
 	int32_t recip = -1;
 	uint16_t sd = 0;
+	const struct apos_rigidity *rg = apos_gw_result_rigidity();
 
 	if (!apos_gw_result_unverified()) {
 		return;
@@ -325,19 +335,41 @@ static void warn_unverified(const struct shell *sh)
 
 	apos_gw_result_quality(&recip, &sd);
 
-	shell_warn(sh, "WARNING: this survey is UNVERIFIED. The mesh has %d "
-		       "spare edge(s) (usable edges minus 3N-6), so the fit "
-		       "reproduced the ranges exactly and rms/worst came back "
-		       "at ~0 however bad the ranging was.",
-		   apos_gw_result_redundancy());
-	/* Deliberately NOT "add a fifth anchor". UWB_MAX_ANCHORS is 4 and
-	 * `anchor id` is bounded 0..3, so there is no fifth anchor an operator
-	 * can add -- see apos_gw_result_unverified(). Point them at numbers
-	 * that are real on the array they have instead. */
+	/* Which of the three conditions failed, because the remedy is different
+	 * for each -- and unlike the old four-anchor-only world, there IS a
+	 * remedy now: UWB_MAX_ANCHORS is 32, so "not enough anchors in range of
+	 * each other" is genuinely actionable rather than a dead end. */
+	if (!rg->connected) {
+		shell_warn(sh, "WARNING: this survey is UNVERIFIED — the mesh "
+			       "is in %u DISCONNECTED pieces. Anchors that "
+			       "cannot hear each other have no measured "
+			       "relationship, so their relative placement is "
+			       "invented. Move an anchor into line of sight of "
+			       "both groups and re-run.",
+			   rg->n_components);
+	} else if (!rg->degree_ok) {
+		enum apos_geom_dim dim = apos_gw_result()->dim;
+
+		shell_warn(sh, "WARNING: this survey is UNVERIFIED — node %u has "
+			       "only %u measured edge(s), fewer than the %d a "
+			       "%s solve needs to pin a node at all. It has been "
+			       "placed somewhere regardless. Bring more anchors "
+			       "into range of it, or check why its pairs did not "
+			       "range.",
+			   rg->min_degree_node, rg->min_degree,
+			   apos_geom_dims(dim),
+			   (dim == APOS_GEOM_2D) ? "2D" : "3D");
+	} else {
+		shell_warn(sh, "WARNING: this survey is UNVERIFIED. The mesh has "
+			       "%d spare edge(s) (%u usable edges minus %d free "
+			       "parameters), so the fit reproduced the ranges "
+			       "exactly and rms/worst came back at ~0 however "
+			       "bad the ranging was.",
+			   apos_gw_result_redundancy(), rg->n_edges,
+			   rg->free_params);
+	}
 	shell_warn(sh, "A PASS here means only that nothing contradicted the "
-		       "ranges — NOT that they are correct. rms is not a check "
-		       "on this array and no anchor count you can configure "
-		       "makes it one.");
+		       "ranges — NOT that they are correct.");
 	shell_warn(sh, "Read these instead: max_reciprocal_mm=%d (largest "
 		       "|A->B minus B->A|, -1 if no pair was measured both "
 		       "ways) and max_sd_mm=%u. They make the RANGING "
