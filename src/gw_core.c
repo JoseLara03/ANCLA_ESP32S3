@@ -523,13 +523,16 @@ bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
      * above, so it reaches here as if brand-new -- but if this EUI's old
      * address is still remembered in addr_map, hand it back instead of
      * drawing a fresh one from the monotonic pool. The defensive
-     * find_seat_by_addr() check guards against that remembered address
-     * somehow being live under a DIFFERENT EUI right now; this should be
-     * unreachable in practice, since alloc_short_addr() never hands out an
-     * address find_seat_by_addr() reports live, and addr_map only ever
-     * records addresses this function itself allocated -- but the check costs
-     * one bounded scan and turns "should never happen" into "provably never
-     * assigned twice" rather than trusting the invariant silently. */
+     * find_seat_by_addr() check guards against address-pool wraparound: after
+     * enough JOIN churn, alloc_short_addr()'s monotonic counter wraps at
+     * 0xFFFE back to GW_TAG_ADDR_BASE. It only checks that an address isn't
+     * currently held by a live seat; if an old EUI's seat fully expired
+     * without rejoining, its map entry survives, and the wrapped-around counter
+     * can validly hand that same address to a brand-new EUI. The check catches
+     * this scenario by re-verifying the remembered address isn't currently
+     * seated elsewhere, turning "stale map entry meets wrapped counter" into
+     * "provably never assigned twice at the same time" rather than relying on
+     * that invariant silently. */
     uint16_t addr;
     uint16_t remembered;
     int live_p, live_s;
