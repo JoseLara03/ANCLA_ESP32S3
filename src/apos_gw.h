@@ -350,8 +350,9 @@ bool apos_gw_accepted(void);
  * check on the ranging.
  *
  * Exactly the negation of apos_geom_rigidity()'s `redundant` over the edge list
- * the solve ran on, so it is true for any of THREE distinct reasons and the
- * `apos_solve` JSON says which:
+ * the solve ran on, so it is true for any of THREE distinct reasons. The
+ * `apos_rigidity` JSON line (and `apos show`) carries all three, and the
+ * warning that follows a run names whichever one fired:
  *
  *   - the framework is DISCONNECTED (rigidity.n_components > 1) -- two groups of
  *     anchors that cannot hear each other have no measured relationship, so
