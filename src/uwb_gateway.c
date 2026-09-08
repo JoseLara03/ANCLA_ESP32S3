@@ -238,11 +238,11 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 			return;
 		}
 		if (!gw_core_join(ctx, eui, req_tier, &g)) {
-			LOG_WRN("JOIN refused — all %u seats occupied", GW_N_CFP);
+			LOG_WRN("JOIN refused — all %u seats occupied", GW_MAX_SEATS);
 			return;
 		}
-		LOG_INF("GRANT addr=0x%04X slot=%u tier=%u lease=%u",
-			g.short_addr, g.slot_index, g.tier, g.lease);
+		LOG_INF("GRANT addr=0x%04X phase=%u slot=%u tier=%u lease=%u",
+			g.short_addr, g.phase, g.slot_index, g.tier, g.lease);
 		send_grant(eui, &g, rx_ts);
 	} else if (uwb_frame_is_keepalive(buf, len)) {
 		uint16_t sa = 0;
