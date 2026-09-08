@@ -17,11 +17,16 @@
 #define UWB_FRAME_TYPE_KEEPALIVE 0xE8
 #define UWB_FRAME_TYPE_RELEASE   0xE9
 #define UWB_FRAME_TYPE_POS       0xEA
+#define UWB_FRAME_TYPE_ALERT     0xEB
+#define UWB_FRAME_TYPE_ANNOUNCE  0xEC
+#define UWB_FRAME_TYPE_MPOL_RESP 0xED
 
 #define UWB_ADDR_GATEWAY  0x0000u
 #define UWB_ADDR_UNASSOC  0xFFFEu   /* tag src before it is granted a short addr */
 
-#define UWB_PROTO_VER     2
+#define UWB_PROTO_VER     3  /* v3: network-scaling (grouped discovery, ANNOUNCE,
+                               * MULTI-POLL, phase-mask GRANT). Bumped once every
+                               * frame change has landed on both tag and anchor. */
 #define UWB_FRAME_N_CFP   11        /* ranging slots per superframe (v2) */
 #define UWB_FRAME_N_CAP   4         /* CAP Aloha mini-slots (v1) */
 
@@ -30,8 +35,14 @@
 #define UWB_FRAME_MAX_ANCHORS 4
 
 #define UWB_FRAME_HDR_LEN     10  /* bytes 0-9 common header */
-#define UWB_FRAME_LEN_DISC    14
+#define UWB_FRAME_LEN_DISC    16
 #define UWB_FRAME_LEN_RESP    20
+
+/* Grouped DISCOVERY: a round covers one group of the anchor population so the
+ * collection window stays bounded as the anchor count grows past 4. Value
+ * tied to ceil(UWB_MAX_ANCHORS / 4) on the anchor side -- 32 anchors, 4 per
+ * group, 8 groups. */
+#define UWB_FRAME_DISC_N_GROUPS_MAX 8
 #define UWB_FRAME_MAX_LEN     37  /* BEACON with 11 slots, excl. FCS */
 
 /* Multi-poll is variable length: header(10) + num(1) + n*(addr2+delay2) + ts(4). */
@@ -39,7 +50,7 @@
 
 #define UWB_FRAME_LEN_BEACON     (15 + 2 * UWB_FRAME_N_CFP)
 #define UWB_FRAME_LEN_JOIN       19
-#define UWB_FRAME_LEN_GRANT      24
+#define UWB_FRAME_LEN_GRANT      26  /* v3: +2 bytes, phase_mask (network-scaling Phase 3) */
 #define UWB_FRAME_LEN_KEEPALIVE  12
 #define UWB_FRAME_LEN_RELEASE    10
 #define UWB_FRAME_EUI_LEN        8
@@ -50,6 +61,49 @@
 #define UWB_FRAME_POS_SOC_UNKNOWN 0xFFu
 #define UWB_FRAME_LEN_POS        24
 
+/* ---- ALERT (0xEB): HELP/CANCEL, tag/anchor -> gateway --------------------
+ * See spec/2026-08-16-uwb-help-alert-design.md §2/§3 for the field
+ * semantics (epoch/repeat_seq/ttl/sender_hop ordering and the reserved
+ * `state` bits). UWB_FRAME_LEN_ALERT (34) <= UWB_FRAME_MAX_LEN (37). */
+#define UWB_ALERT_STATE_CANCEL 0x00u
+#define UWB_ALERT_STATE_HELP   0x01u
+#define UWB_ALERT_STATE_RESERVED_MASK 0xFEu   /* bits1-7, must be 0 */
+#define UWB_ALERT_HOP_UNKNOWN  0xFFu
+#define UWB_ALERT_TTL_INIT     6
+#define UWB_FRAME_LEN_ALERT    34
+
+/* ---- ANNOUNCE (0xEC): passive anchor beacon-followup, anchor -> tag -----
+ * Broadcast in the T_ANNOUNCE_MS window right after a beacon; lets a tag
+ * learn anchor position/quality without running discovery. UWB_FRAME_LEN_ANNOUNCE
+ * (30) <= UWB_FRAME_MAX_LEN (37). z may be NaN (anchor has no height set). */
+#define UWB_FRAME_LEN_ANNOUNCE 30
+
+struct uwb_announce {
+    uint16_t addr;
+    float    x, y, z;      /* z may be NaN: anchor did not report a height */
+    int32_t  cir_power;
+    uint16_t cir_quality;
+};
+
+/* ---- MPOL_RESP (0xED): addressed multi-poll ranging response, anchor -> tag
+ * See spec/2026-09-07-network-scaling-design.md §3.D for the byte layout.
+ * dest = the polling tag's short address, src = the anchor's -- a real
+ * header, unlike the legacy WAVE frames. z may be NaN (anchor has no height
+ * configured); pos_solver falls back to pos_cfg's single dz in that case. */
+#define UWB_FRAME_LEN_MPOL_RESP 31
+
+struct uwb_alert {
+    uint8_t  state;        /* bit0 HELP/CANCEL; bits1-7 reserved, must be 0 */
+    uint8_t  epoch;
+    uint8_t  repeat_seq;
+    uint8_t  sender_hop;
+    uint8_t  ttl;
+    uint8_t  orig_eui[8];
+    uint16_t orig_addr;
+    uint8_t  batt_soc;
+    float    last_x, last_y;   /* NaN when the tag has no fix */
+};
+
 struct uwb_anchor_slot {
     uint16_t addr;      /* anchor short address */
     uint16_t delay_us;  /* staggered response delay, microseconds */
@@ -57,7 +111,8 @@ struct uwb_anchor_slot {
 
 /* ---- Builders: return bytes written (excl. FCS), or negative errno ---- */
 int uwb_frame_discovery_build(uint8_t *buf, size_t buf_len,
-                              uint16_t src_addr, uint32_t tx_ts);
+                              uint16_t src_addr, uint32_t tx_ts,
+                              uint8_t group, uint8_t n_groups);
 int uwb_frame_multipoll_build(uint8_t *buf, size_t buf_len,
                               uint16_t src_addr,
                               const struct uwb_anchor_slot *slots,
@@ -68,6 +123,9 @@ int uwb_frame_response_build(uint8_t *buf, size_t buf_len,
                              uint16_t cir_quality);
 
 /* ---- Parsers: return 0 on success, negative errno on bad frame ---- */
+int uwb_frame_parse_discovery(const uint8_t *buf, size_t len,
+                              uint16_t *src_addr, uint32_t *tx_ts,
+                              uint8_t *group, uint8_t *n_groups);
 int uwb_frame_parse_discovery_response(const uint8_t *buf, size_t len,
                                        uint16_t *src_addr,
                                        int32_t *cir_power,
@@ -90,11 +148,16 @@ int uwb_frame_join_build(uint8_t *buf, size_t buf_len, const uint8_t eui[8], uin
 int uwb_frame_parse_join(const uint8_t *buf, size_t len, uint8_t eui_out[8], uint8_t *req_tier);
 bool uwb_frame_is_join(const uint8_t *buf, size_t len);
 
-/* ---- GRANT frame builders and parsers ---- */
+/* ---- GRANT frame builders and parsers ----
+ * phase_mask (v3): bits over a UWB_NET_CYCLE_C-superframe cycle (uwb_net.h)
+ * naming which superframes this tag actually participates in -- a grant is
+ * (slot, phase_mask), not a permanent every-superframe seat. */
 int uwb_frame_grant_build(uint8_t *buf, size_t buf_len, const uint8_t eui[8],
-                          uint16_t short_addr, uint8_t slot_index, uint8_t rate_tier, uint16_t lease);
+                          uint16_t short_addr, uint8_t slot_index, uint8_t rate_tier,
+                          uint16_t lease, uint16_t phase_mask);
 int uwb_frame_parse_grant(const uint8_t *buf, size_t len, uint8_t eui_out[8],
-                          uint16_t *short_addr, uint8_t *slot_index, uint8_t *rate_tier, uint16_t *lease);
+                          uint16_t *short_addr, uint8_t *slot_index, uint8_t *rate_tier,
+                          uint16_t *lease, uint16_t *phase_mask);
 bool uwb_frame_is_grant(const uint8_t *buf, size_t len);
 
 /* ---- KEEPALIVE and RELEASE frame builders and parsers ---- */
@@ -114,6 +177,31 @@ bool uwb_frame_is_pos(const uint8_t *buf, size_t len);
 int  uwb_frame_parse_pos(const uint8_t *buf, size_t len, uint16_t *src_addr,
                          float *x, float *y, float *residual_m,
                          uint8_t *n_anchors, uint8_t *batt_soc);
+
+/* ---- ALERT (0xEB) builder / parser / validator ---- */
+int  uwb_frame_alert_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                           const struct uwb_alert *a);
+bool uwb_frame_is_alert(const uint8_t *buf, size_t len);
+int  uwb_frame_parse_alert(const uint8_t *buf, size_t len, struct uwb_alert *a);
+
+/* ---- ANNOUNCE (0xEC) builder (anchor) / parser (tag) / validator ---- */
+int  uwb_frame_announce_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                              const struct uwb_announce *a);
+bool uwb_frame_is_announce(const uint8_t *buf, size_t len);
+int  uwb_frame_parse_announce(const uint8_t *buf, size_t len, struct uwb_announce *a);
+
+/* ---- MPOL_RESP (0xED) builder (anchor) / parser (tag) / validator ---- */
+int  uwb_frame_mpol_resp_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                               uint16_t dest_addr, uint8_t anchor_id,
+                               uint32_t poll_rx_ts, uint32_t resp_tx_ts,
+                               float x, float y, float z);
+bool uwb_frame_is_mpol_resp(const uint8_t *buf, size_t len);
+/* dest_addr: the tag's own short address, checked against the frame's dest
+ * field -- rejects a response that was actually addressed to another tag. */
+int  uwb_frame_parse_mpol_resp(const uint8_t *buf, size_t len, uint16_t dest_addr,
+                               uint16_t *src_addr, uint8_t *anchor_id,
+                               uint32_t *poll_rx_ts, uint32_t *resp_tx_ts,
+                               float *x, float *y, float *z);
 
 /* ---- Validators ---- */
 bool uwb_frame_is_valid(const uint8_t *buf, size_t len);

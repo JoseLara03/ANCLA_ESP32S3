@@ -16,6 +16,8 @@
 #define OFF_SRC        7   /* bytes 7-8 */
 #define OFF_TYPE       9
 #define OFF_DISC_TS    10  /* bytes 10-13 */
+#define OFF_DISC_GROUP 14
+#define OFF_DISC_NGRP  15
 #define OFF_RESP_TS    10  /* bytes 10-13 */
 #define OFF_RESP_CIRP  14  /* bytes 14-17 */
 #define OFF_RESP_CIRQ  18  /* bytes 18-19 */
@@ -26,6 +28,28 @@
 #define OFF_POS_RES    18  /* bytes 18-21 */
 #define OFF_POS_NANCH  22
 #define OFF_POS_SOC    23
+#define OFF_AL_STATE   10
+#define OFF_AL_EPOCH   11
+#define OFF_AL_REP     12
+#define OFF_AL_HOP     13
+#define OFF_AL_TTL     14
+#define OFF_AL_EUI     15  /* bytes 15-22 */
+#define OFF_AL_ADDR    23  /* bytes 23-24 */
+#define OFF_AL_SOC     25
+#define OFF_AL_X       26  /* bytes 26-29 */
+#define OFF_AL_Y       30  /* bytes 30-33 */
+#define OFF_AN_ADDR    10  /* bytes 10-11 */
+#define OFF_AN_X       12  /* bytes 12-15 */
+#define OFF_AN_Y       16  /* bytes 16-19 */
+#define OFF_AN_Z       20  /* bytes 20-23 */
+#define OFF_AN_CIRP    24  /* bytes 24-27 */
+#define OFF_AN_CIRQ    28  /* bytes 28-29 */
+#define OFF_MR_AID     10
+#define OFF_MR_POLLTS  11  /* bytes 11-14 */
+#define OFF_MR_RESPTS  15  /* bytes 15-18 */
+#define OFF_MR_X       19  /* bytes 19-22 */
+#define OFF_MR_Y       23  /* bytes 23-26 */
+#define OFF_MR_Z       27  /* bytes 27-30 */
 
 /* ---- Little-endian field helpers ---- */
 static void put_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
@@ -70,12 +94,17 @@ static int write_hdr(uint8_t *buf, size_t buf_len, size_t need,
 
 /* ---- Builders ---- */
 int uwb_frame_discovery_build(uint8_t *buf, size_t buf_len,
-                              uint16_t src_addr, uint32_t tx_ts)
+                              uint16_t src_addr, uint32_t tx_ts,
+                              uint8_t group, uint8_t n_groups)
 {
+    if (n_groups == 0 || n_groups > UWB_FRAME_DISC_N_GROUPS_MAX) return -EINVAL;
+    if (group >= n_groups) return -EINVAL;
     int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_DISC,
                        UWB_FRAME_ADDR_BCAST, src_addr, UWB_FRAME_TYPE_DISC);
     if (rc) return rc;
     put_u32(&buf[OFF_DISC_TS], tx_ts);
+    buf[OFF_DISC_GROUP] = group;
+    buf[OFF_DISC_NGRP]  = n_groups;
     return UWB_FRAME_LEN_DISC;
 }
 
@@ -118,6 +147,27 @@ int uwb_frame_response_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
 }
 
 /* ---- Parsers ---- */
+int uwb_frame_parse_discovery(const uint8_t *buf, size_t len,
+                              uint16_t *src_addr, uint32_t *tx_ts,
+                              uint8_t *group, uint8_t *n_groups)
+{
+    if (!buf || !src_addr || !tx_ts || !group || !n_groups) {
+        return -EINVAL;
+    }
+    if (!uwb_frame_is_discovery(buf, len)) {
+        return -EBADMSG;
+    }
+    uint8_t ng = buf[OFF_DISC_NGRP];
+    uint8_t g  = buf[OFF_DISC_GROUP];
+    if (ng == 0 || ng > UWB_FRAME_DISC_N_GROUPS_MAX) return -EINVAL;
+    if (g >= ng) return -EINVAL;
+    *src_addr  = get_u16(&buf[OFF_SRC]);
+    *tx_ts     = get_u32(&buf[OFF_DISC_TS]);
+    *group     = g;
+    *n_groups  = ng;
+    return 0;
+}
+
 int uwb_frame_parse_discovery_response(const uint8_t *buf, size_t len,
                                        uint16_t *src_addr, int32_t *cir_power,
                                        uint16_t *cir_quality)
@@ -283,7 +333,8 @@ int uwb_frame_parse_join(const uint8_t *buf, size_t len, uint8_t eui_out[8], uin
 /* ---- GRANT frame support ---- */
 
 int uwb_frame_grant_build(uint8_t *buf, size_t buf_len, const uint8_t eui[8],
-                          uint16_t short_addr, uint8_t slot_index, uint8_t rate_tier, uint16_t lease)
+                          uint16_t short_addr, uint8_t slot_index, uint8_t rate_tier,
+                          uint16_t lease, uint16_t phase_mask)
 {
     int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_GRANT, UWB_FRAME_ADDR_BCAST,
                        UWB_ADDR_GATEWAY, UWB_FRAME_TYPE_GRANT);
@@ -294,6 +345,7 @@ int uwb_frame_grant_build(uint8_t *buf, size_t buf_len, const uint8_t eui[8],
     buf[20] = slot_index;
     buf[21] = rate_tier;
     put_u16(&buf[22], lease);
+    put_u16(&buf[24], phase_mask);
     return UWB_FRAME_LEN_GRANT;
 }
 
@@ -304,7 +356,8 @@ bool uwb_frame_is_grant(const uint8_t *buf, size_t len)
 }
 
 int uwb_frame_parse_grant(const uint8_t *buf, size_t len, uint8_t eui_out[8],
-                          uint16_t *short_addr, uint8_t *slot_index, uint8_t *rate_tier, uint16_t *lease)
+                          uint16_t *short_addr, uint8_t *slot_index, uint8_t *rate_tier,
+                          uint16_t *lease, uint16_t *phase_mask)
 {
     if (!uwb_frame_is_grant(buf, len)) return -EINVAL;
     if (eui_out)   memcpy(eui_out, &buf[10], UWB_FRAME_EUI_LEN);
@@ -312,6 +365,7 @@ int uwb_frame_parse_grant(const uint8_t *buf, size_t len, uint8_t eui_out[8],
     if (slot_index) *slot_index = buf[20];
     if (rate_tier)  *rate_tier = buf[21];
     if (lease)      *lease = get_u16(&buf[22]);
+    if (phase_mask) *phase_mask = get_u16(&buf[24]);
     return 0;
 }
 
@@ -392,5 +446,133 @@ int uwb_frame_parse_pos(const uint8_t *buf, size_t len, uint16_t *src_addr,
     if (residual_m) *residual_m = get_f32(&buf[OFF_POS_RES]);
     if (n_anchors)  *n_anchors  = buf[OFF_POS_NANCH];
     if (batt_soc)   *batt_soc   = buf[OFF_POS_SOC];
+    return 0;
+}
+
+/* ---- ALERT frame support ---- */
+
+int uwb_frame_alert_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                          const struct uwb_alert *a)
+{
+    if (!a) return -EINVAL;
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_ALERT, UWB_ADDR_GATEWAY,
+                       src_addr, UWB_FRAME_TYPE_ALERT);
+    if (rc) return rc;
+    buf[OFF_AL_STATE] = a->state;
+    buf[OFF_AL_EPOCH] = a->epoch;
+    buf[OFF_AL_REP]   = a->repeat_seq;
+    buf[OFF_AL_HOP]   = a->sender_hop;
+    buf[OFF_AL_TTL]   = a->ttl;
+    memcpy(&buf[OFF_AL_EUI], a->orig_eui, UWB_FRAME_EUI_LEN);
+    put_u16(&buf[OFF_AL_ADDR], a->orig_addr);
+    buf[OFF_AL_SOC] = a->batt_soc;
+    put_f32(&buf[OFF_AL_X], a->last_x);
+    put_f32(&buf[OFF_AL_Y], a->last_y);
+    return UWB_FRAME_LEN_ALERT;
+}
+
+bool uwb_frame_is_alert(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_ALERT && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_ALERT;
+}
+
+int uwb_frame_parse_alert(const uint8_t *buf, size_t len, struct uwb_alert *a)
+{
+    if (!a) return -EINVAL;
+    if (!uwb_frame_is_alert(buf, len)) return -EINVAL;
+    if (buf[OFF_AL_STATE] & UWB_ALERT_STATE_RESERVED_MASK) return -EINVAL;
+
+    a->state       = buf[OFF_AL_STATE];
+    a->epoch       = buf[OFF_AL_EPOCH];
+    a->repeat_seq  = buf[OFF_AL_REP];
+    a->sender_hop  = buf[OFF_AL_HOP];
+    a->ttl         = buf[OFF_AL_TTL];
+    memcpy(a->orig_eui, &buf[OFF_AL_EUI], UWB_FRAME_EUI_LEN);
+    a->orig_addr   = get_u16(&buf[OFF_AL_ADDR]);
+    a->batt_soc    = buf[OFF_AL_SOC];
+    a->last_x      = get_f32(&buf[OFF_AL_X]);
+    a->last_y      = get_f32(&buf[OFF_AL_Y]);
+    return 0;
+}
+
+/* ---- ANNOUNCE frame support ---- */
+
+int uwb_frame_announce_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                             const struct uwb_announce *a)
+{
+    if (!a) return -EINVAL;
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_ANNOUNCE, UWB_FRAME_ADDR_BCAST,
+                       src_addr, UWB_FRAME_TYPE_ANNOUNCE);
+    if (rc) return rc;
+    put_u16(&buf[OFF_AN_ADDR], a->addr);
+    put_f32(&buf[OFF_AN_X], a->x);
+    put_f32(&buf[OFF_AN_Y], a->y);
+    put_f32(&buf[OFF_AN_Z], a->z);
+    put_u32(&buf[OFF_AN_CIRP], (uint32_t)a->cir_power);
+    put_u16(&buf[OFF_AN_CIRQ], a->cir_quality);
+    return UWB_FRAME_LEN_ANNOUNCE;
+}
+
+bool uwb_frame_is_announce(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_ANNOUNCE && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_ANNOUNCE;
+}
+
+int uwb_frame_parse_announce(const uint8_t *buf, size_t len, struct uwb_announce *a)
+{
+    if (!a) return -EINVAL;
+    if (!uwb_frame_is_announce(buf, len)) return -EINVAL;
+
+    a->addr        = get_u16(&buf[OFF_AN_ADDR]);
+    a->x           = get_f32(&buf[OFF_AN_X]);
+    a->y           = get_f32(&buf[OFF_AN_Y]);
+    a->z           = get_f32(&buf[OFF_AN_Z]);
+    a->cir_power   = (int32_t)get_u32(&buf[OFF_AN_CIRP]);
+    a->cir_quality = get_u16(&buf[OFF_AN_CIRQ]);
+    return 0;
+}
+
+/* ---- MPOL_RESP frame support ---- */
+
+int uwb_frame_mpol_resp_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                              uint16_t dest_addr, uint8_t anchor_id,
+                              uint32_t poll_rx_ts, uint32_t resp_tx_ts,
+                              float x, float y, float z)
+{
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_MPOL_RESP, dest_addr,
+                       src_addr, UWB_FRAME_TYPE_MPOL_RESP);
+    if (rc) return rc;
+    buf[OFF_MR_AID] = anchor_id;
+    put_u32(&buf[OFF_MR_POLLTS], poll_rx_ts);
+    put_u32(&buf[OFF_MR_RESPTS], resp_tx_ts);
+    put_f32(&buf[OFF_MR_X], x);
+    put_f32(&buf[OFF_MR_Y], y);
+    put_f32(&buf[OFF_MR_Z], z);
+    return UWB_FRAME_LEN_MPOL_RESP;
+}
+
+bool uwb_frame_is_mpol_resp(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_MPOL_RESP && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_MPOL_RESP;
+}
+
+int uwb_frame_parse_mpol_resp(const uint8_t *buf, size_t len, uint16_t dest_addr,
+                              uint16_t *src_addr, uint8_t *anchor_id,
+                              uint32_t *poll_rx_ts, uint32_t *resp_tx_ts,
+                              float *x, float *y, float *z)
+{
+    if (!uwb_frame_is_mpol_resp(buf, len)) return -EINVAL;
+    if (get_u16(&buf[OFF_DEST]) != dest_addr) return -EINVAL;
+
+    if (src_addr)    *src_addr    = get_u16(&buf[OFF_SRC]);
+    if (anchor_id)   *anchor_id   = buf[OFF_MR_AID];
+    if (poll_rx_ts)  *poll_rx_ts  = get_u32(&buf[OFF_MR_POLLTS]);
+    if (resp_tx_ts)  *resp_tx_ts  = get_u32(&buf[OFF_MR_RESPTS]);
+    if (x)           *x           = get_f32(&buf[OFF_MR_X]);
+    if (y)           *y           = get_f32(&buf[OFF_MR_Y]);
+    if (z)           *z           = get_f32(&buf[OFF_MR_Z]);
     return 0;
 }
