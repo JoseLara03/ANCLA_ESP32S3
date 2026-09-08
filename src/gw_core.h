@@ -31,14 +31,47 @@
  *      mover four fixes inside 0.8 s and then 2.4 s of silence, which is worse
  *      for its EKF than an even 1.25 Hz.
  *
- * How a tag learns its phase set today: it does NOT come from the GRANT. The
- * tag looks its own short address up in every beacon's slot map
- * (uwb_frame_beacon_find_addr(), tag_testting/src/uwb_net_runner.c) and ranges
- * in whatever superframe names it, so publishing a seat in n phases is by
- * itself sufficient to make the tag range n times per cycle. The deferred
- * GRANT `phase_mask` above is a power optimisation -- it lets a tag sleep
- * through beacons it cannot range in -- not a correctness prerequisite. That
- * is why re-phasing a tag on KEEPALIVE needs no wire change here.
+ * How a tag learns where to range today: NOT from the GRANT. It looks its own
+ * short address up in the slot map of every beacon it receives
+ * (uwb_frame_beacon_find_addr(), called from
+ * tag_testting/src/uwb_net_runner.c:795-805, which sets ev.in_map/ev.map_slot
+ * from the result) and ranges in the CFP slot that names it. That much is
+ * real, and it is how a tag picks up its SLOT without being re-GRANTed.
+ *
+ * What does NOT follow -- and an earlier version of this comment asserted that
+ * it did, wrongly and in the dangerous direction -- is that publishing a tag in
+ * n phases is by itself enough to make it range n times per cycle. A beacon
+ * carries ONE phase's row (uwb_gateway.c's tx_beacon(): frame_counter %
+ * GW_CYCLE_C), and the current tag firmware treats its absence from a beacon
+ * it actually RECEIVED as a reclaimed lease: in both UWB_ST_DISCOVER
+ * (tag_testting/src/uwb_net.c:282-284) and UWB_ST_RANGING (the same file,
+ * :320-322), `if (!ev->in_map)` goes straight to UWB_ST_SCAN on the FIRST such
+ * beacon, with no miss tolerance -- UWB_NET_MISS_MAX guards beacons that never
+ * ARRIVED (UWB_EV_BEACON_MISS), not beacons that arrived without the tag in
+ * them. A FAST tag hears every one of them: tier_defaults in
+ * tag_testting/src/uwb_net.c:17-21 gives FAST listen_skip == 1.
+ *
+ * So a tag holding n < GW_CYCLE_C phases is absent from GW_CYCLE_C - n beacons
+ * per cycle and loses its seat on the first of those. Two things are therefore
+ * genuine FUNCTIONAL prerequisites -- not the power optimisation this comment
+ * used to call them -- before such a grant can be exercised against real tag
+ * firmware:
+ *
+ *   a. the deferred GRANT `phase_mask` (invariant 1 above), so a tag is told
+ *      which phases are its own; and
+ *   b. a tag-side change deriving listen_skip and the in_map test FROM that
+ *      mask -- checking only the beacons of the phases it owns, instead of
+ *      reading absence from any beacon at all as lease loss.
+ *
+ * Scope this honestly: the hazard is a property of publishing one phase per
+ * beacon, which arrived with the phase table itself, NOT of multi-phase
+ * allocation. It already applies to the single-phase grants that predate the
+ * tier ladder below, and holding MORE phases makes a tag absent from FEWER
+ * beacons, not more. Nothing here is unsafe to land -- the allocator and its
+ * host tests are self-contained gateway-side bookkeeping -- but until (a) and
+ * (b) both exist, no phase grant smaller than GW_CYCLE_C should be believed on
+ * air, and a multi-phase one in particular will bounce a tag to SCAN rather
+ * than merely cost it power.
  */
 
 #ifndef GW_CORE_H
@@ -103,17 +136,36 @@
 #define GW_TIER_FAST      2u
 
 /* Phases a tag of each tier may hold. These are CEILINGS, not fixed counts:
- * the allocator starts at the tier's ceiling and halves (8 -> 4 -> 2 -> 1)
- * until it finds that many evenly spread phases actually free at one CFP slot.
- * That is what the plan's "FAST 4 (8 when the budget allows)" reduces to --
- * 8 whenever eight such phases exist, 4 (or 2, or 1) when they do not -- so
- * "budget" is measured by what is genuinely unclaimed, never by evicting
+ * the allocator starts at the tier's ceiling and halves (4 -> 2 -> 1) until it
+ * finds that many evenly spread phases actually free at one CFP slot, so a
+ * shortfall is measured by what is genuinely unclaimed and never by evicting
  * anyone. Halving keeps invariant 2 above exact: every rung divides
  * GW_CYCLE_C. An unrecognised tier byte is treated as IDLE, the direction that
- * cannot let a malformed frame claim eight phases. */
+ * cannot let a malformed frame claim the maximum.
+ *
+ * GW_PHASES_MAX_FAST is 4 -- the plan's "FAST 4". Its parenthetical "(8 when
+ * the budget allows)" is DELIBERATELY NOT IMPLEMENTED: deciding when a budget
+ * allows it needs system-wide occupancy sensing that does not exist here, and
+ * a conservative default is cheap while an early-filled table is not. The
+ * arithmetic behind that choice: GW_MAX_SEATS is GW_CYCLE_C * GW_N_CFP == 176
+ * today (224 only once a deferred task grows GW_N_CFP to 14), while 20
+ * simultaneous FAST tags at 8 phases plus 80 stationary ones at 1 comes to
+ * 240 -- overcommitted even against the eventual 224. And exhaustion does not
+ * gracefully degrade the mover that caused it: this allocator never evicts, so
+ * the cost lands on some unrelated stationary tag whose JOIN is refused
+ * outright (zero fixes), which is strictly worse than the smaller allocation
+ * the mover would have been fine with. 4 phases is 1.25 Hz at a 200 ms
+ * superframe, which the design treats as adequate; 8 is 2.5 Hz, a bonus.
+ * Raising this once real occupancy data justifies it is a one-line change.
+ *
+ * The MECHANISM stays generically capable of any power-of-two n up to
+ * GW_CYCLE_C: nothing in alloc_phases()/find_candidate()/claim() is capped at
+ * 4, and tests/gw_core still pins n == 8 through
+ * gw_core_keepalive_max_for_test() below, so a later raise does not land on
+ * untested code. */
 #define GW_PHASES_MAX_IDLE  1
 #define GW_PHASES_MAX_SLOW  2
-#define GW_PHASES_MAX_FAST  8
+#define GW_PHASES_MAX_FAST  4
 
 _Static_assert(GW_CYCLE_C <= 16,
                "struct gw_grant.phase_mask is 16 bits: GW_CYCLE_C cannot exceed 16");
@@ -200,6 +252,25 @@ bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
 enum gw_keepalive_result gw_core_keepalive(struct gw_core_ctx *c,
                                            uint16_t short_addr, uint8_t req_tier,
                                            struct gw_grant *out);
+
+/* TEST SEAM. Identical to gw_core_keepalive() in every respect -- the same
+ * ladder, the same ownership predicate, the same non-stranding guarantee --
+ * except that the phase ceiling is passed in rather than looked up from the
+ * tier. PRODUCTION CODE MUST NOT CALL THIS: gw_core_keepalive() is what makes
+ * the GW_PHASES_MAX_* ceilings the single place tier policy lives, and a
+ * caller here could hand a tag more phases than its tier allows.
+ *
+ * It exists because GW_PHASES_MAX_FAST is 4, so no tier's ceiling reaches the
+ * ladder's n == 8 rung any more, while the allocator is deliberately still
+ * generic in n (see GW_PHASES_MAX_FAST above). Without this seam, lowering
+ * that ceiling would have silently retired the only coverage of n == 8 and a
+ * later raise back to 8 would be a change to untested code. tests/gw_core is
+ * the only caller; grep for it before adding another. */
+enum gw_keepalive_result gw_core_keepalive_max_for_test(struct gw_core_ctx *c,
+                                                        uint16_t short_addr,
+                                                        uint8_t req_tier,
+                                                        int max_phases,
+                                                        struct gw_grant *out);
 
 /* Free EVERY cell this tag holds, across all phases -- not just the first one
  * found. A multi-phase tag whose other cells survived a release would keep

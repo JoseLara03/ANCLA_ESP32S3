@@ -198,11 +198,21 @@ static void send_grant(const uint8_t eui[UWB_FRAME_EUI_LEN],
 	 *
 	 * g->phase_mask is deliberately NOT sent: the GRANT frame has no field
 	 * for it until a separate, deferred task grows it (and that change has
-	 * to land in the tag's copy of the codec first, since this file is kept
-	 * byte-identical to it). Nothing is lost meanwhile -- the tag derives
-	 * its phase membership from each beacon's slot map, not from the GRANT
-	 * (see gw_core.h). What the tag cannot yet do is skip beacons it has no
-	 * seat in, which is a power cost, not a ranging one. */
+	 * to land in the tag's copy of uwb_frame_802_15_4z.c first, since this
+	 * project's copy is kept byte-identical to it).
+	 *
+	 * That omission is a FUNCTIONAL gap, not a power one. The tag does pick
+	 * its CFP SLOT up from each beacon's slot map rather than from the
+	 * GRANT, which is why a one-phase grant needs no wire change -- but it
+	 * also reads absence from a beacon it RECEIVED as a lost lease and
+	 * drops to UWB_ST_SCAN on the first one, with no miss tolerance
+	 * (tag_testting/src/uwb_net.c:282-284 and :320-322). A beacon publishes
+	 * one phase's row (tx_beacon() above), so until the mask reaches the
+	 * tag AND the tag derives its listen_skip/in_map check from it, a grant
+	 * of more than one phase does not buy a faster fix rate -- it bounces
+	 * the tag back to SCAN. gw_core.h's file comment carries the full
+	 * derivation, including why this is a property of the phase table
+	 * rather than of the tier ladder. */
 	int n = uwb_frame_grant_build(buf, sizeof(buf), eui, g->short_addr,
 				      g->slot_index, g->tier, g->lease);
 	if (n < 0) {
@@ -268,14 +278,19 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 			 * kind of MAC state a "why is this tag reporting at the
 			 * wrong rate" investigation starts from.
 			 *
-			 * The tag needs no GRANT to act on this: it finds its
-			 * own address in each beacon's slot map and ranges in
-			 * whatever superframe names it, so the re-phase is
-			 * already published. A separate, deferred task adds the
-			 * phase mask to the GRANT frame and re-GRANTs here, at
-			 * which point this branch gains a send_grant() -- but
-			 * it needs the tag's EUI, which the KEEPALIVE frame
-			 * does not carry (gw_core_find_eui() would supply it).
+			 * The re-phase IS published in the affected phases'
+			 * beacon slot maps, but that is not enough for the
+			 * tag to act on it: the tag reads absence from any
+			 * beacon it received as a lost lease and drops to
+			 * SCAN (see send_grant() above, and gw_core.h). A
+			 * separate, deferred task adds the phase mask to the
+			 * GRANT frame and re-GRANTs here, at which point this
+			 * branch gains a send_grant() -- but it needs the
+			 * tag's EUI, which the KEEPALIVE frame does not carry
+			 * (gw_core_find_eui() would supply it). Until that
+			 * task and its tag-side counterpart land, a REPHASE
+			 * line records what the gateway decided, not a rate
+			 * change a real tag would survive.
 			 */
 			enum gw_keepalive_result r =
 				gw_core_keepalive(ctx, sa, rt, &g);

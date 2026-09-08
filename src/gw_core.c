@@ -15,8 +15,10 @@
  * The allocator is deliberately non-preemptive: it claims only cells that are
  * free or already the requesting tag's, so no request of any tier can shrink
  * any other tag. The visible cost of that choice is that phases go to whoever
- * asks first -- an early FAST tag can hold eight while a later one is left
- * with one, and enough of them can fill the table until a new JOIN is refused.
+ * asks first -- an early FAST tag can hold GW_PHASES_MAX_FAST while a later
+ * one is left with one, and enough of them can fill the table until a new JOIN
+ * is refused. (That ceiling is 4 rather than 8 partly to bound this very
+ * effect; see GW_PHASES_MAX_FAST in gw_core.h for the capacity arithmetic.)
  * That refusal is loud (uwb_gateway.c logs it) and self-correcting as movers
  * demote to SLOW/IDLE and their KEEPALIVEs hand the excess back, which is why
  * there is no fairness or reservation rule here. Adding one would mean taking
@@ -210,7 +212,7 @@ static int lowest_phase(uint16_t mask)
  * treated as IDLE. That is the direction a malformed frame cannot exploit: the
  * opposite default (the tag's own "unknown reads back FAST", which is the safe
  * direction for a tag deciding how hard to listen) would let one bad byte
- * claim eight phases on a shared table. */
+ * claim a FAST tag's whole allocation on a shared table. */
 static int tier_max_phases(uint8_t tier)
 {
     switch (tier) {
@@ -272,10 +274,13 @@ static bool find_candidate(const struct gw_core_ctx *c, uint16_t addr, int n,
 }
 
 /* Walk DOWN from `max_n` by halving until a candidate of that size is
- * available: 8 -> 4 -> 2 -> 1. This is the whole of "8 when the budget
- * allows" -- the ceiling is attempted first and the fallback is driven purely
- * by what is unclaimed, so no threshold has to be invented and no tag is ever
- * displaced to satisfy a bigger request.
+ * available -- 4 -> 2 -> 1 at today's FAST ceiling, and generically any
+ * power-of-two rung up to GW_CYCLE_C. The tier's ceiling is attempted first
+ * and the fallback is driven purely by what is unclaimed, so no threshold has
+ * to be invented and no tag is ever displaced to satisfy a bigger request.
+ * Nothing here is capped at GW_PHASES_MAX_FAST: raising that constant is all
+ * it takes to use a higher rung, and tests/gw_core keeps n == 8 covered
+ * meanwhile (see gw_core_keepalive_max_for_test()).
  *
  * The ladder ALWAYS succeeds for a tag that already holds a cell: at n == 1
  * stride is GW_CYCLE_C, pass 1 of find_candidate() tries (pref_base,
@@ -434,9 +439,14 @@ bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
     return true;
 }
 
-enum gw_keepalive_result gw_core_keepalive(struct gw_core_ctx *c,
-                                           uint16_t short_addr, uint8_t req_tier,
-                                           struct gw_grant *out)
+/* The whole of gw_core_keepalive(), with the phase ceiling supplied by the
+ * caller instead of looked up from the tier. Both public entry points below
+ * are one line each over this, so the tier-driven production path and the
+ * explicit-ceiling test path cannot drift apart. */
+static enum gw_keepalive_result keepalive_with_max(struct gw_core_ctx *c,
+                                                   uint16_t short_addr,
+                                                   uint8_t req_tier, int max_n,
+                                                   struct gw_grant *out)
 {
     int phase, slot;
     uint8_t eui[UWB_FRAME_EUI_LEN];
@@ -449,8 +459,7 @@ enum gw_keepalive_result gw_core_keepalive(struct gw_core_ctx *c,
      * in the seats, and every cell of the winning set needs its own copy. */
     memcpy(eui, c->seats[phase][slot].eui, UWB_FRAME_EUI_LEN);
 
-    if (!regrant(c, short_addr, eui, req_tier, tier_max_phases(req_tier),
-                 out, &changed)) {
+    if (!regrant(c, short_addr, eui, req_tier, max_n, out, &changed)) {
         /* Unreachable: alloc_phases()'s n == 1 rung re-claims a cell this tag
          * already holds and so cannot fail once find_seat_by_addr() has
          * succeeded. Kept because the alternative on a future refactor that
@@ -468,6 +477,29 @@ enum gw_keepalive_result gw_core_keepalive(struct gw_core_ctx *c,
         return GW_KEEPALIVE_SAME;
     }
     return changed ? GW_KEEPALIVE_REPHASED : GW_KEEPALIVE_SAME;
+}
+
+enum gw_keepalive_result gw_core_keepalive(struct gw_core_ctx *c,
+                                           uint16_t short_addr, uint8_t req_tier,
+                                           struct gw_grant *out)
+{
+    /* The tier ceiling is the ONLY thing this adds over the worker above, and
+     * it is the whole of tier policy: everything else -- the seat lookup, the
+     * EUI copy, the regrant and its unreachable fallback -- is shared. */
+    return keepalive_with_max(c, short_addr, req_tier,
+                              tier_max_phases(req_tier), out);
+}
+
+/* See gw_core.h: a test seam, not for production use. It exists so the
+ * allocator's n == 8 rung stays covered now that GW_PHASES_MAX_FAST is 4 and
+ * no tier's ceiling reaches it. */
+enum gw_keepalive_result gw_core_keepalive_max_for_test(struct gw_core_ctx *c,
+                                                        uint16_t short_addr,
+                                                        uint8_t req_tier,
+                                                        int max_phases,
+                                                        struct gw_grant *out)
+{
+    return keepalive_with_max(c, short_addr, req_tier, max_phases, out);
 }
 
 void gw_core_release(struct gw_core_ctx *c, uint16_t short_addr)

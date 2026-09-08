@@ -565,10 +565,10 @@ static void test_join_grants_one_phase_at_every_tier(void)
 }
 
 /* The brief's headline: a FAST tag's phases spread evenly around the cycle.
- * On an empty table the ceiling (GW_PHASES_MAX_FAST == 8) is available, so
- * "8 when the budget allows" resolves to 8 -- at stride GW_CYCLE_C/8 == 2,
- * i.e. every even phase, NOT phases 0..7. */
-static void test_keepalive_spreads_8_phases_evenly(void)
+ * On an empty table the whole ceiling (GW_PHASES_MAX_FAST == 4) is available,
+ * so "FAST 4" resolves to 4 -- at stride GW_CYCLE_C/4 == 4, i.e. phases
+ * 0,4,8,12 (1.25 Hz at a 200 ms superframe), NOT phases 0..3. */
+static void test_keepalive_spreads_4_phases_evenly(void)
 {
     struct gw_core_ctx c;
     uint8_t eui[UWB_FRAME_EUI_LEN];
@@ -583,17 +583,64 @@ static void test_keepalive_spreads_8_phases_evenly(void)
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
     CHECK(k.short_addr == g.short_addr);
-    CHECK(gw_phase_count(k.phase_mask) == 8);
-    CHECK(is_even_spread(k.phase_mask, 8));
-    CHECK(k.phase_mask != consecutive_mask(k.phase_mask, 8));
+    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(is_even_spread(k.phase_mask, 4));
+    CHECK(k.phase_mask != consecutive_mask(k.phase_mask, 4));
     CHECK(k.phase == 0);                       /* base is the lowest phase */
-    CHECK(k.phase_mask == 0x5555u);            /* phases 0,2,4,...,14 */
+    CHECK(k.phase_mask == 0x1111u);            /* phases 0,4,8,12 */
 
     /* And the table agrees with the grant, at ONE slot index. */
     CHECK(mask_of(&c, g.short_addr, &slot, &cells) == k.phase_mask);
-    CHECK(cells == 8);
+    CHECK(cells == 4);
     CHECK(slot == k.slot_index);
     CHECK(k.slot_index == g.slot_index);       /* grew in place */
+}
+
+/* No tier's ceiling reaches 8 any more -- GW_PHASES_MAX_FAST is 4, and the
+ * plan's "(8 when the budget allows)" is deliberately unimplemented -- but the
+ * allocator is still generic in n, and the ladder's n == 8 rung must stay
+ * covered so a later raise of that ceiling does not land on untested code.
+ *
+ * This is the brief's third even-spread size, and it drives the REAL mechanism:
+ * gw_core_keepalive_max_for_test() is gw_core_keepalive() with the ceiling
+ * passed in instead of read from the tier, so the same alloc_phases() ladder,
+ * find_candidate() search and claim() write are exercised here as in
+ * production. At stride GW_CYCLE_C/8 == 2 that is every even phase, NOT phases
+ * 0..7. */
+static void test_mechanism_spreads_8_phases_evenly(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g, k;
+    int cells = 0, slot = -1;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x10);
+    CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
+    CHECK(gw_phase_count(g.phase_mask) == 1);
+
+    CHECK(gw_core_keepalive_max_for_test(&c, g.short_addr, GW_TIER_FAST, 8, &k)
+          == GW_KEEPALIVE_REPHASED);
+    CHECK(k.short_addr == g.short_addr);
+    CHECK(gw_phase_count(k.phase_mask) == 8);
+    CHECK(is_even_spread(k.phase_mask, 8));
+    CHECK(k.phase_mask != consecutive_mask(k.phase_mask, 8));
+    CHECK(k.phase == 0);
+    CHECK(k.phase_mask == 0x5555u);            /* phases 0,2,4,...,14 */
+    CHECK(mask_of(&c, g.short_addr, &slot, &cells) == k.phase_mask);
+    CHECK(cells == 8);
+    CHECK(slot == k.slot_index);
+    CHECK(k.slot_index == g.slot_index);
+
+    /* The seam changes nothing but the ceiling: a normal FAST KEEPALIVE right
+     * afterwards pulls the same tag back down to the tier's 4, which is both
+     * the proof that tier policy still lives in one place and the proof that
+     * the four surrendered cells go back to the pool. */
+    CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
+          == GW_KEEPALIVE_REPHASED);
+    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(is_even_spread(k.phase_mask, 4));
+    CHECK(occupied_cells(&c) == 4);
 }
 
 /* SLOW's ceiling is 2, so a SLOW tag gets exactly two phases half a cycle
@@ -620,13 +667,13 @@ static void test_keepalive_spreads_2_phases_evenly(void)
     CHECK(slot == k.slot_index);
 }
 
-/* Four phases -- the third size the brief names -- is not any tier's ceiling,
- * it is what the 8 -> 4 -> 2 -> 1 ladder falls back to. Reached by filling
- * phases 0 and 1: every 8-phase candidate has base 0 or 1 (stride 2) and so
- * needs a cell in one of them, while base 2 at stride 4 does not. This is
- * "FAST 4" and the budget test in one shot: the same tag that got 8 on an
- * empty table gets 4 here, without touching a single filler. */
-static void test_keepalive_falls_back_to_4_phases(void)
+/* The ceiling is reached at a SHIFTED base when the low phases are taken: with
+ * phases 0 and 1 full, the 4-phase candidates at base 0 and base 1 both need a
+ * cell in one of them, while base 2 (phases 2,6,10,14) does not. The tag still
+ * gets its full four -- it moves its base rather than shrinking -- and does it
+ * without touching a single filler, which is the "never evict anyone" half of
+ * the budget rule. */
+static void test_keepalive_reaches_4_phases_at_a_shifted_base(void)
 {
     struct gw_core_ctx c;
     uint8_t eui[UWB_FRAME_EUI_LEN];
@@ -660,8 +707,9 @@ static void test_keepalive_falls_back_to_4_phases(void)
 }
 
 /* The ladder's middle rung, to show it steps rather than jumping straight to
- * one phase. Phases 0..3 full blocks every 8- and 4-phase candidate (their
- * bases are 0..1 and 0..3), leaving base 4 at stride 8. */
+ * one phase. Phases 0..3 full blocks every 4-phase candidate (their bases are
+ * 0..3, each needing a cell in one of those phases), leaving the 2-phase rung
+ * at base 4, stride 8. */
 static void test_keepalive_falls_back_to_2_phases(void)
 {
     struct gw_core_ctx c;
@@ -684,7 +732,7 @@ static void test_keepalive_falls_back_to_2_phases(void)
 
 /* The non-stranding rule at maximum pressure. Every cell in the table is a
  * separate single-phase tag, then one of them asks for FAST: the ladder must
- * walk 8 -> 4 -> 2 -> 1 and land back on the one cell that tag already owns,
+ * walk 4 -> 2 -> 1 and land back on the one cell that tag already owns,
  * because that is the only cell candidate_ok() will accept for it. Nothing may
  * be evicted, so the occupancy and every other tag's footprint are unchanged
  * -- a FAST tag taking a stationary tag's last phase would show up here as a
@@ -808,8 +856,8 @@ static void test_regrant_moves_slot_rather_than_shrink(void)
 
 /* A tier drop must hand the excess cells BACK, not merely stop counting them.
  * Proved the only way that really settles it: fill the table completely around
- * a FAST tag holding 8 phases, confirm a JOIN is refused, drop that tag to
- * IDLE, and then show exactly 7 further JOINs succeed -- landing in the cells
+ * a FAST tag holding its 4 phases, confirm a JOIN is refused, drop that tag to
+ * IDLE, and then show exactly 3 further JOINs succeed -- landing in the cells
  * it gave up -- before the table is full again. */
 static void test_tier_drop_returns_phases_to_the_pool(void)
 {
@@ -824,11 +872,11 @@ static void test_tier_drop_returns_phases_to_the_pool(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 8);
-    CHECK(k.phase_mask == 0x5555u);
+    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(k.phase_mask == 0x1111u);
 
     /* Fill every remaining cell, one single-phase tag each. */
-    for (int i = 0; i < total - 8; i++) {
+    for (int i = 0; i < total - 4; i++) {
         uint8_t f[UWB_FRAME_EUI_LEN];
         struct gw_grant fg;
 
@@ -839,19 +887,19 @@ static void test_tier_drop_returns_phases_to_the_pool(void)
     mk_eui(eui, 0xE0);
     CHECK(!gw_core_join(&c, eui, GW_TIER_IDLE, &extra));   /* full */
 
-    /* The mover goes still: 8 phases -> 1, keeping its base cell. */
+    /* The mover goes still: 4 phases -> 1, keeping its base cell. */
     struct gw_grant idle;
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_IDLE, &idle)
           == GW_KEEPALIVE_REPHASED);
     CHECK(gw_phase_count(idle.phase_mask) == 1);
     CHECK(idle.phase_mask == 0x0001u);
     CHECK(idle.slot_index == k.slot_index);
-    CHECK(occupied_cells(&c) == total - 7);
+    CHECK(occupied_cells(&c) == total - 3);
 
-    /* The seven released cells are genuinely back in the pool: seven JOINs
-     * succeed, the eighth is refused, and the first of them lands on a cell
-     * the mover used to hold. */
-    for (int i = 0; i < 7; i++) {
+    /* The three released cells are genuinely back in the pool: three JOINs
+     * succeed, the fourth is refused, and each lands on a cell the mover used
+     * to hold. */
+    for (int i = 0; i < 3; i++) {
         uint8_t f[UWB_FRAME_EUI_LEN];
         struct gw_grant fg;
 
@@ -866,8 +914,9 @@ static void test_tier_drop_returns_phases_to_the_pool(void)
 }
 
 /* gw_core_release() must free EVERY cell of a multi-phase tag. Clearing only
- * the first one found would leave seven cells published in seven phases' slot
- * maps under an address granted to nobody, each aging out on its own lease. */
+ * the first one found would leave the other three published in three phases'
+ * slot maps under an address granted to nobody, each aging out on its own
+ * lease. */
 static void test_release_frees_every_phase(void)
 {
     struct gw_core_ctx c;
@@ -880,8 +929,8 @@ static void test_release_frees_every_phase(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 8);
-    CHECK(occupied_cells(&c) == 8);
+    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(occupied_cells(&c) == 4);
 
     gw_core_release(&c, g.short_addr);
     CHECK(mask_of(&c, g.short_addr, NULL, &cells) == 0);
@@ -894,7 +943,7 @@ static void test_release_frees_every_phase(void)
 }
 
 /* A multi-phase tag's lease must expire as ONE unit after exactly GW_LEASE_SF
- * ticks -- gw_core_superframe_tick() ages each of its 8 cells independently
+ * ticks -- gw_core_superframe_tick() ages each of its 4 cells independently
  * and they stay in step only because claim() set them all in the same call. A
  * partial expiry would leave a tag ranging in some of its phases and silently
  * absent from the rest. */
@@ -910,15 +959,15 @@ static void test_multiphase_lease_expires_as_one_unit(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 8);
+    CHECK(gw_phase_count(k.phase_mask) == 4);
 
     for (unsigned i = 0; i < GW_LEASE_SF - 1; i++) gw_core_superframe_tick(&c);
     CHECK(mask_of(&c, g.short_addr, NULL, &cells) == k.phase_mask);
-    CHECK(cells == 8);                         /* all eight still held */
+    CHECK(cells == 4);                         /* all four still held */
 
     gw_core_superframe_tick(&c);
     CHECK(mask_of(&c, g.short_addr, NULL, &cells) == 0);
-    CHECK(cells == 0);                         /* all eight reclaimed at once */
+    CHECK(cells == 0);                         /* all four reclaimed at once */
     CHECK(c.frame_counter == GW_LEASE_SF);
 }
 
@@ -941,8 +990,8 @@ static void test_keepalive_is_stable_once_at_tier(void)
 
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k1)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k1.phase_mask) == 8);
-    CHECK(k1.phase_mask == 0xAAAAu);           /* odd phases: base 1, stride 2 */
+    CHECK(gw_phase_count(k1.phase_mask) == 4);
+    CHECK(k1.phase_mask == 0x2222u);           /* base 1, stride 4: 1,5,9,13 */
 
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k2)
           == GW_KEEPALIVE_SAME);
@@ -977,7 +1026,8 @@ static void test_keepalive_unknown_addr_is_reported(void)
 
 /* An unrecognised tier byte -- the tag's enum only defines 0..2 and this
  * arrives straight off the air -- must be treated as IDLE. The opposite
- * default would let one malformed frame claim eight phases. */
+ * default would let one malformed frame claim a FAST tag's whole
+ * allocation. */
 static void test_unknown_tier_gets_idle_phase_count(void)
 {
     struct gw_core_ctx c;
@@ -989,7 +1039,7 @@ static void test_unknown_tier_gets_idle_phase_count(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 8);
+    CHECK(gw_phase_count(k.phase_mask) == 4);
 
     CHECK(gw_core_keepalive(&c, g.short_addr, 0xFF, &k) == GW_KEEPALIVE_REPHASED);
     CHECK(gw_phase_count(k.phase_mask) == 1);
@@ -997,7 +1047,7 @@ static void test_unknown_tier_gets_idle_phase_count(void)
     CHECK(occupied_cells(&c) == 1);
 }
 
-/* A re-JOIN from a tag that already holds 8 phases is a lost GRANT, not a
+/* A re-JOIN from a tag that already holds 4 phases is a lost GRANT, not a
  * demotion: it must come back with the same address and the same phase set,
  * not be reset to the one phase a fresh JOIN would get. */
 static void test_rejoin_preserves_a_multiphase_grant(void)
@@ -1011,7 +1061,7 @@ static void test_rejoin_preserves_a_multiphase_grant(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 8);
+    CHECK(gw_phase_count(k.phase_mask) == 4);
 
     for (unsigned i = 0; i < 10; i++) gw_core_superframe_tick(&c);
 
@@ -1019,7 +1069,7 @@ static void test_rejoin_preserves_a_multiphase_grant(void)
     CHECK(rj.short_addr == g.short_addr);
     CHECK(rj.phase_mask == k.phase_mask);
     CHECK(rj.slot_index == k.slot_index);
-    CHECK(occupied_cells(&c) == 8);            /* no second seat consumed */
+    CHECK(occupied_cells(&c) == 4);            /* no second seat consumed */
 
     /* The lease is refreshed on every one of its cells, not just the first. */
     for (int p = 0; p < GW_CYCLE_C; p++) {
@@ -1073,9 +1123,12 @@ static void test_one_slot_per_tag(void)
 }
 
 /* The beacon side of a multi-phase grant: the tag's address appears in the
- * slot map of exactly the phases it holds and in none of the others. This is
- * the only channel that tells the tag when to range today, so it is what makes
- * an 8-phase grant actually produce 8 fixes per cycle. */
+ * slot map of exactly the phases it holds and in none of the others. That is
+ * the gateway holding up its end -- but note it is NOT sufficient to make a
+ * 4-phase grant produce 4 fixes per cycle on a real tag, which needs the
+ * deferred GRANT phase_mask and a tag-side listen_skip/FSM change first (see
+ * gw_core.h's file comment). What this pins is that the published membership
+ * matches the grant exactly, in both directions. */
 static void test_slotmap_reflects_the_whole_phase_mask(void)
 {
     struct gw_core_ctx c;
@@ -1087,7 +1140,7 @@ static void test_slotmap_reflects_the_whole_phase_mask(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 8);
+    CHECK(gw_phase_count(k.phase_mask) == 4);
 
     for (int p = 0; p < GW_CYCLE_C; p++) {
         uint16_t map[GW_N_CFP];
@@ -1129,9 +1182,10 @@ int main(void)
     /* Task 13: phase allocation by tier. */
     test_phase_count();
     test_join_grants_one_phase_at_every_tier();
-    test_keepalive_spreads_8_phases_evenly();
+    test_keepalive_spreads_4_phases_evenly();
+    test_mechanism_spreads_8_phases_evenly();
     test_keepalive_spreads_2_phases_evenly();
-    test_keepalive_falls_back_to_4_phases();
+    test_keepalive_reaches_4_phases_at_a_shifted_base();
     test_keepalive_falls_back_to_2_phases();
     test_contention_never_strands_any_tag();
     test_fast_tag_cannot_take_a_stationary_tags_only_phase();
