@@ -88,7 +88,9 @@ static int cmd_seed(const struct shell *sh, size_t argc, char **argv)
 	if (rc == -EBUSY) {
 		shell_error(sh, "error: an earlier `gw seed` request has not "
 				"been picked up by the gateway loop yet — "
-				"try again shortly");
+				"it may still be filling, or the gateway loop may not "
+				"be running (unpositioned board, or the first beacon "
+				"failed — check the boot log); try again shortly");
 		return rc;
 	}
 	if (rc) {

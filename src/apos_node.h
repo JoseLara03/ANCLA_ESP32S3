@@ -79,8 +79,8 @@
 
 /* Worst-case span of one enumeration reply window. The gateway derives its
  * inter-round gap and its post-re-broadcast settle interval from this
- * (APOS_GW_ENUM_GAP_MS, APOS_GW_ENUM_SETTLE_MS) rather than carrying literals
- * that have to be kept in step with the two constants above by hand. */
+ * (APOS_GW_ENUM_SETTLE_MS) rather than carrying literals that have to be kept
+ * in step with the two constants above by hand. */
 #define APOS_ENUM_WINDOW_MS (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS)
 
 /* Seconds a window is extended by on each in-session APOS frame. Long enough

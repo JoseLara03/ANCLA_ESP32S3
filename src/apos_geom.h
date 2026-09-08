@@ -25,7 +25,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Survey capacity: the full 32-anchor deployment UWB_MAX_ANCHORS now supports.
+/* Survey capacity: the 32-node cap APOS_MAX_NODES now permits (ids past 3
+ * are not yet air-usable — see src/uwb_config.h).
  *
  * Deliberately still a SEPARATE constant rather than `#define APOS_MAX_NODES
  * UWB_MAX_ANCHORS`, even though the two values now agree. Nothing in this file

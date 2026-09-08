@@ -152,7 +152,7 @@ hit them running `docs/anchor-auto-positioning.md`:
 
 None of these have been run.
 
-### Anchor cap and survey scaling to 32 (this session, no hardware)
+### 3. Anchor cap and survey scaling to 32 (this session, no hardware)
 
 `UWB_MAX_ANCHORS` is now 32 (`src/uwb_config.h`, up from 4), against a wire cap
 of 254 (short addresses are `UWB_ANCHOR_ADDR_BASE + id` and must stay below
@@ -237,7 +237,7 @@ Native USB-JTAG (not UART0), prompt `uwb:~$ `.
 
 ```
 anchor show                    active config as JSON
-anchor id <0..31>              ranging id (default 0; only 0..3 usable on air today — see §2)
+anchor id <0..31>              ranging id (default 0; only 0..3 usable on air today — see §3)
 anchor mode <slave|gateway>    boot mode (default slave). GATEWAY refuses to
                                beacon unless `anchor pos` has been set.
 anchor pos <x> <y> <z>         coordinates in metres; sets pos_valid
