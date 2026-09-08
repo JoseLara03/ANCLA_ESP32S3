@@ -237,7 +237,7 @@ Native USB-JTAG (not UART0), prompt `uwb:~$ `.
 
 ```
 anchor show                    active config as JSON
-anchor id <0..3>               ranging id (default 0)
+anchor id <0..31>              ranging id (default 0; only 0..3 usable on air today — see §2)
 anchor mode <slave|gateway>    boot mode (default slave). GATEWAY refuses to
                                beacon unless `anchor pos` has been set.
 anchor pos <x> <y> <z>         coordinates in metres; sets pos_valid
