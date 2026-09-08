@@ -385,4 +385,47 @@ static inline void gw_seed_make_eui(uint8_t eui_out[UWB_FRAME_EUI_LEN],
     eui_out[7] = 0x00u;
 }
 
+/* How many gw_core_join() calls a single GATEWAY-loop iteration may perform
+ * for `gw seed`. NOT a cosmetic tunable -- it is the bound that keeps a fill
+ * from eating the beacon arm margin.
+ *
+ * One gw_core_join() with a never-before-seen EUI is not cheap: it is four
+ * exhaustive table walks, all of them worst-case precisely BECAUSE a synthetic
+ * EUI/address is always a miss -- find_seat_by_eui() scans all GW_MAX_SEATS
+ * cells with a memcmp per live cell, alloc_short_addr()'s find_seat_by_addr()
+ * scans all of them again, alloc_phases()'s find_candidate() reads up to
+ * GW_MAX_SEATS cells in its second pass, and the address-reuse map costs an
+ * addr_map_find() plus an addr_map_put() walk of all GW_ADDR_MAP_SIZE (64)
+ * entries (fully exhaustive once that map saturates, which happens partway
+ * through a full fill). That is several hundred inner iterations per call, so
+ * a whole GW_MAX_SEATS fill is 10^5..10^6 instructions -- single-digit
+ * MILLISECONDS on this XIP-from-flash part, i.e. the same order as
+ * BEACON_ARM_MARGIN_UUS (~5.1 ms), not the "microseconds" an earlier revision
+ * of this code claimed.
+ *
+ * 8 is chosen so that even a deliberately pessimistic 100 us per join leaves a
+ * chunk at ~0.8 ms, well under a fifth of the margin (at a more realistic
+ * ~20 us/join it is ~0.16 ms, ~3%). The cost is latency, not correctness: a
+ * 176-seat fill spreads over ~22 loop iterations, i.e. a few seconds on a
+ * quiet network where the loop turns roughly once per superframe. For a
+ * load-test aid that is free. */
+#define GW_SEED_CHUNK  8u
+
+/* Time the GATEWAY loop reserves ON TOP of BEACON_ARM_MARGIN_UUS before it
+ * starts a chunk, mirroring APOS_GW_STEP_BUDGET_UUS's role for a survey step.
+ * 2000 UUS is ~2.05 ms, i.e. ~2.5x the pessimistic 0.8 ms worst-case chunk
+ * above and ~13x the realistic one. It is a defence in depth, not the primary
+ * bound: the primary bound is GW_SEED_CHUNK, and the loop re-reads to_beacon
+ * after every chunk so that even a blown estimate defers the RX arm rather
+ * than arming it past the beacon. */
+#define GW_SEED_CHUNK_BUDGET_UUS  2000u
+
+/* Joins to attempt in the current loop iteration, given how many are still
+ * outstanding. Pure arithmetic, split out here so the chunking bound is
+ * host-testable rather than buried in the Zephyr loop. */
+static inline uint32_t gw_seed_chunk(uint32_t remaining)
+{
+    return remaining < GW_SEED_CHUNK ? remaining : GW_SEED_CHUNK;
+}
+
 #endif /* GW_CORE_H */

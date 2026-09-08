@@ -109,9 +109,21 @@ static uint8_t gw_seq;
  * explicitly on entry, same as before. */
 static struct gw_core_ctx ctx;
 
-/* Pending synthetic-seed request from `gw seed <n>` (src/gw_shell.c). 0 means
- * "nothing pending" -- gw_seed_valid_count() never accepts 0, so that
- * sentinel can never collide with a real request. Single word, single writer
+/* Synthetic-seed joins still OUTSTANDING from a `gw seed <n>` request
+ * (src/gw_shell.c). 0 means "nothing pending" -- gw_seed_valid_count() never
+ * accepts 0, so that sentinel can never collide with a real request.
+ *
+ * The word is a REMAINING count, not the original request: the GATEWAY loop
+ * performs at most gw_seed_chunk() joins per iteration and decrements by what
+ * it actually did, so a large `n` unfolds over several iterations (see
+ * GW_SEED_CHUNK in gw_core.h for why that bound exists). This changes nothing
+ * about the cross-thread argument below -- it is still one aligned word, still
+ * written nonzero only by the shell thread and still read/decremented/cleared
+ * only by the gateway loop -- and it makes the existing -EBUSY check mean
+ * "a fill is still in flight" as well as "a request is unconsumed", which is
+ * exactly the right refusal for a second `gw seed` arriving mid-fill.
+ *
+ * Single word, single writer
  * (the SHELL thread, via uwb_gateway_request_seed() below) and single reader
  * *and* clearer (this file's own GATEWAY loop, uwb_gateway_run()): no lock is
  * needed. This build has no SMP (WIFI_ESP32 selects `depends on !SMP`, see
@@ -145,52 +157,103 @@ int uwb_gateway_request_seed(uint32_t n)
  * would stop meaning the same thing right when an operator is trying to hit
  * an exact occupancy number for a load test.
  *
- * Runs entirely inline, in one GATEWAY-loop iteration, unlike apos_gw_step()
- * (capped at one TRANSMITTING step per call to protect the beacon arm
- * margin). That cap exists because a survey step can put a frame on the air,
- * and airtime plus the bounded TXFRS wait can approach BEACON_ARM_MARGIN_UUS.
- * gw_core_join() does neither: it is pure in-memory bookkeeping over a table
- * already sized to fit comfortably in RAM (struct gw_core_ctx is ~2.4 KB),
- * with no SPI transaction and no blocking wait anywhere in it. Even at the
- * worst case -- GW_MAX_SEATS calls, each a bounded linear scan over that same
- * small table -- the whole fill is microseconds, nowhere near
- * BEACON_ARM_MARGIN_UUS (5000 UUS, ~5.1 ms). Spreading it across multiple
- * loop iterations the way apos_gw_step() spreads survey steps would only
- * complicate this for no safety benefit.
+ * Deliberately does NOT run the whole fill inline in one GATEWAY-loop
+ * iteration. gw_core_join() transmits nothing and blocks nowhere, but it is
+ * not cheap either: a fresh synthetic EUI is a guaranteed miss in every one of
+ * the four tables it consults, so every call is the worst case of all four
+ * exhaustive scans, and a full GW_MAX_SEATS fill lands in the single-digit
+ * MILLISECONDS on this XIP-from-flash part -- the same order as
+ * BEACON_ARM_MARGIN_UUS (5000 UUS, ~5.1 ms), not the "microseconds" an earlier
+ * revision of this comment asserted. Run unguarded, an overrun would leave the
+ * caller's span_hi32/rx_to_uus computed from a pre-fill to_beacon and arm the
+ * RX window PAST the beacon instant -- i.e. exactly the
+ * "beacon started but TXFRS never completed" fault this codebase documents at
+ * length, and it would appear specifically at the high occupancy counts this
+ * command exists to reach. See GW_SEED_CHUNK (src/gw_core.h) for the cost
+ * breakdown behind the bound.
+ *
+ * So: at most gw_seed_chunk() joins per call, `pending_seed_n` left holding
+ * whatever remains, and the next loop iteration picks up where this one
+ * stopped. The caller additionally reserves a budget before calling and
+ * re-reads to_beacon afterwards, exactly like the apos_gw_step() block above
+ * it, so the bound does not have to be perfectly calibrated to stay safe.
+ * Resuming is trivially correct because the EUI cursor (seed_eui_index) only
+ * ever moves forward: no synthetic EUI is offered twice, so no chunk boundary
+ * can double-count or re-seat anything.
+ *
+ * All three statics here are touched ONLY from uwb_gateway_run()'s own thread
+ * (this function is static and called from exactly one place in that loop), so
+ * none of them widens the single-word cross-thread contract documented on
+ * pending_seed_n -- that word remains the only shared state.
  *
  * Assumes the table is EMPTY going in -- `gw seed` is a load-test aid for a
  * freshly booted gateway, not a way to top up a live deployment with fake
  * occupancy alongside real tags -- but does not silently trust that: a table
  * that already holds real seats simply runs out partway, gw_core_join()
- * reports the failure, and this stops and logs exactly how many synthetic
- * seats actually landed rather than claiming all `n` succeeded. */
-static void do_seed_fill(struct gw_core_ctx *c, uint32_t n)
+ * reports the failure, and this abandons the rest of the request and logs
+ * exactly how many synthetic seats actually landed rather than claiming all
+ * `n` succeeded. */
+static uint32_t seed_total;      /* the `n` the operator asked for */
+static uint32_t seed_seated;     /* joins that actually succeeded so far */
+static uint32_t seed_eui_index;  /* monotonic synthetic-EUI cursor */
+
+static void do_seed_fill_chunk(struct gw_core_ctx *c)
 {
-	uint32_t seated = 0;
+	uint32_t remaining = pending_seed_n;
+	uint32_t this_chunk;
 
-	LOG_WRN("*** SYNTHETIC SEED: filling %u FAKE tag seat(s) for load "
-		"testing -- this is NOT a real deployment state ***", n);
+	if (remaining == 0) {
+		return;
+	}
 
-	for (uint32_t i = 0; i < n; i++) {
+	if (seed_total == 0) {
+		/* First chunk of a new request: the loud banner fires once per
+		 * `gw seed`, not once per chunk. */
+		seed_total = remaining;
+		seed_seated = 0;
+		LOG_WRN("*** SYNTHETIC SEED: filling %u FAKE tag seat(s) for "
+			"load testing, %u per superframe -- this is NOT a real "
+			"deployment state ***", remaining, GW_SEED_CHUNK);
+	}
+
+	this_chunk = gw_seed_chunk(remaining);
+
+	for (uint32_t i = 0; i < this_chunk; i++) {
 		uint8_t eui[UWB_FRAME_EUI_LEN];
 		struct gw_grant g;
 
-		gw_seed_make_eui(eui, i);
+		gw_seed_make_eui(eui, seed_eui_index++);
 		if (!gw_core_join(c, eui, GW_TIER_IDLE, &g)) {
+			/* Out of seats: the rest of the request can never
+			 * succeed either, so abandon it rather than retrying
+			 * once per iteration forever. */
+			remaining = 0;
 			break;
 		}
-		seated++;
+		seed_seated++;
+		remaining--;
 	}
 
-	if (seated < n) {
+	if (remaining != 0) {
+		pending_seed_n = remaining;
+		return;
+	}
+
+	if (seed_seated < seed_total) {
 		LOG_WRN("*** SYNTHETIC SEED: only %u of %u requested FAKE "
 			"seat(s) actually fit -- table was not empty, or ran "
-			"out ***", seated, n);
+			"out ***", seed_seated, seed_total);
 	} else {
 		LOG_WRN("*** SYNTHETIC SEED: %u FAKE seat(s) placed -- load "
 			"test only, this is NOT a real deployment state ***",
-			seated);
+			seed_seated);
 	}
+
+	/* Clear seed_total BEFORE pending_seed_n: the latter is what the shell
+	 * thread's -EBUSY check reads, so the fill must be fully wound down
+	 * before a new request can be accepted. */
+	seed_total = 0;
+	pending_seed_n = 0;
 }
 
 static void cb_rx_ok(const dwt_cb_data_t *cb_data)
@@ -531,22 +594,39 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 				}
 			}
 
-			/* Process a pending `gw seed` request, if any -- same
-			 * "top of the loop, reached every iteration" placement
-			 * reasoning as the apos step above, and gated the same
-			 * way behind `to_beacon > margin` even though the fill
-			 * itself is pure compute with nothing to gain from the
-			 * margin: this keeps one single, easy-to-audit place
-			 * in the loop that decides "is there time to do
-			 * optional gateway-loop work right now", rather than a
-			 * second ad hoc check. do_seed_fill() never transmits
-			 * and never blocks (see its own comment), so it cannot
-			 * itself delay the beacon. */
+			/* Advance a pending `gw seed` fill by at most one
+			 * bounded chunk of gw_core_join() calls -- same "top of
+			 * the loop, reached every iteration" placement
+			 * reasoning as the apos step above, and the same
+			 * reserve-then-re-read shape, for the same reason.
+			 *
+			 * The fill never transmits, but it is NOT free: a
+			 * whole-table fill is milliseconds of table walking on
+			 * this part, the same order as BEACON_ARM_MARGIN_UUS
+			 * (see GW_SEED_CHUNK in gw_core.h and
+			 * do_seed_fill_chunk()'s own comment). Three things
+			 * keep that off the beacon: the chunk bound itself,
+			 * this reserve, and the re-read below -- so if the
+			 * per-join cost estimate behind GW_SEED_CHUNK ever
+			 * turns out optimistic, the worst outcome is a chunk
+			 * that eats into the reserve and defers the RX arm to
+			 * the next iteration, not an RX window armed past the
+			 * beacon instant from a stale to_beacon. */
 			if (pending_seed_n != 0) {
-				uint32_t n = pending_seed_n;
+				int32_t reserve = (int32_t)UUS_TO_HI32(
+					BEACON_ARM_MARGIN_UUS +
+					GW_SEED_CHUNK_BUDGET_UUS);
 
-				pending_seed_n = 0;
-				do_seed_fill(&ctx, n);
+				if (to_beacon > reserve) {
+					do_seed_fill_chunk(&ctx);
+
+					now = dwt_readsystimestamphi32();
+					to_beacon = (int32_t)(next_beacon - now);
+					if (to_beacon <=
+					    (int32_t)UUS_TO_HI32(BEACON_ARM_MARGIN_UUS)) {
+						break;
+					}
+				}
 			}
 
 			/* Expire the RX window BEACON_ARM_MARGIN_UUS before the

@@ -1359,6 +1359,38 @@ static void test_seed_valid_count_bounds(void)
     CHECK(!gw_seed_valid_count(0xFFFFFFFFu));
 }
 
+/* The chunking bound the GATEWAY loop drives `gw seed` with: it must never
+ * exceed GW_SEED_CHUNK (that is the whole point -- a bigger chunk is
+ * milliseconds of table walking against a ~5.1 ms beacon arm margin), must
+ * never exceed what is actually left (or the fill would over-seat), and must
+ * never be 0 while work remains (or the fill would stall forever, one no-op
+ * chunk per superframe). Draining a full GW_MAX_SEATS request one chunk at a
+ * time must sum back to exactly GW_MAX_SEATS in a bounded number of steps. */
+static void test_seed_chunk_bound(void)
+{
+    uint32_t remaining, steps, done;
+
+    CHECK(gw_seed_chunk(0) == 0);
+    CHECK(gw_seed_chunk(1) == 1);
+    CHECK(gw_seed_chunk(GW_SEED_CHUNK) == GW_SEED_CHUNK);
+    CHECK(gw_seed_chunk(GW_SEED_CHUNK + 1) == GW_SEED_CHUNK);
+    CHECK(gw_seed_chunk((uint32_t)GW_MAX_SEATS) == GW_SEED_CHUNK);
+
+    remaining = (uint32_t)GW_MAX_SEATS;
+    steps = 0;
+    done = 0;
+    while (remaining != 0) {
+        uint32_t c = gw_seed_chunk(remaining);
+
+        CHECK(c > 0 && c <= GW_SEED_CHUNK && c <= remaining);
+        remaining -= c;
+        done += c;
+        steps++;
+        CHECK(steps <= (uint32_t)GW_MAX_SEATS); /* cannot stall */
+    }
+    CHECK(done == (uint32_t)GW_MAX_SEATS);
+}
+
 static void test_seed_make_eui_is_tagged_and_distinct(void)
 {
     uint8_t a[UWB_FRAME_EUI_LEN], b[UWB_FRAME_EUI_LEN];
@@ -1469,6 +1501,7 @@ int main(void)
 
     /* Task 17: `gw seed <n>` helpers. */
     test_seed_valid_count_bounds();
+    test_seed_chunk_bound();
     test_seed_make_eui_is_tagged_and_distinct();
     test_seed_make_eui_deterministic();
     test_seed_fills_table_exactly_at_idle_tier();
