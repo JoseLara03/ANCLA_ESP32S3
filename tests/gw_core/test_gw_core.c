@@ -1345,6 +1345,80 @@ static void test_addr_map_full_still_grants_fresh_address(void)
     }
 }
 
+/* Task 17: `gw seed <n>` synthetic occupancy. Only the two pure-C helpers
+ * are host-testable here -- the cross-thread request/consume mechanism and
+ * the shell command itself are Zephyr-API-bound (src/gw_shell.c,
+ * src/uwb_gateway.c) and have no host build. */
+
+static void test_seed_valid_count_bounds(void)
+{
+    CHECK(!gw_seed_valid_count(0));
+    CHECK(gw_seed_valid_count(1));
+    CHECK(gw_seed_valid_count((uint32_t)GW_MAX_SEATS));
+    CHECK(!gw_seed_valid_count((uint32_t)GW_MAX_SEATS + 1));
+    CHECK(!gw_seed_valid_count(0xFFFFFFFFu));
+}
+
+static void test_seed_make_eui_is_tagged_and_distinct(void)
+{
+    uint8_t a[UWB_FRAME_EUI_LEN], b[UWB_FRAME_EUI_LEN];
+
+    gw_seed_make_eui(a, 0);
+    gw_seed_make_eui(b, 1);
+
+    /* Every fabricated EUI carries the fixed FEED prefix, so it can be told
+     * apart from a real tag's EUI by inspection alone -- in a log line, a
+     * console dump, or a sniffer capture. */
+    CHECK(a[0] == GW_SEED_EUI_B0 && a[1] == GW_SEED_EUI_B1);
+    CHECK(b[0] == GW_SEED_EUI_B0 && b[1] == GW_SEED_EUI_B1);
+    /* Distinct indices must not collide, or gw_core_join() would treat two
+     * synthetic seats as one tag's rejoin. */
+    CHECK(memcmp(a, b, UWB_FRAME_EUI_LEN) != 0);
+}
+
+static void test_seed_make_eui_deterministic(void)
+{
+    uint8_t a[UWB_FRAME_EUI_LEN], b[UWB_FRAME_EUI_LEN];
+
+    gw_seed_make_eui(a, 42);
+    gw_seed_make_eui(b, 42);
+    CHECK(memcmp(a, b, UWB_FRAME_EUI_LEN) == 0);
+}
+
+/* Seeding GW_MAX_SEATS synthetic tags at GW_TIER_IDLE (one phase, one cell,
+ * per join) must fill the table exactly -- this is the property `gw seed`'s
+ * "n seats filled" contract rests on. Exercises gw_core_join() the same way
+ * uwb_gateway.c's do_seed_fill() does, as a black box. */
+static void test_seed_fills_table_exactly_at_idle_tier(void)
+{
+    struct gw_core_ctx c;
+    uint32_t seated = 0;
+
+    gw_core_init(&c);
+
+    for (uint32_t i = 0; i < (uint32_t)GW_MAX_SEATS; i++) {
+        uint8_t eui[UWB_FRAME_EUI_LEN];
+        struct gw_grant g;
+
+        gw_seed_make_eui(eui, i);
+        if (!gw_core_join(&c, eui, GW_TIER_IDLE, &g)) {
+            break;
+        }
+        CHECK(gw_phase_count(g.phase_mask) == 1);
+        seated++;
+    }
+    CHECK(seated == (uint32_t)GW_MAX_SEATS);
+
+    /* One more must now be refused -- the table is genuinely full. */
+    {
+        uint8_t eui[UWB_FRAME_EUI_LEN];
+        struct gw_grant g;
+
+        gw_seed_make_eui(eui, (uint32_t)GW_MAX_SEATS);
+        CHECK(!gw_core_join(&c, eui, GW_TIER_IDLE, &g));
+    }
+}
+
 int main(void)
 {
     test_init();
@@ -1392,6 +1466,12 @@ int main(void)
     test_rejoin_after_lease_expiry_reuses_address();
     test_addr_map_evicts_oldest_first();
     test_addr_map_full_still_grants_fresh_address();
+
+    /* Task 17: `gw seed <n>` helpers. */
+    test_seed_valid_count_bounds();
+    test_seed_make_eui_is_tagged_and_distinct();
+    test_seed_make_eui_deterministic();
+    test_seed_fills_table_exactly_at_idle_tier();
 
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;

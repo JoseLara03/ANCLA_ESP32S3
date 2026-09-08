@@ -33,6 +33,8 @@
 
 #include <deca_device_api.h>
 
+#include <errno.h>
+
 LOG_MODULE_REGISTER(uwb_gateway, LOG_LEVEL_INF);
 
 /* T_SUPERFRAME_UUS comes from uwb_mac.h — the slaves predict the beacon from
@@ -106,6 +108,90 @@ static uint8_t gw_seq;
  * file scope costs nothing but the .bss -- and gw_core_init() still resets it
  * explicitly on entry, same as before. */
 static struct gw_core_ctx ctx;
+
+/* Pending synthetic-seed request from `gw seed <n>` (src/gw_shell.c). 0 means
+ * "nothing pending" -- gw_seed_valid_count() never accepts 0, so that
+ * sentinel can never collide with a real request. Single word, single writer
+ * (the SHELL thread, via uwb_gateway_request_seed() below) and single reader
+ * *and* clearer (this file's own GATEWAY loop, uwb_gateway_run()): no lock is
+ * needed. This build has no SMP (WIFI_ESP32 selects `depends on !SMP`, see
+ * CLAUDE.md), so there is exactly one core executing either thread at a time,
+ * and a plain aligned 32-bit load/store cannot be observed half-written by
+ * the other side. `volatile` is doing the only job that matters here: stop
+ * the compiler from caching either side's view of the word across loop
+ * iterations or across the shell command's own return. The one race this
+ * does NOT close is two `gw seed` calls racing each other on the shell
+ * thread itself -- uwb_gateway_request_seed() refuses with -EBUSY while an
+ * earlier request is still unconsumed, rather than silently overwriting it. */
+static volatile uint32_t pending_seed_n;
+
+int uwb_gateway_request_seed(uint32_t n)
+{
+	if (!gw_seed_valid_count(n)) {
+		return -EINVAL;
+	}
+	if (pending_seed_n != 0) {
+		return -EBUSY;
+	}
+	pending_seed_n = n;
+	return 0;
+}
+
+/* Perform the fill `gw seed <n>` asked for: `n` calls to gw_core_join() with
+ * fabricated EUIs (gw_seed_make_eui(), src/gw_core.h), each requesting
+ * GW_TIER_IDLE. IDLE is the only tier that guarantees exactly one phase --
+ * and therefore exactly one seats[][] cell -- per call: SLOW/FAST would
+ * consume 2 or 4 cells per synthetic tag, so "n calls" and "n seats filled"
+ * would stop meaning the same thing right when an operator is trying to hit
+ * an exact occupancy number for a load test.
+ *
+ * Runs entirely inline, in one GATEWAY-loop iteration, unlike apos_gw_step()
+ * (capped at one TRANSMITTING step per call to protect the beacon arm
+ * margin). That cap exists because a survey step can put a frame on the air,
+ * and airtime plus the bounded TXFRS wait can approach BEACON_ARM_MARGIN_UUS.
+ * gw_core_join() does neither: it is pure in-memory bookkeeping over a table
+ * already sized to fit comfortably in RAM (struct gw_core_ctx is ~2.4 KB),
+ * with no SPI transaction and no blocking wait anywhere in it. Even at the
+ * worst case -- GW_MAX_SEATS calls, each a bounded linear scan over that same
+ * small table -- the whole fill is microseconds, nowhere near
+ * BEACON_ARM_MARGIN_UUS (5000 UUS, ~5.1 ms). Spreading it across multiple
+ * loop iterations the way apos_gw_step() spreads survey steps would only
+ * complicate this for no safety benefit.
+ *
+ * Assumes the table is EMPTY going in -- `gw seed` is a load-test aid for a
+ * freshly booted gateway, not a way to top up a live deployment with fake
+ * occupancy alongside real tags -- but does not silently trust that: a table
+ * that already holds real seats simply runs out partway, gw_core_join()
+ * reports the failure, and this stops and logs exactly how many synthetic
+ * seats actually landed rather than claiming all `n` succeeded. */
+static void do_seed_fill(struct gw_core_ctx *c, uint32_t n)
+{
+	uint32_t seated = 0;
+
+	LOG_WRN("*** SYNTHETIC SEED: filling %u FAKE tag seat(s) for load "
+		"testing -- this is NOT a real deployment state ***", n);
+
+	for (uint32_t i = 0; i < n; i++) {
+		uint8_t eui[UWB_FRAME_EUI_LEN];
+		struct gw_grant g;
+
+		gw_seed_make_eui(eui, i);
+		if (!gw_core_join(c, eui, GW_TIER_IDLE, &g)) {
+			break;
+		}
+		seated++;
+	}
+
+	if (seated < n) {
+		LOG_WRN("*** SYNTHETIC SEED: only %u of %u requested FAKE "
+			"seat(s) actually fit -- table was not empty, or ran "
+			"out ***", seated, n);
+	} else {
+		LOG_WRN("*** SYNTHETIC SEED: %u FAKE seat(s) placed -- load "
+			"test only, this is NOT a real deployment state ***",
+			seated);
+	}
+}
 
 static void cb_rx_ok(const dwt_cb_data_t *cb_data)
 {
@@ -443,6 +529,24 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 						break;
 					}
 				}
+			}
+
+			/* Process a pending `gw seed` request, if any -- same
+			 * "top of the loop, reached every iteration" placement
+			 * reasoning as the apos step above, and gated the same
+			 * way behind `to_beacon > margin` even though the fill
+			 * itself is pure compute with nothing to gain from the
+			 * margin: this keeps one single, easy-to-audit place
+			 * in the loop that decides "is there time to do
+			 * optional gateway-loop work right now", rather than a
+			 * second ad hoc check. do_seed_fill() never transmits
+			 * and never blocks (see its own comment), so it cannot
+			 * itself delay the beacon. */
+			if (pending_seed_n != 0) {
+				uint32_t n = pending_seed_n;
+
+				pending_seed_n = 0;
+				do_seed_fill(&ctx, n);
 			}
 
 			/* Expire the RX window BEACON_ARM_MARGIN_UUS before the

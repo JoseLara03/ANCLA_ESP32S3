@@ -344,4 +344,45 @@ bool gw_core_find_eui(const struct gw_core_ctx *c, uint16_t short_addr,
  * just finds nothing here to refresh. */
 void gw_core_pos_seen(struct gw_core_ctx *c, uint16_t short_addr);
 
+/* ---- synthetic load-test seats (`gw seed <n>`, src/gw_shell.c) ---------- */
+
+/* Fixed high two bytes stamped on every fabricated EUI below, so a seat
+ * seeded by `gw seed` is distinguishable from a real tag's on sight -- in a
+ * console log line, in `apos show`-style dumps, or on a sniffer capture that
+ * happens to decode a JOIN. "FEED" as in "fake" tags fed into the table for
+ * load testing; chosen only for being memorable and NOT matching any real
+ * vendor OUI this project has seen on the bench. */
+#define GW_SEED_EUI_B0  0xFEu
+#define GW_SEED_EUI_B1  0xEDu
+
+/* n is valid for `gw seed` iff it fills at least one seat and no more than
+ * every seat the table has -- i.e. exactly the same bound gw_core_join()
+ * itself is subject to, just checked before any radio or table work happens.
+ * Always compared against GW_MAX_SEATS, never a literal: see that macro's own
+ * comment on why 176/224 must never be hardcoded here either. */
+static inline bool gw_seed_valid_count(uint32_t n)
+{
+    return n > 0 && n <= (uint32_t)GW_MAX_SEATS;
+}
+
+/* Fabricate the `index`-th synthetic EUI: GW_SEED_EUI_B0/B1, then `index`
+ * written big-endian across the next 4 bytes (ample: GW_MAX_SEATS is nowhere
+ * near 2^32), with the final 2 bytes held at zero. Deterministic and distinct
+ * for every index in 0 .. GW_MAX_SEATS-1, which is what lets a repeated
+ * `gw seed` run be told apart from one that reused addresses, if anyone ever
+ * compares two captures by hand. Pure C, no gw_core_ctx dependency, so it is
+ * host-testable on its own. */
+static inline void gw_seed_make_eui(uint8_t eui_out[UWB_FRAME_EUI_LEN],
+                                    uint32_t index)
+{
+    eui_out[0] = GW_SEED_EUI_B0;
+    eui_out[1] = GW_SEED_EUI_B1;
+    eui_out[2] = (uint8_t)(index >> 24);
+    eui_out[3] = (uint8_t)(index >> 16);
+    eui_out[4] = (uint8_t)(index >> 8);
+    eui_out[5] = (uint8_t)(index);
+    eui_out[6] = 0x00u;
+    eui_out[7] = 0x00u;
+}
+
 #endif /* GW_CORE_H */

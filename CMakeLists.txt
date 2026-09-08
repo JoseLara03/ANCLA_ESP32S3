@@ -20,6 +20,7 @@ target_sources(app PRIVATE
 	src/beacon_guard.c
 	src/disc_schedule.c
 	src/gw_core.c
+	src/gw_shell.c
 	src/main.c
 	src/net_config.c
 	src/net_shell.c
