@@ -194,7 +194,15 @@ static void send_grant(const uint8_t eui[UWB_FRAME_EUI_LEN],
 	/* eui is non-NULL by construction: it comes from a successfully parsed
 	 * JOIN. uwb_frame_grant_build() writes its header before checking the
 	 * pointer -- another known frame-module defect left unfixed for
-	 * byte-identity with the tag -- which cannot fire on this path. */
+	 * byte-identity with the tag -- which cannot fire on this path.
+	 *
+	 * g->phase_mask is deliberately NOT sent: the GRANT frame has no field
+	 * for it until a separate, deferred task grows it (and that change has
+	 * to land in the tag's copy of the codec first, since this file is kept
+	 * byte-identical to it). Nothing is lost meanwhile -- the tag derives
+	 * its phase membership from each beacon's slot map, not from the GRANT
+	 * (see gw_core.h). What the tag cannot yet do is skip beacons it has no
+	 * seat in, which is a power cost, not a ranging one. */
 	int n = uwb_frame_grant_build(buf, sizeof(buf), eui, g->short_addr,
 				      g->slot_index, g->tier, g->lease);
 	if (n < 0) {
@@ -241,15 +249,43 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 			LOG_WRN("JOIN refused — all %u seats occupied", GW_MAX_SEATS);
 			return;
 		}
-		LOG_INF("GRANT addr=0x%04X phase=%u slot=%u tier=%u lease=%u",
-			g.short_addr, g.phase, g.slot_index, g.tier, g.lease);
+		LOG_INF("GRANT addr=0x%04X phase=%u slot=%u mask=0x%04X n=%u tier=%u lease=%u",
+			g.short_addr, g.phase, g.slot_index, g.phase_mask,
+			gw_phase_count(g.phase_mask), g.tier, g.lease);
 		send_grant(eui, &g, rx_ts);
 	} else if (uwb_frame_is_keepalive(buf, len)) {
 		uint16_t sa = 0;
 		uint8_t rt = 0, si = 0;
 
 		if (uwb_frame_parse_keepalive(buf, len, &sa, &rt, &si) == 0) {
-			gw_core_keepalive(ctx, sa, rt);
+			struct gw_grant g;
+
+			/* A KEEPALIVE is where tiering is applied, so the phase
+			 * set can change here. Logged only on REPHASED: every
+			 * seated tag sends these every few superframes, and at
+			 * any real tag count a line per KEEPALIVE would bury
+			 * the console -- while a phase change is exactly the
+			 * kind of MAC state a "why is this tag reporting at the
+			 * wrong rate" investigation starts from.
+			 *
+			 * The tag needs no GRANT to act on this: it finds its
+			 * own address in each beacon's slot map and ranges in
+			 * whatever superframe names it, so the re-phase is
+			 * already published. A separate, deferred task adds the
+			 * phase mask to the GRANT frame and re-GRANTs here, at
+			 * which point this branch gains a send_grant() -- but
+			 * it needs the tag's EUI, which the KEEPALIVE frame
+			 * does not carry (gw_core_find_eui() would supply it).
+			 */
+			enum gw_keepalive_result r =
+				gw_core_keepalive(ctx, sa, rt, &g);
+
+			if (r == GW_KEEPALIVE_REPHASED) {
+				LOG_INF("REPHASE addr=0x%04X phase=%u slot=%u mask=0x%04X n=%u tier=%u",
+					g.short_addr, g.phase, g.slot_index,
+					g.phase_mask,
+					gw_phase_count(g.phase_mask), g.tier);
+			}
 		}
 	} else if (uwb_frame_is_release(buf, len)) {
 		uint16_t sa = uwb_frame_get_src_addr(buf);
