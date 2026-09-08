@@ -242,11 +242,22 @@ static void handle_survey_begin(const uint8_t *buf, uint16_t plen,
 	LOG_INF("{\"apos\":\"window open\",\"session\":%u,\"window_s\":%u,"
 		"\"round\":%u}", session, window_s, round);
 
-	/* Sleep out our stagger slot before replying. Blocking the SLAVE loop
-	 * for up to 210 ms is acceptable here and nowhere else: this happens
-	 * only when an operator triggers a survey, and the alternative -- a
-	 * timer plus a deferred TX path -- would add a second thread touching
-	 * the SPI bus. */
+	/* Sleep out our stagger slot before replying. With the slot count now
+	 * sized for 32 anchors, that is a block of up to
+	 * (APOS_ENUM_SLOTS - 1) * APOS_ENUM_SLOT_MS = 63 * 12 = 756 ms, inside an
+	 * APOS_ENUM_WINDOW_MS (768 ms) window -- ~3.8 superframes, not the 210 ms
+	 * this comment described when there were 8 slots of 30 ms.
+	 *
+	 * Blocking the SLAVE loop for that long is acceptable here and nowhere
+	 * else: it happens only when an operator triggers a survey, and the
+	 * alternative -- a timer plus a deferred TX path -- would add a second
+	 * thread touching the SPI bus. What the block costs while it lasts is
+	 * spelt out on APOS_ENUM_SLOTS in apos_node.h: the board is deaf to tag
+	 * polls for the duration, and beacon_guard may roll past
+	 * BEACON_GUARD_MAX_MISSES predicted beacons and drop its lock -- which
+	 * fails OPEN (beacon_guard_tx_allowed() returns true while unlocked), so
+	 * a prediction gone stale across the sleep never suppresses the reply. It
+	 * re-locks on the next observed beacon. */
 	k_sleep(K_MSEC(enum_slot(session, round) * APOS_ENUM_SLOT_MS));
 
 	int n = apos_frame_enum_rsp_build(tx_buf, sizeof(tx_buf),
@@ -260,14 +271,24 @@ static void handle_survey_begin(const uint8_t *buf, uint16_t plen,
 		return;
 	}
 
-	/* A suppressed or failed TX here must not be silently lost: with the
-	 * stagger spanning up to APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS (210 ms)
-	 * against a 200 ms superframe, a board that draws one of the longer
-	 * slots is landing its reply right against the next beacon -- exactly
-	 * where beacon_guard_tx_allowed() is designed to refuse. Without a
-	 * retry that board simply never appears in this round's enumeration,
-	 * indistinguishable from it never having answered at all. Same
-	 * one-retry pattern as handle_range_cmd()'s RANGE_RSP below. */
+	/* A suppressed or failed TX here must not be silently lost, and the
+	 * stagger's growth to APOS_ENUM_WINDOW_MS (APOS_ENUM_SLOTS *
+	 * APOS_ENUM_SLOT_MS = 64 * 12 = 768 ms) makes this MORE true, not less.
+	 * At the old 8 x 30 ms = 240 ms span it was the few longest slots that
+	 * landed a reply near the next beacon; at ~3.84 superframes the slot a
+	 * board draws says nothing about where its reply falls relative to a
+	 * beacon at all -- most of the range lands in some LATER superframe, at an
+	 * essentially arbitrary phase within it. So instead of a rare hazard at
+	 * one end of the range, every board now carries roughly the duty cycle of
+	 * beacon_guard's forbidden window (2 * BEACON_GUARD_UUS +
+	 * BEACON_OCCUPANCY_UUS = 4500 of T_SUPERFRAME_UUS's 195000, ~2 %) of being
+	 * refused, whichever slot it drew. The longest draws are the ones that
+	 * escape it, by rolling the guard past BEACON_GUARD_MAX_MISSES into its
+	 * fail-open state (see the sleep above).
+	 *
+	 * Without a retry a refused board simply never appears in this round's
+	 * enumeration, indistinguishable from it never having answered at all.
+	 * Same one-retry pattern as handle_range_cmd()'s RANGE_RSP below. */
 	apos_frame_set_seq(tx_buf, (*seq)++);
 	if (!tx_now(tx_buf, (uint16_t)n, bg)) {
 		LOG_WRN("ENUM_RSP TX failed — retrying once");
