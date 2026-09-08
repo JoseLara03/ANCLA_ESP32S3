@@ -11,6 +11,7 @@
 #ifndef DISC_SCHEDULE_H
 #define DISC_SCHEDULE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Minimum turnaround from DISCOVERY RX to the first anchor's response TX.
@@ -50,7 +51,40 @@
 
 /* Delay in UWB microseconds from DISCOVERY RX to this anchor's response TX.
  * Takes the 0-based console id, NOT the short address -- keying it on the
- * address would make anchor 0 wait a full slot for no reason. */
+ * address would make anchor 0 wait a full slot for no reason.
+ * Equivalent to disc_resp_delay_uus_grouped(anchor_id, 1) -- kept as its own
+ * function rather than a wrapper so callers that never see grouping (host
+ * tests, anything predating network-scaling-v3) do not need to know it
+ * exists. */
 uint32_t disc_resp_delay_uus(uint8_t anchor_id);
+
+/* Highest rank this schedule can stagger inside one DISCOVERY collection
+ * window: DISC_BASE_UUS + DISC_MAX_RANK * DISC_SLOT_UUS = 12500 uus, the
+ * value TX_COMPLETE_TIMEOUT_MS (anchor_respond.c, 18 ms) is derived from.
+ * A group sized so that an anchor's rank inside it exceeds this must not
+ * transmit -- see disc_resp_delay_uus_grouped(). */
+#define DISC_MAX_RANK 3u
+
+/* True if this anchor should answer a DISCOVERY carrying (group, n_groups):
+ * anchor_id mod n_groups == group. n_groups == 0 matches nothing (a
+ * malformed frame the caller should already have rejected via
+ * uwb_frame_parse_discovery()'s own -EINVAL, but this stays safe either
+ * way). */
+bool disc_group_match(uint8_t anchor_id, uint8_t group, uint8_t n_groups);
+
+/* Delay in UWB microseconds from DISCOVERY RX to this anchor's response TX,
+ * for a grouped round: rank = anchor_id / n_groups, delay = DISC_BASE_UUS +
+ * rank * DISC_SLOT_UUS. Grouping is what keeps the collection window bounded
+ * as the deployment grows past 4 anchors -- every group holds at most
+ * ceil(UWB_MAX_ANCHORS / n_groups) anchors, and at n_groups = 8 for 32
+ * anchors that is exactly 4, the same worst case the ungrouped schedule was
+ * already sized for.
+ *
+ * Returns the delay via *delay_uus and true, or false if rank > DISC_MAX_RANK
+ * -- an n_groups too small for the deployment (or a stale tag) would
+ * otherwise schedule a response past TX_COMPLETE_TIMEOUT_MS, which is
+ * silently indistinguishable from a lost frame on air. The caller must
+ * refuse to transmit rather than send late. */
+bool disc_resp_delay_uus_grouped(uint8_t anchor_id, uint8_t n_groups, uint32_t *delay_uus);
 
 #endif /* DISC_SCHEDULE_H */
