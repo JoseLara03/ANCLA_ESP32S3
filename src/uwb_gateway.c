@@ -24,6 +24,7 @@
 #include "gw_core.h"
 #include "pos_sink.h"
 #include "tag_id.h"
+#include "uwb_debug.h"
 #include "uwb_dwtime.h"
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_mac.h"
@@ -35,7 +36,17 @@
 
 #include <errno.h>
 
-LOG_MODULE_REGISTER(uwb_gateway, LOG_LEVEL_INF);
+/* ANCLA_LOG_LEVEL, not LOG_LEVEL_INF: dispatch()'s catch-all needs LOG_DBG, and
+ * a per-module level is a COMPILE-TIME cap that no .conf and no `log enable dbg`
+ * can lift afterwards. Resolves to LOG_LEVEL_INF in production, so this changes
+ * nothing there. */
+LOG_MODULE_REGISTER(uwb_gateway, ANCLA_LOG_LEVEL);
+
+/* Frame-type byte offset, for the dispatch() catch-all only. Duplicated from
+ * OFF_TYPE in uwb_frame_802_15_4z.c (and from uwb_slave.c's DBG_OFF_TYPE, the
+ * same workaround) rather than exported: that header is kept byte-identical to
+ * the tag's copy, so it cannot gain a symbol this project wants. */
+#define DBG_OFF_TYPE 9
 
 /* T_SUPERFRAME_UUS comes from uwb_mac.h — the slaves predict the beacon from
  * the same definition, and a local copy here would drift against theirs. */
@@ -395,6 +406,15 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 		struct gw_grant g;
 
 		if (uwb_frame_parse_join(buf, len, eui, &req_tier) != 0) {
+			/* Was a silent return. A tag that transmits a JOIN the
+			 * gateway cannot parse is indistinguishable, from this
+			 * console, from a tag that never transmitted at all --
+			 * and those have completely different causes. WRN, not
+			 * DBG: uwb_frame_is_join() already matched the type and
+			 * exact length, so reaching here is a real malformation,
+			 * not ordinary traffic, and cannot flood. */
+			LOG_WRN("JOIN failed to parse (len=%u) — malformed frame",
+				len);
 			return;
 		}
 		if (!gw_core_join(ctx, eui, req_tier, &g)) {
@@ -493,7 +513,17 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 		pos_sink_publish(&fix);
 	}
 	/* Anything else is tag<->anchor ranging traffic. MAC-only: not ours,
-	 * and logging every frame on a busy network would flood the console. */
+	 * and logging every frame on a busy network would flood the console --
+	 * hence LOG_DBG, compiled out entirely unless this is the debug image.
+	 * There it is the one line that separates "the tag never transmitted"
+	 * from "it transmitted something this dispatch chain declined to
+	 * claim", which no other gateway log can distinguish. */
+	else {
+		LOG_DBG("{\"rx_unclaimed\":{\"type\":\"0x%02X\",\"len\":%u,"
+			"\"src\":\"0x%04X\"}}",
+			len > DBG_OFF_TYPE ? buf[DBG_OFF_TYPE] : 0u,
+			len, uwb_frame_get_src_addr(buf));
+	}
 }
 
 void uwb_gateway_run(const uwb_config_t *cfg)
