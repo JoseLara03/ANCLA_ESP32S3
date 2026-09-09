@@ -12,7 +12,7 @@
 
 #include "dw3000_spi.h"
 
-#include "version.h"
+#include <zephyr/version.h>
 
 /* This file implements the SPI functions required by decadriver */
 
