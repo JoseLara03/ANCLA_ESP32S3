@@ -75,8 +75,37 @@ LOG_MODULE_REGISTER(anchor_respond, ANCLA_LOG_LEVEL);
  * 864 uus of pure clock time at 2 MHz. Bench-confirmed for DISCOVERY via an
  * external sniffer (clean WAVE/DISCOVERY responses, no TX misses); matching
  * it here for WAVE as before, since both share tx_delayed() and the same
- * driver overhead. */
-#define POLL_RX_TO_RESP_TX_DLY_UUS 2000u
+ * driver overhead.
+ *
+ * 2026-09-08 (network-scaling-v3 Task 11, turnaround-floor measurement): the
+ * temporary turnaround_probe instrumented into anchor_respond_wave_poll()
+ * measured the real RX-to-ready-for-dwt_starttx() floor at 470-561 uus worst
+ * case (bench, ~280 samples, two distances -- distance-independent as
+ * expected, this is software/SPI time not RF). That number alone is NOT the
+ * whole constraint: `dwt_setdelayedtrxtime()` schedules the RMARKER, not the
+ * physical TX start (CMD_DTX in dw3000_deca_vals.h: "RMARKER will be @ time
+ * set in DX_TIME register") -- the PLEN_1024 preamble (~1050 uus) has to be
+ * physically transmitted BEFORE that scheduled instant, so the real floor is
+ * measured_floor + preamble_duration, not measured_floor alone. At the old
+ * 2000, that leaves only ~390 uus of margin above the ~1610 uus hard floor
+ * (560 + 1050) -- far less slack than a naive "2000 - 560 = 1440" reading
+ * suggests. 1800 was tried first, as a modest step down (leaves ~190 uus over
+ * the hard floor). Bench result via `cal peer` (128-exchange batches): ~2/128
+ * (~1.6%) landed on `"verdict":"missed_slot"`/`"no_txfrs"` -- 190 uus of
+ * margin is not quite enough against whatever jitter exists in either the
+ * measured CPU floor or the chip's own arming lead time (still no measured
+ * number for the latter in isolation). Raised to 1850 (~240 uus margin) on
+ * that evidence; re-verify the miss rate drops to ~0 before trusting this
+ * value or pushing further. Do not jump straight back to 2000 on a single bad
+ * batch either -- re-run first, since ~1.6% is small enough that one batch's
+ * count is noisy.
+ * NOTE: the tag's own POLL_TX_TO_RESP_RX_DLY_UUS (production ranging) and the
+ * DWM3001CDK reference node's POLL_RX_TO_RESP_TX_DLY_UUS have NOT been moved
+ * to match -- this value is currently exercised only anchor-to-anchor via
+ * `cal peer` (ss_initiator.c's own RX_AFTER_TX_UUS=300 still has ample margin
+ * at 1850). Move those two in lockstep, and recalibrate antenna delay
+ * afterward, before testing this against a real tag or the DWM3001CDK. */
+#define POLL_RX_TO_RESP_TX_DLY_UUS 1850u
 
 /* ---- Legacy WAVE/0xE0 -> VEWA/0xE1 ---- */
 static const uint8_t rx_poll_ref[] = {
@@ -266,6 +295,21 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
 	uwb_resp_msg_set_ts(&tx_resp_msg[POS_RESP_TX_TS_IDX], resp_tx_ts);
 	memcpy(&tx_resp_msg[POS_ANCHOR_X_IDX], &cfg->x, sizeof(float));
 	memcpy(&tx_resp_msg[POS_ANCHOR_Y_IDX], &cfg->y, sizeof(float));
+
+	/* TEMPORARY -- network-scaling-v3 anchor plan Task 2 (measure the real
+	 * turnaround floor before touching POLL_RX_TO_RESP_TX_DLY_UUS). Reads
+	 * the DW3000's own clock right before arming the delayed TX and diffs
+	 * it against poll_rx_ts, both already in the same hi32/UUS domain
+	 * POLL_RX_TO_RESP_TX_DLY_UUS is expressed in -- this is exactly "how
+	 * much of the 2000 uus budget RX-side processing (readrxdata,
+	 * readrxtimestamp, readdiagnostics, this frame build) has already
+	 * spent" by the time dwt_starttx() is about to be called inside
+	 * tx_delayed(). One extra SPI read, LOG_INF so it shows without the
+	 * debug image. Remove once Task 2 has its number -- do not let this
+	 * ship in a deployment image. */
+	LOG_INF("{\"turnaround_probe\":{\"floor_uus\":%d}}",
+		hi32_delta_uus(dwt_readsystimestamphi32(),
+			       (uint32_t)(poll_rx_ts >> 8)));
 
 	/* tx_resp_msg already carries the two FCS placeholder bytes, hence
 	 * ranging=1 and no extra FCS_LEN in writetxfctrl. */
