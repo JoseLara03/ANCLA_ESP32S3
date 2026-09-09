@@ -17,9 +17,33 @@
 #define UWB_FRAME_TYPE_KEEPALIVE 0xE8
 #define UWB_FRAME_TYPE_RELEASE   0xE9
 #define UWB_FRAME_TYPE_POS       0xEA
-#define UWB_FRAME_TYPE_ALERT     0xEB
 #define UWB_FRAME_TYPE_ANNOUNCE  0xEC
 #define UWB_FRAME_TYPE_MPOL_RESP 0xED
+/* Moved from 0xEB. 0xEB was DOUBLE-ALLOCATED: the anchor project has used it as
+ * APOS_FRAME_TYPE for the auto-positioning survey since before ALERT existed,
+ * and the collision was exact rather than approximate -- APOS_LEN_ENUM_RSP is
+ * 34 bytes, the same as UWB_FRAME_LEN_ALERT, with the discriminating byte at
+ * the same offset 10 (ALERT's `state`, apos's subtype).
+ *
+ * It never bit, but only via two single-point saves: an apos ENUM_RSP reaching
+ * a tag was rejected because subtype 0x02 trips UWB_ALERT_STATE_RESERVED_MASK
+ * by one bit, and a HELP alert reaching an anchor survived only because state
+ * 0x01 is exactly APOS_SUB_SURVEY_BEGIN and the two frames differ in length.
+ * Any new 34-byte apos subtype with bit 1 clear, or any change to
+ * UWB_FRAME_LEN_ALERT, turns that into silent cross-talk between two unrelated
+ * functions -- and the gateway's dispatch() tests apos FIRST, so an ALERT would
+ * have been swallowed by the survey handler.
+ *
+ * ALERT moved rather than apos because apos already has seven subtypes, its own
+ * codec and its own host tests, whereas ALERT is a single type whose relay is
+ * not implemented on the anchor side at all.
+ *
+ * UWB_PROTO_VER is deliberately NOT bumped for this: it is already 3 on this
+ * branch, and no ALERT has ever been transmitted by either firmware (bench
+ * captures show no 0xEB from any node), so no peer can be relying on the old
+ * code. Both repos still have to be reflashed together, as always for a shared
+ * wire constant. */
+#define UWB_FRAME_TYPE_ALERT     0xEE
 
 #define UWB_ADDR_GATEWAY  0x0000u
 #define UWB_ADDR_UNASSOC  0xFFFEu   /* tag src before it is granted a short addr */
@@ -61,7 +85,7 @@
 #define UWB_FRAME_POS_SOC_UNKNOWN 0xFFu
 #define UWB_FRAME_LEN_POS        24
 
-/* ---- ALERT (0xEB): HELP/CANCEL, tag/anchor -> gateway --------------------
+/* ---- ALERT (0xEE): HELP/CANCEL, tag/anchor -> gateway --------------------
  * See spec/2026-08-16-uwb-help-alert-design.md §2/§3 for the field
  * semantics (epoch/repeat_seq/ttl/sender_hop ordering and the reserved
  * `state` bits). UWB_FRAME_LEN_ALERT (34) <= UWB_FRAME_MAX_LEN (37). */
@@ -178,7 +202,7 @@ int  uwb_frame_parse_pos(const uint8_t *buf, size_t len, uint16_t *src_addr,
                          float *x, float *y, float *residual_m,
                          uint8_t *n_anchors, uint8_t *batt_soc);
 
-/* ---- ALERT (0xEB) builder / parser / validator ---- */
+/* ---- ALERT (0xEE) builder / parser / validator ---- */
 int  uwb_frame_alert_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
                            const struct uwb_alert *a);
 bool uwb_frame_is_alert(const uint8_t *buf, size_t len);

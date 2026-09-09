@@ -64,7 +64,15 @@
  * "parse failed" LOG_WRN naming the expected length. Survey traffic is
  * commissioning-only and the whole array is reflashed together, so this is a
  * flag-day change by design rather than an accident; it costs nothing to the
- * tag, which never parses 0xEB. */
+ * tag, which never parses 0xEB.
+ *
+ * That last clause was briefly FALSE: protocol v3 gave the tag an ALERT frame
+ * on 0xEB, colliding exactly with this type -- same code, same 34-byte length
+ * as APOS_LEN_ENUM_RSP, same discriminating byte at offset 10 (apos's subtype
+ * against ALERT's `state`) -- and uwb_gateway.c's dispatch() tests apos FIRST,
+ * so a tag ALERT would have been swallowed by the survey handler. ALERT moved
+ * to 0xEE; apos keeps 0xEB because it already has seven subtypes, its own codec
+ * and its own host tests. The clause is true again, and must stay true. */
 #define APOS_LEN_MAX APOS_LEN_ENUM_RSP
 
 /* Broadcast destination, matching UWB_FRAME_ADDR_BCAST. Redeclared rather than

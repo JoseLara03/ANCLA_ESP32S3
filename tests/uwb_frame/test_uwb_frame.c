@@ -375,7 +375,12 @@ static void test_pos(void)
 
 static void test_alert(void)
 {
-    CHECK(UWB_FRAME_TYPE_ALERT == 0xEB);
+    /* 0xEE, not 0xEB: 0xEB collided exactly with this project's own
+     * APOS_FRAME_TYPE -- same code, same 34-byte length, same discriminating
+     * offset 10, and dispatch() tests apos first. Pinned here because a
+     * function code is a wire value: changing it must be a deliberate edit to
+     * a test, not a silent consequence of editing a header. */
+    CHECK(UWB_FRAME_TYPE_ALERT == 0xEE);
     CHECK(UWB_FRAME_LEN_ALERT == 34);
     CHECK(UWB_FRAME_LEN_ALERT <= UWB_FRAME_MAX_LEN);
     CHECK(UWB_ALERT_STATE_HELP == 0x01);
