@@ -430,8 +430,10 @@ gw seed <n>                    fill n FAKE tag seats (n up to GW_MAX_SEATS)
 - `src/gw_core.{c,h}` — CFP seat table, leases and the tag address pool. The
   single-phase table was ported unchanged from the nRF5 gateway; a
   `[GW_CYCLE_C][GW_N_CFP]` phase dimension is new this session (network-scaling-v3
-  Task 12), letting a tag hold up to `GW_PHASES_MAX_FAST` (4) phases instead of
-  exactly one. Also new this session: `gw_core_release()` frees every phase-cell
+  Task 12), letting a tag hold up to `GW_PHASES_MAX_FAST` phases instead of
+  exactly one — raised to `GW_CYCLE_C` (16, one fix per superframe) in the
+  2026-09-09 session for real-time tracking; see the hard-won fact on this
+  below for the capacity tradeoff that raise reopened. Also new this session: `gw_core_release()` frees every phase-cell
   a tag holds (Task 13), `gw_core_pos_seen()` refreshes a multi-phase tag's
   lease on every cell without touching tier or phase (Task 15), and a 64-entry
   EUI→short-address map (`GW_ADDR_MAP_SIZE`) so a tag rejoining after full
@@ -1038,6 +1040,62 @@ gw seed <n>                    fill n FAKE tag seats (n up to GW_MAX_SEATS)
   both exist, do not grant, test, or demo a tag holding fewer than
   `GW_CYCLE_C` phases against real tag firmware. See `src/gw_core.h`'s full
   file-header comment for the derivation.
+  **UPDATE (2026-09-09 session): both prerequisites (a) and (b) are now done
+  in code, plus a third gap this session found beyond what either of the
+  above ever flagged.** (a) `send_grant()` (`src/uwb_gateway.c`) has carried
+  `g->phase_mask` on the wire since network-scaling-v3 Task 14 (GRANT grew
+  24→26 bytes for it). (b) `tag_testting/src/uwb_net.c`'s `UWB_ST_DISCOVER`
+  and `UWB_ST_RANGING` cases no longer read raw beacon absence as lease loss —
+  they gate on `uwb_net_phase_active(c->phase_mask, ev->frame_counter)` first,
+  and only a beacon covering one of the tag's OWN granted phases can still
+  drop it to SCAN. **The gap this session actually closed:** even with (a)
+  and (b) both in place, a KEEPALIVE that grows/shrinks a tag's phase count
+  (`gw_core_keepalive()` returning `GW_KEEPALIVE_REPHASED`) never reached the
+  tag at all — `uwb_gateway.c`'s KEEPALIVE branch only logged the REPHASE, it
+  never called `send_grant()`, so the tag kept ranging on its stale original
+  phase forever regardless of (a)/(b). Fixed: the KEEPALIVE branch now looks
+  up the tag's EUI via `gw_core_find_eui()` (the KEEPALIVE frame itself
+  carries no EUI) and re-GRANTs on REPHASED, exactly like the JOIN path
+  already does. Two tag-side gaps had to close alongside it, neither
+  previously flagged anywhere: `UWB_EV_GRANT` was only ever handled in
+  `UWB_ST_JOINING`, so a re-GRANT arriving during `RANGING`/`DISCOVER` was
+  silently dropped by the state machine — both cases now update
+  `slot_index`/`tier`/`lease_remaining`/`phase_mask` in place without a state
+  change; and nothing in `uwb_net_runner.c` ever listened for a reply after
+  `UWB_ACT_SEND_KEEPALIVE` in the first place, so the re-GRANT frame had
+  nowhere to land even once the gateway started sending it — the KEEPALIVE
+  handler now opens the same bounded post-TX RX window the JOIN path already
+  uses. Host-tested (`tag_testting/tests/uwb_net/`, four new cases covering
+  RANGING/DISCOVER re-grant, a wrong-address re-grant being ignored, and the
+  accepted fallback for a *lost* re-GRANT still forcing a clean re-JOIN via
+  the existing `in_map` check) and both repos build clean.
+  **Confirmed on hardware, same session:** a live capture showed all three
+  `REPHASE` transitions (`n=1 tier=0` -> `n=2 tier=1` -> `n=4 tier=2` and
+  back down) each followed by `pos_sink` fix intervals matching
+  `T_SUPERFRAME_UUS * GW_CYCLE_C / n` exactly — 3.2s / 1.6s / 0.8s — with no
+  gap-then-rejoin pattern at any transition, i.e. the tag's cached
+  `phase_mask` tracked every re-GRANT without ever bouncing to SCAN. Cadence
+  now genuinely tracks motion instead of being pinned at 3.2s. No retry loop
+  exists for a lost re-GRANT (accepted, documented residual risk — the tag
+  falls back to noticing via beacon absence and rejoining, same as before,
+  just without the fast path) — not exercised by this capture, still open.
+  **UPDATE (2026-09-09 session, later same day): `GW_PHASES_MAX_FAST` raised
+  from 4 to `GW_CYCLE_C` (16) at explicit request — 0.8s was not fast enough
+  for real-time tracking/velocity estimation, and one fix per superframe
+  (0.2s) is the fastest this MAC can produce. The mechanism needed no change
+  (already generic in n; verified via `gw_core_keepalive_max_for_test()` at
+  n=16 before the ceiling was raised, same discipline already used for n=8)
+  and `tests/gw_core` was updated throughout for the new production values —
+  every FAST-tier test that asserted the old ceiling of 4 now asserts
+  `GW_PHASES_MAX_FAST` symbolically or its new concrete values, still PASSED.
+  Capacity tradeoff sharpened, not removed: a FAST tag now costs 16 of the
+  176-cell table instead of 4, so roughly 11 simultaneous movers alone
+  exhausts it — fine for the bench/dev scale this was requested for, revisit
+  before a real many-tag deployment (see `gw_core.h`'s updated
+  `GW_PHASES_MAX_FAST` comment for the full arithmetic). **Not yet confirmed
+  on hardware at n=16** — the REPHASE/cadence capture above was taken at the
+  old ceiling (n=4, 0.8s); re-verify the same way (REPHASE log correlated
+  with `pos_sink` interval) once flashed, expecting 0.2s at `tier=2`.
 - **`GW_MAX_SEATS` is `GW_CYCLE_C * GW_N_CFP` — 176 today, not 224.** `GW_N_CFP`
   is still `UWB_FRAME_N_CFP` (11); it becomes 14, and `GW_MAX_SEATS` 224, only
   once a separate, still-parked task grows it to match a hardware

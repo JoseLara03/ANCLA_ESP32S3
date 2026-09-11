@@ -11,6 +11,8 @@
  */
 
 #include "cal_run.h"
+#include "cal_solve.h"
+#include "cal_math.h"   /* CAL_MAX_SAMPLES */
 #include "uwb_config.h"
 #include "uwb_store.h"
 
@@ -33,6 +35,26 @@ static bool parse_l(const char *arg, long *out)
 
 	*out = v;
 	return true;
+}
+
+/* sqrt of a per-mille probability, in per-mille: sqrt(p/1000)*1000 =
+ * sqrt(p*1000). Integer Newton, same reason cal_solve.c's is integer -- a
+ * reported number must not differ between a host and the target. */
+static uint32_t isqrt_permille(uint32_t p_permille)
+{
+	uint32_t v = p_permille * 1000u;
+	uint32_t r, prev;
+
+	if (v == 0u) return 0u;
+	r = v;
+	prev = 0u;
+	while (r != prev) {
+		prev = r;
+		r = (r + v / r) / 2u;
+	}
+	while ((r + 1u) * (r + 1u) <= v) r++;
+	while (r * r > v) r--;
+	return r;
 }
 
 static void print_result(const struct shell *sh, const struct cal_result *r)
@@ -64,6 +86,105 @@ static void print_failure(const struct shell *sh, int status)
 	}
 }
 
+/* Success rate is a CLIFF; a link already failing shows up in the SPREAD and
+ * in the received level long before the count moves. That is why this reports
+ * sd/min/max and dBm and `cal peer` does not.
+ *
+ * p_oneway = sqrt(p_exchange) assumes the two directions are equally reliable.
+ * That holds for anchor <-> anchor -- identical hardware at both ends and a
+ * reciprocal channel -- and would NOT hold against a tag, which has no PA. It
+ * is what lets this project derive the DS-TWR exchange rate WITHOUT
+ * implementing DS-TWR: any TWR variant's exchange rate is
+ * p_oneway^(frames), so 2 frames for SS-TWR and 3 for DS-TWR. */
+static int cmd_link(const struct shell *sh, size_t argc, char **argv)
+{
+	struct cal_request req = {0};
+	struct cal_result res = {0};
+	long id, n = 0;
+	int ret;
+
+	if (!parse_l(argv[1], &id) || id < 0 || id >= UWB_MAX_ANCHORS) {
+		shell_error(sh, "error: id must be 0..%u", UWB_MAX_ANCHORS - 1);
+		return -EINVAL;
+	}
+	/* Polling your own id is a self-poll: the responder that would answer
+	 * is this very board, whose receiver is off for the whole exchange
+	 * (ss_initiator_enter disables every interrupt and takes over the
+	 * radio). It comes back as N of N rx_timeout_or_err -- identical to a
+	 * peer that is out of range or powered off, and the survey-floor
+	 * warning below would then blame the LINK for what is an addressing
+	 * mistake. */
+	if (id == (long)uwb_config_get()->anchor_id) {
+		shell_error(sh,
+			    "error: id %ld is THIS board's own anchor id -- a "
+			    "board cannot range itself. `anchor show` reports "
+			    "the local id; pick a different peer",
+			    id);
+		return -EINVAL;
+	}
+	if (argc > 2 && (!parse_l(argv[2], &n) || n < 1 || n > 512)) {
+		shell_error(sh, "error: attempts must be 1..512");
+		return -EINVAL;
+	}
+
+	req.peer_wire_id = (uint8_t)((UWB_ANCHOR_ADDR_BASE + id) & 0xFFu);
+	req.link = true;
+	req.attempts = (uint32_t)n;
+	req.persist = false;
+
+	ret = cal_run_execute(&req, &res);
+	if (ret) {
+		print_failure(sh, ret);
+		return ret;
+	}
+
+	/* Rates in per-mille, integer: this is a report, and an integer cannot
+	 * pick up a different last digit between two builds. */
+	uint32_t p_exch = res.attempted ?
+		(uint32_t)((uint64_t)res.valid * 1000u / res.attempted) : 0u;
+	uint32_t p_one = isqrt_permille(p_exch);
+	/* p_oneway^3 in one division, not two: chaining /1000 truncates twice
+	 * and drifts. p_one <= 1000 so the cube is at most 1e9. */
+	uint32_t p_ds  = (uint32_t)((uint64_t)p_one * p_one * p_one / 1000000u);
+
+	shell_print(sh,
+		    "{\"link\":{\"peer\":%d,\"attempted\":%u,\"valid\":%u,"
+		    "\"p_exch_permille\":%u,\"p_oneway_permille\":%u,"
+		    "\"p_dstwr_projected_permille\":%u,"
+		    "\"stats_over\":%u,\"mean_mm\":%d,\"sd_mm\":%d,"
+		    "\"min_mm\":%d,\"max_mm\":%d,"
+		    "\"rx_dbm_x10\":{\"mean\":%d,\"min\":%d,\"max\":%d,\"n\":%u},"
+		    "\"fail\":{\"tx_start\":%u,\"tx_done\":%u,\"rx_to_err\":%u,"
+		    "\"len\":%u,\"hdr\":%u,\"layout\":%u}}}",
+		    (int)id, res.attempted, res.valid,
+		    p_exch, p_one, p_ds,
+		    (unsigned int)((res.valid < CAL_MAX_SAMPLES) ?
+				   res.valid : CAL_MAX_SAMPLES),
+		    res.mean_mm, res.sd_mm, res.min_mm, res.max_mm,
+		    res.rx_level_mean_x10, res.rx_level_min_x10,
+		    res.rx_level_max_x10, res.rx_level_n,
+		    res.f_tx_start, res.f_tx_done, res.f_rx_to_err,
+		    res.f_len, res.f_hdr, res.f_layout);
+
+	/* The one threshold an operator would otherwise have to look up:
+	 * the tag needs UWB_NET_MIN_ANCHORS = 3 anchors and a batch that
+	 * completes within its own budget, so a low exchange rate here means
+	 * the same pair would be marginal or unusable in production too. */
+	if (p_exch < 363u) {
+		shell_warn(sh,
+			   "exchange rate %u.%u %% is low -- this pair may be "
+			   "unusable at this distance",
+			   p_exch / 10u, p_exch % 10u);
+	}
+	if (res.rx_level_n == 0u && res.valid > 0u) {
+		shell_warn(sh,
+			   "no RX level: the CIA never reported done. Not a "
+			   "weak signal -- check dwt_configciadiag() ran");
+	}
+
+	return 0;
+}
+
 static int cmd_peer(const struct shell *sh, size_t argc, char **argv)
 {
 	struct cal_request req = {0};
@@ -75,6 +196,15 @@ static int cmd_peer(const struct shell *sh, size_t argc, char **argv)
 
 	if (!parse_l(argv[1], &id) || id < 0 || id >= UWB_MAX_ANCHORS) {
 		shell_error(sh, "error: id must be 0..%u", UWB_MAX_ANCHORS - 1);
+		return -EINVAL;
+	}
+	/* Same self-poll trap as `cal link` -- see its comment. */
+	if (id == (long)uwb_config_get()->anchor_id) {
+		shell_error(sh,
+			    "error: id %ld is THIS board's own anchor id -- a "
+			    "board cannot range itself. `anchor show` reports "
+			    "the local id; pick a different peer",
+			    id);
 		return -EINVAL;
 	}
 	if (!parse_l(argv[2], &mm) || mm <= 0) {
@@ -168,6 +298,11 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_cal,
 		      "peer <id> <mm> — range anchor <id> at a known distance; "
 		      "reports only, never persists",
 		      cmd_peer, 3, 0),
+	SHELL_CMD_ARG(link, NULL,
+		      "link <id> [attempts] - range/link quality against a peer. "
+		      "No reference distance: reports exchange success rate, "
+		      "distance spread and RX level in dBm. Never persists.",
+		      cmd_link, 2, 1),
 	SHELL_SUBCMD_SET_END
 );
 

@@ -146,36 +146,39 @@
 #define GW_TIER_FAST      2u
 
 /* Phases a tag of each tier may hold. These are CEILINGS, not fixed counts:
- * the allocator starts at the tier's ceiling and halves (4 -> 2 -> 1) until it
- * finds that many evenly spread phases actually free at one CFP slot, so a
- * shortfall is measured by what is genuinely unclaimed and never by evicting
- * anyone. Halving keeps invariant 2 above exact: every rung divides
- * GW_CYCLE_C. An unrecognised tier byte is treated as IDLE, the direction that
- * cannot let a malformed frame claim the maximum.
+ * the allocator starts at the tier's ceiling and halves (16 -> 8 -> 4 -> 2 ->
+ * 1) until it finds that many evenly spread phases actually free at one CFP
+ * slot, so a shortfall is measured by what is genuinely unclaimed and never
+ * by evicting anyone. Halving keeps invariant 2 above exact: every rung
+ * divides GW_CYCLE_C. An unrecognised tier byte is treated as IDLE, the
+ * direction that cannot let a malformed frame claim the maximum.
  *
- * GW_PHASES_MAX_FAST is 4 -- the plan's "FAST 4". Its parenthetical "(8 when
- * the budget allows)" is DELIBERATELY NOT IMPLEMENTED: deciding when a budget
- * allows it needs system-wide occupancy sensing that does not exist here, and
- * a conservative default is cheap while an early-filled table is not. The
- * arithmetic behind that choice: GW_MAX_SEATS is GW_CYCLE_C * GW_N_CFP == 176
- * today (224 only once a deferred task grows GW_N_CFP to 14), while 20
- * simultaneous FAST tags at 8 phases plus 80 stationary ones at 1 comes to
- * 240 -- overcommitted even against the eventual 224. And exhaustion does not
- * gracefully degrade the mover that caused it: this allocator never evicts, so
- * the cost lands on some unrelated stationary tag whose JOIN is refused
- * outright (zero fixes), which is strictly worse than the smaller allocation
- * the mover would have been fine with. 4 phases is 1.25 Hz at a 200 ms
- * superframe, which the design treats as adequate; 8 is 2.5 Hz, a bonus.
- * Raising this once real occupancy data justifies it is a one-line change.
+ * GW_PHASES_MAX_FAST is GW_CYCLE_C (16) -- one fix every single superframe,
+ * the fastest this MAC can produce (200 ms), needed for real-time tracking
+ * and velocity estimation. Raised from 4 (1.25 Hz) this session at explicit
+ * request; the previous comment here reasoned 4 as "adequate" against a
+ * conservative capacity budget and left 8 as an unimplemented "bonus" -- that
+ * reasoning is superseded, not wrong, by a requirement this constant did not
+ * anticipate. The capacity tradeoff it flagged is now sharper, not gone:
+ * GW_MAX_SEATS is GW_CYCLE_C * GW_N_CFP == 176 today, and a FAST tag at 16
+ * phases now costs 16 cells instead of 4 -- roughly 11 simultaneous movers
+ * alone exhausts the table (11*16 = 176), leaving zero for any stationary
+ * tag, whose JOIN would then be refused outright (this allocator never
+ * evicts). Fine for a bench/dev setup with a handful of tags, which is what
+ * motivated the change; revisit before a real multi-tag deployment -- either
+ * back this off for SLOW/IDLE-heavy fleets, or build the occupancy-aware
+ * throttling the original "(8 when the budget allows)" note deferred.
  *
  * The MECHANISM stays generically capable of any power-of-two n up to
  * GW_CYCLE_C: nothing in alloc_phases()/find_candidate()/claim() is capped at
- * 4, and tests/gw_core still pins n == 8 through
- * gw_core_keepalive_max_for_test() below, so a later raise does not land on
- * untested code. */
+ * any particular n, and tests/gw_core pins both n == 8 and n == 16 through
+ * gw_core_keepalive_max_for_test() below (the 16 case was verified via that
+ * seam before this ceiling was raised to it, so the raise did not land on
+ * untested code), so a future ceiling change in either direction has the same
+ * safety net. */
 #define GW_PHASES_MAX_IDLE  1
 #define GW_PHASES_MAX_SLOW  2
-#define GW_PHASES_MAX_FAST  4
+#define GW_PHASES_MAX_FAST  GW_CYCLE_C
 
 _Static_assert(GW_CYCLE_C <= 16,
                "struct gw_grant.phase_mask is 16 bits: GW_CYCLE_C cannot exceed 16");
@@ -239,10 +242,11 @@ struct gw_grant {
                            * covers (invariant 1 in the file comment) */
     uint16_t phase_mask;  /* bit i set == this tag holds phase i. Always
                            * gw_phase_count() bits, always evenly spaced.
-                           * A separate, deferred task puts exactly this field
-                           * on the wire in the GRANT frame; until then it is
-                           * for logging and for the beacon slot maps, which
-                           * already carry the same information implicitly. */
+                           * Goes out on the wire in the GRANT frame
+                           * (send_grant(), uwb_gateway.c) on both the initial
+                           * JOIN grant and a KEEPALIVE-triggered re-grant, so
+                           * the tag's own cached mask never goes stale
+                           * relative to what this table actually holds. */
     uint8_t  tier;
     uint16_t lease;
 };

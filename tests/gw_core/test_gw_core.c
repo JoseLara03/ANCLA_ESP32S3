@@ -566,10 +566,10 @@ static void test_join_grants_one_phase_at_every_tier(void)
 }
 
 /* The brief's headline: a FAST tag's phases spread evenly around the cycle.
- * On an empty table the whole ceiling (GW_PHASES_MAX_FAST == 4) is available,
- * so "FAST 4" resolves to 4 -- at stride GW_CYCLE_C/4 == 4, i.e. phases
- * 0,4,8,12 (1.25 Hz at a 200 ms superframe), NOT phases 0..3. */
-static void test_keepalive_spreads_4_phases_evenly(void)
+ * On an empty table the whole ceiling (GW_PHASES_MAX_FAST == GW_CYCLE_C, one
+ * fix every superframe) is available, so a FAST tag ends up holding every
+ * phase -- the only possible "even spread" of size GW_CYCLE_C. */
+static void test_keepalive_spreads_to_the_fast_ceiling_evenly(void)
 {
     struct gw_core_ctx c;
     uint8_t eui[UWB_FRAME_EUI_LEN];
@@ -584,15 +584,14 @@ static void test_keepalive_spreads_4_phases_evenly(void)
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
     CHECK(k.short_addr == g.short_addr);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
-    CHECK(is_even_spread(k.phase_mask, 4));
-    CHECK(k.phase_mask != consecutive_mask(k.phase_mask, 4));
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
+    CHECK(is_even_spread(k.phase_mask, GW_PHASES_MAX_FAST));
     CHECK(k.phase == 0);                       /* base is the lowest phase */
-    CHECK(k.phase_mask == 0x1111u);            /* phases 0,4,8,12 */
+    CHECK(k.phase_mask == 0xFFFFu);            /* every phase */
 
     /* And the table agrees with the grant, at ONE slot index. */
     CHECK(mask_of(&c, g.short_addr, &slot, &cells) == k.phase_mask);
-    CHECK(cells == 4);
+    CHECK(cells == GW_PHASES_MAX_FAST);
     CHECK(slot == k.slot_index);
     CHECK(k.slot_index == g.slot_index);       /* grew in place */
 }
@@ -634,14 +633,47 @@ static void test_mechanism_spreads_8_phases_evenly(void)
     CHECK(k.slot_index == g.slot_index);
 
     /* The seam changes nothing but the ceiling: a normal FAST KEEPALIVE right
-     * afterwards pulls the same tag back down to the tier's 4, which is both
-     * the proof that tier policy still lives in one place and the proof that
-     * the four surrendered cells go back to the pool. */
+     * afterwards pulls the same tag back up to the tier's real ceiling (which
+     * happens to be MORE than 8 now that GW_PHASES_MAX_FAST is GW_CYCLE_C) --
+     * proof that tier policy still lives in one place, not in the seam. */
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
-    CHECK(is_even_spread(k.phase_mask, 4));
-    CHECK(occupied_cells(&c) == 4);
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
+    CHECK(is_even_spread(k.phase_mask, GW_PHASES_MAX_FAST));
+    CHECK(occupied_cells(&c) == GW_PHASES_MAX_FAST);
+}
+
+/* n == GW_CYCLE_C (16): a tag holding every phase, one fix every superframe
+ * (200 ms, the hard floor -- there is no faster rung). Unlike every smaller n,
+ * there is no "spread" to check: holding all 16 phases is unconditionally the
+ * most even layout possible, and is_even_spread()'s own base<stride canonical-
+ * base check degenerates to base==0 exactly, since stride == 1. Added via the
+ * generic max-for-test seam BEFORE promoting GW_PHASES_MAX_FAST to 16, per
+ * this header's own note that a ceiling raise must not land on untested code. */
+static void test_mechanism_spreads_16_phases_evenly(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g, k;
+    int cells = 0, slot = -1;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x10);
+    CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
+    CHECK(gw_phase_count(g.phase_mask) == 1);
+
+    CHECK(gw_core_keepalive_max_for_test(&c, g.short_addr, GW_TIER_FAST,
+                                         GW_CYCLE_C, &k)
+          == GW_KEEPALIVE_REPHASED);
+    CHECK(k.short_addr == g.short_addr);
+    CHECK(gw_phase_count(k.phase_mask) == GW_CYCLE_C);
+    CHECK(is_even_spread(k.phase_mask, GW_CYCLE_C));
+    CHECK(k.phase == 0);
+    CHECK(k.phase_mask == 0xFFFFu);            /* every phase */
+    CHECK(mask_of(&c, g.short_addr, &slot, &cells) == k.phase_mask);
+    CHECK(cells == GW_CYCLE_C);
+    CHECK(slot == k.slot_index);
+    CHECK(k.slot_index == g.slot_index);
 }
 
 /* SLOW's ceiling is 2, so a SLOW tag gets exactly two phases half a cycle
@@ -857,9 +889,10 @@ static void test_regrant_moves_slot_rather_than_shrink(void)
 
 /* A tier drop must hand the excess cells BACK, not merely stop counting them.
  * Proved the only way that really settles it: fill the table completely around
- * a FAST tag holding its 4 phases, confirm a JOIN is refused, drop that tag to
- * IDLE, and then show exactly 3 further JOINs succeed -- landing in the cells
- * it gave up -- before the table is full again. */
+ * a FAST tag holding its full ceiling of phases, confirm a JOIN is refused,
+ * drop that tag to IDLE, and then show exactly (ceiling - 1) further JOINs
+ * succeed -- landing in the cells it gave up -- before the table is full
+ * again. */
 static void test_tier_drop_returns_phases_to_the_pool(void)
 {
     struct gw_core_ctx c;
@@ -873,11 +906,11 @@ static void test_tier_drop_returns_phases_to_the_pool(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
-    CHECK(k.phase_mask == 0x1111u);
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
+    CHECK(k.phase_mask == 0xFFFFu);
 
     /* Fill every remaining cell, one single-phase tag each. */
-    for (int i = 0; i < total - 4; i++) {
+    for (int i = 0; i < total - GW_PHASES_MAX_FAST; i++) {
         uint8_t f[UWB_FRAME_EUI_LEN];
         struct gw_grant fg;
 
@@ -888,29 +921,29 @@ static void test_tier_drop_returns_phases_to_the_pool(void)
     mk_eui(eui, 0xE0);
     CHECK(!gw_core_join(&c, eui, GW_TIER_IDLE, &extra));   /* full */
 
-    /* The mover goes still: 4 phases -> 1, keeping its base cell. */
+    /* The mover goes still: ceiling phases -> 1, keeping its base cell. */
     struct gw_grant idle;
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_IDLE, &idle)
           == GW_KEEPALIVE_REPHASED);
     CHECK(gw_phase_count(idle.phase_mask) == 1);
     CHECK(idle.phase_mask == 0x0001u);
     CHECK(idle.slot_index == k.slot_index);
-    CHECK(occupied_cells(&c) == total - 3);
+    CHECK(occupied_cells(&c) == total - (GW_PHASES_MAX_FAST - 1));
 
-    /* The three released cells are genuinely back in the pool: three JOINs
-     * succeed, the fourth is refused, and each lands on a cell the mover used
+    /* The released cells are genuinely back in the pool: (ceiling - 1) JOINs
+     * succeed, the next is refused, and each lands on a cell the mover used
      * to hold. */
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < GW_PHASES_MAX_FAST - 1; i++) {
         uint8_t f[UWB_FRAME_EUI_LEN];
         struct gw_grant fg;
 
-        mk_eui(f, (uint8_t)(0xE1 + i));
+        mk_eui(f, (uint8_t)(0xA0 + i));
         CHECK(gw_core_join(&c, f, GW_TIER_IDLE, &fg));
         CHECK(k.phase_mask & (uint16_t)(1u << fg.phase));  /* a released cell */
         CHECK(fg.slot_index == k.slot_index);
     }
     CHECK(occupied_cells(&c) == total);
-    mk_eui(eui, 0xE9);
+    mk_eui(eui, 0xFD);
     CHECK(!gw_core_join(&c, eui, GW_TIER_IDLE, &extra));
 }
 
@@ -930,8 +963,8 @@ static void test_release_frees_every_phase(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
-    CHECK(occupied_cells(&c) == 4);
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
+    CHECK(occupied_cells(&c) == GW_PHASES_MAX_FAST);
 
     gw_core_release(&c, g.short_addr);
     CHECK(mask_of(&c, g.short_addr, NULL, &cells) == 0);
@@ -1002,16 +1035,16 @@ static void test_pos_seen_refreshes_every_phase(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
 
-    /* Tick to just short of expiry, then let POS refresh all four cells. */
+    /* Tick to just short of expiry, then let POS refresh every cell. */
     for (unsigned i = 0; i < GW_LEASE_SF - 1; i++) gw_core_superframe_tick(&c);
     CHECK(mask_of(&c, g.short_addr, NULL, &cells) == k.phase_mask);
-    CHECK(cells == 4);
+    CHECK(cells == GW_PHASES_MAX_FAST);
 
     gw_core_pos_seen(&c, g.short_addr);
 
-    /* Without the refresh, one more tick would reclaim all four cells (as
+    /* Without the refresh, one more tick would reclaim every cell (as
      * test_multiphase_lease_expires_as_one_unit() confirms); with it, every
      * cell must still be at full lease. */
     for (int p = 0; p < GW_CYCLE_C; p++) {
@@ -1023,11 +1056,11 @@ static void test_pos_seen_refreshes_every_phase(void)
     }
 
     /* Tick GW_LEASE_SF - 1 more times: a naive single-cell refresh would have
-     * let the other three cells expire by now, GW_LEASE_SF - 1 ticks after
-     * they were last (not) refreshed. All four must still be held. */
+     * let the other cells expire by now, GW_LEASE_SF - 1 ticks after they were
+     * last (not) refreshed. Every cell must still be held. */
     for (unsigned i = 0; i < GW_LEASE_SF - 1; i++) gw_core_superframe_tick(&c);
     CHECK(mask_of(&c, g.short_addr, NULL, &cells) == k.phase_mask);
-    CHECK(cells == 4);
+    CHECK(cells == GW_PHASES_MAX_FAST);
 }
 
 /* A multi-phase tag's lease must expire as ONE unit after exactly GW_LEASE_SF
@@ -1047,15 +1080,15 @@ static void test_multiphase_lease_expires_as_one_unit(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
 
     for (unsigned i = 0; i < GW_LEASE_SF - 1; i++) gw_core_superframe_tick(&c);
     CHECK(mask_of(&c, g.short_addr, NULL, &cells) == k.phase_mask);
-    CHECK(cells == 4);                         /* all four still held */
+    CHECK(cells == GW_PHASES_MAX_FAST);        /* every cell still held */
 
     gw_core_superframe_tick(&c);
     CHECK(mask_of(&c, g.short_addr, NULL, &cells) == 0);
-    CHECK(cells == 0);                         /* all four reclaimed at once */
+    CHECK(cells == 0);                         /* every cell reclaimed at once */
     CHECK(c.frame_counter == GW_LEASE_SF);
 }
 
@@ -1078,8 +1111,12 @@ static void test_keepalive_is_stable_once_at_tier(void)
 
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k1)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k1.phase_mask) == 4);
-    CHECK(k1.phase_mask == 0x2222u);           /* base 1, stride 4: 1,5,9,13 */
+    /* Phase 0 is entirely full (every CFP slot, from join_fillers()), so the
+     * full-ceiling (16-phase) candidate is unreachable at ANY slot -- it always
+     * needs phase 0. The ladder falls to the next rung, 8, which does not: base
+     * 1 (stride 2) needs only the odd phases, none of which the fillers touch. */
+    CHECK(gw_phase_count(k1.phase_mask) == 8);
+    CHECK(k1.phase_mask == 0xAAAAu);           /* base 1, stride 2: every odd phase */
 
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k2)
           == GW_KEEPALIVE_SAME);
@@ -1127,7 +1164,7 @@ static void test_unknown_tier_gets_idle_phase_count(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
 
     CHECK(gw_core_keepalive(&c, g.short_addr, 0xFF, &k) == GW_KEEPALIVE_REPHASED);
     CHECK(gw_phase_count(k.phase_mask) == 1);
@@ -1149,7 +1186,7 @@ static void test_rejoin_preserves_a_multiphase_grant(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
 
     for (unsigned i = 0; i < 10; i++) gw_core_superframe_tick(&c);
 
@@ -1157,7 +1194,7 @@ static void test_rejoin_preserves_a_multiphase_grant(void)
     CHECK(rj.short_addr == g.short_addr);
     CHECK(rj.phase_mask == k.phase_mask);
     CHECK(rj.slot_index == k.slot_index);
-    CHECK(occupied_cells(&c) == 4);            /* no second seat consumed */
+    CHECK(occupied_cells(&c) == GW_PHASES_MAX_FAST);   /* no second seat consumed */
 
     /* The lease is refreshed on every one of its cells, not just the first. */
     for (int p = 0; p < GW_CYCLE_C; p++) {
@@ -1228,7 +1265,7 @@ static void test_slotmap_reflects_the_whole_phase_mask(void)
     CHECK(gw_core_join(&c, eui, GW_TIER_FAST, &g));
     CHECK(gw_core_keepalive(&c, g.short_addr, GW_TIER_FAST, &k)
           == GW_KEEPALIVE_REPHASED);
-    CHECK(gw_phase_count(k.phase_mask) == 4);
+    CHECK(gw_phase_count(k.phase_mask) == GW_PHASES_MAX_FAST);
 
     for (int p = 0; p < GW_CYCLE_C; p++) {
         uint16_t map[GW_N_CFP];
@@ -1524,8 +1561,9 @@ int main(void)
     /* Task 13: phase allocation by tier. */
     test_phase_count();
     test_join_grants_one_phase_at_every_tier();
-    test_keepalive_spreads_4_phases_evenly();
+    test_keepalive_spreads_to_the_fast_ceiling_evenly();
     test_mechanism_spreads_8_phases_evenly();
+    test_mechanism_spreads_16_phases_evenly();
     test_keepalive_spreads_2_phases_evenly();
     test_keepalive_reaches_4_phases_at_a_shifted_base();
     test_keepalive_falls_back_to_2_phases();

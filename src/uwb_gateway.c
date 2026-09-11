@@ -440,28 +440,34 @@ static void dispatch(struct gw_core_ctx *ctx, const uint8_t *buf, uint16_t len,
 			 * kind of MAC state a "why is this tag reporting at the
 			 * wrong rate" investigation starts from.
 			 *
-			 * The re-phase IS published in the affected phases'
-			 * beacon slot maps, but that is not enough for the
-			 * tag to act on it: the tag reads absence from any
-			 * beacon it received as a lost lease and drops to
-			 * SCAN (see send_grant() above, and gw_core.h). A
-			 * separate, deferred task adds the phase mask to the
-			 * GRANT frame and re-GRANTs here, at which point this
-			 * branch gains a send_grant() -- but it needs the
-			 * tag's EUI, which the KEEPALIVE frame does not carry
-			 * (gw_core_find_eui() would supply it). Until that
-			 * task and its tag-side counterpart land, a REPHASE
-			 * line records what the gateway decided, not a rate
-			 * change a real tag would survive.
-			 */
+			 * The re-phase is now also re-GRANTed to the tag, not
+			 * just published in the beacon slot maps: a tag reads
+			 * absence from any beacon covering a phase it still
+			 * thinks it holds as a lost lease and drops to SCAN
+			 * (gw_core.h), so leaving it on its stale phase_mask
+			 * after a REPHASE would reintroduce exactly that. The
+			 * KEEPALIVE frame carries no EUI, so gw_core_find_eui()
+			 * supplies it from the seat the KEEPALIVE just proved
+			 * live -- regrant() never moves a tag's EUI, only its
+			 * phase/slot/tier/mask, so this lookup cannot miss on
+			 * this path; a failure is defensive-only. */
 			enum gw_keepalive_result r =
 				gw_core_keepalive(ctx, sa, rt, &g);
 
 			if (r == GW_KEEPALIVE_REPHASED) {
+				uint8_t eui[UWB_FRAME_EUI_LEN];
+
 				LOG_INF("REPHASE addr=0x%04X phase=%u slot=%u mask=0x%04X n=%u tier=%u",
 					g.short_addr, g.phase, g.slot_index,
 					g.phase_mask,
 					gw_phase_count(g.phase_mask), g.tier);
+
+				if (gw_core_find_eui(ctx, sa, eui)) {
+					send_grant(eui, &g, rx_ts);
+				} else {
+					LOG_WRN("REPHASE addr=0x%04X but EUI lookup failed — not re-GRANTed",
+						sa);
+				}
 			}
 		}
 	} else if (uwb_frame_is_release(buf, len)) {

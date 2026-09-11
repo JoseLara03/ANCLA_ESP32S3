@@ -908,6 +908,9 @@ static void on_range_rsp(const uint8_t *buf, uint16_t plen)
 	} else if (from >= 0 && to >= 0) {
 		apos_table_add_meas(&tbl, (uint8_t)from, (uint8_t)to, mean, sd,
 				    n_ok);
+		LOG_INF("{\"apos_range\":{\"from\":\"0x%04X\",\"to\":\"0x%04X\","
+			"\"mean_mm\":%d,\"sd_mm\":%u,\"n_ok\":%u}}",
+			await_from_addr, await_peer_addr, mean, sd, n_ok);
 	}
 
 	awaiting_rsp = false;

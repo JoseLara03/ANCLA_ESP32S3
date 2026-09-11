@@ -113,14 +113,55 @@ static void run_batch(const struct cal_request *req, struct cal_result *res,
 		      uwb_config_t *cfg)
 {
 	uint32_t valid = 0;
+	uint32_t attempts = CAL_MAX_SAMPLES;
+	int64_t lvl_sum = 0;
+
+	if (req->link && req->attempts > 0u) {
+		attempts = req->attempts;
+	}
 
 	ss_initiator_enter();
 
-	for (uint32_t i = 0; i < CAL_MAX_SAMPLES; i++) {
-		int32_t mm = ss_initiator_range(req->peer_wire_id);
+	for (uint32_t i = 0; i < attempts; i++) {
+		uint32_t cir_power = 0;
+		uint16_t accum = 0;
+		int32_t mm;
+
+		if (req->link) {
+			mm = ss_initiator_range_ex(req->peer_wire_id,
+						   &cir_power, &accum);
+		} else {
+			mm = ss_initiator_range(req->peer_wire_id);
+		}
 
 		if (mm != INT32_MIN) {
-			samples[valid++] = mm;
+			/* samples[] holds CAL_MAX_SAMPLES. In link mode a
+			 * caller may ask for more ATTEMPTS than that -- the
+			 * point at long range is a bigger denominator, not a
+			 * bigger sample set -- so keep counting valid
+			 * exchanges past the array and store only what fits.
+			 * The statistics are then over the first
+			 * CAL_MAX_SAMPLES, which is stated in the report. */
+			if (valid < CAL_MAX_SAMPLES) {
+				samples[valid] = mm;
+			}
+			valid++;
+
+			int32_t lvl = cal_rx_level_dbm_x10(cir_power, accum);
+
+			if (lvl != CAL_RX_LEVEL_INVALID) {
+				if (res->rx_level_n == 0u) {
+					res->rx_level_min_x10 = lvl;
+					res->rx_level_max_x10 = lvl;
+				} else {
+					if (lvl < res->rx_level_min_x10)
+						res->rx_level_min_x10 = lvl;
+					if (lvl > res->rx_level_max_x10)
+						res->rx_level_max_x10 = lvl;
+				}
+				lvl_sum += lvl;
+				res->rx_level_n++;
+			}
 		}
 
 		/* Yields to the shell (priority 14) so the console stays
@@ -131,8 +172,37 @@ static void run_batch(const struct cal_request *req, struct cal_result *res,
 
 	ss_initiator_leave();
 
-	res->attempted = CAL_MAX_SAMPLES;
+	res->attempted = attempts;
 	res->valid = valid;
+
+	ss_initiator_diag(NULL, &res->f_tx_start, &res->f_tx_done,
+			  &res->f_rx_to_err, &res->f_len, &res->f_hdr,
+			  &res->f_layout);
+
+	if (req->link) {
+		size_t n = (valid < CAL_MAX_SAMPLES) ? valid : CAL_MAX_SAMPLES;
+		struct cal_link_stats st;
+
+		if (res->rx_level_n > 0u) {
+			res->rx_level_mean_x10 =
+				(int32_t)(lvl_sum / (int64_t)res->rx_level_n);
+		}
+
+		/* NO -ENODATA floor here, deliberately. That gate protects a
+		 * CALIBRATION from being computed over a handful of lucky
+		 * frames; in link mode a low success rate is not a failed
+		 * measurement, it IS the measurement. A batch with zero valid
+		 * exchanges still reports attempted/valid and the failure
+		 * breakdown, which at range is the whole answer. */
+		if (n > 0u && cal_link_stats_compute(samples, n, &st)) {
+			res->mean_mm = st.mean_mm;
+			res->sd_mm   = st.sd_mm;
+			res->min_mm  = st.min_mm;
+			res->max_mm  = st.max_mm;
+		}
+		res->status = 0;
+		return;
+	}
 
 	/* Enough samples to mean anything. Below this the peer is not really
 	 * answering -- wrong PHY, wrong peer id, or out of range -- and a mean
