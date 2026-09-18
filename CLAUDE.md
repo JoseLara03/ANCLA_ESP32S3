@@ -1383,7 +1383,16 @@ sync master                    transmit half — CCP sent/dropped counts as
   arrives (it broke a host test on the way in). Weighting by `quality`
   (`ipatovAccumCount`) is deliberately NOT done: whether it carries any
   information at fixed PLEN is unmeasured, and measuring it needs a real
-  capture nobody has taken yet. **Since 2026-09-06 `sigma_m` has NO consumer**:
+  capture nobody has taken yet. **Since 2026-09-18 what is published is
+  `sync_model_sigma_dtu()`, not `sync_model_jitter_est_dtu()`** — the 1-sigma
+  CONVERSION error over a full CCP interval rather than the raw link jitter.
+  Same wire meaning (a 1-sigma DTU figure, larger for a worse anchor) plus the
+  one thing a long-run statistic structurally cannot do: it RISES while that
+  anchor is mid-re-baseline and falls as its baseline reconverges. That was
+  B13 — see the T6 entry below. The measured-not-assumed argument in the rest
+  of this bullet is unchanged and is now inside `sync_model_error_dtu()`
+  itself, so `blink_rx.c` no longer has to reach past it.
+  **Since 2026-09-06 `sigma_m` has NO consumer**:
   `pos_ekf_update_tdoa()` was its only reader and the EKF is removed. The
   wire field (`sigma_dtu`, proto 5) and the `struct tdoa_meas` field stay,
   because the anchors publish it regardless and a weighted `tdoa_solve()` is
@@ -2686,3 +2695,74 @@ sits against the beacon's own frame length. Same shim pattern as the tag's
 feature branches (`feat/rtls-scale-tdoa` as of 2026-08-31), pushed to `origin`;
 `master` is the base branch. This corrects an earlier version of this section
 that said no remote was configured — true once, not since.
+
+- **The CCP sync converts into the master's TRANSMIT time base, so every
+  anchor's converted timestamp is EARLY by its own distance from the gateway —
+  and nothing subtracts it back off.** Found 2026-09-18 while preparing the
+  TDoA precision test sequence; full derivation and evidence in
+  `docs/diag-tdoa-precision-stage1-audit.md`'s B14 addendum. `ccp_slave.c`
+  feeds `sync_model_observe()` the pair (master's TX timestamp, this anchor's
+  RX timestamp of that same frame), which are separated by the flight time, so
+  `sync_model_to_master()` returns `true_master_time - d_Mk/c`. The TDoA
+  observable therefore carries `-(d_Mk - d_M0)` as a per-anchor constant and
+  `tdoa_solve()` fits with **no constant term**. **One metre of
+  gateway-distance difference is one metre of range-difference bias** —
+  one-for-one, not halved, because there is no round trip — before this array's
+  1.16-4.21x geometry amplification. The gateway is not in the survey
+  (`tdoa_gw.c:anchor_xyz()` resolves `UWB_ANCHOR_ADDR_BASE + anchor_id` only),
+  `struct apos_survey` has no master position, and `struct ccp_frame` carries
+  no distance, so there is nothing in the system that could correct it today.
+  Four consequences worth not re-deriving. (1) It is **structurally
+  indistinguishable from an RX antenna-delay error** — both are per-anchor
+  constants — which is why the Stage-1 audit's A1-A7 table could not reach it:
+  that table asked whether the estimator was self-consistent, and it is; this
+  is a missing term in the measurement equation. (2) It reproduces the 3.11 m
+  position shift `docs/rx-antenna-delay-calibration.md` records when a fourth
+  anchor was added and the tag never moved, with **no** manufacturing spread
+  needed. (3) `tools/rx_cal.py` **absorbs it for free** and its correction is
+  still the right correction to apply — only the LABEL is wrong, since the
+  fitted `b_k` is (RX antenna-delay difference) + (master flight-time
+  difference); that doc's §1 model has been corrected to carry the term. (4) A
+  bench pairwise-reciprocal split calibration using converted timestamps does
+  **not** get this for free: reciprocity DOUBLES the term rather than
+  cancelling it (`Delta_iR = 2*(d_MR - d_Mi)/c + s_R - s_i`), so put the CCP
+  master on the perpendicular bisector of the two boards under test, and
+  tape-measure it rather than eyeballing it. The cheap way to attribute the
+  bias at all is a tape measure on the gateway: compute `-(d_Mk - d_M0)` and
+  compare it against `rx_cal.py`'s fitted offsets.
+
+- **`sync_model` published conversions from a one-interval baseline after
+  every re-baseline — fixed 2026-09-18 (B13), and the fix's own limit is worth
+  knowing.** `sync_model_observe()` set `valid` as soon as one interval had
+  completed, and nothing anywhere gated on `SYNC_BASELINE_USEFUL` (whose own
+  comment said it was "not a threshold anything switches on"). At the measured
+  hardware jitter that two-point rate estimate is ~10.8 ppb, i.e. ~2.2 ns
+  (~0.65 m) over one 200 ms extrapolation, about **35x** the converged state —
+  while the anchor went on publishing its long-run `sigma_dtu`, which does not
+  move during a transient at all, so nothing downstream could tell. Fires on
+  every re-baseline path in `ccp_slave.c`: root change, sequence discontinuity,
+  gateway reboot. Now: `sync_model_to_master()` refuses below the threshold
+  unless a CARRIED skew stands in, `sync_model_sigma_dtu()` publishes a sigma
+  that is non-increasing in `n_obs` by construction, and `sync stats` carries
+  `n_obs` / `rebaselines` / `sync_gaps` (cleared only by `sync_model_init()`).
+  **The carry is worth only a few hundred milliseconds and that is physics, not
+  a shortcut**: its budget is `SYNC_SKEW_MAX_ERR_PPB / SYNC_SKEW_DRIFT_PPB_PER_S`
+  = 5 ppb / 10 ppb/s = 0.5 s, so it covers a root change or a one-to-two
+  superframe discontinuity and deliberately does NOT cover a multi-second
+  gateway reboot — past that the anchor publishes nothing for up to ~2 s while
+  it reconverges, which is the gate working, not a fault. Carrying further
+  would reintroduce B13 by another route, since at 10 ppb/s a skew carried
+  several seconds is worse than the two-point estimate it replaces.
+  Two side effects that are improvements in their own right: residual
+  statistics are now accumulated **only while converged** and **survive** a
+  re-baseline, which fixes at the source the "`sync reset` is worth 3.7x"
+  trap `docs/anchor-sync-measurement.md` §4.1 records (an un-reset 30 cm
+  reading came back 188 DTU against a true 50); and `sync_model_error_dtu()`
+  is now built from the anchor's own MEASURED jitter with a pessimistic
+  fallback (`SYNC_JITTER_FALLBACK_DTU`, 96 DTU) rather than the 15x-optimistic
+  `SYNC_JITTER_DTU` design assumption, which is why `blink_rx.c` no longer has
+  to reach past it for `jitter_est_dtu()`. **Verified in software only** —
+  host suites pass, both images link clean, production `dram0_0_seg`
+  271944 -> 271984 B; the hardware acceptance (induced gateway reboot,
+  transient quantified in mm before vs after) has NOT run. Procedure:
+  `docs/diag-tdoa-precision-test-sequence.md` T6.

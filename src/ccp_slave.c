@@ -80,15 +80,15 @@ static uint32_t n_no_announce;
  * local_delta can legitimately fall outside this factor-of-4 band, so this
  * branch can mislabel that one case as a discontinuity (n_reject, logged as
  * a probable reboot) instead of a gap (n_gap). That costs only the
- * DIAGNOSTIC label: this whole branch already calls sync_model_init() for
- * both a genuine large gap and a reboot (see the `else if` below), so the
+ * DIAGNOSTIC label: this whole branch already calls sync_model_rebaseline()
+ * for both a genuine large gap and a reboot (see the `else if` below), so the
  * sync estimate itself is identical either way -- nothing is poisoned, and
  * nothing here changes what the model does, only what an operator reads
  * about why. */
 
 /* Signed difference between two 40-bit DW3220 timestamps. Pattern-matched
- * from sync_model.c's sdelta40() (that file must not be modified, so this is
- * a deliberate local copy, not a shared helper): the counter wraps every
+ * from sync_model.c's sdelta40() (a deliberate local copy rather than a shared
+ * helper -- sync_model.c stays free of any dependency on this file): the counter wraps every
  * 2^40 DTU (~17.2 s), so an unsigned compare is wrong across the wrap and the
  * failure is rare, timing-dependent, and looks like a radio fault. Correct for
  * any interval under 2^39 DTU (~8.6 s) -- far past the largest run (128
@@ -174,8 +174,19 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts)
 		if (have_prev && f.root_id != cur_root) {
 			LOG_WRN("{\"ccp_slave\":{\"root_changed\":%u,"
 				"\"was\":%u}}", f.root_id, cur_root);
+			/* keep_skew = FALSE. A different root is a different
+			 * crystal, so the carried ratio describes the wrong
+			 * pair of clocks -- the one case where bridging the
+			 * re-baseline would be actively wrong rather than
+			 * merely stale. */
+			sync_model_rebaseline(&model, false);
+		} else {
+			/* First CCP this node has ever seen. ccp_slave_init()
+			 * already left the model clear; re-running the full
+			 * init here keeps that true without charging a
+			 * re-baseline against a boot. */
+			sync_model_init(&model);
 		}
-		sync_model_init(&model);
 		cur_root = f.root_id;
 		have_obs = false;
 		save_prev(f.seq, this_rx_ts);
@@ -247,7 +258,14 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts)
 			 * n_reject is what it actually is: a pairing this node
 			 * could not fold into its running count. */
 			n_reject++;
-			sync_model_init(&model);
+			/* keep_skew = true: the sequence numbering became
+			 * meaningless, the crystals did not. Whether the
+			 * carried skew is still young enough to use is
+			 * sync_model.c's own decision
+			 * (SYNC_SKEW_MAX_AGE_DTU), and for a real reboot it
+			 * will not be -- which is correct, and is why this
+			 * call is not asserting that it will. */
+			sync_model_rebaseline(&model, true);
 			have_obs = false;
 		} else {
 			/* intervals in 1..128. Sequence number alone cannot
@@ -293,7 +311,7 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts)
 					intervals, expected_us,
 					local_delta_us);
 				n_reject++;
-				sync_model_init(&model);
+				sync_model_rebaseline(&model, true);
 				have_obs = false;
 			} else if (intervals >
 				   (uint8_t)(SYNC_MISS_MAX + 1u)) {
@@ -303,7 +321,7 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts)
 				 * misses one call at a time on the SLAVE
 				 * loop. */
 				n_gap += (uint32_t)intervals - 1u;
-				sync_model_init(&model);
+				sync_model_rebaseline(&model, true);
 				have_obs = false;
 			} else {
 				for (uint8_t k = 1u; k < intervals; k++) {

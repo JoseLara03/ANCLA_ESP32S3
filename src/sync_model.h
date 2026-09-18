@@ -70,8 +70,9 @@
  *     error, DTU     14    4     4     5     4     3
  *
  * So the plateau is real and arrives by about five observations -- one second.
- * SYNC_BASELINE_USEFUL is set to 10 as a conservative statement of that, not
- * as a threshold anything switches on. Worth knowing: a SINGLE seed is far too
+ * SYNC_BASELINE_USEFUL is set to 10 as a conservative statement of that. It IS
+ * now the threshold the conversion gate switches on -- see its own definition
+ * below for why that changed. Worth knowing: a SINGLE seed is far too
  * noisy to see this, and reading a trend off one gave 2 DTU at n=5 and 10 DTU
  * at n=10, which looks like the plateau does not exist.
  *
@@ -118,8 +119,110 @@
 /* Baseline past which the rate estimate stops being the dominant error term,
  * per the table above. Kept as a named constant because it is a CONCLUSION,
  * not a tuning knob: growing it does not improve accuracy once the phase
- * reference dominates. */
+ * reference dominates.
+ *
+ * ---- 2026-09-18: this IS now a threshold something switches on ----------
+ *
+ * An earlier version of this comment said it was "not as a threshold anything
+ * switches on", and that was exactly the defect (B13,
+ * docs/diag-tdoa-precision-stage1-audit.md section 2): sync_model_observe()
+ * used to set `valid` as soon as one interval had completed, so every
+ * re-baseline published conversions built on a TWO-POINT rate estimate. At the
+ * jitter this hardware actually measures (92-98 DTU at 3 m) that is a ~10.8 ppb
+ * rate error, which over one 200 ms extrapolation is ~2.2 ns ~= 0.65 m -- about
+ * 35x the converged state -- while the anchor went on publishing its long-run
+ * sigma as if nothing had happened.
+ *
+ * It is now the gate: a model that has never converged converts NOTHING, and a
+ * model that has been re-baselined converts on the CARRIED skew (below) with a
+ * sigma that says so. */
 #define SYNC_BASELINE_USEFUL  10u
+
+/* ---- Carrying a converged skew across a re-baseline --------------------
+ *
+ * A re-baseline (root change, sequence discontinuity, gateway reboot) throws
+ * away the rate estimate but not the physics: the two crystals' relative rate
+ * did not change just because the sequence numbering did. So the last
+ * CONVERGED ratio is kept and used until the fresh baseline reaches
+ * SYNC_BASELINE_USEFUL -- which is what makes the gate above affordable
+ * instead of a 2-second blackout after every discontinuity.
+ *
+ * How long a carried skew may be trusted is a physics question, and the answer
+ * is the drift RATE bound below times its age. Both constants are named rather
+ * than folded into one number because they are assumptions with different
+ * provenance and a future measurement may move either one.
+ */
+
+/* Bound on how fast the RELATIVE rate of two crystals can change, ppb per
+ * second. The figure quoted for a plain XO earlier in this header is ~8 ppb/s
+ * (a thermal-transient figure -- a settled crystal in a settled room is three
+ * orders of magnitude quieter, and the same sentence's "1.6 ppt per 200 ms"
+ * is that settled regime, so the header carries both). 10 rounds the transient
+ * figure UP, which is the safe direction here: assuming a LARGER drift rate
+ * makes a carried skew go stale SOONER, and the fallback when it does is
+ * simply the pre-existing behaviour of waiting for a fresh baseline. Assuming
+ * a smaller one would let a genuinely stale skew keep converting. */
+#define SYNC_SKEW_DRIFT_PPB_PER_S  10u
+
+/* Admissible rate error, ppb, for a carried skew -- the budget its age is
+ * spent against, and the figure the published sigma charges for the whole
+ * un-converged window.
+ *
+ * 5 ppb sits between the two states it has to beat and be beaten by:
+ *
+ *   converged estimator  ~1.1 ppb  (98 DTU * 15.65 ps * sqrt(2) /
+ *                                   (SYNC_BASELINE_USEFUL * 200 ms))
+ *   CARRIED, this bound   5.0 ppb  -> 1.0 ns over a 200 ms extrapolation
+ *   two-point estimate   ~10.8 ppb -> 2.2 ns, which is B13 itself
+ *
+ * So a carried skew is always better than the state it replaces and always
+ * worse than the state it is waiting for, which is exactly the ordering the
+ * published sigma has to express. */
+#define SYNC_SKEW_MAX_ERR_PPB      5u
+
+/* The two above, resolved into an age limit. SYNC_SKEW_MAX_ERR_PPB /
+ * SYNC_SKEW_DRIFT_PPB_PER_S seconds, expressed in DTU (there are 5 CCP
+ * intervals in a second at SYNC_CCP_INTERVAL_DTU).
+ *
+ * At today's numbers this is 0.5 s -- two and a half CCP intervals -- and the
+ * consequence is worth stating plainly rather than discovering on a bench.
+ *
+ * The carry covers a discontinuity with no real outage behind it (a root
+ * change, a local-clock mismatch on an otherwise consecutive frame, a reject
+ * spanning one or two superframes). It does NOT cover a multi-second gateway
+ * reboot: the age is re-evaluated at every observation, so a carried skew goes
+ * stale part-way through the un-converged window and the anchor then publishes
+ * NOTHING until its fresh baseline converges. That silence is the correct
+ * outcome and is the gate doing its job -- at 10 ppb/s a skew carried across
+ * several seconds would be worse than the two-point estimate it is standing in
+ * for, so bridging further would reintroduce B13 by another route.
+ *
+ * Read that together: the bulk of the B13 fix is the GATE and the dynamic
+ * sigma. The carry is a bounded refinement that removes the common,
+ * sub-second discontinuities from the gate's cost, not a way to make a reboot
+ * free. Carrying further would mean asserting a drift-rate bound nobody on
+ * this project has measured. */
+#define SYNC_SKEW_MAX_AGE_DTU                                                  \
+	(((uint64_t)SYNC_CCP_INTERVAL_DTU * 5ULL *                             \
+	  (uint64_t)SYNC_SKEW_MAX_ERR_PPB) /                                   \
+	 (uint64_t)SYNC_SKEW_DRIFT_PPB_PER_S)
+
+/* Per-observation jitter, DTU, assumed by the error estimate before this
+ * anchor has gathered enough of its OWN residuals to measure it.
+ *
+ * Deliberately NOT SYNC_JITTER_DTU. That constant is the design-time
+ * ASSUMPTION (~100 ps) the tables above are built on; the Fase 2 hardware
+ * measurement came in at 782 ps to 1.53 ns, so using it as a fallback would
+ * hand a consumer a sigma ~15x too confident during exactly the window where
+ * the model is least trustworthy. 96 DTU is the measured 3 m figure. The
+ * fallback errs pessimistic on purpose: a sigma that is too large costs some
+ * down-weighting, a sigma that is too small is silent overconfidence. */
+#define SYNC_JITTER_FALLBACK_DTU   96u
+
+/* Residual samples below which sync_model_jitter_est_dtu() is too noisy to
+ * stand in for the fallback above. Matches the baseline threshold rather than
+ * inventing a second number. */
+#define SYNC_JITTER_EST_MIN_N      SYNC_BASELINE_USEFUL
 
 /* Hard cap on baseline length, after which it is rolled forward onto its own
  * midpoint. Bounding it is what lets a slow change in either crystal (thermal
@@ -206,16 +309,57 @@ struct sync_model {
     uint32_t n_obs;          /* observations in the current baseline */
     uint32_t misses;         /* consecutive missed CCPs */
     bool     have_raw;       /* l_raw/m_raw usable for differencing */
-    bool     valid;          /* a usable rate estimate exists */
+    bool     valid;          /* sync_model_to_master() would succeed */
+    /* Last CONVERGED rate, carried across a re-baseline. Stored as the same
+     * (numerator, denominator) pair the conversion uses -- (m_acc - l_acc,
+     * l_acc) -- rather than as a ppb scalar, because a ppb integer resolves
+     * only 1 part in 1e9 and one CCP interval of extrapolation turns that into
+     * ~12.8 DTU of error. Keeping the exact rational costs 17 bytes and loses
+     * nothing. `skew_l_raw` is the local timestamp it was last refreshed at,
+     * which is what SYNC_SKEW_MAX_AGE_DTU is measured against. */
+    int64_t  skew_num;
+    int64_t  skew_den;
+    uint64_t skew_l_raw;
+    bool     have_skew;
     /* Residual statistics. See sync_model_residual_rms_dtu() -- these are what
      * turn the Phase 2 gate into a self-measurement rather than a bench setup
-     * with external equipment. Survive everything except an explicit reset. */
+     * with external equipment. Survive everything except an explicit reset
+     * (sync_model_residual_reset()) or a full sync_model_init(); in particular
+     * they now survive a sync_model_rebaseline(), because the link's jitter is
+     * a property of the link and not of the sequence numbering. Only
+     * CONVERGED observations are folded in -- see sync_model_observe(). */
     uint64_t res_sq_sum;
     uint32_t res_n;
     uint32_t res_max;
+    /* Lifetime counters. Cleared ONLY by sync_model_init(), so they survive
+     * every re-baseline -- which is the whole point: a counter that a
+     * re-baseline resets cannot measure re-baselines. */
+    uint32_t n_rebaseline;
+    uint32_t n_miss_total;
 };
 
 void sync_model_init(struct sync_model *m);
+
+/* Start a fresh baseline WITHOUT forgetting everything the model has learned.
+ *
+ * This is what a caller reaches for when the sequence numbering became
+ * meaningless (a gateway reboot, a sequence discontinuity, a root change) but
+ * the hardware did not: the rate estimate built against the old numbering
+ * describes nothing, while the link's measured jitter and the two crystals'
+ * relative rate are unchanged.
+ *
+ * So the baseline (l_acc/m_acc/n_obs/phase_corr/have_raw) is cleared, and:
+ *   - the residual statistics are KEPT (they measure the link, not the
+ *     baseline -- and a caller that wants them gone has
+ *     sync_model_residual_reset());
+ *   - the lifetime counters are KEPT and n_rebaseline is incremented;
+ *   - the last converged skew is KEPT when `keep_skew`, so conversion can
+ *     continue through the un-converged window -- see SYNC_SKEW_MAX_AGE_DTU.
+ *
+ * `keep_skew` MUST be false when the master itself changed (a different
+ * root_id is a different clock, so the carried ratio describes the wrong pair
+ * of crystals) and true when only this node's view of the sequence broke. */
+void sync_model_rebaseline(struct sync_model *m, bool keep_skew);
 
 /* Feed one CCP. `m_dtu` is the master's transmit time as carried in the CCP
  * payload; `l_dtu` is our own RX timestamp of it. Both are raw 40-bit DW3220
@@ -226,16 +370,66 @@ void sync_model_observe(struct sync_model *m, uint64_t m_dtu, uint64_t l_dtu);
 void sync_model_miss(struct sync_model *m);
 
 /* Convert a local 40-bit timestamp into the master's time base. Returns false
- * (leaving *out untouched) while the model has no rate estimate or has coasted
- * past SYNC_MISS_MAX. */
+ * (leaving *out untouched) when the model cannot convert, which is any of:
+ *
+ *   - no phase reference yet (nothing observed since the last re-baseline);
+ *   - coasted past SYNC_MISS_MAX;
+ *   - the current baseline is shorter than SYNC_BASELINE_USEFUL **and** there
+ *     is no usable carried skew to stand in for it. That second clause is the
+ *     B13 gate: a two-point rate estimate is ~35x worse than a converged one
+ *     at this hardware's measured jitter, and publishing conversions built on
+ *     one -- which is what this function used to do -- is worse than
+ *     publishing nothing, because nothing downstream could tell. */
 bool sync_model_to_master(const struct sync_model *m, uint64_t l_dtu,
                           uint64_t *out);
 
 /* Estimated 1-sigma conversion error, DTU, for a timestamp `ahead_dtu` after
  * the last observation. This is the figure the Phase 2 hardware gate measures
  * against, so it is exposed rather than left implicit. Returns UINT32_MAX when
- * the model is not valid. */
+ * the model is not valid.
+ *
+ * DYNAMIC, since 2026-09-18, in two ways that both matter:
+ *
+ *   - the jitter it is built from is this anchor's OWN measured residual
+ *     statistic once it has SYNC_JITTER_EST_MIN_N of them, not the design-time
+ *     SYNC_JITTER_DTU assumption (which is ~15x optimistic against what this
+ *     hardware measures). Before then it is SYNC_JITTER_FALLBACK_DTU, which
+ *     errs pessimistic.
+ *   - the PHASE term now accounts for how many observations the residual EMA
+ *     has actually averaged. Straight after a re-baseline the phase reference
+ *     is one unfiltered sample, not 2^SYNC_PHASE_EMA_SHIFT of them, and the
+ *     old fixed phase term said otherwise.
+ *
+ * The result is non-increasing in n_obs by construction, which is the property
+ * a consumer needs and tests/sync_model/ pins: it can never claim to be more
+ * confident during the un-converged window than it is once converged. */
 uint32_t sync_model_error_dtu(const struct sync_model *m, uint32_t ahead_dtu);
+
+/* The 1-sigma conversion error over a FULL CCP interval -- the worst case
+ * within a superframe, and therefore the figure to publish to a consumer that
+ * will weight this anchor's observation against another's.
+ *
+ * Exists as its own call rather than sync_model_error_dtu(m, ONE_INTERVAL)
+ * because SYNC_CCP_INTERVAL_DTU (1.278e10) does not fit that function's
+ * uint32_t `ahead_dtu`.
+ *
+ * Returns 0 when the model cannot convert. Zero is also the wire sentinel for
+ * "unknown" on the blink observation topic, which is the correct reading here:
+ * an anchor that cannot convert publishes no observation at all, so the value
+ * never travels. When the model CAN convert the result is clamped to a minimum
+ * of 1, so a valid sigma can never be mistaken for the sentinel. */
+uint32_t sync_model_sigma_dtu(const struct sync_model *m);
+
+/* ---- Lifetime counters, for the console -------------------------------
+ *
+ * These exist because B13 was invisible: every symptom of a re-baseline
+ * (conversions built on a two-point rate, a phase reference averaged over one
+ * sample) is indistinguishable at the console from a healthy anchor, and the
+ * one statistic that was published -- the long-run residual RMS -- does not
+ * move during the transient at all. `sync stats` surfaces all three. */
+uint32_t sync_model_rebaseline_count(const struct sync_model *m);
+uint32_t sync_model_miss_count(const struct sync_model *m);
+uint32_t sync_model_n_obs(const struct sync_model *m);
 
 /* Relative drift of the local clock against the master, in parts per billion,
  * signed. POSITIVE means the local clock runs fast. Diagnostics and the CFO

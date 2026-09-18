@@ -107,16 +107,25 @@ void ccp_slave_residual_reset(void);
  * which the sequence number alone cannot distinguish from a genuine gap and
  * the local DW3220 clock can (see ccp_slave.c's CCP_SLAVE_GAP_TOL_FACTOR).
  *
- * Every one of the re-baseline paths above calls sync_model_init(), which
- * also clears the residual statistics (res_sq_sum/res_n/res_max) along with
- * the rate estimate -- sync_model.h documents those as surviving "everything
- * except an explicit reset", and that is still true of sync_model.c's own
- * API; ccp_slave.c is simply a caller that invokes sync_model_init() itself
- * mid-life rather than only at ccp_slave_init(), so from this module's own
- * callers' point of view a re-baseline IS a second, implicit reset. A `sync
- * stats` read straight after one of these will show `count` restarted and the
- * verdict back at "insufficient", with no other symptom -- expected, not a
- * bug. */
+ * Every one of the re-baseline paths above calls sync_model_rebaseline(),
+ * which as of 2026-09-18 KEEPS the residual statistics and the lifetime
+ * counters and clears only the baseline. An earlier revision called
+ * sync_model_init() on these paths, which wiped res_sq_sum/res_n/res_max too,
+ * so a `sync stats` read straight after a discontinuity showed `count`
+ * restarted and the verdict back at "insufficient" with no other symptom.
+ * That is no longer the behaviour, and the change is deliberate twice over:
+ * the residuals measure the LINK's jitter, which a sequence discontinuity
+ * does not alter, and a re-baseline counter that a re-baseline resets could
+ * never have counted one.
+ *
+ * What a re-baseline DOES still cost is the rate estimate. Reading it back:
+ * `n_obs` restarts at 0, `rebaselines` increments, and the published
+ * `sigma_dtu` jumps (sync_model_sigma_dtu()) until the fresh baseline reaches
+ * SYNC_BASELINE_USEFUL -- see sync_model.h's B13 note. Conversion continues
+ * across the gap only while the carried skew is young enough
+ * (SYNC_SKEW_MAX_AGE_DTU); past that, this anchor stops publishing
+ * observations until it re-converges, which is the correct outcome and shows
+ * up on the gateway as that anchor simply going quiet for ~2 s. */
 void ccp_slave_stats(uint32_t *n_rx, uint32_t *n_gap, uint32_t *n_reject,
 		     uint32_t *root_id);
 

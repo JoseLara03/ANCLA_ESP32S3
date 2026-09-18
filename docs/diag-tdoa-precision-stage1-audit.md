@@ -281,3 +281,111 @@ and 3 are not yet separated. But the audit alone identifies a dominant root
 cause (B8) with a magnitude consistent with the observed 3 m, and its fix
 procedure already exists and requires no firmware change — which reorders the
 plan: run the calibration before building the instrumentation, not after.
+
+---
+
+# Addendum, 2026-09-18 — B14, found while preparing the T0-T7 test sequence
+
+**B14: the CCP master-to-anchor propagation delay is never subtracted, so every
+anchor's converted timestamp carries a per-anchor constant equal to its own
+distance from the gateway.** CONFIRMED statically. It is structurally
+indistinguishable from B8, has a larger available magnitude on this
+deployment, and it changes what three of the ordered tests can conclude.
+
+## 1. The derivation
+
+`sync_model_observe()` is fed the pair (master's **transmit** timestamp,
+this anchor's **receive** timestamp of that same frame) — `ccp_slave.c`'s
+`sync_model_observe(&model, f.tx_dtu, prev_rx_ts)`, where `f.tx_dtu` is the
+value `ccp_master.c` read back with `uwb_get_tx_timestamp_u64()` after TXFRS.
+So the model is trained to map *this anchor's local RX instant* onto *the
+master's TX instant*. Those two instants are not the same instant: they are
+separated by the flight time `d_Mi/c`.
+
+`sync_model_to_master()` therefore returns master-TX-base time, which for any
+later event at anchor *i* is the true master-clock time **minus** `d_Mi/c`:
+
+```
+converted_i  =  T_emit  +  r_i/c  -  delta_i  -  d_Mi/c
+```
+
+where `r_i` is tag-to-anchor distance, `delta_i` the RX antenna-delay error
+(B8), and `d_Mi` the **gateway-to-anchor** distance. `T_emit` cancels in a
+difference; `d_Mi` does not:
+
+```
+(converted_i - converted_0) * c  =  (r_i - r_0)  -  (delta_i - delta_0)*4.69mm
+                                                 -  (d_Mi - d_M0)
+```
+
+`tdoa_solve()` fits `r_i - r_0 = (t_i - t_0) * TDOA_M_PER_DTU` with **no
+constant term**. Grep confirms there is nothing to correct it with: the
+gateway is not in the survey (`apos` covers the four ranging anchors;
+`tdoa_gw.c:anchor_xyz()` resolves `UWB_ANCHOR_ADDR_BASE + anchor_id` only),
+`struct apos_survey` has no master position field, and `struct ccp_frame`
+carries only `seq`/`hop`/`tx_dtu`/`root_id`.
+
+## 2. Magnitude
+
+**One metre of gateway-distance difference is one metre of range-difference
+bias** — one-for-one, not halved, because this is a one-way path with no round
+trip. Before geometry amplification (1.16x at the triangle centre, 4.21x near
+the origin corner).
+
+The gateway on this deployment sits at its own spot, metres from the anchors,
+and has never been surveyed or tape-measured. Distances differing by the array
+size (1.2-2.5 m) are the default expectation, which puts B14 at **1.2-2.5 m of
+range-difference bias, 1.4-10 m of position error** — larger than B8's
+~971 mm, and enough on its own to produce the observed symptom.
+
+It also reproduces the observation the audit above cites as B8's best
+evidence: the **3.11 m** position shift recorded in
+`docs/rx-antenna-delay-calibration.md` when a fourth anchor was added and the
+tag never moved. Adding an anchor adds an equation carrying its own
+un-modelled `-d_M4/c`. B14 explains that with no manufacturing spread at all.
+
+## 3. Why the audit above missed it, and what corrects it
+
+A1-A7 asked whether the sync arithmetic was *self-consistent*. It is — the
+model does exactly what its header says. B14 is a missing term in the
+measurement equation, not a defect in the estimator, so no check in that
+table could have reached it.
+
+Corrections to two things the audit and the ordered plan assume:
+
+- **`docs/rx-antenna-delay-calibration.md` section 1 is missing this term.**
+  Its model is `tau_k = T_emit + r_k/c - delta_k + noise`; the true model has
+  `- d_Mk/c` as well. The practical consequence is mild and in the useful
+  direction: `- d_Mk/c` is a **per-anchor constant**, exactly the same shape
+  as `delta_k`, so `tools/rx_cal.py`'s per-anchor mean **absorbs it** and the
+  correction it computes is still the right correction to apply. What is
+  wrong is only the LABEL: the fitted `b_k` is
+  `(RX antenna delay difference) + (master flight-time difference)`, not RX
+  antenna delay, and writing it into `ant_rx` is a bookkeeping fiction that
+  happens to produce the right numbers. It also means the tool's own
+  consistency check (the same `b_k` at every tag spot) still holds, because
+  both components are tag-position-independent.
+- **The published `sigma_dtu` and the Phase 2 jitter figure are unaffected.**
+  B14 is a constant; it is absorbed by the phase term and contributes nothing
+  to the residual spread.
+
+## 4. Updated ranking
+
+| Rank | Cause | Range-diff error | Position error | Kind | Status |
+|---|---|---|---|---|---|
+| 1 | **B14** master flight time unmodelled | 1.2-2.5 m (est.) | **1.4 - 10 m** | bias | CONFIRMED (static), magnitude UNMEASURED |
+| 2 | **B8** RX delay split uncalibrated | ~971 mm | 1.1 - 4.1 m | bias | CONFIRMED (static) |
+| 3 | **B11** geometry amplification | — | x1.16 - x4.21 | multiplier | CONFIRMED (survey) |
+| 4 | survey geometry never tape-validated | up to 1037 mm | 1.2 - 4.4 m | bias | OPEN |
+| 5 | sync jitter (CCP path) | ~450 mm | 0.52 - 1.9 m | **noise** | measured, Fase 2 — see the provenance note in the T-report |
+| 6 | `apos tagz` = 0.0, unmeasured | — | ~0.23 m inward | bias | CONFIRMED (static) |
+| 7 | **B10** NLOS ungated | — | unknown | spikes | UNTESTED |
+| 8 | **B13** short-baseline publish | ~0.65 m transient | 0.75 - 2.7 m | transient | **FIXED 2026-09-18** |
+
+Ranks 1, 2 and 4 are all per-anchor constants and **no measurement this
+firmware makes can separate them from each other.** What separates rank 1 is
+that it is the only one that is *predictable from geometry*: tape-measure the
+gateway's position, compute `-(d_Mi - d_M0)`, and compare it against the
+per-anchor offsets `tools/rx_cal.py` fits. Agreement within the fit's own
+spread attributes the bias; disagreement leaves the remainder to ranks 2 and 4.
+That check costs one tape measure and no firmware.

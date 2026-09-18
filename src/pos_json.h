@@ -62,19 +62,31 @@ struct pos_blink_obs {
 	 * moving, no alert". That is the safe direction for the consumer --
 	 * see pos_json_blink_parse()'s note. */
 	uint8_t  flags;
-	/* The publishing anchor's own MEASURED per-observation timestamp
-	 * jitter, 1-sigma, in DTU (sync_model_jitter_est_dtu()). Lets the
-	 * gateway weight each anchor's equations instead of assuming every
-	 * link is equally good.
+	/* The publishing anchor's own 1-sigma TIMEBASE-CONVERSION error over a
+	 * full CCP interval, in DTU (sync_model_sigma_dtu()). Lets the gateway
+	 * weight each anchor's equations instead of assuming every link is
+	 * equally good.
 	 *
-	 * 0 means UNKNOWN -- either the anchor has not gathered enough CCP
-	 * residuals yet, or it is older than proto 5 and never sent the field.
-	 * A consumer must treat 0 as "fall back to a flat sigma" and never as
-	 * zero uncertainty, which would read as infinite confidence.
+	 * Since 2026-09-18 this is the conversion error, not the raw link
+	 * jitter (it used to be sync_model_jitter_est_dtu()). The wire meaning
+	 * is compatible -- both are a 1-sigma DTU figure and both are larger
+	 * for a worse anchor -- but the new one additionally RISES while that
+	 * anchor is mid-re-baseline and falls as its baseline reconverges,
+	 * which the long-run jitter statistic could not do at all. That was
+	 * B13: an anchor coming out of a gateway reboot published its usual
+	 * confidence while converting ~35x worse.
 	 *
-	 * Per-ANCHOR and slowly varying, not per-blink: it is a long-run
-	 * statistic for that anchor's CCP link. Per-blink discrimination is
-	 * what `quality` above would be for, and whether ipatovAccumCount
+	 * 0 means UNKNOWN -- an anchor older than proto 5 that never sent the
+	 * field. A consumer must treat 0 as "fall back to a flat sigma" and
+	 * never as zero uncertainty, which would read as infinite confidence.
+	 * A proto-5 anchor cannot publish 0: an anchor that cannot convert
+	 * publishes no observation at all, and every convertible state clamps
+	 * to at least 1.
+	 *
+	 * Mostly per-ANCHOR and slowly varying rather than per-blink: its
+	 * jitter input is a long-run statistic for that anchor's CCP link, and
+	 * only the baseline-state term moves faster. Per-blink discrimination
+	 * is what `quality` above would be for, and whether ipatovAccumCount
 	 * carries any at fixed PLEN has NOT been measured -- until it has,
 	 * `quality` stays diagnostic and nothing weights by it. */
 	uint16_t sigma_dtu;

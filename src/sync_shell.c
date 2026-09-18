@@ -106,20 +106,59 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	/* 1 DTU = 15.65 ps. Printed because nobody reasons in DTU. */
 	uint32_t jit_ps = (uint32_t)(((uint64_t)jit * 1565u) / 100u);
 
+	/* The B13 trio. `n_obs` is the CURRENT baseline's length, so it reads 0
+	 * straight after a discontinuity and climbs to SYNC_BASELINE_USEFUL;
+	 * `rebaselines` and `sync_gaps` are lifetime counters that no
+	 * re-baseline clears. Without these the transient is invisible: every
+	 * other number on this line looks identical during it. */
+	uint32_t n_obs       = sync_model_n_obs(m);
+	uint32_t rebaselines = sync_model_rebaseline_count(m);
+
+	/* The DYNAMIC sigma -- what this anchor actually publishes with each
+	 * blink observation, over a full CCP interval of extrapolation. Unlike
+	 * jitter_est (a long-run link statistic that does not move during a
+	 * transient) this rises after a re-baseline and falls as the baseline
+	 * converges, which is the whole point of surfacing it here next to
+	 * n_obs. */
+	uint32_t sigma = sync_model_sigma_dtu(m);
+
 	shell_print(sh,
 		    "{\"sync\":{\"role\":\"%s\",\"root\":%u,\"rx\":%u,"
 		    "\"paired\":%u,\"no_announce\":%u,\"gaps\":%u,"
 		    "\"rejected\":%u,\"count\":%u,\"valid\":%u,"
+		    "\"n_obs\":%u,\"rebaselines\":%u,\"sync_gaps\":%u,"
+		    "\"sigma_dtu\":%u,\"sigma_ps\":%u,"
 		    "\"jitter_est_dtu\":%u,\"jitter_est_ps\":%u,"
 		    "\"rms_dtu\":%u,\"max_dtu\":%u,\"drift_ppb\":%d,"
 		    "\"verdict\":\"%s\"}}",
 		    board_role(), root, rx, paired, no_announce, gap, reject,
 		    cnt, valid ? 1u : 0u,
+		    n_obs, rebaselines, sync_model_miss_count(m),
+		    sigma, (uint32_t)(((uint64_t)sigma * 1565u) / 100u),
 		    jit, jit_ps,
 		    sync_model_residual_rms_dtu(m),
 		    sync_model_residual_max_dtu(m),
 		    sync_model_drift_ppb(m),
 		    verdict_of(jit, cnt, valid));
+
+	if (valid && n_obs < SYNC_BASELINE_USEFUL) {
+		shell_warn(sh,
+			   "n_obs is %u of %u — this anchor is mid-re-baseline "
+			   "and is converting on its CARRIED skew, with "
+			   "sigma_dtu raised to say so. Transient, not a "
+			   "fault; if it persists, `rebaselines` and `gaps` "
+			   "say which discontinuity keeps firing.",
+			   n_obs, SYNC_BASELINE_USEFUL);
+	} else if (!valid && rx > 0u && rebaselines > 0u) {
+		shell_warn(sh,
+			   "rx is climbing but this model cannot convert: it "
+			   "has re-baselined %u time(s) and the current "
+			   "baseline is %u of %u, with no carried skew young "
+			   "enough to bridge it. This anchor is publishing NO "
+			   "observations right now — correct behaviour after a "
+			   "gateway reboot, and it clears itself within ~2 s.",
+			   rebaselines, n_obs, SYNC_BASELINE_USEFUL);
+	}
 
 	if (valid && cnt >= SYNC_GATE_MIN_COUNT) {
 		uint32_t mx = sync_model_residual_max_dtu(m);

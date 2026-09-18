@@ -108,7 +108,11 @@ static int64_t sim_conv_err(const struct sim *s, const struct sync_model *m,
 
 /* ---- 1. Lifecycle -------------------------------------------------------- */
 
-static void test_needs_two_observations(void)
+/* B13: a COLD model must refuse to convert until its baseline is actually
+ * useful. It used to go valid after one completed interval -- a two-point rate
+ * estimate, ~35x worse than the converged state at this hardware's measured
+ * jitter -- and nothing downstream could tell. */
+static void test_needs_a_useful_baseline(void)
 {
 	struct sync_model m;
 	struct sim s;
@@ -123,9 +127,31 @@ static void test_needs_two_observations(void)
 	sim_step(&s, &m);                       /* one point is not a baseline */
 	CHECK(!sync_model_to_master(&m, 5000000, &out));
 
-	sim_step(&s, &m);
+	/* n_obs counts INTERVALS, so SYNC_BASELINE_USEFUL of them needs one
+	 * more observation than that. Every step short of the threshold must
+	 * still refuse -- this is the loop the old two-observation test was
+	 * missing entirely. */
+	for (unsigned int i = 0; i < SYNC_BASELINE_USEFUL; i++) {
+		CHECK(sync_model_n_obs(&m) == i);
+		CHECK(!sync_model_to_master(&m, 5000000, &out));
+		CHECK(sync_model_error_dtu(&m, 0) == UINT32_MAX);
+		sim_step(&s, &m);
+	}
+
+	CHECK(sync_model_n_obs(&m) == SYNC_BASELINE_USEFUL);
 	CHECK(sync_model_to_master(&m, 5000000, &out));
 	CHECK(sync_model_error_dtu(&m, 0) != UINT32_MAX);
+	CHECK(sync_model_rebaseline_count(&m) == 0u);
+}
+
+/* Run a model to convergence, for the tests below that are not about the
+ * lifecycle. `extra` observations beyond the threshold. */
+static void run_to_converged(struct sim *s, struct sync_model *m,
+			     unsigned int extra)
+{
+	for (unsigned int i = 0; i <= SYNC_BASELINE_USEFUL + extra; i++) {
+		sim_step(s, m);
+	}
 }
 
 /* ---- 2. Noiseless cases must be EXACT, not merely close ----------------- */
@@ -138,7 +164,7 @@ static void test_identical_clocks_are_exact(void)
 	sync_model_init(&m);
 	sim_init(&s, 0x1122334455ULL, 0x00AABBCCDDULL, 0, 0);
 
-	for (int i = 0; i < 5; i++) sim_step(&s, &m);
+	run_to_converged(&s, &m, 0);
 
 	/* Anywhere inside the next interval, to the DTU. */
 	for (uint64_t x = 0; x < SYNC_CCP_INTERVAL_DTU * 5; x += 997000000ULL) {
@@ -157,12 +183,14 @@ static void test_constant_drift_no_noise_is_exact(void)
 
 		sync_model_init(&m);
 		sim_init(&s, 0x0102030405ULL, 0x0908070605ULL, ppbs[k], 0);
-		for (int i = 0; i < 6; i++) sim_step(&s, &m);
+		run_to_converged(&s, &m, 1);
 
 		/* A perfect linear clock is a linear model's exact fit. Allow
 		 * 1 DTU for the integer division in the correction term -- that
 		 * is 15.65 ps, four orders inside the target. */
-		int64_t e = sim_conv_err(&s, &m, SYNC_CCP_INTERVAL_DTU * 6);
+		int64_t e = sim_conv_err(&s, &m,
+					 SYNC_CCP_INTERVAL_DTU *
+					 (SYNC_BASELINE_USEFUL + 2));
 
 		CHECK(e > -2 && e < 2);
 
@@ -243,7 +271,14 @@ static void test_sub_nanosecond_is_reached(void)
  * averaging and at n=10 has not finished settling from its zero start. */
 static void test_error_scaling_is_measured_not_assumed(void)
 {
-	const unsigned int ns[] = { 2, 5, 10, 25, 100, 300 };
+	/* Starts at SYNC_BASELINE_USEFUL + 1 observations, not 2. n_obs counts
+	 * INTERVALS, so that is the shortest run this model will convert at
+	 * all since the B13 gate landed -- and the two entries the list used to
+	 * open with (2 and 5) are precisely the states that gate exists to
+	 * refuse. */
+	const unsigned int ns[] = { SYNC_BASELINE_USEFUL + 1,
+				    SYNC_BASELINE_USEFUL + 3,
+				    SYNC_BASELINE_USEFUL + 6, 25, 100, 300 };
 	int64_t mean[6];
 
 	printf("  observations -> worst error, DTU, mean of 12 seeds"
@@ -261,7 +296,7 @@ static void test_error_scaling_is_measured_not_assumed(void)
 						ns[i], seed);
 
 			CHECK(e != INT64_MAX);
-			CHECK(e < NS);        /* sub-ns from n=2 onward */
+			CHECK(e < NS);        /* sub-ns from the gate on */
 			sum += e;
 		}
 		mean[i] = sum / 12;
@@ -479,7 +514,15 @@ static void test_residual_rms_measures_the_jitter(void)
 		       amps[i], sigma, rms,
 		       sync_model_residual_max_dtu(&m));
 
-		CHECK(sync_model_residual_count(&m) > 390u);
+		/* Not 400: residuals are only folded in once the baseline is
+		 * CONVERGED (see sync_model_observe()), so the first
+		 * SYNC_BASELINE_USEFUL + 1 observations contribute none. That
+		 * is deliberate -- it is what makes the statistics safe to
+		 * carry across a re-baseline, and it is the same effect
+		 * docs/anchor-sync-measurement.md section 4.1 records as
+		 * "`sync reset` is worth 3.7x", fixed at the source. */
+		CHECK(sync_model_residual_count(&m) >=
+		      400u - SYNC_BASELINE_USEFUL - 2u);
 
 		/* The RMS itself sits at SYNC_RESIDUAL_TO_JITTER x sigma, not at
 		 * sigma -- the residual differences two independent noisy
@@ -520,7 +563,7 @@ static void test_residual_reset_keeps_sync(void)
 	sim_init(&s, 0x0300000000ULL, 0x0900000000ULL, 40000, SYNC_JITTER_DTU);
 	for (unsigned int k = 0; k < 60u; k++) sim_step(&s, &m);
 
-	CHECK(sync_model_residual_count(&m) > 50u);
+	CHECK(sync_model_residual_count(&m) >= 60u - SYNC_BASELINE_USEFUL - 2u);
 	int32_t drift_before = sync_model_drift_ppb(&m);
 
 	sync_model_residual_reset(&m);
@@ -533,12 +576,237 @@ static void test_residual_reset_keeps_sync(void)
 	CHECK(sync_model_drift_ppb(&m) == drift_before);
 }
 
+/* ---- 6. B13: the re-baseline transient ----------------------------------
+ *
+ * These pin the fix recorded in docs/diag-tdoa-precision-stage1-audit.md
+ * section 2: the model used to go valid after ONE completed interval, so every
+ * discontinuity published conversions built on a two-point rate estimate
+ * (~10.8 ppb at this hardware's measured jitter, ~2.2 ns over a 200 ms
+ * extrapolation, ~35x the converged state) while still reporting its long-run
+ * sigma, which does not move during a transient at all.
+ */
+
+/* Advance the simulated clock pair by `n` intervals WITHOUT feeding the model,
+ * i.e. produce a real elapsed gap behind a discontinuity. */
+static void sim_skip(struct sim *s, uint64_t n)
+{
+	s->k += n;
+}
+
+static void test_rebaseline_keeps_the_link_and_the_counters(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	rng_seed(4242);
+	sync_model_init(&m);
+	sim_init(&s, 0x1234500000ULL, 0x0765400000ULL, 12000, 64);
+	for (unsigned int k = 0; k < 60u; k++) sim_step(&s, &m);
+
+	uint32_t res_before = sync_model_residual_count(&m);
+	uint32_t rms_before = sync_model_residual_rms_dtu(&m);
+
+	CHECK(res_before > 0u);
+	CHECK(sync_model_rebaseline_count(&m) == 0u);
+	CHECK(sync_model_n_obs(&m) >= SYNC_BASELINE_USEFUL);
+
+	sync_model_rebaseline(&m, true);
+
+	/* KEPT: the residual statistics measure the LINK, which a sequence
+	 * discontinuity does not alter -- and a counter that a re-baseline
+	 * resets could never have counted one. CLEARED: the baseline. */
+	CHECK(sync_model_residual_count(&m) == res_before);
+	CHECK(sync_model_residual_rms_dtu(&m) == rms_before);
+	CHECK(sync_model_rebaseline_count(&m) == 1u);
+	CHECK(sync_model_n_obs(&m) == 0u);
+
+	/* sync_model_init() is the one thing that does clear them. */
+	sync_model_init(&m);
+	CHECK(sync_model_rebaseline_count(&m) == 0u);
+	CHECK(sync_model_residual_count(&m) == 0u);
+}
+
+/* A MISS is counted for the lifetime, not just until the next re-baseline --
+ * `sync_gaps` on the console is how an operator tells a link that keeps losing
+ * CCPs from one that keeps re-baselining. */
+static void test_miss_counter_is_lifetime(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	sync_model_init(&m);
+	sim_init(&s, 0x0400000000ULL, 0x0800000000ULL, 5000, 0);
+	for (unsigned int k = 0; k <= SYNC_BASELINE_USEFUL; k++) sim_step(&s, &m);
+
+	CHECK(sync_model_miss_count(&m) == 0u);
+	for (unsigned int k = 0; k < 3u; k++) sync_model_miss(&m);
+	CHECK(sync_model_miss_count(&m) == 3u);
+
+	sync_model_rebaseline(&m, true);
+	CHECK(sync_model_miss_count(&m) == 3u);
+}
+
+/* THE property the fix exists for, and the one the plan asks for by name:
+ * after a re-baseline the PUBLISHED sigma must exceed its converged value for
+ * as long as the baseline is short, and must never get WORSE as the baseline
+ * grows. */
+static void test_sigma_rises_after_rebaseline_and_never_worsens(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	rng_seed(909);
+	sync_model_init(&m);
+	sim_init(&s, 0x0500000000ULL, 0x0A00000000ULL, 12000, 64);
+	for (unsigned int k = 0; k < 120u; k++) sim_step(&s, &m);
+
+	uint32_t sigma_converged = sync_model_sigma_dtu(&m);
+
+	CHECK(sigma_converged > 0u);
+	CHECK(sync_model_n_obs(&m) >= SYNC_BASELINE_USEFUL);
+
+	sync_model_rebaseline(&m, true);
+	sim_step(&s, &m);            /* a phase reference and a carried skew */
+
+	printf("  sigma across a re-baseline (converged = %u DTU):\n",
+	       sigma_converged);
+
+	uint32_t prev = UINT32_MAX;
+	unsigned int seen_elevated = 0;
+
+	for (unsigned int i = 0; i <= SYNC_BASELINE_USEFUL + 2u; i++) {
+		uint32_t sig = sync_model_sigma_dtu(&m);
+		uint32_t n   = sync_model_n_obs(&m);
+
+		printf("      n_obs=%-3u sigma=%4u%s\n", n, sig,
+		       sig == 0u ? "   (not converting)" : "");
+
+		if (sig != 0u) {
+			/* Monotone: the published confidence may improve as
+			 * the baseline grows and may never degrade. */
+			CHECK(sig <= prev);
+			prev = sig;
+
+			if (n < SYNC_BASELINE_USEFUL) {
+				/* ... and while short it must SAY it is worse,
+				 * which is the half a long-run jitter
+				 * statistic structurally could not do. */
+				CHECK(sig > sigma_converged);
+				seen_elevated++;
+			}
+		}
+		sim_step(&s, &m);
+	}
+
+	/* The transient has to actually have been observable, or the loop
+	 * above proves nothing. */
+	CHECK(seen_elevated > 0u);
+
+	/* And it comes back down. The residual statistics kept accumulating
+	 * through all of this, so allow a little movement in the measured
+	 * jitter the sigma is built from rather than demanding equality. */
+	uint32_t sigma_after = sync_model_sigma_dtu(&m);
+
+	CHECK(sigma_after > 0u);
+	CHECK(sigma_after <= sigma_converged + sigma_converged / 4u);
+}
+
+/* The carry bridges a SHORT discontinuity: conversion continues across it, and
+ * the answer is right, because the rate it is using was measured over a long
+ * converged baseline rather than re-estimated from two points. */
+static void test_carried_skew_bridges_a_short_discontinuity(void)
+{
+	struct sync_model m;
+	struct sim s;
+	uint64_t out;
+
+	sync_model_init(&m);
+	/* No jitter: this test is about WHICH rate gets used, so any error
+	 * left is the carry's own, not the link's. */
+	sim_init(&s, 0x0600000000ULL, 0x0300000000ULL, 25000, 0);
+	for (unsigned int k = 0; k < 40u; k++) sim_step(&s, &m);
+
+	sync_model_rebaseline(&m, true);
+	CHECK(!sync_model_to_master(&m, s.l0, &out));   /* no phase reference */
+
+	sim_step(&s, &m);                               /* one observation */
+	CHECK(sync_model_n_obs(&m) == 0u);
+	CHECK(sync_model_to_master(&m, s.l0, &out));    /* ... and it converts */
+
+	/* Converting a whole interval ahead on the carried rate must still be
+	 * exact to the DTU with a noiseless clock pair -- the carried ratio is
+	 * the same integer pair the converged baseline was using. */
+	int64_t e = sim_conv_err(&s, &m, (uint64_t)s.k * SYNC_CCP_INTERVAL_DTU);
+
+	CHECK(e != INT64_MAX);
+	CHECK(e > -2 && e < 2);
+
+	/* drift_ppb reads off the CURRENT baseline, which is empty, so it is
+	 * 0 here. Asserted rather than left implicit: the carried skew is NOT
+	 * visible through that accessor, and a reader looking for it there
+	 * would wrongly conclude the carry did not happen. */
+	CHECK(sync_model_drift_ppb(&m) == 0);
+}
+
+/* ... and refuses to bridge a LONG one. A gateway reboot is seconds, the carry
+ * budget is SYNC_SKEW_MAX_ERR_PPB / SYNC_SKEW_DRIFT_PPB_PER_S = 0.5 s, so the
+ * anchor correctly publishes nothing until its fresh baseline converges. */
+static void test_carried_skew_goes_stale(void)
+{
+	struct sync_model m;
+	struct sim s;
+	uint64_t out;
+
+	sync_model_init(&m);
+	sim_init(&s, 0x0700000000ULL, 0x0100000000ULL, 25000, 0);
+	for (unsigned int k = 0; k < 40u; k++) sim_step(&s, &m);
+
+	sync_model_rebaseline(&m, true);
+	sim_skip(&s, 30u);           /* 6 s of real elapsed time: a reboot */
+	sim_step(&s, &m);
+
+	CHECK(!sync_model_to_master(&m, s.l0, &out));
+	CHECK(sync_model_sigma_dtu(&m) == 0u);
+
+	/* And it recovers on its own once the fresh baseline is useful. */
+	for (unsigned int k = 0; k <= SYNC_BASELINE_USEFUL; k++) sim_step(&s, &m);
+	CHECK(sync_model_n_obs(&m) >= SYNC_BASELINE_USEFUL);
+	CHECK(sync_model_to_master(&m, s.l0, &out));
+	CHECK(sync_model_sigma_dtu(&m) > 0u);
+}
+
+/* A ROOT change must NOT carry the skew: a different root is a different
+ * crystal, so the old ratio describes the wrong pair of clocks -- the one case
+ * where bridging would be actively wrong rather than merely stale. */
+static void test_root_change_does_not_carry_the_skew(void)
+{
+	struct sync_model m;
+	struct sim s;
+	uint64_t out;
+
+	sync_model_init(&m);
+	sim_init(&s, 0x0200000000ULL, 0x0B00000000ULL, 25000, 0);
+	for (unsigned int k = 0; k < 40u; k++) sim_step(&s, &m);
+
+	sync_model_rebaseline(&m, false);
+	sim_step(&s, &m);
+	CHECK(!sync_model_to_master(&m, s.l0, &out));
+
+	/* Still refuses right up to the threshold. */
+	for (unsigned int i = 0; i < SYNC_BASELINE_USEFUL; i++) {
+		CHECK(!sync_model_to_master(&m, s.l0, &out));
+		sim_step(&s, &m);
+	}
+	CHECK(sync_model_n_obs(&m) == SYNC_BASELINE_USEFUL);
+	CHECK(sync_model_to_master(&m, s.l0, &out));
+}
+
 int main(void)
 {
 	printf("sync_model: 1 ns = %" PRId64 " DTU, CCP interval = %llu DTU\n",
 	       NS, (unsigned long long)SYNC_CCP_INTERVAL_DTU);
 
-	test_needs_two_observations();
+	test_needs_a_useful_baseline();
 	test_identical_clocks_are_exact();
 	test_constant_drift_no_noise_is_exact();
 	test_sub_nanosecond_is_reached();
@@ -551,6 +819,12 @@ int main(void)
 	test_coasting_then_giving_up();
 	test_residual_rms_measures_the_jitter();
 	test_residual_reset_keeps_sync();
+	test_rebaseline_keeps_the_link_and_the_counters();
+	test_miss_counter_is_lifetime();
+	test_sigma_rises_after_rebaseline_and_never_worsens();
+	test_carried_skew_bridges_a_short_discontinuity();
+	test_carried_skew_goes_stale();
+	test_root_change_does_not_carry_the_skew();
 
 	if (failures) {
 		printf("\n%d CHECK(s) FAILED\n", failures);

@@ -87,32 +87,42 @@ bool blink_rx_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
 	 * weight its equations against the other anchors' instead of assuming
 	 * every link is equally good.
 	 *
-	 * sync_model_jitter_est_dtu(), NOT sync_model_error_dtu(), and the
-	 * difference is not cosmetic: error_dtu() is built from
-	 * SYNC_JITTER_DTU, a hardcoded ASSUMPTION of ~100 ps, while the Fase 2
-	 * hardware measurement came in at 782 ps to 1.53 ns. Publishing
-	 * error_dtu() would hand the gateway a sigma roughly 15x too
-	 * optimistic and make its filter overconfident in every observation --
-	 * worse than the flat r_tdoa fallback it would be replacing.
-	 * jitter_est_dtu() is derived from this anchor's own residual
-	 * statistics, i.e. from what its link actually did.
+	 * sync_model_sigma_dtu(), since 2026-09-18. It used to be
+	 * sync_model_jitter_est_dtu(), chosen over sync_model_error_dtu()
+	 * because error_dtu() was built from SYNC_JITTER_DTU -- a hardcoded
+	 * ASSUMPTION of ~100 ps against a Fase 2 hardware measurement of
+	 * 782 ps to 1.53 ns -- and would have been roughly 15x too optimistic.
+	 * error_dtu() no longer works that way: it is built from this anchor's
+	 * OWN measured residuals with a pessimistic fallback before there are
+	 * enough of them, so reaching past it is no longer necessary. See
+	 * sync_model.h.
 	 *
-	 * WHAT IT IS NOT: a per-BLINK figure. It is a long-run statistic for
-	 * this anchor's CCP link, so it discriminates between ANCHORS (a weak
-	 * or distant one counts less) and not between one blink and the next.
-	 * Per-blink SNR is what `quality` would be for, and whether that
-	 * carries any information is unmeasured -- see pos_json.h.
+	 * The reason to move BACK to it is B13: jitter_est_dtu() is a long-run
+	 * statistic that does not move at all during a re-baseline, so a
+	 * freshly-discontinuous anchor published its usual confidence while
+	 * converting on a carried or two-point rate. sync_model_sigma_dtu()
+	 * is the conversion error over a full CCP interval and rises during
+	 * that window, which is exactly what a consumer needs in order to
+	 * down-weight it.
 	 *
-	 * 0 means "not enough observations yet" (the RMS is 0 before any
-	 * residual has been folded in), and it must NOT reach the gateway as a
-	 * sigma: zero sigma reads as infinite confidence. It is forwarded as 0
-	 * on purpose and the gateway treats 0 as "unknown, use the fallback".
-	 * Saturated rather than wrapped at 16 bits: 65535 DTU is 307 m of path
-	 * error, so anything near it is already meaningless and the exact
-	 * value does not matter, but a wrap would turn a terrible link into an
-	 * excellent-looking one. */
+	 * WHAT IT IS NOT: a per-BLINK figure. Its jitter input is a long-run
+	 * statistic for this anchor's CCP link, so it discriminates between
+	 * ANCHORS (a weak or distant one counts less) and, apart from the
+	 * baseline-state term, not between one blink and the next. Per-blink
+	 * SNR is what `quality` would be for, and whether that carries any
+	 * information is unmeasured -- see pos_json.h.
+	 *
+	 * 0 means "unknown" on the wire and must NOT reach the gateway as a
+	 * sigma, since zero sigma reads as infinite confidence.
+	 * sync_model_sigma_dtu() returns 0 only when the model cannot convert
+	 * -- and in that case sync_model_to_master() above already refused and
+	 * this line was never reached -- and clamps every other result to at
+	 * least 1. Saturated rather than wrapped at 16 bits: 65535 DTU is
+	 * 307 m of path error, so anything near it is already meaningless and
+	 * the exact value does not matter, but a wrap would turn a terrible
+	 * link into an excellent-looking one. */
 	{
-		uint32_t j = sync_model_jitter_est_dtu(ccp_slave_model());
+		uint32_t j = sync_model_sigma_dtu(ccp_slave_model());
 
 		obs.sigma_dtu = (j > 0xFFFFu) ? 0xFFFFu : (uint16_t)j;
 	}

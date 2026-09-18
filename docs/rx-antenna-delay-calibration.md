@@ -30,15 +30,42 @@ The DW3220 **subtracts** the configured `ant_rx` from every RX timestamp, so
 anchor *k* reports
 
 ```
-tau_k = T_emit + r_k / c - delta_k + noise
+tau_k = T_emit + r_k / c - delta_k - d_Mk / c + noise
 ```
 
 `T_emit` — and with it the transmitting tag's own TX delay — is common to
 every anchor that hears one blink, so it cancels in a range difference:
 
 ```
-(tau_k - tau_0) * 4.69mm  -  (r_k - r_0)  =  -(delta_k - delta_0) * 4.69mm
+(tau_k - tau_0) * 4.69mm  -  (r_k - r_0)
+        =  -(delta_k - delta_0) * 4.69mm  -  (d_Mk - d_M0)
 ```
+
+**`d_Mk` is the distance from the CCP MASTER (the gateway) to anchor k, and it
+is there because the sync model converts into the master's TRANSMIT time
+base.** `ccp_slave.c` pairs the master's TX timestamp with this anchor's RX
+timestamp of that same frame, so the conversion output is early by exactly the
+flight time, and nothing anywhere subtracts it back off — see B14 in
+`docs/diag-tdoa-precision-stage1-audit.md` for the full derivation and why no
+check in that audit's A1–A7 table could have found it.
+
+An earlier version of this section omitted that term. It changes **nothing
+about the procedure** and everything about what the answer is called:
+`d_Mk/c` is a per-anchor constant, the same shape as `delta_k`, so the
+per-anchor mean below absorbs it, the consistency check across tag positions
+still holds, and the correction computed is still the correct correction to
+apply. What it is NOT is "RX antenna delay": the fitted `b_k` is
+`(RX antenna-delay difference) + (master flight-time difference)`, and writing
+the whole thing into `ant_rx` is a bookkeeping fiction that happens to produce
+the right numbers.
+
+Two consequences worth acting on. **Tape-measure the gateway's position too**
+and compute `-(d_Mk - d_M0)`: if it accounts for the fitted `b_k` within the
+fit's own spread, the bias is geometry rather than manufacturing, which is a
+different (and cheaper) thing to fix properly. And a **bench** split
+calibration that uses converted timestamps between two anchors does NOT get
+this for free — reciprocity DOUBLES the term rather than cancelling it — so
+put the master on the perpendicular bisector of the two boards under test.
 
 The left side is computable from a raw observation capture plus the surveyed
 geometry plus a tape-measured tag position. The right side is a
