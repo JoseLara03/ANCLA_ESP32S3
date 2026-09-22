@@ -4,10 +4,11 @@ Companion to `docs/diag-tdoa-precision-stage1-audit.md` (including its B14
 addendum). This is the **runnable** half: exact console commands, what to
 record, and how to read each result.
 
-**Status as of 2026-09-18: T6 is implemented and verified in software. T0–T5
-have NOT been run — no bench access in the session that prepared them. T7 is
-not triggered.** Every verdict box below is filled in with `NOT RUN` and the
-prerequisites needed to fill it.
+**Status as of 2026-09-18: T6 implemented and software-verified (plus one piece
+of hardware evidence — see the T0 side-finding). T0 has RUN → verdict T0-A.
+T1–T5 have NOT run and are BLOCKED — see the blocker section below. T7 is not
+triggered and is not yet evaluable.** Verdict boxes still marked `NOT RUN` carry
+the prerequisites needed to fill them.
 
 Fill each verdict box in place as it runs, and keep the raw console output —
 these are the numbers that go back to the supervisor.
@@ -34,6 +35,42 @@ these are the numbers that go back to the supervisor.
    Wait for `n_obs >= 10` before recording any position data.
 5. **Tag static and in clear line of sight** for every positional measurement,
    on a marked spot that is itself tape-measured into the survey frame.
+
+---
+
+## BLOCKER found 2026-09-18 — the reported position is pinned at the centroid
+
+**Observed while running T0**: two tags placed together near the A3-A0 edge are
+both reported at the **centre of the array**, and the reading did not change at
+all under a 1.88 m perturbation. This blocks T1-T5, because every one of those
+tests is read out through the reported position — a frozen output makes all of
+them uninterpretable, and no amount of calibration moves a number that is not
+tracking.
+
+**Why it is not simply a bias.** The height model (`apos tagz = 0`) pulls
+positions INWARD toward the anchor centroid — real, documented, ~23% on this
+array — but that is ~0.28 m at 1.2 m from centre. It cannot put a tag *on* the
+centroid. What can: `tdoa_solve()` uses the **anchor centroid as its seed** when
+no seed is supplied, so a position sitting exactly there and refusing to move is
+the signature of a solve returning its starting point, a filter that froze, or a
+map displaying a stale value.
+
+**Three candidates, all separated by one command** (`blink stats` on the
+gateway, run twice ~30 s apart so the deltas are readable):
+
+| Candidate | Signature |
+|---|---|
+| **(a) Filter still-freeze** | `tdoa_abg` line: `still` ~= `filtered`, and the shell prints its own warning. `BLINK_FLAG_MOVING`'s ABSENCE reads as "still" (proto-4 publisher, or a tag that never sets it), so the filter freezes every cycle: seeded once near the centroid, frozen after, identical for both tags, immune to everything. Fits the symptom exactly. |
+| **(b) Nothing published, map is stale** | `tdoa.fixes` not climbing between the two reads, and/or `jump` climbing. A tag on or outside the hull edge can converge on the mirror branch; `TDOA_GW_MAX_JUMP_M` rejects it and publishes NOTHING, so the platform keeps showing its last value. |
+| **(c) Equations dropped** | `no_anchor` climbing — observations from anchor ids absent from the applied survey, which `anchor_xyz()` refuses. Check `solve_fail` alongside. |
+
+Also read `apos show` (are the surveyed coordinates and node count what you
+expect, and do the ids map to the boards you think?) and the `pos_sink` console
+line — whether a new `(x, y)` is printed per fix at all separates (b) from
+(a)/(c) immediately, and consecutive values identical to two decimals is the
+stale-republish signature that caught a real bug on this gateway before.
+
+**Status: NOT YET DIAGNOSED.** Awaiting those reads.
 
 ---
 
@@ -111,15 +148,67 @@ kernel reboot cold
 ### T0 verdict
 
 ```
-Status:            NOT RUN — needs bench access (tag + 3-4 anchors + gateway)
-Perturbation used: (+400 DTU recommended / +100 DTU as briefed)
-Anchor probed:     ___   original ant_tx/ant_rx: ___ / ___
-Baseline (x,y) mean over >=60 s:      ___
-Perturbed (x,y) mean over >=60 s:     ___    delta: ___ mm
-Reverted (x,y) mean over >=60 s:      ___    delta vs baseline: ___ mm
-Master probe delta:                   ___ mm
-Verdict:           T0-A / T0-A' / T0-B / T0-C
+Status:            RUN 2026-09-18 (slave probe only; master probe not run)
+Perturbation used: +400 DTU (1.88 m of one-way path)
+Anchor probed:     A3     original ant_tx/ant_rx: NOT RECORDED before the change
+Baseline (x,y):    both tags reported at the ARRAY CENTROID
+Perturbed (x,y):   IDENTICAL to baseline — no movement
+Verdict:           T0-A — cancellation active, as derived in T0.0
 ```
+
+**T0-A confirmed, and it is the predicted outcome, not a null result.** A 1.88 m
+perturbation moved the reported position by zero, which is what the algebra in
+T0.0 says must happen: the DW3220 subtracts `ant_rx` from every RX timestamp on
+that board including the CCP's, so the offset appears in both the sync model's
+training input and its evaluation input and cancels exactly. **Slave RX-delay
+error is not the bias**, and rank 2 (B8) collapses to whatever the *difference*
+between boards is after the master term is accounted for.
+
+**Two things this run did NOT establish**, recorded so they are not assumed:
+
+- The **master probe was not run**, and per T0.0 it is expected to be
+  uninformative anyway (the gateway takes no blink observations).
+- A3's original `ant_tx`/`ant_rx` were **not recorded before the change**, so
+  the revert is reconstruction rather than restoration. Read the other anchors
+  with `anchor show` and treat A3's values as suspect until `cal ref` or
+  `rx_cal.py` re-derives them. **This is the standing rule in this document's
+  own preamble and it was skipped — it costs a calibration, not just a note.**
+
+### T0 side-finding: `sync stats` improved, and it was NOT the antenna change
+
+A3 read `verdict:"fail"` before this session and `jitter_est_dtu` 14-17
+(219-266 ps, `pass`) after. **That is the T6 firmware, not the antenna delay**,
+and the distinction is load-bearing:
+
+- Antenna delay is a constant offset and is absorbed entirely by the model's
+  phase term. `docs/anchor-sync-measurement.md` §0.1 states this as a design
+  property — it is why the Fase 2 gate can be run on uncalibrated boards.
+  `rebaselines:0` on the same read confirms the model never even restarted.
+- T6 changed exactly this statistic: residuals are now accumulated **only while
+  converged**. The arithmetic for why that is worth ~5x:
+
+```
+RMS^2 = (390*sigma^2 + 10*(35*sigma)^2)/400 = sigma^2 * 31.6  ->  RMS = 5.6*sigma
+```
+
+  Ten un-converged samples out of 400 inflate the RMS about fivefold, because
+  an RMS squares them and an un-converged conversion is ~35x worse. Right
+  magnitude, right direction, same effect §4.1 of that doc already records as
+  "`sync reset` is worth 3.7x".
+
+So this is the **first hardware evidence that T6 works** — partial, on one
+board. It is NOT a calibration result and must not be cited as one.
+
+**Possible consequence worth chasing, bounded honestly:** 219-266 ps against
+the Fase 2 measurement of 1.44-1.53 ns that the "~45 cm accepted instead of
+10-30 cm" product decision rests on. If the fleet reads like this on current
+firmware, that decision has headroom to be revisited. **Do not report the gate
+as re-passed on this**: one anchor, unknown distance to the gateway (the
+2026-08-26 figure was at 3 m), different board with unconfirmed PA rework
+status, and the shell's own tail warning fired (`max 139` vs `rms 27` = 5.1x,
+i.e. multipath or an intermittent obstruction on that link). Settling it is one
+command per board: `sync reset`, wait 90 s, record `jitter_est_dtu` with that
+anchor's measured distance to the gateway.
 
 ---
 
