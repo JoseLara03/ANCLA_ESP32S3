@@ -40,15 +40,56 @@
  *
  * The hash is salted with the SURVEY_BEGIN round counter and the session
  * (apos_node.c's enum_slot()), so it is deliberately NOT stable across rounds or
- * across runs. Uniqueness of the EUI does not make the SLOT unique -- 8 slots
- * and 4 anchors collide with probability ~59 % -- and an unsalted hash would
- * repeat that same collision in every round of every run, which is a permanently
- * missing anchor rather than a retryable one.
+ * across runs. Uniqueness of the EUI does not make the SLOT unique, and an
+ * unsalted hash would repeat the same collision in every round of every run,
+ * which is a permanently missing anchor rather than a retryable one. Do not
+ * "fix" the collision arithmetic below by slotting on anchor_id -- that trades
+ * a retryable collision for an undetectable duplicate-id fault, which is the
+ * whole reason this is a hash.
  *
- * 8 slots x 30 ms bounds the worst-case reply delay at 210 ms, which is about
- * one superframe -- short enough for the SLAVE loop to simply sleep through it. */
-#define APOS_ENUM_SLOTS   8u
-#define APOS_ENUM_SLOT_MS 30u
+ * ---- 2026-09-22: resized, ported from master (b87a767) ------------------
+ *
+ * These were 8 slots x 30 ms, and at that size a 4-anchor array collides with
+ * probability 1 - (7/8)^3 = 33 % PER ROUND. The gateway's independent redraws
+ * hide most of it, but not all: an anchor missing from enumeration was a
+ * routine, intermittent event on this deployment, which is what prompted the
+ * port.
+ *
+ * A hash into S slots gives an anchor a clean slot in one round with
+ * probability ((S-1)/S)^(N-1), so the slot count has to grow with the
+ * deployment. At 64 slots and 4 anchors that is 1 - (63/64)^3 = 4.6 % per
+ * round, and over APOS_GW_ENUM_ROUNDS independent draws the chance an anchor
+ * is lost in ALL of them is 0.046^3 = 1e-4. (Master sizes the same constants
+ * for 32 anchors, where 8 slots would have been 1 - (7/8)^31 = 98.4 % and
+ * enumeration essentially never completes.)
+ *
+ * 64 slots x 12 ms bounds the worst-case reply delay at 63 * 12 = 756 ms and
+ * the whole window at APOS_ENUM_WINDOW_MS (768 ms). Two things set the 12 ms:
+ * an ENUM_RSP's ~1.6 ms of airtime (a PLEN_1024 preamble alone is ~1.05 ms)
+ * plus the SPI writes around dwt_starttx(); and CONFIG_SYS_CLOCK_TICKS_PER_SEC
+ * is 1000 on this SoC, so a slot much below 10 ms starts quantising into its
+ * neighbours. A FAILED TX is the one case that overruns a slot --
+ * TX_COMPLETE_TIMEOUT_MS (8 ms) then a 5 ms sleep before the single retry --
+ * which costs the NEXT slot's reply in that round only, and the round union
+ * recovers it.
+ *
+ * The cost of the longer window is paid on the SLAVE loop, which blocks
+ * through its own slot delay: up to 756 ms, ~3.8 superframes. Two
+ * consequences, both bounded and both commissioning-only. The board is deaf to
+ * tag polls and BLINKs for that long; and beacon_guard may roll past
+ * BEACON_GUARD_MAX_MISSES predicted beacons and drop its lock -- which fails
+ * OPEN (beacon_guard_tx_allowed() returns true while unlocked), so a stale
+ * prediction never suppresses the ENUM_RSP. It re-locks on the next observed
+ * beacon. */
+#define APOS_ENUM_SLOTS   64u
+#define APOS_ENUM_SLOT_MS 12u
+
+/* Worst-case span of one enumeration reply window. The gateway derives its
+ * inter-round gap and its post-re-broadcast settle interval from this
+ * (APOS_GW_ENUM_SETTLE_MS) rather than carrying literals that have to be kept
+ * in step with the two constants above by hand -- which is exactly how the old
+ * 240 ms figure ended up hand-copied into three comments and one constant. */
+#define APOS_ENUM_WINDOW_MS (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS)
 
 /* Seconds a window is extended by on each in-session APOS frame. Long enough
  * that a slow ranging phase never lets the window lapse mid-survey, short

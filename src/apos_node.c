@@ -239,9 +239,9 @@ static void handle_survey_begin(const uint8_t *buf, uint16_t plen,
 	}
 
 	/* A suppressed or failed TX here must not be silently lost: with the
-	 * stagger spanning up to APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS (210 ms)
-	 * against a 200 ms superframe, a board that draws one of the longer
-	 * slots is landing its reply right against the next beacon -- exactly
+	 * stagger spanning up to APOS_ENUM_WINDOW_MS (768 ms) against a 200 ms
+	 * superframe, a board that draws one of the longer slots is landing
+	 * its reply right against some beacon -- exactly
 	 * where beacon_guard_tx_allowed() is designed to refuse. Without a
 	 * retry that board simply never appears in this round's enumeration,
 	 * indistinguishable from it never having answered at all. Same

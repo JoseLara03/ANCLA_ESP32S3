@@ -23,6 +23,7 @@
 #define APOS_GW_H
 
 #include "apos_geom.h"
+#include "apos_node.h"   /* APOS_ENUM_WINDOW_MS */
 #include "apos_table.h"
 
 #include <stdbool.h>
@@ -50,15 +51,37 @@ enum apos_gw_phase {
  * collide in one round are very unlikely to collide in the next, and the union
  * still enumerates both. With an unsalted hash the same pair would collide in
  * every round and the extra broadcasts would buy nothing at all -- see
- * enum_slot() in apos_node.c. With 8 slots, 4 anchors and 3 independent draws,
- * the chance an anchor is lost in all three is under 2 %.
+ * enum_slot() in apos_node.c.
  *
- * The gap must exceed the worst-case stagger
- * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 8 * 30 = 240 ms) plus reply airtime;
- * 400 ms clears 240 ms with ~160 ms to spare, which is ample for a ~1.5 ms
- * ENUM_RSP. */
+ * With APOS_ENUM_SLOTS now 64 (2026-09-22, ported from master), 4 anchors
+ * collide at 4.6 % per round and three independent draws put the chance an
+ * anchor is lost in all of them at 1e-4. That is the number that matters here:
+ * an anchor intermittently missing from enumeration was the defect the resize
+ * fixes.
+ *
+ * DELIBERATE DIVERGENCE FROM MASTER, recorded so a future merge is a decision
+ * and not a surprise: master uses 8 rounds, sized so that ROUNDS-1 of them
+ * yield adjacency evidence for its candidate-pair pruning. This branch did NOT
+ * port that feature -- it ranges every ordered pair -- so the extra five rounds
+ * would buy nothing but 3.3 s per run, on a branch whose whole purpose is
+ * iterating surveys. Raise this to 8 when the pruning lands. */
 #define APOS_GW_ENUM_ROUNDS  3u
-#define APOS_GW_ENUM_GAP_MS  400u
+
+/* Long enough for a whole enumeration reply window to drain before the next
+ * frame competes with it on the air: APOS_ENUM_WINDOW_MS (768 ms) plus the
+ * last slot's reply airtime and TX path.
+ *
+ * DERIVED, not a literal. The value it has to clear is
+ * APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS in apos_node.h, and an earlier version
+ * of this header carried the product as a hand-copied 240 ms in two places --
+ * both of which would have silently become wrong the moment the slot count
+ * moved, which is exactly what just happened.
+ *
+ * One constant serves both call sites, because both are the same question: the
+ * gap between ENUM rounds, and the settle after APPLY's one-shot SURVEY_BEGIN
+ * re-broadcast. It replaces APOS_GW_ENUM_GAP_MS and APOS_GW_APPLY_SETTLE_MS,
+ * which were separate literals that happened to agree. */
+#define APOS_GW_ENUM_SETTLE_MS (APOS_ENUM_WINDOW_MS + 60u)
 
 /* Worst-case cost of one apos_gw_step() transmission. The gateway loop refuses
  * to enter a step unless BEACON_ARM_MARGIN_UUS + this much time remains before
@@ -158,11 +181,15 @@ enum apos_gw_phase {
 #define APOS_GW_APPLY_TIMEOUT_MS 1500u
 
 /* Settle time between APPLY's one-shot SURVEY_BEGIN re-broadcast and the first
- * SETPOS. Must clear the anchors' worst-case enumeration stagger
- * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 240 ms) so the ENUM_RSPs that
- * re-broadcast provokes -- harmless, and discarded by the gateway's phase
- * guard -- are off the air before the first SETPOS needs an acknowledgement. */
-#define APOS_GW_APPLY_SETTLE_MS 400u
+ * SETPOS. Must clear the anchors' worst-case enumeration stagger so the
+ * ENUM_RSPs that re-broadcast provokes -- harmless, and discarded by the
+ * gateway's phase guard -- are off the air before the first SETPOS needs an
+ * acknowledgement.
+ *
+ * This used to be a hand-copied 400 ms against a 240 ms stagger. It is now the
+ * same derived constant the ENUM rounds use, because it is the same question
+ * and the literal did not survive the stagger being resized. */
+#define APOS_GW_APPLY_SETTLE_MS APOS_GW_ENUM_SETTLE_MS
 
 /* Three attempts per anchor. Unlike a failed range, a failed SETPOS cannot be
  * shrugged off as a hole: an anchor left on its old coordinates while its peers

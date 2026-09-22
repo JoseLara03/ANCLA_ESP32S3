@@ -1052,7 +1052,7 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 		apply_reopen = false;
 		send_survey_begin(seq);
 		/* Enough for the worst-case enumeration stagger
-		 * (APOS_ENUM_SLOTS * APOS_ENUM_SLOT_MS = 240 ms) to drain
+		 * (APOS_ENUM_WINDOW_MS, 768 ms) to drain
 		 * before the first SETPOS competes with it on the air. Not
 		 * retried on TX failure: a SETPOS refused for a closed window is
 		 * already reported per anchor, loudly, by the retry path below. */
@@ -1281,7 +1281,7 @@ static void step_enum(uint8_t *seq)
 
 	send_survey_begin(seq);
 	enum_round++;
-	next_action_ms = now + APOS_GW_ENUM_GAP_MS;
+	next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
 }
 
 void apos_gw_step(uint32_t avail_uus, uint8_t *seq)
