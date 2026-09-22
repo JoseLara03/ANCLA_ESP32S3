@@ -389,3 +389,84 @@ gateway's position, compute `-(d_Mi - d_M0)`, and compare it against the
 per-anchor offsets `tools/rx_cal.py` fits. Agreement within the fit's own
 spread attributes the bias; disagreement leaves the remainder to ranks 2 and 4.
 That check costs one tape measure and no firmware.
+
+---
+
+## B14 addendum 2: CONFIRMED ON HARDWARE, 2026-09-22 — root cause, measured
+
+B14 is no longer a static reading. It was **predicted, then falsified twice,
+then fixed by moving one board.** The record, because the method is reusable.
+
+### The measurement
+
+Two tag spots on the same applied survey (anchors at `0x0001 (0,0)`,
+`0x0002 (3.143,0)`, `0x0003 (3.564,1.924)`, `0x0004 (-0.105,2.192)`):
+
+| spot | tag truth | reported | error |
+|---|---|---|---|
+| P1 centre | (1.650, 1.029) | (-0.481, 1.225), n=107 | **2.141 m** |
+| P2 edge | (3.354, 0.962) | (1.520, 1.230) | **1.885 m** |
+
+The reported position **tracked** the tag at 117 % of its true motion, so this
+was never a collapse to the seed. Converting both errors into per-anchor
+range-difference bias gave the same numbers at both spots, 1.7 m apart:
+
+```
+0x0002  +2.642 vs +2.585 m   (agree to  56 mm)
+0x0003  +2.622 vs +2.708 m   (agree to  86 mm)
+0x0004  -0.440 vs -0.249 m   (agree to 191 mm)
+```
+
+A constant per-anchor bias. The two large ones agree to ~2 % of their own
+magnitude.
+
+### The prediction, made from radio alone
+
+B14 requires those three biases to equal `-(d_Mk - d_M0)`, i.e. distances from
+ONE point. Three equations, two unknowns — **overdetermined, so it could
+fail.** Fitting gave the gateway at **(3.54, 0.90)**, rms 84 mm.
+
+Tape-measured afterwards: `GW->0x0001 3.393, ->0x0002 1.091, ->0x0003 1.253,
+->0x0004 3.702`, which trilaterates to **(3.313, 0.877)** — **228 mm** from the
+radio-only prediction. The operator had put the gateway between two anchors
+because that is where the laptop cable reached.
+
+Decomposition against that tape:
+
+```
+0x0002  bias +2.614   B14 explains +2.302  (88 %)   left over  +66 DTU
+0x0003  bias +2.665   B14 explains +2.140  (80 %)   left over +112 DTU
+0x0004  bias -0.345   B14 explains -0.309  (90 %)   left over   -8 DTU
+```
+
+### The fix, and the second confirmation
+
+**Moving the gateway is the whole fix**, because the observable carries the
+*difference* `d_Mk - d_M0`: place it equidistant and the term cancels. For this
+array the optimum is ~(1.62, 1.26), spread 94 mm against the 2611 mm it had.
+
+Moved to roughly the array centre on a longer cable, same survey, same anchors:
+
+```
+error      2.141 m -> 0.634 m   (-70 %)
+dispersion 0.230 m -> 0.162 m
+```
+
+And the residual bias re-fits a gateway at **(1.88, 0.81), rms 38 mm** — 0.53 m
+off the optimum, leaving 913 mm of spread, which is most of the 0.634 m that
+remains. Second overdetermined fit, second small residual.
+
+### What this changes
+
+- **Rank 1 is confirmed and is the dominant term**, at 80-90 % of a 2.1 m
+  error on this deployment.
+- **The cheapest fix is physical and needs no firmware**: put the gateway
+  equidistant from every anchor. Practically — move it until the tape reads the
+  same distance to all four.
+- **It is a design gap, not an operator error.** `ccp_slave.c` pairs the
+  master's TX timestamp with this anchor's RX timestamp of that same frame, so
+  each anchor's time base is early by its own flight time, and `tdoa_solve()`
+  fits with no constant term. The proper fix subtracts `d_Mk/c` in the solve,
+  which needs the gateway's position stored and is firmware work.
+- **`tools/rx_cal.py` absorbs whatever is left**, B8 and residual B14 together,
+  which is why its fitted `b_k` must not be called "RX antenna delay".
