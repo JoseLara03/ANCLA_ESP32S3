@@ -29,6 +29,8 @@ LOG_MODULE_REGISTER(uwb_store, LOG_LEVEL_INF);
 #define KEY_ANT_TX    "anchor/ant_tx"
 #define KEY_ANT_RX    "anchor/ant_rx"
 #define KEY_POS       "anchor/pos"
+#define KEY_SYNC_TAU      "anchor/sync_tau"
+#define KEY_SYNC_TAU_MODE "anchor/sync_tau_mode"
 
 /* Written as one record so x, y, z and the valid flag can never disagree. */
 struct stored_pos {
@@ -147,6 +149,36 @@ static int anchor_settings_set(const char *key, size_t len,
 		return 0;
 	}
 
+	if (strcmp(key, "sync_tau") == 0) {
+		if (len != sizeof(cfg->sync_tau_dtu)) {
+			LOG_WRN("stored sync_tau size %u invalid — expected %u, keeping %d",
+				(unsigned int)len, (unsigned int)sizeof(cfg->sync_tau_dtu),
+				cfg->sync_tau_dtu);
+			return -EINVAL;
+		}
+		return read_val(read_cb, cb_arg, &cfg->sync_tau_dtu,
+				sizeof(cfg->sync_tau_dtu));
+	}
+
+	if (strcmp(key, "sync_tau_mode") == 0) {
+		uint8_t v;
+
+		if (len != sizeof(v)) {
+			LOG_WRN("stored sync_tau_mode size %u invalid — expected %u, keeping %s",
+				(unsigned int)len, (unsigned int)sizeof(v),
+				uwb_config_sync_tau_mode_name(cfg->sync_tau_mode));
+			return -EINVAL;
+		}
+		if (read_val(read_cb, cb_arg, &v, sizeof(v))) {
+			return -EINVAL;
+		}
+		if (!uwb_config_set_sync_tau_mode(cfg, v)) {
+			LOG_WRN("stored sync_tau_mode %u invalid — keeping %s", v,
+				uwb_config_sync_tau_mode_name(cfg->sync_tau_mode));
+		}
+		return 0;
+	}
+
 	/* An unrecognised key is a field from a newer firmware; ignore it. */
 	return 0;
 }
@@ -228,4 +260,18 @@ int uwb_store_save_pos(void)
 	};
 
 	return save_one(KEY_POS, &p, sizeof(p));
+}
+
+int uwb_store_save_sync_tau(void)
+{
+	const uwb_config_t *cfg = uwb_config_get();
+
+	return save_one(KEY_SYNC_TAU, &cfg->sync_tau_dtu, sizeof(cfg->sync_tau_dtu));
+}
+
+int uwb_store_save_sync_tau_mode(void)
+{
+	const uwb_config_t *cfg = uwb_config_get();
+
+	return save_one(KEY_SYNC_TAU_MODE, &cfg->sync_tau_mode, sizeof(cfg->sync_tau_mode));
 }

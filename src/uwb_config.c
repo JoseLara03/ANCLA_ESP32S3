@@ -20,6 +20,13 @@ static const char *const cell_mode_names[UWB_CELL_MODE_COUNT] = {
 	[UWB_CELL_BLINK] = "blink",
 };
 
+static const char *const sync_tau_mode_names[SYNC_TAU_MODE_COUNT] = {
+	[SYNC_TAU_MODE_LEGACY] = "legacy",
+	[SYNC_TAU_MODE_SURVEY] = "survey",
+	[SYNC_TAU_MODE_TWR]    = "twr",
+	[SYNC_TAU_MODE_AUTO]   = "auto",
+};
+
 void uwb_config_set_defaults(uwb_config_t *c)
 {
 	memset(c, 0, sizeof(*c));
@@ -31,6 +38,13 @@ void uwb_config_set_defaults(uwb_config_t *c)
 	/* x/y/z zeroed above; position_valid stays false so a GATEWAY that has
 	 * never been positioned refuses to beacon rather than beaconing from
 	 * a bogus origin. */
+	c->sync_tau_dtu  = 0;
+	/* SURVEY, not LEGACY: an unconfigured board (sync_tau_dtu == 0) behaves
+	 * identically to LEGACY either way, but this is the mode an operator
+	 * expects to already be selected once the survey tool pushes a real
+	 * value -- FR-11's rollback path is `sync tau mode legacy`, not the
+	 * factory default. */
+	c->sync_tau_mode = SYNC_TAU_MODE_SURVEY;
 }
 
 uwb_config_t *uwb_config_get(void)
@@ -92,6 +106,20 @@ void uwb_config_set_pos(uwb_config_t *c, float x, float y, float z)
 	c->position_valid = true;
 }
 
+void uwb_config_set_sync_tau(uwb_config_t *c, int32_t tau_dtu)
+{
+	c->sync_tau_dtu = tau_dtu;
+}
+
+bool uwb_config_set_sync_tau_mode(uwb_config_t *c, uint8_t mode)
+{
+	if (mode >= SYNC_TAU_MODE_COUNT) {
+		return false;
+	}
+	c->sync_tau_mode = mode;
+	return true;
+}
+
 bool uwb_config_mode_from_name(const char *name, uint8_t *out)
 {
 	for (uint8_t i = 0; i < UWB_MODE_COUNT; i++) {
@@ -128,6 +156,39 @@ const char *uwb_config_cell_mode_name(uint8_t cell_mode)
 		return "unknown";
 	}
 	return cell_mode_names[cell_mode];
+}
+
+bool uwb_config_sync_tau_mode_from_name(const char *name, uint8_t *out)
+{
+	for (uint8_t i = 0; i < SYNC_TAU_MODE_COUNT; i++) {
+		if (strcmp(name, sync_tau_mode_names[i]) == 0) {
+			*out = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+const char *uwb_config_sync_tau_mode_name(uint8_t mode)
+{
+	if (mode >= SYNC_TAU_MODE_COUNT) {
+		return "unknown";
+	}
+	return sync_tau_mode_names[mode];
+}
+
+int32_t uwb_config_sync_tau_effective(const uwb_config_t *c)
+{
+	switch (c->sync_tau_mode) {
+	case SYNC_TAU_MODE_LEGACY:
+		return 0;
+	case SYNC_TAU_MODE_SURVEY:
+	case SYNC_TAU_MODE_TWR:  /* Fase B stub: no TWR source yet, degrade */
+	case SYNC_TAU_MODE_AUTO: /* to the stored survey value -- see the   */
+		return c->sync_tau_dtu; /* enum's own comment.               */
+	default:
+		return 0;
+	}
 }
 
 uint16_t uwb_config_short_addr(const uwb_config_t *c)

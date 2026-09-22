@@ -135,6 +135,11 @@ void sync_model_init(struct sync_model *m)
     m->res_max      = 0;
     m->n_rebaseline = 0;
     m->n_miss_total = 0;
+    /* Deterministic LEGACY (tau=0) rather than whatever an uninitialised
+     * caller's stack held. A caller that owns a configured tau (ccp_slave.c)
+     * must call sync_model_set_tau() again after this -- see tau_dtu's own
+     * doc comment in sync_model.h. */
+    m->tau_dtu      = 0;
 }
 
 void sync_model_rebaseline(struct sync_model *m, bool keep_skew)
@@ -196,6 +201,13 @@ void sync_model_observe(struct sync_model *m, uint64_t m_dtu, uint64_t l_dtu)
 {
     m_dtu &= SYNC_DTU_MASK;
     l_dtu &= SYNC_DTU_MASK;
+
+    /* B14 fix: train against the master's TX time as it would read at THIS
+     * anchor's antenna, not at the master's -- see sync_model_set_tau()'s
+     * doc comment in sync_model.h for the full derivation. tau_dtu is 0 for
+     * every caller that has not opted in (LEGACY, or a host test that never
+     * touches it), so this is a no-op until then. */
+    m_dtu = (uint64_t)((int64_t)m_dtu + (int64_t)m->tau_dtu) & SYNC_DTU_MASK;
 
     if (!m->have_raw) {
         m->l_raw    = l_dtu;
@@ -435,6 +447,33 @@ uint32_t sync_model_miss_count(const struct sync_model *m)
 uint32_t sync_model_n_obs(const struct sync_model *m)
 {
     return m->n_obs;
+}
+
+void sync_model_set_tau(struct sync_model *m, int32_t new_tau_dtu)
+{
+    int64_t delta = (int64_t)new_tau_dtu - (int64_t)m->tau_dtu;
+
+    m->tau_dtu = new_tau_dtu;
+
+    /* Feed-forward (FR-5): shift the running absolute reference by the same
+     * delta a fresh observation would have applied, so the NEXT
+     * sync_model_to_master() call already reflects the new tau -- no wait
+     * for the next CCP, no re-baseline. l_acc/m_acc/skew_num/skew_den need
+     * no correction: they are sums of differences between two m_dtu values
+     * that both carried the SAME tau at the time they were observed, so a
+     * change here does not touch anything already folded into them (see the
+     * header comment for the algebra). Left untouched when there is no
+     * observation yet (!have_raw) -- there is nothing to shift, and
+     * sync_model_observe() applies the new tau to its very first m_dtu on
+     * its own. */
+    if (m->have_raw) {
+        m->m_raw = (uint64_t)((int64_t)m->m_raw + delta) & SYNC_DTU_MASK;
+    }
+}
+
+int32_t sync_model_get_tau(const struct sync_model *m)
+{
+    return m->tau_dtu;
 }
 
 int32_t sync_model_drift_ppb(const struct sync_model *m)

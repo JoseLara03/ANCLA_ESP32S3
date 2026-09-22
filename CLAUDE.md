@@ -2731,6 +2731,47 @@ that said no remote was configured — true once, not since.
   bias at all is a tape measure on the gateway: compute `-(d_Mk - d_M0)` and
   compare it against `rx_cal.py`'s fitted offsets.
 
+- **B14 Fase A (the fix for the bullet above) is implemented, host-tested and
+  build-verified on branch `fix/b14-flight-compensation`, NOT yet run on
+  hardware.** Full plan:
+  `docs/superpowers/plans/2026-09-22-b14-flight-compensation.md`. The
+  correction is a single per-anchor signed-DTU constant, `tau_dtu`, added to
+  the master's declared TX time at the ONE place `sync_model.c` folds a CCP
+  into the model (`sync_model_observe()`) — see `sync_model_set_tau()`'s own
+  doc comment in `sync_model.h` for why one insertion point is enough for
+  both training and every later conversion, and why it is provably invisible
+  to the rate/skew estimate (a constant cancels in the differences that
+  estimate is built from — `tests/sync_model/test_tau_change_does_not_move_the_skew()`
+  pins this). Config: `uwb_config_t` gained `sync_tau_dtu` (the survey-computed
+  value) and `sync_tau_mode` (`legacy|survey|twr|auto`,
+  `uwb_config_sync_tau_effective()` resolving the FR-3 priority — TWR/AUTO
+  currently degrade to SURVEY since Fase B has not shipped a TWR source to
+  prefer), persisted under `anchor/sync_tau`/`anchor/sync_tau_mode`
+  (`uwb_store.c`). Console: `sync tau mode|set|show`
+  (`src/sync_shell.c`), applying LIVE via `ccp_slave_set_tau()` — deliberately
+  NOT gated behind the snapshot-at-mode-entry / reboot-to-apply contract
+  `uwb_slave_run()` otherwise enforces for `ant_delay` and friends, because
+  FR-5 requires the feed-forward to be immediate. `ccp_slave.c` owns a
+  `configured_tau_dtu` static specifically because `sync_model_init()` always
+  zeroes `tau_dtu` back to deterministic LEGACY (host-test determinism
+  demands it) — every call site that re-inits the model, including the inline
+  one on the "first CCP ever" path, goes through a local `reinit_model()`
+  helper so the configured value can never be silently dropped on a
+  re-baseline path that happens to call the full init. Host tool:
+  `tools/sync_tau_from_survey.py`, reading a pasted `apos show` capture plus
+  a `--gateway x,y,z` (the gateway is not itself a surveyed node — see the
+  "gateway is not in the survey" entry above) and emitting one
+  `sync tau set <dtu>` line per anchor at `round(distance_m * 213.14)`.
+  Both firmware images build clean (production `dram0_0_seg` 271984 ->
+  272016 B, +32 B for the new fields). **None of this has run on a board.**
+  Gate A (this file's §1 table in the plan doc — the two historical test
+  points collapsing from 2.1/1.9 m to <=0.35 m, the gateway-position-from-
+  bias fit failing to converge, the T0 antenna-delay-invariance probe still
+  holding, `rx_cal.py` residuals under 0.5 ns/anchor) has not been attempted.
+  Fase B (on-air TWR measurement of tau, so a moved gateway is tracked rather
+  than requiring a re-survey) is designed in the same plan doc but not
+  started.
+
 - **`sync_model` published conversions from a one-interval baseline after
   every re-baseline — fixed 2026-09-18 (B13), and the fix's own limit is worth
   knowing.** `sync_model_observe()` set `valid` as soon as one interval had

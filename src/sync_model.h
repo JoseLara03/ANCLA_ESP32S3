@@ -336,6 +336,18 @@ struct sync_model {
      * re-baseline resets cannot measure re-baselines. */
     uint32_t n_rebaseline;
     uint32_t n_miss_total;
+    /* B14 flight-time compensation: this anchor's own flight time from the
+     * sync master, in signed DTU (positive when the master is farther away).
+     * See sync_model_set_tau()'s doc comment for the algebra. Survives every
+     * sync_model_rebaseline() (it describes the deployment geometry, not the
+     * baseline) but IS zeroed by a full sync_model_init(), same as every
+     * other field -- a test or a cold boot that never calls
+     * sync_model_set_tau() must get deterministic LEGACY (tau=0) behaviour,
+     * not whatever garbage was on the stack. A caller that owns a configured
+     * non-zero tau (ccp_slave.c) is responsible for calling
+     * sync_model_set_tau() again after every sync_model_init(), including
+     * the internal one on the "first CCP ever" path. */
+    int32_t  tau_dtu;
 };
 
 void sync_model_init(struct sync_model *m);
@@ -368,6 +380,53 @@ void sync_model_observe(struct sync_model *m, uint64_t m_dtu, uint64_t l_dtu);
 
 /* Record that an expected CCP did not arrive. */
 void sync_model_miss(struct sync_model *m);
+
+/* ---- B14: master->anchor flight-time compensation -----------------------
+ *
+ * The CCP converts every local timestamp into the master's TRANSMIT time
+ * base, but sync_model_observe() (before this fix) paired the master's
+ * declared TX time m_dtu directly against this anchor's RX time l_dtu, as if
+ * the two were readings of the same physical instant. They are not: the CCP
+ * physically arrives here `tau_dtu` (this anchor's own flight time from the
+ * master, d_Mi/c in DTU) after the master transmitted it. So the model's
+ * learned mapping was missing a constant term, and every timestamp this
+ * anchor later converts with sync_model_to_master() reads EARLY by exactly
+ * that anchor's flight time -- a per-anchor constant that a TDoA solver
+ * cannot distinguish from an RX antenna-delay error, and that reproduces the
+ * multi-metre bias measured on hardware (see CLAUDE.md's B14 entry).
+ *
+ * The fix is one addition, at the one place m_dtu is folded into the model:
+ * sync_model_observe() now trains against (m_dtu + tau_dtu), not m_dtu. That
+ * single point of application is deliberate -- sync_model_to_master()'s own
+ * arithmetic is UNCHANGED, because a constant added to every m_dtu the model
+ * has ever seen becomes, automatically, a constant added to m_raw and
+ * therefore to every future conversion. It is also why tau is invisible to
+ * the RATE estimate: m_acc/l_acc/skew_num/skew_den are sums of DIFFERENCES
+ * between consecutive m_dtu values, and a constant tau cancels in any
+ * difference of two m_dtu that both carry it.
+ *
+ * tau_dtu is a per-anchor DEPLOYMENT parameter (this anchor's distance from
+ * the sync master), not a model estimate, so it is set from outside rather
+ * than learned. sync_model_set_tau() is how a caller (ccp_slave.c, from
+ * uwb_config's persisted value) installs or changes it.
+ *
+ * FR-5's feed-forward requirement: a tau change is exact, known information,
+ * not noise, so it must not wait for the model's own convergence to take
+ * effect. Because tau enters as a pure additive constant on m_dtu, and
+ * m->m_raw is the running "last known master time" that every future
+ * sync_model_to_master() call adds its own delta onto, shifting tau by
+ * `delta` and shifting m_raw by the SAME `delta` is exactly equivalent to
+ * having always used the new tau -- so this function does both atomically,
+ * with no re-baseline, no re-convergence wait, and no change to l_acc/m_acc/
+ * skew (they are unaffected by construction, per the paragraph above).
+ * m_raw is left untouched when the model has no observation yet
+ * (!have_raw): there is nothing to shift, and the next sync_model_observe()
+ * will apply the new tau to its very first m_dtu. */
+void sync_model_set_tau(struct sync_model *m, int32_t new_tau_dtu);
+
+/* The tau currently in effect. 0 (LEGACY / unconfigured) until
+ * sync_model_set_tau() has been called with something else. */
+int32_t sync_model_get_tau(const struct sync_model *m);
 
 /* Convert a local 40-bit timestamp into the master's time base. Returns false
  * (leaving *out untouched) when the model cannot convert, which is any of:

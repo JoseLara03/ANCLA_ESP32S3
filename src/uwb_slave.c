@@ -285,6 +285,13 @@ void uwb_slave_run(const uwb_config_t *cfg)
 	apos_node_init();
 	blink_rx_init(cfg);
 	ccp_slave_init();
+	/* B14: install this anchor's configured flight-time compensation
+	 * (see sync_model.h's sync_model_set_tau()) before the loop below
+	 * ever feeds it a CCP. `sync tau` shell commands re-apply this live
+	 * afterward -- FR-5's feed-forward, deliberately NOT gated behind the
+	 * snapshot-at-mode-entry / reboot-to-apply contract cfg_snapshot
+	 * otherwise enforces for ant_delay and friends. */
+	ccp_slave_set_tau(uwb_config_sync_tau_effective(cfg));
 
 	beacon_guard_init(&bguard, UUS_TO_HI32(T_SUPERFRAME_UUS),
 			  UUS_TO_HI32(BEACON_GUARD_UUS),

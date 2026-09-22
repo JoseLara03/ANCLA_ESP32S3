@@ -146,4 +146,16 @@ void ccp_slave_stats(uint32_t *n_rx, uint32_t *n_gap, uint32_t *n_reject,
  * suspecting the pairing logic itself. */
 void ccp_slave_stats_ex(uint32_t *n_paired, uint32_t *n_no_announce);
 
+/* B14 flight-compensation wiring (see sync_model.h's sync_model_set_tau()):
+ * install or change this anchor's tau live. ccp_slave_init() calls this once
+ * at boot with uwb_config's resolved effective tau; the `sync tau` shell
+ * commands call it again on every change (FR-5's feed-forward). Fenced with
+ * k_sched_lock()/k_sched_unlock() for the same reason
+ * ccp_slave_residual_reset() is: the SLAVE loop is a preemptible-priority
+ * writer that can interrupt the shell mid-call. */
+void ccp_slave_set_tau(int32_t tau_dtu);
+
+/* The tau currently applied to the live model. */
+int32_t ccp_slave_get_tau(void);
+
 #endif /* CCP_SLAVE_H */

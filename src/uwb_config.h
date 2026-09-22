@@ -49,6 +49,26 @@ enum uwb_cell_mode {
 	UWB_CELL_MODE_COUNT
 };
 
+/* B14 flight-compensation source. See sync_model.h's sync_model_set_tau() for
+ * what tau_dtu corrects and docs/superpowers/plans/2026-09-22-b14-flight-compensation.md
+ * for the full derivation.
+ *
+ * TWR and AUTO are Fase B stubs: this board has no on-air tau measurement
+ * yet, so uwb_config_sync_tau_effective() resolves both of them to the same
+ * stored survey value SURVEY uses. That is not a placeholder bug -- it is
+ * FR-9's documented degrade-on-no-source behaviour, just permanently true
+ * until Fase B ships a TWR source to degrade FROM. */
+enum sync_tau_mode {
+	SYNC_TAU_MODE_LEGACY = 0, /* tau forced to 0 -- FR-11 rollback, bit-exact
+				   * pre-B14-fix behaviour regardless of the
+				   * stored survey value */
+	SYNC_TAU_MODE_SURVEY = 1, /* use sync_tau_dtu, from a one-time survey
+				   * computation pushed over the console */
+	SYNC_TAU_MODE_TWR    = 2, /* Fase B, not yet implemented */
+	SYNC_TAU_MODE_AUTO   = 3, /* Fase B, not yet implemented */
+	SYNC_TAU_MODE_COUNT
+};
+
 typedef struct {
 	uint8_t  mode;           /* enum uwb_mode */
 	uint8_t  anchor_id;      /* 0..UWB_MAX_ANCHORS-1 */
@@ -59,6 +79,8 @@ typedef struct {
 	float    y;
 	float    z;
 	bool     position_valid; /* false until coordinates are set */
+	int32_t  sync_tau_dtu;   /* SURVEY source value, signed DTU */
+	uint8_t  sync_tau_mode;  /* enum sync_tau_mode */
 } uwb_config_t;
 
 /* Overwrite *c with the documented defaults: SLAVE, id 0, 16385/16385,
@@ -77,6 +99,26 @@ bool uwb_config_set_ant(uwb_config_t *c, uint32_t tx, uint32_t rx);
 
 /* Always succeeds; any coordinate triple is legitimate. Sets position_valid. */
 void uwb_config_set_pos(uwb_config_t *c, float x, float y, float z);
+
+/* Always succeeds; any int32 is a legitimate (if perhaps absurd) flight-time
+ * correction -- validating a physically-plausible range is the survey tool's
+ * job, not this layer's, same as uwb_config_set_pos(). */
+void uwb_config_set_sync_tau(uwb_config_t *c, int32_t tau_dtu);
+
+bool uwb_config_set_sync_tau_mode(uwb_config_t *c, uint8_t mode);
+
+/* "legacy" / "survey" / "twr" / "auto", matched exactly. Returns false and
+ * leaves *out untouched on an unknown name. */
+bool uwb_config_sync_tau_mode_from_name(const char *name, uint8_t *out);
+
+/* One of the names above, or "unknown" for an out-of-range value. Never
+ * NULL. */
+const char *uwb_config_sync_tau_mode_name(uint8_t mode);
+
+/* Resolves FR-3's source priority into the DTU value the sync model should
+ * actually apply. TWR and AUTO currently resolve identically to SURVEY --
+ * see enum sync_tau_mode's comment for why that is not a bug. */
+int32_t uwb_config_sync_tau_effective(const uwb_config_t *c);
 
 /* "slave" / "gateway", matched exactly. Returns false and leaves *out
  * untouched on an unknown name. */

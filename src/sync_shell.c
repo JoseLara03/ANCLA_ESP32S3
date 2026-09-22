@@ -33,10 +33,12 @@
 #include "ccp_slave.h"
 #include "sync_model.h"
 #include "uwb_config.h"
+#include "uwb_store.h"
 
 #include <zephyr/shell/shell.h>
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef CONFIG_ANCLA_CAL_MODE
@@ -295,6 +297,120 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/* Re-apply uwb_config's resolved tau to the live model. Shared by `tau mode`
+ * and `tau set` so a change from either one takes effect immediately
+ * (FR-5) instead of waiting for the next reboot -- deliberately NOT the
+ * snapshot-at-mode-entry contract uwb_slave_run() otherwise applies to
+ * ant_delay and friends. */
+static void apply_tau_live(void)
+{
+	ccp_slave_set_tau(uwb_config_sync_tau_effective(uwb_config_get()));
+}
+
+static int cmd_tau_mode(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	uwb_config_t *cfg = uwb_config_get();
+	uint8_t mode;
+
+	if (!uwb_config_sync_tau_mode_from_name(argv[1], &mode)) {
+		shell_error(sh, "sync tau mode: unknown mode \"%s\" (want "
+				"legacy|survey|twr|auto)", argv[1]);
+		return -EINVAL;
+	}
+	uwb_config_set_sync_tau_mode(cfg, mode);
+	if (uwb_store_save_sync_tau_mode()) {
+		shell_warn(sh, "mode applied but NOT persisted — will revert "
+				"to \"%s\" on reboot",
+			   uwb_config_sync_tau_mode_name(cfg->sync_tau_mode));
+	}
+	apply_tau_live();
+	shell_print(sh, "{\"sync_tau\":{\"mode\":\"%s\",\"tau_used_dtu\":%d}}",
+		    uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
+		    ccp_slave_get_tau());
+	if (mode == SYNC_TAU_MODE_TWR || mode == SYNC_TAU_MODE_AUTO) {
+		shell_warn(sh, "Fase B (on-air TWR measurement) is not "
+				"implemented on this build — \"%s\" resolves "
+				"to the stored SURVEY value (tau_survey_dtu), "
+				"same as \"survey\".",
+			   uwb_config_sync_tau_mode_name(mode));
+	}
+	return 0;
+}
+
+static int cmd_tau_set(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	uwb_config_t *cfg = uwb_config_get();
+	char *endp = NULL;
+	long v = strtol(argv[1], &endp, 10);
+
+	if (endp == argv[1] || *endp != '\0' || v < INT32_MIN || v > INT32_MAX) {
+		shell_error(sh, "sync tau set: \"%s\" is not a valid signed "
+				"DTU value", argv[1]);
+		return -EINVAL;
+	}
+	uwb_config_set_sync_tau(cfg, (int32_t)v);
+	if (uwb_store_save_sync_tau()) {
+		shell_warn(sh, "tau_survey_dtu applied but NOT persisted — "
+				"will revert to %d on reboot",
+			   cfg->sync_tau_dtu);
+	}
+	apply_tau_live();
+	shell_print(sh, "{\"sync_tau\":{\"tau_survey_dtu\":%d,\"mode\":\"%s\","
+			"\"tau_used_dtu\":%d}}",
+		    cfg->sync_tau_dtu,
+		    uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
+		    ccp_slave_get_tau());
+	if (cfg->sync_tau_mode == SYNC_TAU_MODE_LEGACY) {
+		shell_warn(sh, "mode is \"legacy\" — this value is stored but "
+				"has NO effect until `sync tau mode survey` "
+				"(or twr/auto).");
+	}
+	return 0;
+}
+
+static int cmd_tau_show(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	const uwb_config_t *cfg = uwb_config_get();
+
+	/* tau_twr_* fields are wire-compatible placeholders for FR-6..FR-9
+	 * (Fase B): always "no source yet" on this build, since no on-air
+	 * measurement exists to report. tau_used_dtu is read from the LIVE
+	 * model (ccp_slave_get_tau()), not recomputed from cfg here, so this
+	 * command shows what is actually being applied, not merely what is
+	 * configured -- the two can differ for one superframe if a caller
+	 * changed cfg without going through this file's apply_tau_live(). */
+	shell_print(sh,
+		    "{\"sync_tau\":{\"mode\":\"%s\",\"tau_survey_dtu\":%d,"
+		    "\"tau_used_dtu\":%d,\"tau_twr_dtu\":null,"
+		    "\"tau_twr_age_s\":null,\"twr_quality\":null,"
+		    "\"tau_jump_events\":0}}",
+		    uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
+		    cfg->sync_tau_dtu, ccp_slave_get_tau());
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync_tau,
+	SHELL_CMD_ARG(mode, NULL,
+		      "mode <legacy|survey|twr|auto> — select the B14 tau "
+		      "source, persist, apply live",
+		      cmd_tau_mode, 2, 0),
+	SHELL_CMD_ARG(set, NULL,
+		      "set <dtu> — write tau_survey_dtu (signed DTU, from the "
+		      "survey tool), persist, apply live",
+		      cmd_tau_set, 2, 0),
+	SHELL_CMD_ARG(show, NULL,
+		      "show — mode, configured and live tau as JSON",
+		      cmd_tau_show, 1, 0),
+	SHELL_SUBCMD_SET_END
+);
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync,
 	SHELL_CMD_ARG(stats, NULL,
 		      "stats — the Phase 2 gate as JSON, with a verdict "
@@ -311,6 +427,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync,
 		      "txtest — BENCH DIAGNOSTIC: queue one immediate-TX CCP "
 		      "(GATEWAY only); read the result with `sync master`",
 		      cmd_txtest, 1, 0),
+	SHELL_CMD(tau, &sub_sync_tau,
+		  "tau — B14 master->anchor flight-time compensation "
+		  "(mode/set/show)",
+		  NULL),
 	SHELL_SUBCMD_SET_END
 );
 

@@ -801,6 +801,174 @@ static void test_root_change_does_not_carry_the_skew(void)
 	CHECK(sync_model_to_master(&m, s.l0, &out));
 }
 
+/* ---- B14: master->anchor flight-time compensation -----------------------
+ *
+ * See sync_model.h's sync_model_set_tau() doc comment for the algebra these
+ * pin. Test numbering (T1, T3, ...) matches
+ * docs/superpowers/plans/2026-09-22-b14-flight-compensation.md section 6.1.
+ */
+
+/* T1: a converged model with tau=TAU converts every point exactly TAU DTU
+ * ahead of the same model with tau=0 -- and, since sync_model_observe() is
+ * the only place tau is ever applied, this single result also stands in for
+ * T2 (no double application): a double-apply would read 2*TAU here, not
+ * TAU. */
+static void test_tau_shifts_conversion_by_exactly_tau(void)
+{
+	const int32_t taus[] = { 0, 1, -1, 1000, -1000, 123456, -654321 };
+
+	for (size_t i = 0; i < sizeof(taus) / sizeof(taus[0]); i++) {
+		struct sync_model m;
+		struct sim s;
+		uint64_t out;
+
+		sync_model_init(&m);
+		sync_model_set_tau(&m, taus[i]);
+		sim_init(&s, 0x0500000000ULL, 0x0900000000ULL, 0, 0);
+		run_to_converged(&s, &m, 5);
+
+		for (uint64_t x = 0; x < SYNC_CCP_INTERVAL_DTU * 3;
+		     x += 777000000ULL) {
+			CHECK(sync_model_to_master(&m, sim_local_at(&s, x), &out));
+
+			uint64_t want = ((s.m0 + x) + (uint64_t)(int64_t)taus[i]) &
+					SYNC_DTU_MASK;
+			int64_t d = (int64_t)((out - want) & SYNC_DTU_MASK);
+
+			if (d & (1LL << 39)) d -= (1LL << 40);
+			CHECK(d == 0);
+		}
+	}
+}
+
+/* T3: the same shift holds when the master timestamp is close enough to the
+ * 40-bit boundary that adding tau wraps it, and when the wrap goes the other
+ * way (a negative tau underflowing a small m0). */
+static void test_tau_wrap_safety(void)
+{
+	struct sync_model m;
+	struct sim s;
+	uint64_t out;
+
+	/* m0 near the top of the 40-bit range; a positive tau pushes the
+	 * trained m_dtu across the wrap. */
+	sync_model_init(&m);
+	sync_model_set_tau(&m, 5000);
+	sim_init(&s, SYNC_DTU_MASK - 2000ULL, 0x0300000000ULL, 0, 0);
+	run_to_converged(&s, &m, 5);
+
+	CHECK(sync_model_to_master(&m, s.l0, &out));
+	uint64_t want = ((s.m0 + (uint64_t)5000) ) & SYNC_DTU_MASK;
+	CHECK(out == want);
+
+	/* m0 near zero; a negative tau pushes the trained m_dtu below zero,
+	 * which must wrap back up rather than underflow. */
+	sync_model_init(&m);
+	sync_model_set_tau(&m, -5000);
+	sim_init(&s, 1000ULL, 0x0300000000ULL, 0, 0);
+	run_to_converged(&s, &m, 5);
+
+	CHECK(sync_model_to_master(&m, s.l0, &out));
+	want = (uint64_t)((int64_t)s.m0 - 5000) & SYNC_DTU_MASK;
+	CHECK(out == want);
+}
+
+/* T4: the rate/skew estimate is blind to tau -- it is built entirely from
+ * DIFFERENCES between successive trained m_dtu values, and a constant tau
+ * cancels in any such difference. Changing tau mid-run must not move
+ * drift_ppb by even one part. */
+static void test_tau_change_does_not_move_the_skew(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	sync_model_init(&m);
+	sync_model_set_tau(&m, 1000);
+	sim_init(&s, 0x0200000000ULL, 0x0700000000ULL, 30000, 0);
+	run_to_converged(&s, &m, 20);
+
+	int32_t drift_before = sync_model_drift_ppb(&m);
+
+	sync_model_set_tau(&m, -8000);
+	CHECK(sync_model_drift_ppb(&m) == drift_before);
+
+	/* And it stays unmoved as more observations arrive under the new
+	 * tau -- the skew this run converges to is a property of the two
+	 * crystals, not of tau. */
+	for (unsigned int k = 0; k < 10u; k++) sim_step(&s, &m);
+	CHECK(sync_model_drift_ppb(&m) == drift_before);
+}
+
+/* T5: a tau change is visible on the VERY NEXT sync_model_to_master() call --
+ * no waiting for the next observation, no re-baseline. */
+static void test_tau_feed_forward_is_immediate(void)
+{
+	struct sync_model m;
+	struct sim s;
+	uint64_t before, after;
+
+	sync_model_init(&m);
+	sim_init(&s, 0x0400000000ULL, 0x0800000000ULL, 0, 0);
+	run_to_converged(&s, &m, 5);
+
+	CHECK(sync_model_to_master(&m, s.l0, &before));
+	sync_model_set_tau(&m, 4242);
+	/* No sim_step() here: FR-5 says the shift lands without a new CCP. */
+	CHECK(sync_model_to_master(&m, s.l0, &after));
+
+	int64_t d = (int64_t)((after - before) & SYNC_DTU_MASK);
+	if (d & (1LL << 39)) d -= (1LL << 40);
+	CHECK(d == 4242);
+}
+
+/* T6: changing tau is not a discontinuity. It must not touch n_obs, the
+ * rebaseline counter, or validity -- all the things a genuine
+ * sync_model_rebaseline() resets. */
+static void test_tau_change_is_not_a_rebaseline(void)
+{
+	struct sync_model m;
+	struct sim s;
+	uint64_t out;
+
+	sync_model_init(&m);
+	sim_init(&s, 0x0100000000ULL, 0x0600000000ULL, 0, 0);
+	run_to_converged(&s, &m, 3);
+
+	uint32_t n_obs_before = sync_model_n_obs(&m);
+	uint32_t rebaselines_before = sync_model_rebaseline_count(&m);
+	bool valid_before = sync_model_to_master(&m, s.l0, &out);
+
+	sync_model_set_tau(&m, 777);
+
+	CHECK(sync_model_n_obs(&m) == n_obs_before);
+	CHECK(sync_model_rebaseline_count(&m) == rebaselines_before);
+	CHECK(sync_model_to_master(&m, s.l0, &out) == valid_before);
+}
+
+/* T10 (partial, at this layer): tau defaults to 0 on a freshly-initialised
+ * model (LEGACY, or a caller -- like every OTHER test in this file -- that
+ * never touches sync_model_set_tau() at all), and an explicit set_tau(0)
+ * after convergence is a true no-op. Bit-for-bit LEGACY compatibility for
+ * the config-mode selection itself is uwb_config's test suite
+ * (uwb_config_sync_tau_effective() forcing 0 under SYNC_TAU_MODE_LEGACY). */
+static void test_tau_defaults_to_zero_and_zero_is_a_no_op(void)
+{
+	struct sync_model m;
+	struct sim s;
+	uint64_t before, after;
+
+	sync_model_init(&m);
+	CHECK(sync_model_get_tau(&m) == 0);
+
+	sim_init(&s, 0x0300000000ULL, 0x0500000000ULL, 0, 0);
+	run_to_converged(&s, &m, 5);
+
+	CHECK(sync_model_to_master(&m, s.l0, &before));
+	sync_model_set_tau(&m, 0);
+	CHECK(sync_model_to_master(&m, s.l0, &after));
+	CHECK(before == after);
+}
+
 int main(void)
 {
 	printf("sync_model: 1 ns = %" PRId64 " DTU, CCP interval = %llu DTU\n",
@@ -825,6 +993,13 @@ int main(void)
 	test_carried_skew_bridges_a_short_discontinuity();
 	test_carried_skew_goes_stale();
 	test_root_change_does_not_carry_the_skew();
+
+	test_tau_shifts_conversion_by_exactly_tau();
+	test_tau_wrap_safety();
+	test_tau_change_does_not_move_the_skew();
+	test_tau_feed_forward_is_immediate();
+	test_tau_change_is_not_a_rebaseline();
+	test_tau_defaults_to_zero_and_zero_is_a_no_op();
 
 	if (failures) {
 		printf("\n%d CHECK(s) FAILED\n", failures);

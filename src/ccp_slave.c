@@ -49,6 +49,21 @@ static uint32_t n_gap;
 static uint32_t n_reject;
 static uint32_t n_no_announce;
 
+/* B14: the tau this anchor is configured with, kept OUTSIDE `model` because
+ * sync_model_init() zeroes model.tau_dtu (deterministic LEGACY default, see
+ * that function's own comment) and this file is what re-applies it every
+ * time init() runs -- including the inline re-init on the "first CCP ever"
+ * path below, not just ccp_slave_init() itself. */
+static int32_t configured_tau_dtu;
+
+/* sync_model_init() plus re-applying the configured tau, so no call site can
+ * forget the second half. */
+static void reinit_model(void)
+{
+	sync_model_init(&model);
+	sync_model_set_tau(&model, configured_tau_dtu);
+}
+
 /* A genuine forward run of `intervals` observations should show local elapsed
  * time within a small fraction of intervals * SYNC_CCP_INTERVAL_DTU -- the
  * only thing that can move it off that mark is the two crystals' combined
@@ -121,7 +136,8 @@ static void save_prev(uint8_t seq, uint64_t rx_ts)
 
 void ccp_slave_init(void)
 {
-	sync_model_init(&model);
+	configured_tau_dtu = 0;
+	reinit_model();
 	cur_root = 0u;
 	prev_seq = 0u;
 	prev_rx_ts = 0u;
@@ -184,8 +200,10 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts)
 			/* First CCP this node has ever seen. ccp_slave_init()
 			 * already left the model clear; re-running the full
 			 * init here keeps that true without charging a
-			 * re-baseline against a boot. */
-			sync_model_init(&model);
+			 * re-baseline against a boot. reinit_model(), not a
+			 * bare sync_model_init(): that call alone would zero
+			 * tau_dtu right back to LEGACY behaviour. */
+			reinit_model();
 		}
 		cur_root = f.root_id;
 		have_obs = false;
@@ -388,4 +406,21 @@ void ccp_slave_stats_ex(uint32_t *paired, uint32_t *no_announce)
 	if (no_announce) {
 		*no_announce = n_no_announce;
 	}
+}
+
+void ccp_slave_set_tau(int32_t tau_dtu)
+{
+	/* Same fence as ccp_slave_residual_reset(): the SLAVE loop can
+	 * preempt the shell mid-update at this priority. sync_model_set_tau()
+	 * touches at most tau_dtu and m_raw, both plain stores, so the
+	 * critical section is as short as that function's own body. */
+	k_sched_lock();
+	configured_tau_dtu = tau_dtu;
+	sync_model_set_tau(&model, tau_dtu);
+	k_sched_unlock();
+}
+
+int32_t ccp_slave_get_tau(void)
+{
+	return configured_tau_dtu;
 }

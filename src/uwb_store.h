@@ -27,5 +27,7 @@ int uwb_store_save_id(void);
 int uwb_store_save_cell_mode(void);
 int uwb_store_save_ant(void);
 int uwb_store_save_pos(void);
+int uwb_store_save_sync_tau(void);
+int uwb_store_save_sync_tau_mode(void);
 
 #endif /* UWB_STORE_H */
