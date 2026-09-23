@@ -2987,14 +2987,37 @@ that said no remote was configured — true once, not since.
   0.224 m, the whole log 0.208 m, even the sparse IDLE-tier tail 0.208 m --
   all better than test point 1's 0.293 m.
 
-  **Gate A numeric target: 2 of 2 test points now PASS.** What still needs
-  running before the gate can be called fully closed (unchanged from
-  before, none of it satisfied by passing the position-error numbers
-  alone): the negative test (the gateway-position-from-radio-bias fit
-  should no longer converge to a sensible gateway location -- this
-  session's ground-truth cross-checks arguably did a more direct version of
-  it already, but the plan's specific procedure has not been executed); the
-  T0 antenna-delay-invariance repeat; `tools/rx_cal.py` residuals under
+  **Gate A numeric target: 2 of 2 test points now PASS.**
+
+  **Negative test: PASSES, using this session's own two spots.** Reproduced
+  the Stage-1 audit's method (`docs/diag-tdoa-precision-stage1-audit.md`'s
+  B14 addendum 2): convert each spot's position error into per-anchor
+  range-difference bias relative to `0x0001` (`rd_i(reported) -
+  rd_i(true)`), then check whether that bias is a CONSTANT (B14's
+  signature) and whether it still fits a sensible gateway location.
+  Pre-fix, the historical two-spot measurement agreed to 2-8 % per anchor
+  and fit a gateway 228 mm from its tape-measured position. Post-fix, this
+  session's two spots give:
+  ```
+          P1 centro    P2 mesa      diff
+  0x0002  +465 mm      -86 mm       551 mm
+  0x0003  +517 mm      -329 mm      846 mm
+  0x0004   +61 mm      -151 mm      212 mm
+  ```
+  not even the SIGN agrees -- the opposite of a constant, i.e. exactly what
+  removing a position-independent bias term should look like (what
+  survives is position-DEPENDENT noise: `0x0002`'s still-open survey
+  error, RX-split, GDOP). Fitting a "gateway" from each spot's bias
+  separately gives `(2.00, 1.30)` (P1) and `(1.60, 1.15)` (P2) -- they
+  don't agree with each other, and NEITHER lands anywhere near this
+  session's own tape/laser-triangulated real gateway position `(3.29,
+  0.57)` (over 1.3 m off, both of them), unlike the pre-fix fit's 228 mm
+  hit. Confirms the fix is structural, not a numerical coincidence at one
+  spot.
+
+  What still needs running before the gate can be called fully closed
+  (unchanged, none of it satisfied by the above): the T0
+  antenna-delay-invariance repeat; `tools/rx_cal.py` residuals under
   0.5 ns/anchor from a fresh capture; the TWR tag<->anchor regression
   (±10 cm against pre-fix); and the T6 (`kernel reboot cold`) regression.
   `0x0002`'s ~487 mm surveyed-position error is STILL open and unfixed --
