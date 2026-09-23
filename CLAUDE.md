@@ -2944,13 +2944,39 @@ that said no remote was configured — true once, not since.
   replacing the on-air 241 -- both were close; use the direct measurement
   now that it exists), `0x0003` 381 (geometric, replacing on-air 550/443 --
   its own direct link cannot be trusted while the furniture is there),
-  `0x0004` 796 (was ~797, on-air, unchanged in substance). **Not yet
-  re-tested with these values.** Even with tau fully corrected on all four,
-  expect `0x0002`'s ~487 mm position error to keep showing up in the fix
-  until its SURVEYED coordinate is independently corrected (re-survey, a
-  physical recheck of that board's mounting/orientation, or excluding it
-  from the gauge) -- that is a separate, still-open defect, not something
-  this session's tau work can or should paper over.
+  `0x0004` 796 (was ~797, on-air, unchanged in substance).
+
+  **Re-tested the same day, same centroid ("P1_centro_tau_corrected"): Gate
+  A's numeric target is MET at this point.** 18 stable fixes (tier=2,
+  filter locked, excluding the settle burst in the first ~1 s after the
+  GRANT and every structurally-zero `n:3` sample) average `(1.481, 1.224)`
+  against the surveyed centroid `(1.773, 1.250)` -- **0.293 m of error**,
+  under the plan's `<=0.35 m` target, down from 1.1 m two runs ago and
+  1.9-2.1 m pre-B14. `residual_m` averaged 0.142 (range 0.006-0.345),
+  consistent with the position error actually shrinking rather than the
+  solver just reporting a confident wrong answer. `0x0002`'s still-open
+  ~487 mm surveyed-position error (above) turned out to cost less at THIS
+  tag location than feared -- expected, since its contribution is
+  position-dependent (this array's GDOP amplification ranges 1.16-4.21x
+  across the floor, per this file's own earlier measurement) -- but that is
+  a property of where the tag happened to be standing, not a guarantee it
+  stays small everywhere, and fixing `0x0002`'s coordinate is still a
+  separate, open item.
+
+  **What Gate A still needs before it can be called closed, and is NOT
+  satisfied by this one result:** a second test point (per the plan's own
+  §1 table, one point is not the gate); the negative test (the
+  gateway-position-from-radio-bias fit should no longer converge to a
+  sensible gateway location -- not run, and this session's own
+  ground-truth cross-checks arguably did a more direct version of that
+  test already, but the plan's specific procedure has not been executed);
+  the T0 antenna-delay-invariance repeat; `tools/rx_cal.py` residuals under
+  0.5 ns/anchor from a fresh capture; the TWR tag<->anchor regression
+  (±10 cm against pre-fix); and the T6 (`kernel reboot cold`) regression.
+  None of the four anchors could be reflashed or re-verified with `anchor
+  show` this session (USB out of reach post-install) -- keep that
+  constraint in mind when planning how any of the above get executed on
+  this specific deployment.
 
 - **`sync_model` published conversions from a one-interval baseline after
   every re-baseline — fixed 2026-09-18 (B13), and the fix's own limit is worth
