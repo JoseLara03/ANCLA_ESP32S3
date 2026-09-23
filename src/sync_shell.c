@@ -491,7 +491,33 @@ static int cmd_tau_result(const struct shell *sh, size_t argc, char **argv)
 				"is a mean over the %u that did, treat it "
 				"with more caution than a clean run",
 			   r.valid, r.attempted, r.valid);
-	} else {
+	}
+
+	/* Caught in the field 2026-09-23: a plain arithmetic mean has no
+	 * outlier rejection, and ss_initiator_range() only returns
+	 * INT32_MIN on a frame that never arrived -- a frame that arrived
+	 * but carries a MULTIPATH-corrupted distance still counts as
+	 * "valid" and drags the mean with it. One anchor read min/max/mean
+	 * 1920/2757/2578 mm (837 mm spread) against three clean anchors at
+	 * 25-63 mm, and the contaminated mean produced a tau_dtu visibly
+	 * off from the clean cluster. 20% of the mean is a deliberately
+	 * generous threshold -- every clean anchor observed so far sits
+	 * under 6% -- same "catches the gross case, not a tuned
+	 * sync-quality gate" philosophy as TDOA_DTU_MAX_SPREAD. */
+	if (r.done && r.valid > 0u &&
+	    (int64_t)(r.max_mm - r.min_mm) * 5 > (int64_t)r.mean_mm) {
+		shell_warn(sh,
+			   "spread is %d mm on a %d mm mean (%d..%d) -- that "
+			   "is NOT ordinary link jitter (compare the other "
+			   "anchors' spreads), it looks like one or more "
+			   "exchanges hit multipath/a reflection. tau_dtu "
+			   "may be dragged well off the true value. Check "
+			   "line-of-sight to this anchor and re-run with a "
+			   "larger n before trusting this result.",
+			   r.max_mm - r.min_mm, r.mean_mm, r.min_mm, r.max_mm);
+	}
+
+	if (r.done && r.valid == r.attempted && r.valid > 0u) {
 		shell_print(sh, "copy `sync tau set %d` into anchor %u's OWN "
 				"console -- this value is not applied here, "
 				"it describes THAT anchor's distance from "

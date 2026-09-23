@@ -1619,7 +1619,32 @@ sync tau result                last `sync tau measure` run, as JSON
   machine itself has no host suite, same reasoning `blink_rx.c` and
   `apos_node.c` give for theirs — everything it calls is already tested or
   needs a real DW3220. Both firmware images build clean (production
-  `dram0_0_seg` 272016 -> 272096 B, +80 B). **Not yet run on hardware.**
+  `dram0_0_seg` 272016 -> 272096 B, +80 B).
+
+  **Run on hardware 2026-09-23, and it immediately caught a real defect in
+  itself: a plain arithmetic mean has no outlier rejection, and
+  `ss_initiator_range()` only returns `INT32_MIN` for a frame that never
+  arrived at all -- a frame that DID arrive but carries a
+  multipath/reflection-corrupted distance still counts as "valid" and drags
+  the mean with it.** Field data, `sync tau measure <id> 8` against all four
+  anchors: three came back with 25-63 mm of min/max spread on their mean
+  (clean); one (`0x0003`, `anchor_id 2`) came back `min_mm:1920,
+  max_mm:2757, mean_mm:2578` -- 837 mm of spread, over 13x the others, with
+  the mean visibly dragged off what looks like the true ~2740-2760 mm
+  cluster by one or two bad exchanges. Fixed by adding a spread check to
+  `sync tau result` (`sync_shell.c`, not `gw_selftau.c` -- report-layer,
+  same as `sync stats`'s "max is 5x RMS = tail" warning and `cal_link`'s
+  floor warning are report-layer, not measurement-layer): `(max-min)*5 >
+  mean`, i.e. spread over 20% of the mean, a deliberately generous
+  threshold since every clean anchor observed so far sits under 6%. This
+  does not FIX the contaminated tau -- it only tells the operator not to
+  trust it and to re-measure (larger `n`, check line-of-sight) before
+  copying it into `sync tau set`. A median, or a proper outlier-rejection
+  pass, would fix it structurally; not done, since the manual-and-supervised
+  nature of this Fase A tool means a loud warning plus a re-run is
+  sufficient and cheaper than getting outlier rejection right on the first
+  try. Both images re-verified building clean after the fix
+  (`dram0_0_seg` unchanged -- the change is FLASH only, no new state).
 - `src/apos_frame.{c,h}` — the survey wire format: one message type (`0xEB`)
   with a subtype byte carrying seven messages (SURVEY_BEGIN, ENUM_RSP,
   RANGE_CMD, RANGE_RSP, SETPOS, SETPOS_ACK, SURVEY_END). Deliberately *not*
@@ -2840,6 +2865,42 @@ that said no remote was configured — true once, not since.
   Fase B (on-air TWR measurement of tau, so a moved gateway is tracked rather
   than requiring a re-survey) is designed in the same plan doc but not
   started.
+
+- **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
+  gate NOT yet met, and the dominant remaining cause was found the same
+  session — see `src/gw_selftau.{c,h}`'s own CLAUDE.md entry above.** Deployment:
+  4 anchors physically fixed in place with USB out of reach after
+  installation (walls/ceiling mounts) -- `sync tau mode|set|show` had to be
+  run once during setup, before final placement, and cannot be re-checked
+  live without re-accessing each board. Operator confirms all four passed
+  `cal ref` beforehand; not independently re-verified with `anchor show`
+  this session (couldn't reach them), so this is trusted, not measured,
+  going forward. `apos run` on this array:
+  `{"rms_mm":31,"worst_mm":45,"worst_pair":[0,2],"max_reciprocal_mm":15,
+  "max_sd_mm":36,"accepted":1}` -- healthy, comparable to the project's
+  post-laser-correction floor (24 mm) elsewhere, so the SURVEY geometry is
+  not implicated in what follows. `sync tau set` applied to all 4 anchors
+  from `gw_selftau`'s on-air measurement (the tool from this section, not
+  `tools/sync_tau_from_survey.py`). Tag placed at the array's centroid
+  (`(1.75, 1.38)` from the surveyed corners); reported fixes averaged
+  roughly `(1.22, 0.40)`, ~1.1 m of error -- down from the 1.9-2.1 m
+  pre-B14 baseline this plan's own §1 table recorded, real progress, but
+  well over the `<=0.35 m` Gate A target. `residual_m` sat mostly in
+  0.3-0.8 m throughout (`n:4`, so per `src/tdoa_solve.c`'s own caller
+  contract this IS a real, if weak, quality signal here, not the
+  structurally-zero 3-anchor case) -- consistent with a real, uncorrected
+  bias rather than noise. Root cause candidate found the same session: one
+  anchor's `gw_selftau` measurement (`0x0003`) carried 837 mm of spread
+  against 25-63 mm on the other three, meaning its `tau_dtu` was likely
+  contaminated by multipath before it was ever applied. **Not yet
+  re-measured with the spread warning now in place, or re-tested at the
+  centroid point** -- the natural next step is re-running `sync tau
+  measure 2 16` (larger `n`) on `0x0003` after checking its line-of-sight
+  to the gateway, applying the corrected value, and re-testing before
+  concluding whether that alone closes the gap or the RX antenna-delay
+  split (`docs/rx-antenna-delay-calibration.md`, never run) accounts for
+  the rest. Do not re-read this paragraph's numbers as the current state of
+  the fleet once that re-test happens -- update it.
 
 - **`sync_model` published conversions from a one-interval baseline after
   every re-baseline — fixed 2026-09-18 (B13), and the fix's own limit is worth
