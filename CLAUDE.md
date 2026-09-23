@@ -2867,40 +2867,90 @@ that said no remote was configured — true once, not since.
   started.
 
 - **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
-  gate NOT yet met, and the dominant remaining cause was found the same
-  session — see `src/gw_selftau.{c,h}`'s own CLAUDE.md entry above.** Deployment:
-  4 anchors physically fixed in place with USB out of reach after
-  installation (walls/ceiling mounts) -- `sync tau mode|set|show` had to be
-  run once during setup, before final placement, and cannot be re-checked
-  live without re-accessing each board. Operator confirms all four passed
-  `cal ref` beforehand; not independently re-verified with `anchor show`
-  this session (couldn't reach them), so this is trusted, not measured,
-  going forward. `apos run` on this array:
+  gate NOT yet met, TWO independent bias sources found the same session by
+  cross-checking `gw_selftau` against a laser distance meter -- not one, and
+  not the one first suspected.** Deployment: 4 anchors physically fixed in
+  place with USB out of reach after installation (walls/ceiling mounts) --
+  `sync tau mode|set|show` had to be run once during setup, before final
+  placement, and cannot be re-checked live without re-accessing each board.
+  Operator confirms all four passed `cal ref` beforehand; not independently
+  re-verified with `anchor show` this session (couldn't reach them), so
+  this is trusted, not measured. `apos run`:
   `{"rms_mm":31,"worst_mm":45,"worst_pair":[0,2],"max_reciprocal_mm":15,
-  "max_sd_mm":36,"accepted":1}` -- healthy, comparable to the project's
-  post-laser-correction floor (24 mm) elsewhere, so the SURVEY geometry is
-  not implicated in what follows. `sync tau set` applied to all 4 anchors
-  from `gw_selftau`'s on-air measurement (the tool from this section, not
-  `tools/sync_tau_from_survey.py`). Tag placed at the array's centroid
-  (`(1.75, 1.38)` from the surveyed corners); reported fixes averaged
-  roughly `(1.22, 0.40)`, ~1.1 m of error -- down from the 1.9-2.1 m
-  pre-B14 baseline this plan's own §1 table recorded, real progress, but
-  well over the `<=0.35 m` Gate A target. `residual_m` sat mostly in
-  0.3-0.8 m throughout (`n:4`, so per `src/tdoa_solve.c`'s own caller
-  contract this IS a real, if weak, quality signal here, not the
-  structurally-zero 3-anchor case) -- consistent with a real, uncorrected
-  bias rather than noise. Root cause candidate found the same session: one
-  anchor's `gw_selftau` measurement (`0x0003`) carried 837 mm of spread
-  against 25-63 mm on the other three, meaning its `tau_dtu` was likely
-  contaminated by multipath before it was ever applied. **Not yet
-  re-measured with the spread warning now in place, or re-tested at the
-  centroid point** -- the natural next step is re-running `sync tau
-  measure 2 16` (larger `n`) on `0x0003` after checking its line-of-sight
-  to the gateway, applying the corrected value, and re-testing before
-  concluding whether that alone closes the gap or the RX antenna-delay
-  split (`docs/rx-antenna-delay-calibration.md`, never run) accounts for
-  the rest. Do not re-read this paragraph's numbers as the current state of
-  the fleet once that re-test happens -- update it.
+  "max_sd_mm":36,"accepted":1}` -- comparable to the project's
+  post-laser-correction floor (24 mm) elsewhere, but **this rms figure
+  turned out NOT to rule out a real per-node position error** (see below):
+  it measures the anchors' mutual consistency, not their agreement with the
+  outside world, and a 4-node 2D mesh (1 spare equation) has too little
+  redundancy to always catch one node's coordinate being wrong when the
+  RANGES it was solved from are all consistently biased in a way the LM
+  refine can partly absorb into that node's position instead of its
+  residual. `sync tau set` first applied to all 4 anchors from
+  `gw_selftau`'s raw on-air mean. Tag at the array's centroid (`(1.75,
+  1.38)` from the surveyed corners); fixes averaged roughly `(1.22, 0.40)`,
+  ~1.1 m of error -- down from the 1.9-2.1 m pre-B14 baseline, real
+  progress, but over the `<=0.35 m` target.
+
+  **Investigation, in the order it actually happened (the false leads are
+  kept, because the corrections are the useful part):** `0x0003`'s
+  `gw_selftau` spread (837 mm at n=8 against 25-63 mm on the other three)
+  was the obvious first suspect -- root cause confirmed as metal furniture
+  directly between the gateway and that anchor (operator-identified NLOS).
+  Re-measuring at n=16 gave mean 2080 mm; **first read as "got worse"
+  (further from a GUESSED-at "clean cluster" near 2740-2760 mm with no
+  ground truth behind that guess) -- WRONG, corrected below once a laser
+  measurement existed.** Attempting a quick fix by trilaterating the
+  gateway's own position from the OTHER three `gw_selftau` means (assuming
+  they were clean) instead put the largest residual on `0x0002` (-554 mm),
+  bigger than `0x0003`'s -- surfacing a real gap in the spread check
+  (added the same session, see `gw_selftau`'s own entry above): **a single,
+  geometrically stable reflection gives LOW spread (precision) with a
+  WRONG mean (accuracy)**, which no spread threshold can catch. Laser
+  ground truth then settled it, and reversed part of the read twice over:
+  - `GW<->0x0001` (3.339 m) and `GW<->0x0004` (3.731 m) matched
+    `gw_selftau` to 6-11 mm -- both genuinely clean, and precise enough to
+    solve the gateway's own position unambiguously by two-circle
+    intersection: `(3.289, 0.573)` in the survey frame (the mirror
+    solution lands outside the array and is discarded).
+  - `GW<->0x0002` (laser, 1.061 m) matched `gw_selftau`'s RAW mean
+    (1.130 m, +69 mm) far better than the trilaterated geometric
+    prediction from the solved gateway position + `0x0002`'s SURVEYED
+    coordinate (0.574 m, -487 mm). **The earlier trilateration-based
+    recommendation to override `0x0002`'s tau was wrong** -- `0x0002`'s
+    on-air ranging and antenna calibration are fine; its *surveyed (x, y)*
+    is what disagrees with reality, by ~487 mm. This is a second,
+    independent bias source from `0x0003`'s NLOS, and it will keep
+    corrupting `tdoa_solve()`'s fixes regardless of tau, because the solver
+    uses that stored coordinate as a fixed reference point -- fixing tau
+    everywhere does not fix a wrong anchor position anywhere. Shape matches
+    this file's own older, not-yet-root-caused note ("One anchor shows a
+    ~200 mm deviation despite reporting itself as calibrated") closely
+    enough to be worth checking whether it is the same board, but the
+    magnitude here (487 mm) is over double what that note recorded, so
+    treat it as a fresh, larger measurement of a possibly-related defect,
+    not a confirmed identity.
+  - `GW<->0x0003` (laser, **approximate** -- no direct line of sight to
+    measure it properly, 1.841 m) landed within 55 mm of the SAME
+    trilateration's prediction for `0x0003` (1.786 m) -- confirming, for
+    THIS anchor, that the geometric derivation (bypassing its own NLOS
+    entirely) is the trustworthy number, unlike `0x0002`'s case just above.
+    It also confirms the n=16 re-measurement (2080 mm) really was closer to
+    truth than n=8 (2578 mm) -- 239 mm of error vs 737 mm -- so averaging
+    MORE exchanges did help here; the earlier "got worse" read was an
+    artifact of guessing at ground truth instead of measuring it.
+
+  **tau_dtu actually applied, final for this run**: `0x0001` 712 (was
+  ~710, on-air, unchanged in substance), `0x0002` 226 (laser-derived,
+  replacing the on-air 241 -- both were close; use the direct measurement
+  now that it exists), `0x0003` 381 (geometric, replacing on-air 550/443 --
+  its own direct link cannot be trusted while the furniture is there),
+  `0x0004` 796 (was ~797, on-air, unchanged in substance). **Not yet
+  re-tested with these values.** Even with tau fully corrected on all four,
+  expect `0x0002`'s ~487 mm position error to keep showing up in the fix
+  until its SURVEYED coordinate is independently corrected (re-survey, a
+  physical recheck of that board's mounting/orientation, or excluding it
+  from the gauge) -- that is a separate, still-open defect, not something
+  this session's tau work can or should paper over.
 
 - **`sync_model` published conversions from a one-interval baseline after
   every re-baseline — fixed 2026-09-18 (B13), and the fix's own limit is worth
