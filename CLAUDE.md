@@ -2963,20 +2963,48 @@ that said no remote was configured — true once, not since.
   stays small everywhere, and fixing `0x0002`'s coordinate is still a
   separate, open item.
 
-  **What Gate A still needs before it can be called closed, and is NOT
-  satisfied by this one result:** a second test point (per the plan's own
-  §1 table, one point is not the gate); the negative test (the
-  gateway-position-from-radio-bias fit should no longer converge to a
-  sensible gateway location -- not run, and this session's own
-  ground-truth cross-checks arguably did a more direct version of that
-  test already, but the plan's specific procedure has not been executed);
-  the T0 antenna-delay-invariance repeat; `tools/rx_cal.py` residuals under
+  **Second test point ("P2_izq_centro_plane", same day, same corrected
+  taus, same four anchors untouched): ALSO passes, and more comfortably
+  than the first.** Placed on a table roughly between `0x0003`/`0x0004`,
+  ~1 m below the anchor plane (matching the deployment's `tag_z:-1.0`).
+  First pass used the A2-A3 geometric midpoint as the target and got an
+  ambiguous 0.31-0.45 m depending which slice of the log was averaged --
+  **that target itself was wrong**, not the system: laser-measured the tag
+  directly against all four anchors (3.173/2.690/1.746/2.215 m to
+  `0x0001`/`0x0002`/`0x0003`/`0x0004`) and multilaterated its true position
+  at `(2.098, 2.183)`, 0.364 m from the guessed midpoint. The height
+  correction (`horizontal = sqrt(slant^2 - dz^2)`) turned out to matter
+  only for judging RESIDUALS, not for the solved (x, y) itself -- the
+  standard reference-subtraction trilateration cancels a COMMON `dz^2` term
+  identically in every equation, since every anchor here shares the same
+  surveyed `z:0.000`; it would matter if the anchors were at different
+  heights from each other. Fit residuals post-correction: `0x0001 +17 mm,
+  0x0002 -25 mm, 0x0004 -21 mm` (laser-noise level), `0x0003 +106 mm`
+  (larger but not alarming, plausibly a different aim point on that board,
+  not the same defect as its RF NLOS to the gateway -- this was a laser
+  measurement to the tag, an unrelated link). Against the CORRECTED target,
+  every slice of the log lands well inside the gate: dense tier=2 block
+  0.224 m, the whole log 0.208 m, even the sparse IDLE-tier tail 0.208 m --
+  all better than test point 1's 0.293 m.
+
+  **Gate A numeric target: 2 of 2 test points now PASS.** What still needs
+  running before the gate can be called fully closed (unchanged from
+  before, none of it satisfied by passing the position-error numbers
+  alone): the negative test (the gateway-position-from-radio-bias fit
+  should no longer converge to a sensible gateway location -- this
+  session's ground-truth cross-checks arguably did a more direct version of
+  it already, but the plan's specific procedure has not been executed); the
+  T0 antenna-delay-invariance repeat; `tools/rx_cal.py` residuals under
   0.5 ns/anchor from a fresh capture; the TWR tag<->anchor regression
   (±10 cm against pre-fix); and the T6 (`kernel reboot cold`) regression.
-  None of the four anchors could be reflashed or re-verified with `anchor
-  show` this session (USB out of reach post-install) -- keep that
-  constraint in mind when planning how any of the above get executed on
-  this specific deployment.
+  `0x0002`'s ~487 mm surveyed-position error is STILL open and unfixed --
+  it simply cost little at these two particular tag locations, which is a
+  property of where the tag stood (this array's GDOP amplification runs
+  1.16-4.21x depending on position), not evidence the defect is gone. None
+  of the four anchors could be reflashed or re-verified with `anchor show`
+  this session (USB out of reach post-install) -- keep that constraint in
+  mind when planning how any of the above get executed on this specific
+  deployment.
 
 - **`sync_model` published conversions from a one-interval baseline after
   every re-baseline — fixed 2026-09-18 (B13), and the fix's own limit is worth
