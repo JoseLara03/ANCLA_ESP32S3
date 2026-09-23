@@ -28,6 +28,21 @@
 
 #include <stdint.h>
 
+/* mm of one-way path length per DW3220 device time unit, x1000, matching
+ * this file's OWN SPEED_OF_LIGHT (299702547.0, this network's air value, not
+ * vacuum) and DWT_TIME_UNITS_V (1/(499.2 MHz * 128)) -- i.e. it is the exact
+ * inverse of the conversion ss_initiator_range()'s mm result was already
+ * computed with, not an independently-derived constant that could drift from
+ * it. Exposed here, rather than restated at each caller, for the same reason
+ * CLAUDE.md's cal_math.c entry exists: a duplicated conversion constant is a
+ * second thing to keep in sync and nothing fails loudly when it does not.
+ * 4690 (4.690 mm/DTU) -- close to, but not identical to, tools/rx_cal.py's
+ * 4.6917214: that tool's constant is derived from the VACUUM speed of light
+ * (299792458.0), which is the wrong physical constant for a value derived
+ * from this project's own mm results and would silently reintroduce a
+ * ~0.03% scale mismatch against them. */
+#define SS_INITIATOR_MM_PER_DTU_X1000 4690
+
 /* Put the radio into initiator mode. Must be paired with ss_initiator_leave();
  * between the two, this board does not answer anything. */
 void ss_initiator_enter(void);

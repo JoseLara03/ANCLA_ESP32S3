@@ -31,6 +31,7 @@
 
 #include "ccp_master.h"
 #include "ccp_slave.h"
+#include "gw_selftau.h"
 #include "sync_model.h"
 #include "uwb_config.h"
 #include "uwb_store.h"
@@ -396,6 +397,110 @@ static int cmd_tau_show(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/* strtol(), not the config-layer helpers: `id` and `n` here are console
+ * arguments to THIS gateway-side command, not uwb_config_t fields. `endp ==
+ * arg` (empty/non-numeric) and a trailing non-NUL both reject, same
+ * discipline cmd_tau_set() above already applies. */
+static bool parse_arg(const char *arg, long *out)
+{
+	char *endp = NULL;
+	long v = strtol(arg, &endp, 10);
+
+	if (endp == arg || *endp != '\0') {
+		return false;
+	}
+	*out = v;
+	return true;
+}
+
+static int cmd_tau_measure(const struct shell *sh, size_t argc, char **argv)
+{
+	long id, n = GW_SELFTAU_DEFAULT_N;
+
+	/* Same refusal pattern as apos_shell.c and `sync txtest`: this rides
+	 * the gateway's own K_PRIO_COOP(0) loop (gw_selftau_step(), called
+	 * from uwb_gateway_run()) and means nothing anywhere else -- a SLAVE
+	 * has no ss_initiator caller wired to consume the request at all, so
+	 * it would sit "pending" forever with nothing to report. */
+	if (strcmp(board_role(), "gateway") != 0) {
+		shell_error(sh, "sync tau measure: gateway mode only (this "
+				"board is \"%s\")", board_role());
+		return -ENOTSUP;
+	}
+
+	if (!parse_arg(argv[1], &id) || id < 0 || id >= UWB_MAX_ANCHORS) {
+		shell_error(sh, "sync tau measure: id must be 0..%u",
+			    UWB_MAX_ANCHORS - 1);
+		return -EINVAL;
+	}
+	if (argc > 2) {
+		if (!parse_arg(argv[2], &n) || n < 1 || n > GW_SELFTAU_MAX_N) {
+			shell_error(sh, "sync tau measure: n must be 1..%u",
+				    GW_SELFTAU_MAX_N);
+			return -EINVAL;
+		}
+	}
+
+	if (!gw_selftau_request((uint8_t)id, (uint32_t)n)) {
+		shell_error(sh, "sync tau measure: a request is already in "
+				"progress -- check `sync tau result` first");
+		return -EBUSY;
+	}
+
+	shell_print(sh, "queued: %ld exchange(s) against anchor %ld, spread "
+			"over up to %ld superframes (~%ld ms) so the beacon "
+			"is never held for more than one bounded exchange at "
+			"a time. Read the result with `sync tau result`.",
+		    n, id, n, n * 200L);
+	return 0;
+}
+
+static int cmd_tau_result(const struct shell *sh, size_t argc, char **argv)
+{
+	struct gw_selftau_result r;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (strcmp(board_role(), "gateway") != 0) {
+		shell_error(sh, "sync tau result: gateway mode only (this "
+				"board is \"%s\")", board_role());
+		return -ENOTSUP;
+	}
+
+	gw_selftau_get_result(&r);
+	shell_print(sh,
+		    "{\"gw_selftau\":{\"anchor_id\":%u,\"done\":%u,"
+		    "\"attempted\":%u,\"valid\":%u,\"mean_mm\":%d,"
+		    "\"min_mm\":%d,\"max_mm\":%d,\"tau_dtu\":%d}}",
+		    r.anchor_id, r.done ? 1u : 0u, r.attempted, r.valid,
+		    r.mean_mm, r.min_mm, r.max_mm, r.tau_dtu);
+
+	if (!r.done) {
+		shell_print(sh, "still running (%u of the requested "
+				"exchanges so far) -- try again shortly",
+			    r.attempted);
+	} else if (r.valid == 0u) {
+		shell_warn(sh, "0 of %u exchanges got a response -- check the "
+				"anchor is powered, positioned "
+				"(`anchor show`'s pos_valid) and in range "
+				"before trusting tau_dtu:0",
+			   r.attempted);
+	} else if (r.valid < r.attempted) {
+		shell_warn(sh, "only %u of %u exchanges succeeded -- tau_dtu "
+				"is a mean over the %u that did, treat it "
+				"with more caution than a clean run",
+			   r.valid, r.attempted, r.valid);
+	} else {
+		shell_print(sh, "copy `sync tau set %d` into anchor %u's OWN "
+				"console -- this value is not applied here, "
+				"it describes THAT anchor's distance from "
+				"this gateway",
+			    r.tau_dtu, r.anchor_id);
+	}
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync_tau,
 	SHELL_CMD_ARG(mode, NULL,
 		      "mode <legacy|survey|twr|auto> — select the B14 tau "
@@ -408,6 +513,16 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync_tau,
 	SHELL_CMD_ARG(show, NULL,
 		      "show — mode, configured and live tau as JSON",
 		      cmd_tau_show, 1, 0),
+	SHELL_CMD_ARG(measure, NULL,
+		      "measure <id> [n] — GATEWAY-only: range this gateway "
+		      "directly to anchor <id> over SS-TWR, averaged over n "
+		      "exchanges (default 8, max 32), and compute tau_dtu "
+		      "with no coordinates or tape measurement needed. "
+		      "Queues; read the result with `sync tau result`.",
+		      cmd_tau_measure, 2, 1),
+	SHELL_CMD_ARG(result, NULL,
+		      "result — the last `sync tau measure` run, as JSON",
+		      cmd_tau_result, 1, 0),
 	SHELL_SUBCMD_SET_END
 );
 

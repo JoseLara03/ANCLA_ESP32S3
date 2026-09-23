@@ -24,6 +24,7 @@
 #include "blink_sched.h"
 #include "ccp_master.h"
 #include "gw_core.h"
+#include "gw_selftau.h"
 #include "mac_budget.h"
 #include "pos_sink.h"
 #include "tag_id.h"
@@ -153,6 +154,8 @@ enum gw_crumb {
 	GW_CRUMB_TX_BEACON,   /* 8: inside tx_beacon() -- delayed TX + TXFRS */
 	GW_CRUMB_CCP_TX,      /* 9: inside ccp_master_after_beacon() */
 	GW_CRUMB_CCP_TXTEST,  /* 10: inside ccp_master_txtest_step() -- bench-only */
+	GW_CRUMB_SELFTAU_STEP, /* 11: inside gw_selftau_step() -- one bounded
+				* SS-TWR exchange against an anchor, RX off */
 };
 
 static volatile uint32_t gw_crumb;
@@ -677,6 +680,29 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 
 					CRUMB(GW_CRUMB_APOS_STEP);
 					apos_gw_step(avail_uus, &gw_seq);
+
+					now = dwt_readsystimestamphi32();
+					to_beacon = (int32_t)(next_beacon - now);
+					if (to_beacon <=
+					    (int32_t)UUS_TO_HI32(BEACON_ARM_MARGIN_UUS)) {
+						break;
+					}
+				}
+			} else if (gw_selftau_busy()) {
+				/* `else`: at most one of the two on any given
+				 * iteration, same as this loop already does for
+				 * every other transmit site. gw_selftau_step()'s
+				 * cost is FIXED (one ss_initiator_range()
+				 * exchange), unlike apos_gw_step()'s variable
+				 * budget above, so the reserve check alone is
+				 * enough -- there is no "avail_uus" to compute. */
+				int32_t reserve = (int32_t)UUS_TO_HI32(
+					BEACON_ARM_MARGIN_UUS +
+					GW_SELFTAU_STEP_BUDGET_UUS);
+
+				if (to_beacon > reserve) {
+					CRUMB(GW_CRUMB_SELFTAU_STEP);
+					gw_selftau_step();
 
 					now = dwt_readsystimestamphi32();
 					to_beacon = (int32_t)(next_beacon - now);

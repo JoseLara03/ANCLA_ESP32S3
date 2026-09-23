@@ -140,7 +140,9 @@ sync tau show                               ; tau_used, fuente, edad twr, jumps
 
 Config persistida: `{ tau_survey_dtu: i32, mode: u8 }`. Runtime: `{ tau_twr_dtu: i32, tau_twr_age_s: u32, twr_quality: u8, jump_events: u32 }`.
 
-Herramienta host: extender el tooling de survey para emitir `sync tau set` por ancla desde las coordenadas (distancia 3D master→ancla × 213 DTU/m). La survey actual tiene rms 7 mm → error en τ ≈ 23 ps, despreciable.
+Herramienta host: extender el tooling de survey para emitir `sync tau set` por ancla desde las coordenadas (distancia 3D master→ancla × 213 DTU/m). La survey actual tiene rms 7 mm → error en τ ≈ 23 ps, despreciable. Implementado en `tools/sync_tau_from_survey.py`.
+
+**Adenda 2026-09-23 — alternativa on-air, evita medir la posición del gateway a mano.** En campo, medir con cinta la posición del gateway en el MISMO frame del survey resultó poco práctico (anclas montadas en techo/paredes lejanas, el gateway no es parte del survey en sí) y propenso a error humano — un desalineamiento de ~0.8 m entre la posición usada para `sync_tau_from_survey.py` y la real fue justo lo que se detectó en la primera corrida de campo. `src/gw_selftau.{c,h}` (ver su entrada en el Layout de CLAUDE.md) evita esa conversión de coordenadas por completo: el gateway rangea DIRECTO a cada ancla ya posicionada por SS-TWR (mismo `ss_initiator.c` que ya usa el survey ancla↔ancla, mismo responder WAVE que cada ancla ya contesta — sin frame nuevo, sin protocolo nuevo) y calcula `tau_dtu` de la distancia medida, sin geometría de por medio. Consola: `sync tau measure <id> [n]` / `sync tau result`. Sigue siendo Fase A (manual, one-shot, el operador copia el número a mano) — NO es la Fase B de este plan (FR-6..FR-9: round-robin, filtro, CCP v2, auto-tracking). El operador elige la fuente que le convenga: `sync_tau_from_survey.py` (si tiene cómo medir bien la posición del gateway) o `sync tau measure` (si no). **No corrido en hardware.**
 
 ### 4.3 TWR de sync (Fase B)
 

@@ -27,6 +27,7 @@ target_sources(app PRIVATE
 	src/ccp_slave.c
 	src/disc_schedule.c
 	src/gw_core.c
+	src/gw_selftau.c
 	src/mac_budget.c
 	src/main.c
 	src/net_config.c

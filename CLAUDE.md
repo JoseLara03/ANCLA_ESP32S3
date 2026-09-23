@@ -771,8 +771,11 @@ blink abg [lambda|gamma|gate|still|reset <v>]
 The `sync` tree reports the CCP sync gate. It is registered unconditionally —
 in the **production** image on every role, AND in the **calibration** image
 too (`ccp_slave.c`/`ccp_master.c` compile into both; only `cal_run.c`'s own
-loop never drives either). It only reports; it transmits nothing and has no
-configuration commands. `stats` and `master` each print a `role` field for
+loop never drives either). `stats`/`reset`/`master` only report or reset
+statistics; it is the `tau` subtree (added for B14, see the "URGENT next
+work" / antenna-delay section and
+`docs/superpowers/plans/2026-09-22-b14-flight-compensation.md`) that
+configures and transmits. `stats` and `master` each print a `role` field for
 exactly this reason: on a role that does not exercise them (a GATEWAY reading
 `stats`, a SLAVE reading `master`, or either command on the cal image) the
 underlying counters simply never moved, so a static "no-lock" or `sent:0,
@@ -788,6 +791,27 @@ sync reset                     clear the residual statistics without
                                touching the lock or the baseline
 sync master                    transmit half — CCP sent/dropped counts as
                                JSON; meaningful on a GATEWAY
+sync tau mode <legacy|survey|twr|auto>
+                               select the B14 flight-compensation source;
+                               persists, applies LIVE (not gated behind a
+                               reboot like `ant_delay`). twr/auto currently
+                               degrade to survey (no Fase B source yet)
+sync tau set <dtu>             write tau_survey_dtu (signed DTU); persists,
+                               applies live if mode uses it
+sync tau show                  mode, configured and live tau as JSON —
+                               meaningful on a SLAVE (this is where tau is
+                               APPLIED)
+sync tau measure <id> [n]      GATEWAY-only: range THIS gateway directly to
+                               anchor <id> over SS-TWR, averaged over n
+                               exchanges (default 8, max 32) — computes
+                               tau_dtu with no coordinates or tape
+                               measurement of the gateway's own position.
+                               Queues (spreads over up to n superframes so
+                               the beacon is never held); read with
+                               `sync tau result`. The printed tau_dtu is
+                               for anchor <id>'s OWN `sync tau set` — this
+                               command applies nothing locally
+sync tau result                last `sync tau measure` run, as JSON
 ```
 
 ## Layout
@@ -1553,7 +1577,49 @@ sync master                    transmit half — CCP sent/dropped counts as
   initiator, the role the tag normally plays. Was `cal_initiator.{c,h}` and
   calibration-image-only; it is now in **both** images, because the anchor
   survey needs an anchor to poll its peers. Renamed accordingly — nothing about
-  it is calibration-specific.
+  it is calibration-specific. Also exposes `SS_INITIATOR_MM_PER_DTU_X1000`
+  (4690, i.e. 4.690 mm/DTU) — the exact inverse of the conversion
+  `ss_initiator_range()`'s mm result was computed with (this project's own
+  air-value `SPEED_OF_LIGHT`, 299702547.0, not vacuum), so a caller converting
+  its mm result back to DTU (`src/gw_selftau.c`) cannot silently drift from
+  it the way `tools/rx_cal.py`'s independently-derived 4.6917214 (vacuum
+  `c`) would if reused here — same drift-risk class as the `cal_math.c`
+  entry above.
+- `src/gw_selftau.{c,h}` — GATEWAY-only, one-shot alternative to measuring
+  the gateway's own position with a tape for B14 (see
+  `docs/superpowers/plans/2026-09-22-b14-flight-compensation.md`): range the
+  gateway directly to an already-surveyed anchor over the air with
+  `ss_initiator.c` (same WAVE responder every anchor already answers — no
+  new wire format), average `n` exchanges, and compute
+  `tau_dtu = round(mean_mm / 4.690)` with no coordinates, no frame of
+  reference to align, and no measurement of the gateway's own position at
+  all. A STEP MACHINE like `apos_gw.c`, not a blocking shell call:
+  `gw_selftau_step()` runs at most ONE bounded `ss_initiator_range()`
+  exchange (worst case ~35 ms, `GW_SELFTAU_STEP_BUDGET_UUS`) per call, from
+  the exact point and under the exact beacon-margin reserve check
+  `uwb_gateway.c` already uses for `apos_gw_step()` — `else if`, not both in
+  the same iteration, since `gw_selftau_step()`'s cost is fixed rather than
+  variable so it needs no `avail_uus` budget to compute. `n` exchanges
+  therefore spread over up to `n` superframes; deliberately NOT back-to-back
+  like `cal link`'s (that command's own dedicated calibration-image loop has
+  no beacon to protect). `ss_initiator_leave()` restores `DWT_INT_RX`
+  enabled, which happens to be exactly the GATEWAY's own normal
+  interrupt-driven RX state (`uwb_gateway_run()` sets it once, same call as
+  `uwb_slave.c`) — unlike a hypothetical polled-RX caller, there is nothing
+  to restore differently here, which is worth stating because it is easy to
+  assume a mismatch exists without checking. Console:
+  `sync tau measure <id> [n]` / `sync tau result` (`src/sync_shell.c`) —
+  the printed `tau_dtu` is for anchor `<id>`'s OWN `sync tau set`; this
+  command applies nothing locally. This is Fase A tooling, not Fase B
+  (FR-6..FR-9): manual, operator-triggered, one-shot, no round-robin
+  schedule, no CCP v2 payload, no EMA filter, no jump detection — the
+  operator still copies the number by hand. Pure conversion function
+  (`gw_selftau_mm_to_dtu()`) is `static inline` in the header with no Zephyr
+  dependency, host-tested in `tests/gw_selftau/`; the request/step state
+  machine itself has no host suite, same reasoning `blink_rx.c` and
+  `apos_node.c` give for theirs — everything it calls is already tested or
+  needs a real DW3220. Both firmware images build clean (production
+  `dram0_0_seg` 272016 -> 272096 B, +80 B). **Not yet run on hardware.**
 - `src/apos_frame.{c,h}` — the survey wire format: one message type (`0xEB`)
   with a subtype byte carrying seven messages (SURVEY_BEGIN, ENUM_RSP,
   RANGE_CMD, RANGE_RSP, SETPOS, SETPOS_ACK, SURVEY_END). Deliberately *not*
@@ -2666,6 +2732,9 @@ gcc -Wall -Wextra -Isrc -o tests/tdoa_solve/test_tdoa_solve.exe tests/tdoa_solve
 
 gcc -Wall -Wextra -Isrc -o tests/pos_abg/test_pos_abg.exe tests/pos_abg/test_pos_abg.c src/pos_abg.c -lm
 ./tests/pos_abg/test_pos_abg.exe                # pos_abg: ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/gw_selftau/test_gw_selftau.exe tests/gw_selftau/test_gw_selftau.c
+./tests/gw_selftau/test_gw_selftau.exe          # gw_selftau: ALL TESTS PASSED, exits 0
 ```
 
 `tests/pos_ekf/` was removed with the EKF on 2026-09-06 (the tag's own copy
