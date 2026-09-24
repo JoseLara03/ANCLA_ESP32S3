@@ -3058,28 +3058,43 @@ that said no remote was configured — true once, not since.
   run" already used for P2/P3/P4) would strengthen this conclusion but is
   not blocking.
 
-  **TWR tag<->anchor regression: run, and it did NOT reproduce the exact
-  plan wording (`±10 cm against pre-fix`) because no pre-fix TWR baseline
-  was ever recorded to compare against -- but nothing anomalous showed
-  up.** `anchor cell twr` + `kernel reboot cold` on the gateway; found
-  and fixed a real latent bug on the way in: `anchor pos` (the legacy
-  per-anchor field the classic WAVE responder encodes into its reply) had
-  drifted from the applied survey (`apos_store`) -- confirmed on `0x0003`
+  **TWR tag<->anchor regression: ATTEMPTED, and the attempt itself is the
+  finding -- the "0.202 m" measurement an earlier draft of this entry
+  recorded here was retracted the same session: it did not measure TWR at
+  all.** `anchor cell twr` + `kernel reboot cold` on the gateway, tag held
+  at P2, 39 fixes captured over `uwb/response/position/<zone>` -- but the
+  operator noticed the tag was still publishing to the BLINK topic
+  throughout, which should not happen in a TWR cell. Traced in code, not
+  guessed: `gw_blink_mode` (`src/uwb_gateway.c:244`, set from
+  `cfg->cell_mode`) gates exactly ONE thing -- whether `tx_beacon()`'s
+  broadcast `sched[]` carries a real TWR rotation or a reserved/zero
+  placeholder (`uwb_gateway.c:253-264`). It does **not** gate
+  `tdoa_gw_step()` (`uwb_gateway.c:607`, called unconditionally every
+  superframe, `cell_mode` never checked) and does not reach
+  `blink_rx.c` (anchor-side, always active regardless of the gateway's
+  own `cell_mode`). On the tag's own side, its BLINK slot is
+  `slot_index(seat_id) = seat_id`, computed locally -- the tag never reads
+  the beacon's `sched[]` at all, so it has no channel through which
+  `anchor cell twr` could ever tell it to stop blinking. **This specific
+  tag is a Phase-3-migrated, blink-only build**, and `anchor cell twr` is
+  a GATEWAY-side MAC-capacity knob for tags that still do classic ranging
+  -- with none deployed, flipping it changes nothing about what actually
+  gets measured, and the "0.202 m" figure was the same TDoA pipeline
+  running exactly as it does in blink mode, not a TWR result. **A real TWR
+  regression is not executable against the current fleet** -- it needs a
+  pre-Phase-3 tag firmware build, which may or may not still exist to
+  flash. Given B14 touches zero lines in `anchor_respond.c`/
+  `ss_initiator.c`/`cal_solve.c` (verified by diff, not assumption), the
+  a-priori regression risk on that path is already close to zero; this
+  item just could not be independently confirmed by measurement. One real
+  thing did come out of the attempt and stays fixed: `anchor pos` (the
+  legacy per-anchor field the classic WAVE responder would encode into a
+  reply) had drifted from the applied survey -- confirmed on `0x0003`
   earlier this session (`anchor show` read `3.51, 2.63` against the
-  survey's `3.629, 2.326`) -- so all four were re-synced to the survey's
-  coordinates before this test, or the tag's own TWR solve would have
-  been wrong for a reason unrelated to B14 and muddied the result. Tag
-  held at P2 (the best-verified ground truth, `(2.098, 2.183)`): 39
-  fixes over the `uwb/response/position/<zone>` MQTT topic (no
-  `residual`/`n` on that topic, console-only) average `(2.170, 1.994)`,
-  **0.202 m of error, SE ~0.03-0.04 m** (a solid number, not noise). That
-  is in the SAME band as TDoA's own error at the identical spot
-  (0.208-0.224 m) -- consistent with a shared array noise/GDOP floor
-  common to both ranging modes on this deployment, not a TWR-specific
-  regression and not evidence B14 touched this path (which the code
-  already rules out structurally: TWR never enters `sync_model.c`).
-  Gateway reverted to `anchor cell blink` + reboot afterward to restore
-  the TDoA deployment.
+  survey's `3.629, 2.326`) -- and all four were re-synced to the survey's
+  coordinates before this attempt. That is now current regardless of this
+  test's outcome. Gateway reverted to `anchor cell blink` + reboot
+  afterward to restore the TDoA deployment.
 
   Remaining: the T6 (`kernel reboot cold`) regression for THIS fix
   specifically (distinct from the anchor-cell-mode reboots just done, which
