@@ -3248,9 +3248,44 @@ that said no remote was configured — true once, not since.
   (46 min, `0x0001`, `0x0002`, `0x0003` unverified individually but
   structurally identical code path). Still open: a run with all four
   anchors up SIMULTANEOUSLY (only ever tested one at a time so far,
-  batteries permitting), and the jump-detector's behaviour under an
-  actual physical relocation has not been deliberately exercised (only
-  observed as ordinary EMA convergence so far).
+  batteries permitting).
+
+  **The §6.2-B "mobile gateway" test — the one that demonstrates the
+  plan's ORIGINAL requirement — was run informally by the operator later
+  this same session, full deployment, anchors moved rather than the
+  gateway (same physics, same test in spirit).** Outcome, in the
+  operator's own words: with tau on SURVEY (frozen), moving an anchor
+  moves the reported position — expected, and exactly the negative-control
+  half of §6.2-B item 2 (the plan's own prediction: "con modo SURVEY, el
+  error DEBE crecer"). **With TWR/AUTO active, the system DOES track a
+  moved anchor without a manual re-measurement — the actual point of Fase
+  B — confirmed working.** But convergence is SLOW: while the filter is
+  re-settling toward the new tau, the position it feeds the tag noticeably
+  degrades/noises up in the meantime, before landing back on a good fix.
+  **Not a correctness bug — the mechanism works exactly as designed, the
+  open question is TUNING.** Two known, unquantified contributors, worth
+  chasing before calling §6.2-B item 2 formally passed rather than merely
+  "works":
+  (1) **`TAU_FILTER_EMA_NUM/DEN` (5/100, alpha=0.05) is deliberately slow**
+  per FR-8's own number — at that gain, reaching ~95% of the way to a new
+  value takes roughly 60 EMA-weighted samples (`(1-0.05)^n < 0.05` around
+  n~58), and at this deployment's ~1.25 Hz/anchor round-robin rate that is
+  tens of seconds, not the plan's own "τ converge al nuevo valor en < 60 s"
+  target margin — close to it, not comfortably inside it.
+  (2) **The JUMP DETECTOR (5 sustained samples -> snap to the run's mean)
+  should have been the fast path here** — a real relocation is exactly
+  what it exists to catch and adopt quickly instead of crawling via EMA —
+  but this session's `tau_jump_events` stayed at 0 through every hardware
+  test, including this informal mobile test, so it is not confirmed
+  whether it actually fired and helped, or never triggered at all (e.g. if
+  the anchor move was smaller than `TAU_FILTER_JUMP_THRESHOLD_DTU`, ~2 ns,
+  or if quality-gate rejections broke up the run before 5 consecutive
+  samples could accumulate). **This is the concrete next step**: instrument
+  or watch `tau_jump_events` specifically during a deliberate relocation
+  test, since if the jump path isn't the one doing the work, the slow EMA
+  is carrying a transition it was never meant to carry alone.
+  Not chased further this session — logged as real, working, but needing
+  more tuning work, not blocking.
 
 - **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
   gate NOT yet met, TWO independent bias sources found the same session by
