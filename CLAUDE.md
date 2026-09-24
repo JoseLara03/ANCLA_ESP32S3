@@ -1486,6 +1486,32 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
 - `src/anchor_shell.c` — the `anchor` console command tree.
 - `src/uwb_slave.c` — SLAVE mode: interrupt-driven SS-TWR responder, beacon
   observe, and beacon-collision TX suppression.
+
+  **`uwb_slave_run()` snapshots `cfg` at mode-entry (`cfg_snapshot`) on
+  purpose, so `anchor id`/`ant`/`pos` only take effect on reboot — and B14
+  Fase B's Task 4/5 wiring read `sync_tau_mode`/`sync_tau_dtu` off that
+  SAME frozen snapshot instead of the live singleton, caught live on
+  hardware 2026-09-25.** `sync_tau_mode` and `sync_tau_dtu` are the
+  documented EXCEPTION to the snapshot contract (FR-5: a tau change
+  applies live, no reboot needed) — which is exactly why
+  `ccp_slave_set_tau(uwb_config_sync_tau_effective(cfg))` is already
+  called separately, outside the snapshot, right after it is taken. The
+  bug: the `twr_tau_mode_active`/`survey_tau_dtu` values computed each RX
+  event for `ccp_slave_on_rx()` used `cfg` (the snapshot) instead of
+  `uwb_config_get()` (live) for those two fields. Symptom on the bench: an
+  operator ran `sync tau mode survey` on `0x0004` — the command's own
+  print confirmed `"mode":"survey"`, and it genuinely wrote the live
+  singleton — but the SLAVE loop kept computing `twr_tau_mode_active`
+  from the BOOT-time mode (`twr`, persisted from an earlier test) and
+  kept re-applying live TWR-sourced tau every round-robin turn,
+  indefinitely, regardless of what the console said. Fixed by reading
+  `uwb_config_get()->sync_tau_mode`/`->sync_tau_dtu` directly at that one
+  call site instead of through `cfg`; `own_short_addr` correctly keeps
+  reading the snapshot (an anchor's address changing live was never
+  intended — that one genuinely needs a reboot, same as `anchor id`
+  always has). Both firmware images build clean. **Not yet re-verified on
+  hardware with the fix applied** — caught and fixed in the same session
+  the original bug surfaced.
 - `src/uwb_gateway.c` — GATEWAY mode: TDMA beacon plus the CAP seat protocol.
   MAC-only for *ranging*; it does not answer ranging polls. It does decode
   `0xEA` POS frames and hand them to `pos_sink`.
@@ -3202,10 +3228,21 @@ that said no remote was configured — true once, not since.
   always literally the survey value) -- independent of the mode's own
   name. Both firmware images rebuilt clean after the fix,
   `dram0_0_seg` unchanged (string-selection logic only, no new state).
-  **Not yet re-verified on hardware with the fix applied** -- the
-  original degrade and the buggy report were both caught on the
-  pre-fix build; the next `0x0004` (or any TWR-mode anchor) session
-  should confirm `tau_source` now reads `"survey"` after a degrade.
+  **Fixed the same session, on real hardware, a second time** (see the
+  `src/uwb_slave.c` entry below for the actual root cause and fix): the
+  degrade itself worked correctly, but re-testing it turned up a
+  DIFFERENT, more serious bug -- `sync tau mode` changes were not
+  actually taking effect live on the SLAVE loop at all, despite every
+  console print insisting they had. `0x0004` kept applying TWR-sourced
+  values indefinitely regardless of what mode the operator switched to,
+  until reboot. Both firmware images rebuilt clean after this second fix.
+  **Neither fix has been re-verified on hardware yet** -- the original
+  degrade test, the tau_source display bug, and the mode-gating bug were
+  all caught and fixed in the same session; the next `0x0004` (or any
+  TWR-mode anchor) session should confirm `sync tau mode survey` now
+  actually stops a live TWR value from being re-applied.
+
+- **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
   gate NOT yet met, TWO independent bias sources found the same session by
   cross-checking `gw_selftau` against a laser distance meter -- not one, and
   not the one first suspected.** Deployment: 4 anchors physically fixed in

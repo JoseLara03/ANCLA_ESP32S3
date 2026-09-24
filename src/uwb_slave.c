@@ -366,21 +366,40 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		 * is a type-and-length test. A CCP arrives once per superframe
 		 * and is for nobody else, so there is no reason to walk it past
 		 * the survey and ranging responders. */
-		/* B14 Fase B, Task 4: resolved HERE, not read inside
+		/* B14 Fase B, Task 4/5: resolved HERE, not read inside
 		 * ccp_slave.c, which stays config-agnostic on purpose (same
 		 * pattern sync_shell.c's apply_tau_live() already uses for
 		 * ccp_slave_set_tau()'s value). The TWR filter itself always
 		 * runs on every v2 frame regardless of this flag -- only
 		 * whether its output gets APPLIED is gated on it, see
-		 * ccp_slave.h. */
+		 * ccp_slave.h.
+		 *
+		 * uwb_config_get(), NOT `cfg` -- caught live on hardware
+		 * 2026-09-25: `cfg` above this point in the function is
+		 * `&cfg_snapshot`, frozen at mode-entry on purpose so
+		 * `anchor id`/`ant`/`pos` only take effect on reboot (see this
+		 * function's own top-of-function comment). `sync_tau_mode` and
+		 * `sync_tau_dtu` are the documented EXCEPTION to that contract
+		 * (FR-5: a tau change applies live, no reboot) -- the same
+		 * reason `ccp_slave_set_tau()` is called separately from the
+		 * snapshot below rather than folded into it. Reading them off
+		 * the snapshot here silently defeated that exception: a
+		 * `sync tau mode survey` command visibly changed the LIVE
+		 * singleton (and its own console print confirmed it), while
+		 * this loop kept computing `twr_tau_mode_active` from
+		 * whatever `sync_tau_mode` was AT BOOT, forever, until the
+		 * anchor rebooted -- so a TWR-sourced tau kept getting
+		 * re-applied every round-robin turn no matter what mode the
+		 * operator switched to. */
+		const uwb_config_t *live_cfg = uwb_config_get();
 		bool twr_tau_mode_active =
-			cfg->sync_tau_mode == SYNC_TAU_MODE_TWR ||
-			cfg->sync_tau_mode == SYNC_TAU_MODE_AUTO;
+			live_cfg->sync_tau_mode == SYNC_TAU_MODE_TWR ||
+			live_cfg->sync_tau_mode == SYNC_TAU_MODE_AUTO;
 
 		if (ccp_slave_on_rx(rx_buf, plen, rx_ts,
 				    uwb_config_short_addr(cfg),
 				    twr_tau_mode_active,
-				    cfg->sync_tau_dtu)) {
+				    live_cfg->sync_tau_dtu)) {
 			rx_arm();
 			continue;
 		}
