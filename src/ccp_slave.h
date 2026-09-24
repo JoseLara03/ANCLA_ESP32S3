@@ -57,8 +57,24 @@ void ccp_slave_init(void);
  * `rx_ts` is the full 40-bit DW3220 RX timestamp, exactly as
  * uwb_get_rx_timestamp_u64() returns it. Do not shift it: sync_model works in
  * whole DTU, and handing it a hi32 value would throw away the bottom 8 bits --
- * 255 DTU, ~4 ns, against a 1 ns gate. */
-bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts);
+ * 255 DTU, ~4 ns, against a 1 ns gate.
+ *
+ * `own_short_addr` (B14 Fase B, Task 4) is this anchor's own wire address
+ * (uwb_config_short_addr()) -- needed to tell whether a v2 CCP's
+ * tau_meas_anchor is addressed to THIS board, since ccp_slave.c otherwise
+ * carries no uwb_config dependency at all (deliberately -- see the
+ * module comment). `twr_tau_mode_active` is whether the CURRENT
+ * sync_tau_mode is TWR or AUTO (uwb_config_get()->sync_tau_mode ==
+ * SYNC_TAU_MODE_TWR/_AUTO), resolved by the CALLER for the same reason:
+ * this file stays config-agnostic, matching how ccp_slave_set_tau()'s
+ * value is already resolved externally (sync_shell.c's apply_tau_live())
+ * rather than read from uwb_config here. The filter itself (tau_filter.c)
+ * always runs on every v2 frame addressed to this anchor regardless of
+ * this flag, so switching INTO twr/auto mode never has to "warm up" --
+ * only whether its output is actually APPLIED (ccp_slave_set_tau()) is
+ * gated on it. */
+bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
+		     uint16_t own_short_addr, bool twr_tau_mode_active);
 
 /* The live model, for the `sync` shell command. Read-only: on a SLAVE, main()
  * is left at the default (preemptible) priority -- see main.c's comment on why
@@ -157,5 +173,42 @@ void ccp_slave_set_tau(int32_t tau_dtu);
 
 /* The tau currently applied to the live model. */
 int32_t ccp_slave_get_tau(void);
+
+/* ---- B14 Fase B, Task 4: TWR filter telemetry (FR-10) -------------------
+ *
+ * All read-only, all safe from the shell thread with no locking: each is a
+ * single plain-old-data field the SLAVE loop only ever REPLACES wholesale
+ * (never partially updates across multiple stores), same reasoning
+ * ccp_slave_model()'s own comment gives for why a const read needs no
+ * fence here.
+ */
+
+/* True if this anchor's tau IS CURRENTLY the TWR filter's output (i.e. the
+ * live value applied via ccp_slave_get_tau() came from tau_filter.c, not
+ * from a `sync tau set`/mode-entry console write) -- "tau_source" in
+ * FR-10's telemetry list, as a bool rather than a string so the shell
+ * layer owns the string mapping. */
+bool ccp_slave_twr_is_source(void);
+
+/* The TWR filter's own current estimate, independent of sync_tau_mode or
+ * whether it has ever been applied -- lets an operator preview what TWR
+ * would give even while parked in survey/legacy mode. *have is false (and
+ * *tau_dtu 0) if no v2 measurement addressed to this anchor has ever
+ * passed the quality gate. */
+void ccp_slave_twr_tau(bool *have, int32_t *tau_dtu);
+
+/* Milliseconds since the last ACCEPTED (quality-gate-passed) TWR sample,
+ * from k_uptime_get_32() -- UINT32_MAX if none yet. FR-10's
+ * "tau_twr_age_s" is this divided by 1000 at the shell layer, matching
+ * every other *_s console field's convention in this project. */
+uint32_t ccp_slave_twr_age_ms(void);
+
+/* The quality byte of the last ACCEPTED TWR sample (undefined, reads 0, if
+ * none yet -- check ccp_slave_twr_tau()'s *have first). */
+uint8_t ccp_slave_twr_last_quality(void);
+
+/* Completed "controlled transition" events (tau_filter.h's
+ * TAU_FILTER_JUMPED) since boot -- FR-10's "tau_jump_events". */
+uint32_t ccp_slave_twr_jump_count(void);
 
 #endif /* CCP_SLAVE_H */

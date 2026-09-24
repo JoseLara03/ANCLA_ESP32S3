@@ -1249,10 +1249,12 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   run on hardware** — the plan's own risk framing for this task ("mayor
   riesgo, como el CCP mismo en su momento") is about real superframe/CFP
   timing, and nothing here has been verified with a sniffer or against a
-  live beacon yet. Tasks 4 (anchor-side EMA + NLOS + jump-detection filter
-  actually consuming `tau_meas_*`), 5 (freshness/degrade wired into
-  `uwb_config_sync_tau_effective()`'s TWR/AUTO stub), 6 (console telemetry
-  per FR-10) and 7 (final host tests / build verification) remain.
+  live beacon yet. **Task 4 (anchor-side EMA + NLOS + jump-detection
+  filter actually consuming `tau_meas_*`) is now also done** — see
+  `src/tau_filter.{c,h}`'s own Layout entry. Task 5 (freshness/degrade
+  wired into `uwb_config_sync_tau_effective()`'s TWR/AUTO stub) and Task 7
+  (final host tests / build verification) remain; Task 6's console
+  telemetry (FR-10) landed as part of Task 4 rather than separately.
 - `src/ccp_sched.h` — where the CCP falls in the superframe. Header-only, no
   `.c`, same pattern as `uwb_mac.h`; host-tested in `tests/ccp_sched/` where
   **including the header is the test**. Carries the design-history writeup for
@@ -1364,6 +1366,23 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   reachable from the shell (`sync reset`'s residual clear) goes through
   `ccp_slave_residual_reset()`, fenced with `k_sched_lock()`/
   `k_sched_unlock()` instead.
+
+  **B14 Fase B, Task 4 (2026-09-24): also the CONSUMER of CCP v2's
+  `tau_meas_*` fields, extracted independently of the deferred-timestamp
+  pairing above** — a v2 payload describes a measurement `gw_selftau.c`'s
+  auto round-robin completed at most a few superframes ago, not "the
+  previous frame" the way `tx_dtu` does, so `ccp_slave_on_rx()` (now
+  taking two new parameters, `own_short_addr` and `twr_tau_mode_active`,
+  both resolved by `uwb_slave.c` so this file stays config-agnostic)
+  extracts and feeds it to `src/tau_filter.c` on EVERY parsed v2 frame
+  addressed to this anchor, before any of the pairing/rebaseline branches
+  run — including a root-change or first-CCP re-init, which must not
+  silently swallow a fresh measurement. See `tau_filter.{c,h}`'s own entry
+  for the filter itself; this file only owns the address match, the
+  mode gate (`apply_twr_tau()`, a second internal write path alongside the
+  public `ccp_slave_set_tau()`, distinguished so `sync tau show` can
+  report which source — console or TWR — is actually live) and the FR-10
+  telemetry getters.
 - `src/sync_shell.c` — the `sync` command tree. Prints the gate's verdict
   itself, because the natural mistake here (reading `rms` as if it were the
   jitter) rejects hardware that passes. Registered unconditionally, including
@@ -1755,6 +1774,54 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   gateway loop now gates on, since `gw_selftau_busy()` stays manual-only
   on purpose), `_take()` (consumed by `ccp_master.c`) and `_get_anchor()`
   (read-only, `sync tau auto show`). **Not yet run on hardware.**
+- `src/tau_filter.{c,h}` — B14 Fase B, Task 4 (2026-09-24): the anchor-side
+  filter that turns gw_selftau.c's raw, unaveraged, per-superframe TWR
+  measurements (arriving over CCP v2) into a value safe to hand
+  `sync_model_set_tau()`. Pure C, no Zephyr dependency, host-tested in
+  `tests/tau_filter/` with every branch checked against a hand-computed
+  exact expected value (same discipline as `sync_model.c`). Three stages
+  per FR-8, in order: (1) an NLOS/quality gate — deliberately NARROW right
+  now (rejects only `GW_SELFTAU_AUTO_QUALITY_NONE`, i.e. "no RSSI read at
+  all"), not a tuned RSSI floor, since CLAUDE.md already records that
+  whether a DW3000 quality figure carries real information at fixed PLEN
+  is unmeasured on this hardware — inventing a specific floor with no site
+  data behind it would repeat that mistake; (2) a slow EMA, alpha =
+  5/100 exactly (not a power-of-two shift like `SYNC_PHASE_EMA_SHIFT` —
+  0.05 isn't one, and that constant's own sweep already showed shifts near
+  it buy negligible extra smoothing, so there is no reason to approximate
+  here instead of computing it exactly); (3) jump detection — 5
+  consecutive accepted samples, all deviating from the currently applied
+  value in the SAME direction by more than ~2 ns
+  (`TAU_FILTER_JUMP_THRESHOLD_DTU`, via `SYNC_DTU_PER_NS` rather than a
+  second independently-derived constant), snap the filter to the MEAN of
+  that confirming run as a "controlled transition" rather than the ~20
+  cycles a pure EMA would take to crawl there. A quality-rejected sample
+  neither advances nor breaks an in-progress jump run — it is absent, not
+  a contradicting measurement, per FR-8's own "mediciones" wording.
+  `src/ccp_slave.c` is the only caller: `ccp_slave_on_rx()` gained two
+  parameters (`own_short_addr`, `twr_tau_mode_active`, both resolved by
+  the CALLER — `src/uwb_slave.c` — so this file stays config-agnostic, the
+  same pattern `sync_shell.c`'s `apply_tau_live()` already uses for
+  `ccp_slave_set_tau()`'s value) and now extracts a v2 frame's
+  `tau_meas_*` fields and feeds the filter on EVERY frame addressed to
+  this anchor, regardless of `sync_tau_mode` or which pairing/rebaseline
+  branch the deferred-timestamp logic takes that same call — the filter
+  always runs, so switching INTO twr/auto mode never starts cold; only
+  whether its output is actually APPLIED (`ccp_slave_set_tau()`, via a new
+  internal `apply_twr_tau()` that also marks the live tau as
+  TWR-sourced) is gated on the mode. New `ccp_slave.h` getters
+  (`ccp_slave_twr_is_source()`, `_twr_tau()`, `_twr_age_ms()`,
+  `_twr_last_quality()`, `_twr_jump_count()`) feed FR-10's telemetry,
+  wired into `sync tau show` the same session (`tau_source`,
+  `tau_twr_dtu`, `tau_twr_age_s`, `twr_quality`, `tau_jump_events` —
+  literal JSON `null` until a first sample has ever passed the quality
+  gate). `sync tau mode twr|auto`'s warning text updated to match: it now
+  starts on the survey value and switches to live TWR the moment a
+  measurement passes the gate, with FR-9's freshness degrade (a stale TWR
+  value reverting to survey after 60 s) still NOT implemented — Task 5.
+  Both firmware images build clean (production `dram0_0_seg` 272152 ->
+  272200 B, +48 B). **Not yet run on hardware** — nothing here has been
+  exercised against a real v2 CCP off the air yet.
 - `src/apos_frame.{c,h}` — the survey wire format: one message type (`0xEB`)
   with a subtype byte carrying seven messages (SURVEY_BEGIN, ENUM_RSP,
   RANGE_CMD, RANGE_RSP, SETPOS, SETPOS_ACK, SURVEY_END). Deliberately *not*
@@ -2870,6 +2937,9 @@ gcc -Wall -Wextra -Isrc -o tests/pos_abg/test_pos_abg.exe tests/pos_abg/test_pos
 
 gcc -Wall -Wextra -Isrc -o tests/gw_selftau/test_gw_selftau.exe tests/gw_selftau/test_gw_selftau.c
 ./tests/gw_selftau/test_gw_selftau.exe          # gw_selftau: ALL TESTS PASSED, exits 0
+
+gcc -Wall -Wextra -Isrc -o tests/tau_filter/test_tau_filter.exe tests/tau_filter/test_tau_filter.c src/tau_filter.c
+./tests/tau_filter/test_tau_filter.exe          # tau_filter: ALL TESTS PASSED, exits 0
 ```
 
 `tests/pos_ekf/` was removed with the EKF on 2026-09-06 (the tag's own copy
@@ -2988,17 +3058,24 @@ that said no remote was configured — true once, not since.
   holding, `rx_cal.py` residuals under 0.5 ns/anchor) has not been attempted.
   Fase B (on-air TWR measurement of tau, so a moved gateway is tracked rather
   than requiring a re-survey) is designed in the same plan doc.
-  **Status 2026-09-24: Tasks 1-3 of 7 done, host-tested and build-verified,
-  NOT yet run on hardware** — CCP v2 wire format (Task 1), and the master
-  now transmits it every superframe carrying an automatic round-robin
+  **Status 2026-09-24: Tasks 1-4 of 7 done, host-tested and build-verified,
+  NOT yet run on hardware** — CCP v2 wire format (Task 1); the master
+  transmitting it every superframe carrying an automatic round-robin
   self-tau measurement (Tasks 2+3, reusing `src/gw_selftau.c`'s
   hardware-proven step machine rather than building the plan's literal "2
   reserved MAC slots" — see that file's and `src/ccp_frame.c`'s own
   entries for the full reasoning, approved as a documented deviation
-  before implementing). `ccp_slave.c` and every anchor remain completely
-  unaffected by this so far: nothing reads the v2 fields yet. Tasks 4-7
-  (the anchor-side EMA/NLOS/jump-detection filter, freshness/degrade
-  logic, console telemetry, final tests) remain.
+  before implementing); and the anchor now actually CONSUMING it (Task 4,
+  `src/tau_filter.{c,h}` + `src/ccp_slave.c` — NLOS/quality gate, EMA
+  alpha=0.05, jump detection, feeding `sync_model_set_tau()` live, gated
+  on `sync_tau_mode` being TWR/AUTO). FR-10's console telemetry
+  (`tau_source`, `tau_twr_dtu`, `tau_twr_age_s`, `twr_quality`,
+  `tau_jump_events`) landed as part of Task 4 rather than waiting for the
+  originally-separate Task 6, once the filter made every one of those
+  fields honestly answerable — see `src/tau_filter.{c,h}`'s own entry
+  below. Tasks 5-7 (freshness/degrade wired into
+  `uwb_config_sync_tau_effective()`'s TWR/AUTO stub, any remaining console
+  polish, final tests/build) remain.
 
 - **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
   gate NOT yet met, TWO independent bias sources found the same session by

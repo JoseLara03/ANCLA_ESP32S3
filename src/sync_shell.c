@@ -39,6 +39,8 @@
 #include <zephyr/shell/shell.h>
 
 #include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -331,10 +333,19 @@ static int cmd_tau_mode(const struct shell *sh, size_t argc, char **argv)
 		    uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
 		    ccp_slave_get_tau());
 	if (mode == SYNC_TAU_MODE_TWR || mode == SYNC_TAU_MODE_AUTO) {
-		shell_warn(sh, "Fase B (on-air TWR measurement) is not "
-				"implemented on this build — \"%s\" resolves "
-				"to the stored SURVEY value (tau_survey_dtu), "
-				"same as \"survey\".",
+		shell_warn(sh, "\"%s\" starts on the stored SURVEY value "
+				"(tau_survey_dtu) and switches to the live "
+				"on-air TWR measurement (src/gw_selftau.c + "
+				"src/tau_filter.c) the moment this anchor's "
+				"next v2 CCP measurement passes the quality "
+				"gate — usually within a few round-robin "
+				"turns. `sync tau show`'s \"tau_source\" says "
+				"which one is actually live right now. NOT "
+				"yet implemented: FR-9's freshness degrade — "
+				"a TWR value that goes stale (this anchor "
+				"stops being addressed, or the master goes "
+				"quiet) is currently kept forever rather than "
+				"reverting to survey after 60 s.",
 			   uwb_config_sync_tau_mode_name(mode));
 	}
 	return 0;
@@ -380,20 +391,57 @@ static int cmd_tau_show(const struct shell *sh, size_t argc, char **argv)
 
 	const uwb_config_t *cfg = uwb_config_get();
 
-	/* tau_twr_* fields are wire-compatible placeholders for FR-6..FR-9
-	 * (Fase B): always "no source yet" on this build, since no on-air
-	 * measurement exists to report. tau_used_dtu is read from the LIVE
-	 * model (ccp_slave_get_tau()), not recomputed from cfg here, so this
-	 * command shows what is actually being applied, not merely what is
-	 * configured -- the two can differ for one superframe if a caller
-	 * changed cfg without going through this file's apply_tau_live(). */
+	/* tau_used_dtu is read from the LIVE model (ccp_slave_get_tau()), not
+	 * recomputed from cfg here, so this command shows what is actually
+	 * being applied, not merely what is configured -- the two can differ
+	 * for one superframe if a caller changed cfg without going through
+	 * this file's apply_tau_live().
+	 *
+	 * tau_source (FR-10) is "twr" only while the TWR filter's own output
+	 * is the value actually live right now (ccp_slave_twr_is_source()) --
+	 * NOT merely "mode is twr/auto", since that mode can still be
+	 * running on a cold-start or degraded (Task 5, not yet wired) value.
+	 * tau_twr_dtu/twr_quality/tau_twr_age_s report the filter's state
+	 * REGARDLESS of source or mode, so an operator can preview what TWR
+	 * would give even while parked on survey/legacy -- rendered as
+	 * literal JSON `null` (not the string "null") until a first sample
+	 * has ever been accepted, via small snprintf'd sub-buffers since
+	 * shell_print() has no conditional-format facility of its own. */
+	bool twr_have = false;
+	int32_t twr_dtu = 0;
+	uint32_t twr_age_ms = ccp_slave_twr_age_ms();
+	char twr_dtu_buf[16];
+	char twr_age_buf[16];
+	char twr_q_buf[8];
+
+	ccp_slave_twr_tau(&twr_have, &twr_dtu);
+
+	if (twr_have) {
+		snprintf(twr_dtu_buf, sizeof(twr_dtu_buf), "%d", twr_dtu);
+	} else {
+		snprintf(twr_dtu_buf, sizeof(twr_dtu_buf), "null");
+	}
+	if (twr_age_ms != UINT32_MAX) {
+		snprintf(twr_age_buf, sizeof(twr_age_buf), "%u",
+			 twr_age_ms / 1000u);
+		snprintf(twr_q_buf, sizeof(twr_q_buf), "%u",
+			 (unsigned int)ccp_slave_twr_last_quality());
+	} else {
+		snprintf(twr_age_buf, sizeof(twr_age_buf), "null");
+		snprintf(twr_q_buf, sizeof(twr_q_buf), "null");
+	}
+
 	shell_print(sh,
 		    "{\"sync_tau\":{\"mode\":\"%s\",\"tau_survey_dtu\":%d,"
-		    "\"tau_used_dtu\":%d,\"tau_twr_dtu\":null,"
-		    "\"tau_twr_age_s\":null,\"twr_quality\":null,"
-		    "\"tau_jump_events\":0}}",
+		    "\"tau_used_dtu\":%d,\"tau_source\":\"%s\","
+		    "\"tau_twr_dtu\":%s,\"tau_twr_age_s\":%s,"
+		    "\"twr_quality\":%s,\"tau_jump_events\":%u}}",
 		    uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
-		    cfg->sync_tau_dtu, ccp_slave_get_tau());
+		    cfg->sync_tau_dtu, ccp_slave_get_tau(),
+		    ccp_slave_twr_is_source() ?
+			"twr" : uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
+		    twr_dtu_buf, twr_age_buf, twr_q_buf,
+		    ccp_slave_twr_jump_count());
 	return 0;
 }
 

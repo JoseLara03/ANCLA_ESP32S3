@@ -43,6 +43,7 @@ target_sources(app PRIVATE
 	src/sync_model.c
 	src/sync_shell.c
 	src/tag_id.c
+	src/tau_filter.c
 	src/tdoa_collect.c
 	src/tdoa_dtu.c
 	src/tdoa_gw.c
