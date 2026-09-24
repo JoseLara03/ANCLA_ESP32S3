@@ -3096,9 +3096,34 @@ that said no remote was configured — true once, not since.
   test's outcome. Gateway reverted to `anchor cell blink` + reboot
   afterward to restore the TDoA deployment.
 
-  Remaining: the T6 (`kernel reboot cold`) regression for THIS fix
-  specifically (distinct from the anchor-cell-mode reboots just done, which
-  were operational, not the B14 induced-reboot transient test).
+  **T6 (`kernel reboot cold`) regression: run, partially verified.** Tag
+  static at P2. 300 s baseline before the reboot (n=45, error 0.321 m vs
+  the laser-verified true position, stdev 0.305/0.235); gateway
+  `kernel reboot cold`; 600 s captured through the reboot and after
+  (n=92). No timestamp per message in this session's capture tooling (a
+  real gap in `tools/`, worth fixing before the next induced-reboot test)
+  means the exact transient moment cannot be located in the file, so the
+  plan's own "position transient in mm, before vs after" template cannot
+  be filled with a precise number here -- what follows is the coarser
+  substitute this session's tooling could actually produce. Every slice
+  checked (first 10 fixes after the capture restarted, last 30, the whole
+  600 s) reads error 0.328-0.339 m, stdev in the same 0.16-0.32 m band as
+  the baseline -- **no permanent bias shift, no crash, publishing resumed
+  at the same cadence.** That is real, positive evidence against the
+  failure mode T6 exists to prevent (a re-baseline that silently poisons
+  every position afterward). What it does NOT establish: the FINE-GRAINED
+  transient itself. This tag reports roughly once per 6-7 s at its
+  current tier, far coarser than B13's own ~0.5-2 s recovery window
+  (`SYNC_SKEW_MAX_AGE_DTU`'s budget, `sync_model.h`) -- two fixes that far
+  apart cannot resolve a transient shorter than the gap between them, so
+  an unremarkable-looking sequence here is WEAK evidence the transient
+  behaved, not strong evidence, and the doc's own acceptance template
+  (`rebaselines` incrementing by exactly 1, `sigma_dtu` rising then
+  falling) needs `sync stats` on each anchor -- console-only, no MQTT
+  publication of it exists, and none of the four anchors had USB reach
+  this session. That half of T6's acceptance stays open until physical
+  access is possible.
+
   `0x0002`'s ~487 mm surveyed-position error is STILL open and unfixed --
   it simply cost little at these two particular tag locations, which is a
   property of where the tag stood (this array's GDOP amplification runs
@@ -3110,8 +3135,19 @@ that said no remote was configured — true once, not since.
   defect; not chased further this session. None of the four anchors could
   be reflashed this session (USB out of reach post-install, `anchor pos`
   sync and the `ant_rx` T0 probe were the only console access this
-  session had) -- keep that constraint in mind when planning how the T6
-  regression gets executed on this specific deployment.
+  session had).
+
+  **Gate A checklist, final status for this session:** numeric target (2/2
+  points) PASS, negative test PASS, T0 PASS, RX-split evaluated (no
+  correction needed) PASS, T6 PARTIAL (no permanent-shift/crash evidence
+  is solid; the fine-grained transient and per-anchor counters are not
+  verifiable without anchor USB access), TWR regression NOT EXECUTABLE
+  against the current (blink-only) tag fleet. Nothing here is blocked on
+  more analysis -- everything left open is blocked on physical access to
+  the anchors (USB for `sync stats`/reflash) or hardware that does not
+  exist in this deployment (a pre-Phase-3 tag). `0x0002`'s survey-position
+  error is the one item that is neither closed nor access-blocked --
+  it is simply not yet worked.
 
 - **`sync_model` published conversions from a one-interval baseline after
   every re-baseline — fixed 2026-09-18 (B13), and the fix's own limit is worth
