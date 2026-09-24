@@ -1245,11 +1245,34 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   quotes the old figure and has not been updated to match.
 
   Both firmware images build clean (production `dram0_0_seg` 272096 ->
-  272152 B, +56 B for the auto round-robin's per-anchor cache). **Not yet
-  run on hardware** — the plan's own risk framing for this task ("mayor
-  riesgo, como el CCP mismo en su momento") is about real superframe/CFP
-  timing, and nothing here has been verified with a sniffer or against a
-  live beacon yet. **Tasks 4-7 are now all also done** — see
+  272152 B, +56 B for the auto round-robin's per-anchor cache).
+
+  **Run on hardware 2026-09-25 (gateway only, all four anchors offline for
+  battery charging — a real, if accidental, 100%-exchange-failure stress
+  test) — the plan's own flagged risk ("mayor riesgo, como el CCP mismo en
+  su momento") is CLEARED.** `sync master` after ~46 min (13759 CCPs):
+  `dropped:0`, `arm_cost_ns_last:229550` against the v2 budget of
+  `263594` — **34044 ns (13%) of measured margin, positive**, tighter
+  than v1's but real and sustained, not a compile-time guess.
+  `offset_ns_min/max` spread only 76619 ns, far inside that margin, so
+  this is a stable number, not a near-miss. No
+  `"beacon started but TXFRS never completed"` and no `cap_overlap`
+  warning across the whole run. The accidental 100%-failure window is
+  itself useful evidence: `gw_selftau_step()`'s auto path kept cycling
+  every superframe for 46 minutes with every single exchange timing out
+  (no anchors to answer) and the beacon never missed a cycle — confirms
+  the reserve-check gating is safe under sustained total failure, not
+  just the occasional miss Fase A's manual tool saw. **Still open from
+  this same session, unrelated to the CCP timing question just closed**:
+  of the four anchors, `0x0004` got ZERO successful SS-TWR exchanges via
+  the auto path in the window observed before the fleet went offline for
+  charging (the other three matched Fase A's known-good values closely --
+  `0x0001` 706 vs 712, `0x0003` 382 vs 381 on the nose, `0x0002` 251 vs
+  226, the latter noisier because the auto path is deliberately
+  unaveraged n=1 per turn) -- not yet root-caused, candidates being
+  range/LOS from the gateway's current mounted position vs a power/boot
+  issue, to revisit once the anchors are charged and back up. **Tasks 4-7
+  are now all also done** — see
   `src/tau_filter.{c,h}`'s and `src/ccp_slave.c`'s own Layout entries for
   the anchor-side filter (Task 4) and freshness degrade (Task 5); Task 6's
   console telemetry (FR-10) landed as part of Task 4 rather than
@@ -3084,8 +3107,13 @@ that said no remote was configured — true once, not since.
   holding, `rx_cal.py` residuals under 0.5 ns/anchor) has not been attempted.
   Fase B (on-air TWR measurement of tau, so a moved gateway is tracked rather
   than requiring a re-survey) is designed in the same plan doc.
-  **Status 2026-09-24: all 7 tasks done, host-tested and build-verified,
-  NOT yet run on hardware.** CCP v2 wire format (Task 1); the master
+  **Status 2026-09-24: all 7 tasks done, host-tested and build-verified.
+  Status 2026-09-25: CCP v2's timing margin CONFIRMED on hardware
+  (gateway only, `dropped:0` and positive measured arm-cost margin over a
+  46-minute run — see `src/ccp_frame.c`'s own entry for the numbers);
+  the anchor-side filter and freshness degrade (Tasks 4-5) still have NOT
+  run on hardware, since all four anchors were offline for battery
+  charging during this session.** CCP v2 wire format (Task 1); the master
   transmitting it every superframe carrying an automatic round-robin
   self-tau measurement (Tasks 2+3, reusing `src/gw_selftau.c`'s
   hardware-proven step machine rather than building the plan's literal "2
@@ -3112,8 +3140,13 @@ that said no remote was configured — true once, not since.
   reasoning. Final Task 7 sweep: every host suite touched by Fase B
   (`ccp_frame`, `ccp_sched`, `gw_selftau`, `tau_filter`, plus the full
   existing suite) passes, and both firmware images build clean with the
-  complete Fase B changeset. What remains for B14 as a whole is unchanged
-  from before this phase: nothing in Fase B has run on a board yet.
+  complete Fase B changeset. **2026-09-25: the CCP v2 timing question
+  (Tasks 2+3's own flagged risk) is now closed on hardware** — see
+  `src/ccp_frame.c`'s entry. Tasks 4 and 5 (the anchor-side filter and
+  freshness degrade) are still unverified on hardware — no anchor was up
+  during this session (all four offline charging), only the gateway.
+  0x0004 not answering the auto round-robin at all is also still open,
+  separate from and not evidence against the CCP timing result.
 
 - **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
   gate NOT yet met, TWO independent bias sources found the same session by
