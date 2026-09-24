@@ -3015,11 +3015,24 @@ that said no remote was configured — true once, not since.
   hit. Confirms the fix is structural, not a numerical coincidence at one
   spot.
 
+  **T0 antenna-delay-invariance repeat: PASSES.** `ant_rx` bumped +400 on
+  `0x0003`, `kernel reboot cold`, tag left at the same P2 spot: 226 fixes
+  average `(2.186, 2.233)`, 0.101 m from the true position (2.098, 2.183)
+  -- if anything tighter than the pre-change baseline (0.224 m) -- and only
+  0.12-0.15 m from the pre-change reported mean, the same order as this
+  array's normal run-to-run noise (stdev 0.10-0.13 m here vs 0.09-0.20 m
+  earlier). No systematic jump from a 400-DTU RX-delay change on a slave,
+  confirming B14's fix did not disturb the pre-existing T0-A invariant
+  (the DW3220 subtracts `ant_rx` from every timestamp including the CCP, so
+  a slave's own RX delay already cancelled between training and evaluation
+  before this fix, and still does). `ant_rx` reverted to its original value
+  and rebooted afterward -- this was a probe, not a config change.
+
   What still needs running before the gate can be called fully closed
-  (unchanged, none of it satisfied by the above): the T0
-  antenna-delay-invariance repeat; `tools/rx_cal.py` residuals under
-  0.5 ns/anchor from a fresh capture; the TWR tag<->anchor regression
-  (±10 cm against pre-fix); and the T6 (`kernel reboot cold`) regression.
+  (unchanged, none of it satisfied by the above): `tools/rx_cal.py`
+  residuals under 0.5 ns/anchor from a fresh capture; the TWR tag<->anchor
+  regression (±10 cm against pre-fix); and the T6 (`kernel reboot cold`)
+  regression.
   `0x0002`'s ~487 mm surveyed-position error is STILL open and unfixed --
   it simply cost little at these two particular tag locations, which is a
   property of where the tag stood (this array's GDOP amplification runs
