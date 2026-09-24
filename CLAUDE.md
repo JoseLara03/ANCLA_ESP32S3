@@ -3111,9 +3111,13 @@ that said no remote was configured — true once, not since.
   Status 2026-09-25: CCP v2's timing margin CONFIRMED on hardware
   (gateway only, `dropped:0` and positive measured arm-cost margin over a
   46-minute run — see `src/ccp_frame.c`'s own entry for the numbers);
-  the anchor-side filter and freshness degrade (Tasks 4-5) still have NOT
-  run on hardware, since all four anchors were offline for battery
-  charging during this session.** CCP v2 wire format (Task 1); the master
+  the anchor-side filter and freshness degrade (Tasks 4-5) had NOT run on
+  hardware, since all four anchors were offline for battery charging.
+  Status 2026-09-25, later the same day: anchor `0x0004` came back online
+  (charging via USB) and Tasks 4 AND 5 both ran on real hardware,
+  confirmed working, and Task 5 caught a real (now fixed) reporting bug
+  in the process -- see the T4/T5 hardware entry a few paragraphs below
+  for the full readout.** CCP v2 wire format (Task 1); the master
   transmitting it every superframe carrying an automatic round-robin
   self-tau measurement (Tasks 2+3, reusing `src/gw_selftau.c`'s
   hardware-proven step machine rather than building the plan's literal "2
@@ -3148,7 +3152,60 @@ that said no remote was configured — true once, not since.
   0x0004 not answering the auto round-robin at all is also still open,
   separate from and not evidence against the CCP timing result.
 
-- **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
+- **B14 Fase B Tasks 4 and 5 run on hardware for the first time, 2026-09-25
+  (anchor `0x0004`, reconnected via USB to charge): both confirmed
+  working, and the exercise caught and fixed a real reporting bug.**
+  `0x0004`'s earlier 100% auto-round-robin failure (recorded just above)
+  turned out to be nothing but battery -- once powered via USB it heard
+  and answered the gateway's poll immediately, same board, same
+  position.
+
+  **Task 4 (filter):** `sync tau mode twr` on `0x0004` applied the
+  cold-start survey seed (`tau_used_dtu:796`, the Fase A on-air value
+  from BEFORE this anchor's final wall/ceiling mount) exactly as
+  designed, then adopted the first live measurement immediately
+  (`tau_twr_dtu:341`, unsmoothed seed per tau_filter.c's own contract)
+  and visibly converged over the next several `sync tau show` reads: 341
+  -> 349 -> 358 -> 362 -> 365 -> 367, step size shrinking each time (EMA
+  alpha=0.05 behaving exactly as modelled), `twr_quality` stable at
+  17-22, `tau_jump_events:0` throughout (no false jump triggers on
+  ordinary convergence noise). **The gap between the old value (796) and
+  the converged one (~370, ~430 DTU / ~6.7 ns / ~2 m) is real, not
+  noise or a bug** -- `0x0004` physically moved between the original Fase
+  A measurement and its final mount, and this is exactly the scenario
+  Fase B exists to track automatically instead of requiring another
+  manual `gw_selftau` run. `tau_source` correctly read `"twr"` throughout
+  this phase.
+
+  **Task 5 (freshness degrade), tested deliberately:** `sync tau auto
+  off` on the GATEWAY, wait >60 s, confirmed on `0x0004`'s own console
+  log: `{"ccp_slave":{"tau_degrade":1,"age_ms":60002,
+  "reverted_survey_dtu":796}}` -- fired at essentially exactly the 60000
+  ms threshold, and `tau_used_dtu` correctly reverted to 796. **But
+  `sync tau show` right after still printed `"tau_source":"twr"`** --
+  looked like the degrade had silently failed, until the OTHER fields in
+  the same line (`tau_twr_age_s:120`, i.e. 2 minutes since the last
+  accepted sample, `tau_twr_dtu:418` unchanged from the filter's own
+  frozen state) proved no new sample could possibly have re-promoted it.
+  Root cause: `cmd_tau_show()`'s `tau_source` fallback (when
+  `ccp_slave_twr_is_source()` is false) printed
+  `uwb_config_sync_tau_mode_name(cfg->sync_tau_mode)` -- and
+  `sync_tau_mode` was still `SYNC_TAU_MODE_TWR`, whose NAME is the
+  literal string `"twr"`, identical by coincidence to the sentinel this
+  field uses for "the applied value actually came from the live filter".
+  So the mode's name and the value's provenance collided in exactly the
+  one case (mode TWR, source NOT twr) where they disagree and the
+  distinction matters most. Fixed in `sync_shell.c`'s `cmd_tau_show()`:
+  the fallback is now `"legacy"` under LEGACY mode (matches the forced-0
+  value) and `"survey"` under every other mode (SURVEY, or TWR/AUTO
+  sitting on the cold-start seed or a Task-5 degrade, both of which are
+  always literally the survey value) -- independent of the mode's own
+  name. Both firmware images rebuilt clean after the fix,
+  `dram0_0_seg` unchanged (string-selection logic only, no new state).
+  **Not yet re-verified on hardware with the fix applied** -- the
+  original degrade and the buggy report were both caught on the
+  pre-fix build; the next `0x0004` (or any TWR-mode anchor) session
+  should confirm `tau_source` now reads `"survey"` after a degrade.
   gate NOT yet met, TWO independent bias sources found the same session by
   cross-checking `gw_selftau` against a laser distance meter -- not one, and
   not the one first suspected.** Deployment: 4 anchors physically fixed in

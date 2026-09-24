@@ -431,15 +431,38 @@ static int cmd_tau_show(const struct shell *sh, size_t argc, char **argv)
 		snprintf(twr_q_buf, sizeof(twr_q_buf), "null");
 	}
 
+	/* Caught on hardware 2026-09-25: printing uwb_config_sync_tau_mode_name()
+	 * as the "not TWR-sourced" fallback is wrong specifically under mode
+	 * TWR itself -- that mode's own NAME is the string "twr", identical
+	 * to the sentinel this field uses for "the applied value actually
+	 * came from the live filter". So a degrade (Task 5) correctly reverted
+	 * tau_used_dtu to the survey value and correctly cleared
+	 * ccp_slave_twr_is_source(), but this line still printed
+	 * "tau_source":"twr" -- reporting the MODE, not the actual
+	 * provenance, and looking exactly like the degrade had silently
+	 * failed. The provenance of a NOT-twr-sourced tau_used_dtu is always
+	 * "legacy" (forced 0) under LEGACY mode and "survey" under every
+	 * other mode -- survey mode uses it directly, and TWR/AUTO mode uses
+	 * it as the cold-start seed and the Task 5 degrade target, never
+	 * anything else -- so that is what belongs here, independent of the
+	 * mode's own name. */
+	const char *tau_source;
+
+	if (ccp_slave_twr_is_source()) {
+		tau_source = "twr";
+	} else if (cfg->sync_tau_mode == SYNC_TAU_MODE_LEGACY) {
+		tau_source = "legacy";
+	} else {
+		tau_source = "survey";
+	}
+
 	shell_print(sh,
 		    "{\"sync_tau\":{\"mode\":\"%s\",\"tau_survey_dtu\":%d,"
 		    "\"tau_used_dtu\":%d,\"tau_source\":\"%s\","
 		    "\"tau_twr_dtu\":%s,\"tau_twr_age_s\":%s,"
 		    "\"twr_quality\":%s,\"tau_jump_events\":%u}}",
 		    uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
-		    cfg->sync_tau_dtu, ccp_slave_get_tau(),
-		    ccp_slave_twr_is_source() ?
-			"twr" : uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
+		    cfg->sync_tau_dtu, ccp_slave_get_tau(), tau_source,
 		    twr_dtu_buf, twr_age_buf, twr_q_buf,
 		    ccp_slave_twr_jump_count());
 	return 0;
