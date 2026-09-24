@@ -3028,19 +3028,75 @@ that said no remote was configured — true once, not since.
   before this fix, and still does). `ant_rx` reverted to its original value
   and rebooted afterward -- this was a probe, not a config change.
 
-  What still needs running before the gate can be called fully closed
-  (unchanged, none of it satisfied by the above): `tools/rx_cal.py`
-  residuals under 0.5 ns/anchor from a fresh capture; the TWR tag<->anchor
-  regression (±10 cm against pre-fix); and the T6 (`kernel reboot cold`)
-  regression.
+  **`tools/rx_cal.py` run on real hardware for the first time, 2026-09-24 --
+  no correction applied, and that is the right call, not an unfinished
+  step.** Captured the raw `uwb/anchor/blink/<zone>` topic at four spots
+  (`anchor show`'s stale `x`/`y` -- see below -- is NOT what this needs;
+  anchor geometry came from the applied `apos_solve`). Two of the four
+  spots (P1, the plan's own centroid guess never laser-verified; P3, whose
+  own multilateration residual was already flagged as elevated, 70-166 mm
+  vs P2's <20 mm) turned out to have wrong ASSUMED positions -- P3
+  specifically showed the same large negative shift on all three
+  non-reference anchors at once, which is the signature of a bad spot
+  coordinate, not a real RX-delay difference (a genuine per-anchor offset
+  would not move together like that). With those two excluded, the two
+  laser-verified spots (P2, P4) gave near-zero mean bias on all three
+  anchors (-3 to -33 mm) -- but `rx_cal.py`'s own consistency check still
+  printed INCONSISTENT, because its threshold is `spread < 50% of the
+  mean`, and dividing a ~70-130 mm spread (plausible noise at n=225-256)
+  by a near-zero mean makes any nonzero spread look enormous in relative
+  terms. **Conclusion: the RX split does not need correcting on this
+  fleet post-B14** -- the magnitudes involved are at the noise floor, and
+  applying a "correction" of a few tens of mm would not be evidence-based.
+  This also reframes the project's own 2026-08-28 laser campaign and the
+  original "~971 mm of range-difference bias" RX-split estimate in
+  `docs/diag-tdoa-precision-stage1-audit.md`: with B14 unfixed at the
+  time, a large share of what looked like RX-split bias may actually have
+  been the B14 term itself, now removed. Only 2 of the tool's own
+  recommended "at least four" spots were trustworthy; re-doing P1 and P3
+  with their own laser triangulation (same method §"First Gate A field
+  run" already used for P2/P3/P4) would strengthen this conclusion but is
+  not blocking.
+
+  **TWR tag<->anchor regression: run, and it did NOT reproduce the exact
+  plan wording (`±10 cm against pre-fix`) because no pre-fix TWR baseline
+  was ever recorded to compare against -- but nothing anomalous showed
+  up.** `anchor cell twr` + `kernel reboot cold` on the gateway; found
+  and fixed a real latent bug on the way in: `anchor pos` (the legacy
+  per-anchor field the classic WAVE responder encodes into its reply) had
+  drifted from the applied survey (`apos_store`) -- confirmed on `0x0003`
+  earlier this session (`anchor show` read `3.51, 2.63` against the
+  survey's `3.629, 2.326`) -- so all four were re-synced to the survey's
+  coordinates before this test, or the tag's own TWR solve would have
+  been wrong for a reason unrelated to B14 and muddied the result. Tag
+  held at P2 (the best-verified ground truth, `(2.098, 2.183)`): 39
+  fixes over the `uwb/response/position/<zone>` MQTT topic (no
+  `residual`/`n` on that topic, console-only) average `(2.170, 1.994)`,
+  **0.202 m of error, SE ~0.03-0.04 m** (a solid number, not noise). That
+  is in the SAME band as TDoA's own error at the identical spot
+  (0.208-0.224 m) -- consistent with a shared array noise/GDOP floor
+  common to both ranging modes on this deployment, not a TWR-specific
+  regression and not evidence B14 touched this path (which the code
+  already rules out structurally: TWR never enters `sync_model.c`).
+  Gateway reverted to `anchor cell blink` + reboot afterward to restore
+  the TDoA deployment.
+
+  Remaining: the T6 (`kernel reboot cold`) regression for THIS fix
+  specifically (distinct from the anchor-cell-mode reboots just done, which
+  were operational, not the B14 induced-reboot transient test).
   `0x0002`'s ~487 mm surveyed-position error is STILL open and unfixed --
   it simply cost little at these two particular tag locations, which is a
   property of where the tag stood (this array's GDOP amplification runs
-  1.16-4.21x depending on position), not evidence the defect is gone. None
-  of the four anchors could be reflashed or re-verified with `anchor show`
-  this session (USB out of reach post-install) -- keep that constraint in
-  mind when planning how any of the above get executed on this specific
-  deployment.
+  1.16-4.21x depending on position), not evidence the defect is gone. Its
+  `apos run` re-solve this session moved further still (`0x0003` now
+  `(3.695, 2.085)` against the earlier `(3.629, 2.326)`, a ~250 mm shift on
+  one coordinate with no anchor having moved) -- normal solve-to-solve
+  variance on a thin 2D mesh, or a symptom of the same still-open survey
+  defect; not chased further this session. None of the four anchors could
+  be reflashed this session (USB out of reach post-install, `anchor pos`
+  sync and the `ant_rx` T0 probe were the only console access this
+  session had) -- keep that constraint in mind when planning how the T6
+  regression gets executed on this specific deployment.
 
 - **`sync_model` published conversions from a one-interval baseline after
   every re-baseline — fixed 2026-09-18 (B13), and the fix's own limit is worth
