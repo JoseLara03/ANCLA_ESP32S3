@@ -812,6 +812,15 @@ sync tau measure <id> [n]      GATEWAY-only: range THIS gateway directly to
                                for anchor <id>'s OWN `sync tau set` — this
                                command applies nothing locally
 sync tau result                last `sync tau measure` run, as JSON
+sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
+                               automatic round-robin tau measurement
+                               (default ON). Reuses gw_selftau's step
+                               machine to measure one anchor per
+                               superframe, feeding CCP v2's tau_meas_*
+                               fields with no operator action needed.
+                               `off` reverts to sending
+                               CCP_TAU_MEAS_ANCHOR_NONE every superframe;
+                               `sync tau measure` is unaffected either way
 ```
 
 ## Layout
@@ -1180,6 +1189,70 @@ sync tau result                last `sync tau measure` run, as JSON
   wired). Host-tested in `tests/ccp_frame/` (6 new cases); needed its own
   errno shim to build on this host at all, see the Host Tests section
   below for why.
+
+  **B14 Fase B, Tasks 2+3 (2026-09-24): the master now sends v2 every
+  superframe, carrying an automatic round-robin measurement — and this
+  deliberately did NOT build the plan's literal "2 reserved MAC slots".**
+  Re-examined before writing any new scheduling code: `src/gw_selftau.c`
+  (Fase A's manual on-air self-tau tool, hardware-validated the same day
+  this plan started) is ALREADY exactly the primitive FR-6 needs — a
+  budget-gated, beacon-margin-checked, one-bounded-SS-TWR-exchange-per-call
+  step machine. The only things Fase B actually needed on top of it were
+  (a) an automatic trigger instead of an operator running `sync tau
+  measure`, and (b) publishing the result on the wire instead of a console
+  line. Building a NEW dedicated superframe partition for this would have
+  duplicated a mechanism already proven safe on hardware, for no benefit —
+  flagged to the operator as a real design deviation from the plan's
+  literal text before proceeding (approved: "reutiliza gw_selftau, pues al
+  final de cuentas fue un adelanto que hicimos de la Fase B"). See
+  `src/gw_selftau.h`'s own "Fase B" header comment for the full mechanism:
+  `gw_selftau_step()` now also drives an unaveraged (n=1), round-robin
+  auto exchange, capped to ONE per superframe by
+  `gw_selftau_auto_new_superframe()` (called once per superframe from
+  `uwb_gateway.c`, same placement as `tdoa_gw_step()`) — which at this
+  deployment's 4 anchors / 200 ms superframe gives ~1.25 Hz/anchor,
+  matching the plan's own §4.3 target exactly, self-throttling by
+  construction (the existing beacon-margin reserve check just skips a
+  turn on a busy superframe, latency not correctness). `twr_quality` is
+  populated from `ss_initiator_range_ex()`'s RSSI (already-hardware-
+  validated, used elsewhere for the range-test) via a documented
+  PLACEHOLDER encoding (`quality ≈ dBm + 100`, clamped 1..255,
+  `GW_SELFTAU_AUTO_QUALITY_NONE` when CIA diagnostics were not ready) —
+  not asserted as a calibrated confidence score, since CLAUDE.md already
+  records that whether a DW3000 quality figure carries real information at
+  fixed PLEN is unmeasured; it exists so the anchor-side filter (Task 4,
+  still open) has a real signal to start from. `ccp_master_after_beacon()`
+  calls `gw_selftau_auto_take()` (consumes the oldest unannounced
+  measurement) each superframe and builds a v2 frame regardless — v1 is no
+  longer the routine case. `ccp_slave.c` needed **zero changes**: it never
+  reads the v2 fields, so this is silent on every anchor until Task 4
+  actually consumes `tau_meas_*` — the exact backward-compatibility
+  property Task 1 built and tested.
+
+  Re-derived, not left stale: `src/ccp_sched.h`'s `CCP_SCHED_MAX_ARM_NS`
+  was sized against `CCP_FRAME_LEN` (21 bytes, v1) — wrong now that v2 (30
+  bytes) is the frame actually transmitted every superframe. Moved to
+  `CCP_FRAME_LEN_V2`: **263594 ns** (was 348300), still comfortably
+  positive — 9 extra bytes cost ~84706 ns of airtime against a guard
+  window with ample headroom. `ccp_master.c`'s own runtime CAP-overlap
+  check now measures against the frame's ACTUAL built length (the `n`
+  `ccp_frame_build()` returns) rather than a compile-time constant, for
+  the same reason. `tests/ccp_sched/` re-pinned for both the v2 budget
+  and the v1 frame's own airtime (kept, since `ccp_frame_build()` can
+  still build a v1 frame on request). CCP airtime share of the 200 ms
+  superframe: 0.687% now (was 0.645%), still far under NFR-1's <1%
+  target — recorded here since `docs/anchor-sync-measurement.md` §2
+  quotes the old figure and has not been updated to match.
+
+  Both firmware images build clean (production `dram0_0_seg` 272096 ->
+  272152 B, +56 B for the auto round-robin's per-anchor cache). **Not yet
+  run on hardware** — the plan's own risk framing for this task ("mayor
+  riesgo, como el CCP mismo en su momento") is about real superframe/CFP
+  timing, and nothing here has been verified with a sniffer or against a
+  live beacon yet. Tasks 4 (anchor-side EMA + NLOS + jump-detection filter
+  actually consuming `tau_meas_*`), 5 (freshness/degrade wired into
+  `uwb_config_sync_tau_effective()`'s TWR/AUTO stub), 6 (console telemetry
+  per FR-10) and 7 (final host tests / build verification) remain.
 - `src/ccp_sched.h` — where the CCP falls in the superframe. Header-only, no
   `.c`, same pattern as `uwb_mac.h`; host-tested in `tests/ccp_sched/` where
   **including the header is the test**. Carries the design-history writeup for
@@ -1669,6 +1742,19 @@ sync tau result                last `sync tau measure` run, as JSON
   sufficient and cheaper than getting outlier rejection right on the first
   try. Both images re-verified building clean after the fix
   (`dram0_0_seg` unchanged -- the change is FLASH only, no new state).
+
+  **Fase B, Tasks 2+3 (2026-09-24): this module now ALSO drives an
+  automatic round-robin**, reusing this exact step machine rather than
+  building a new one -- see the header's own "Fase B" comment block for
+  the mechanism and `src/ccp_frame.c`'s entry above for why this replaced
+  the plan's literal "2 reserved slots" design. Manual (`sync tau
+  measure`/`gw_selftau_request()`) and auto never share state, and manual
+  always wins when both want the radio the same superframe. New API:
+  `gw_selftau_auto_set_enabled()`/`_get_enabled()`, `_new_superframe()`
+  (called once/superframe from `uwb_gateway.c`), `_has_work()` (what the
+  gateway loop now gates on, since `gw_selftau_busy()` stays manual-only
+  on purpose), `_take()` (consumed by `ccp_master.c`) and `_get_anchor()`
+  (read-only, `sync tau auto show`). **Not yet run on hardware.**
 - `src/apos_frame.{c,h}` — the survey wire format: one message type (`0xEB`)
   with a subtype byte carrying seven messages (SURVEY_BEGIN, ENUM_RSP,
   RANGE_CMD, RANGE_RSP, SETPOS, SETPOS_ACK, SURVEY_END). Deliberately *not*
@@ -2901,8 +2987,18 @@ that said no remote was configured — true once, not since.
   bias fit failing to converge, the T0 antenna-delay-invariance probe still
   holding, `rx_cal.py` residuals under 0.5 ns/anchor) has not been attempted.
   Fase B (on-air TWR measurement of tau, so a moved gateway is tracked rather
-  than requiring a re-survey) is designed in the same plan doc but not
-  started.
+  than requiring a re-survey) is designed in the same plan doc.
+  **Status 2026-09-24: Tasks 1-3 of 7 done, host-tested and build-verified,
+  NOT yet run on hardware** — CCP v2 wire format (Task 1), and the master
+  now transmits it every superframe carrying an automatic round-robin
+  self-tau measurement (Tasks 2+3, reusing `src/gw_selftau.c`'s
+  hardware-proven step machine rather than building the plan's literal "2
+  reserved MAC slots" — see that file's and `src/ccp_frame.c`'s own
+  entries for the full reasoning, approved as a documented deviation
+  before implementing). `ccp_slave.c` and every anchor remain completely
+  unaffected by this so far: nothing reads the v2 fields yet. Tasks 4-7
+  (the anchor-side EMA/NLOS/jump-detection filter, freshness/degrade
+  logic, console telemetry, final tests) remain.
 
 - **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
   gate NOT yet met, TWO independent bias sources found the same session by

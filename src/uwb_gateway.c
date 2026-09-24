@@ -606,6 +606,14 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 		 * watchdog without a reason. */
 		tdoa_gw_step(&ctx, k_uptime_get_32());
 
+		/* B14 Fase B: resets the "already took an auto tau turn this
+		 * superframe" latch. Same placement reasoning as tdoa_gw_step()
+		 * just above -- once per superframe, here rather than in the
+		 * inner for(;;), which runs several times per superframe and
+		 * would otherwise let the round-robin race far ahead of its
+		 * intended ~1 exchange/anchor/N-superframes rate. */
+		gw_selftau_auto_new_superframe();
+
 		int64_t loop_entry_ms = k_uptime_get();
 		uint32_t loop_entry_systime = dwt_readsystimestamphi32();
 
@@ -688,14 +696,20 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 						break;
 					}
 				}
-			} else if (gw_selftau_busy()) {
+			} else if (gw_selftau_has_work()) {
 				/* `else`: at most one of the two on any given
 				 * iteration, same as this loop already does for
 				 * every other transmit site. gw_selftau_step()'s
 				 * cost is FIXED (one ss_initiator_range()
 				 * exchange), unlike apos_gw_step()'s variable
 				 * budget above, so the reserve check alone is
-				 * enough -- there is no "avail_uus" to compute. */
+				 * enough -- there is no "avail_uus" to compute.
+				 * gw_selftau_has_work(), not gw_selftau_busy():
+				 * since B14 Fase B, gw_selftau_step() also
+				 * drives the automatic round-robin, which
+				 * gw_selftau_busy() (manual-only, by design --
+				 * `sync tau measure`'s busy check must not trip
+				 * on it) does not see. */
 				int32_t reserve = (int32_t)UUS_TO_HI32(
 					BEACON_ARM_MARGIN_UUS +
 					GW_SELFTAU_STEP_BUDGET_UUS);

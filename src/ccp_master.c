@@ -8,6 +8,7 @@
 
 #include "ccp_frame.h"
 #include "ccp_sched.h"
+#include "gw_selftau.h"
 #include "sync_model.h"
 #include "tag_id.h"
 #include "uwb_config.h"
@@ -58,7 +59,10 @@ LOG_MODULE_REGISTER(ccp_master, ANCLA_LOG_LEVEL);
  * persistently-late arm. */
 #define CCP_MASTER_OVERLAP_LOG_PERIOD_SF 25u
 
-static uint8_t tx_buf[CCP_FRAME_LEN];
+/* Sized for the LARGER of the two frames this module builds: every ordinary
+ * per-superframe CCP is v2 now (see ccp_master_after_beacon() below), only
+ * the "sync txtest" probe (txtest_buf, separate buffer) stays v1. */
+static uint8_t tx_buf[CCP_FRAME_LEN_V2];
 static uint32_t root_id;
 static uint8_t  ccp_seq;
 static uint32_t n_sent;
@@ -205,11 +209,33 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 	 * refuses to pair anything against seq 0xFF (see ccp_slave.c). */
 	uint64_t announce_tx_dtu = have_prev_tx ? prev_tx_dtu : 0u;
 
+	/* B14 Fase B (2026-09-24): every ordinary CCP is v2 now, piggybacking
+	 * gw_selftau.c's automatic round-robin measurement on top of the
+	 * deferred-timestamp payload that was already going out every
+	 * superframe -- see ccp_frame.h's v2 comment for why this costs no
+	 * extra frame. gw_selftau_auto_take() returns false on a superframe
+	 * where no auto exchange has completed since the last CCP (the round
+	 * -robin period is N_ANCHORS superframes, the CCP period is one), in
+	 * which case CCP_TAU_MEAS_ANCHOR_NONE goes out -- ccp_slave.c already
+	 * ignores an unrecognised/absent measurement by construction (see its
+	 * own header), so this is silent on every anchor until Fase B's next
+	 * task (the anchor-side filter) is wired to actually read it. */
+	uint16_t tau_anchor = CCP_TAU_MEAS_ANCHOR_NONE;
+	int32_t  tau_meas_dtu = 0;
+	uint8_t  tau_quality = 0;
+
+	(void)gw_selftau_auto_take(&tau_anchor, &tau_meas_dtu, &tau_quality);
+
 	struct ccp_frame f = {
 		.seq = ccp_seq,
 		.hop = CCP_HOP_ROOT,
 		.tx_dtu = announce_tx_dtu,
 		.root_id = root_id,
+		.version = CCP_VERSION_V2,
+		.tier = 0,
+		.tau_meas_dtu = tau_meas_dtu,
+		.tau_meas_anchor = tau_anchor,
+		.twr_quality = tau_quality,
 	};
 
 	/* Consumed at BUILD time, not on success, and that is deliberate. A CCP
@@ -343,8 +369,11 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 	 * ranging traffic on this superframe. Rate-limited the same way as the
 	 * drop summary above -- this loop is K_PRIO_COOP(0) and cannot afford
 	 * per-superframe logging. */
+	/* `n`, not CCP_FRAME_LEN: this must reflect what was actually put on
+	 * air (v2 today, CCP_FRAME_LEN_V2 bytes), or the check would compare
+	 * against a shorter frame than the one it is meant to be guarding. */
 	int32_t frame_end_ns = offset_ns +
-				(int32_t)CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN);
+				(int32_t)CCP_SCHED_POST_RMARKER_NS((uint32_t)n);
 
 	if (frame_end_ns >= (int32_t)CCP_SCHED_CAP_PREAMBLE_NS) {
 		/* Rate-limited independently of the drop summary above: an

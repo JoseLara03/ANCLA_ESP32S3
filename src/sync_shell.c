@@ -527,6 +527,53 @@ static int cmd_tau_result(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_tau_auto(const struct shell *sh, size_t argc, char **argv)
+{
+	if (strcmp(board_role(), "gateway") != 0) {
+		shell_error(sh, "sync tau auto: gateway mode only (this board "
+				"is \"%s\")", board_role());
+		return -ENOTSUP;
+	}
+
+	if (argc > 1) {
+		if (strcmp(argv[1], "on") == 0) {
+			gw_selftau_auto_set_enabled(true);
+		} else if (strcmp(argv[1], "off") == 0) {
+			gw_selftau_auto_set_enabled(false);
+		} else {
+			shell_error(sh, "sync tau auto: want on|off, or no "
+					"argument to show");
+			return -EINVAL;
+		}
+	}
+
+	shell_print(sh, "{\"sync_tau_auto\":{\"enabled\":%d}}",
+		    gw_selftau_auto_get_enabled() ? 1 : 0);
+
+	for (uint8_t i = 0; i < UWB_MAX_ANCHORS; i++) {
+		bool valid;
+		int32_t tau;
+		uint8_t q;
+
+		gw_selftau_auto_get_anchor(i, &valid, &tau, &q);
+		shell_print(sh,
+			    "{\"sync_tau_auto\":{\"anchor_id\":%u,"
+			    "\"anchor_addr\":\"0x%04X\",\"valid\":%d,"
+			    "\"tau_dtu\":%d,\"quality\":%u}}",
+			    i, (unsigned int)(UWB_ANCHOR_ADDR_BASE + i),
+			    valid ? 1 : 0, tau, q);
+	}
+
+	if (!gw_selftau_auto_get_enabled()) {
+		shell_warn(sh, "auto round-robin is OFF -- every CCP v2 "
+				"announces CCP_TAU_MEAS_ANCHOR_NONE and no "
+				"anchor's tau tracks a moved gateway "
+				"automatically. `sync tau measure` still "
+				"works manually regardless of this setting.");
+	}
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync_tau,
 	SHELL_CMD_ARG(mode, NULL,
 		      "mode <legacy|survey|twr|auto> — select the B14 tau "
@@ -549,6 +596,11 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync_tau,
 	SHELL_CMD_ARG(result, NULL,
 		      "result — the last `sync tau measure` run, as JSON",
 		      cmd_tau_result, 1, 0),
+	SHELL_CMD_ARG(auto, NULL,
+		      "auto [on|off] — GATEWAY-only: show or toggle the Fase B "
+		      "automatic round-robin tau measurement (default ON), "
+		      "which feeds CCP v2's tau_meas_* fields",
+		      cmd_tau_auto, 1, 1),
 	SHELL_SUBCMD_SET_END
 );
 

@@ -41,23 +41,28 @@ static void test_derived_quantities_are_pinned(void)
 /* The number this whole redesign turns on: how much of the post-beacon guard
  * window is left over for the CCP's own frame plus the immediate-TX arm
  * sequence, after subtracting the beacon's own airtime and the CCP's whole
- * SHR-through-FCS airtime. Pinned at 348300 ns per the approved design. */
-static void test_max_arm_ns_is_348300(void)
+ * SHR-through-FCS airtime. Sized against CCP_FRAME_LEN_V2 (30 bytes), not
+ * the original CCP_FRAME_LEN (21): B14 Fase B (2026-09-24) made v2 the
+ * ROUTINE per-superframe frame (src/ccp_master.c), so the budget this test
+ * pins must reflect what is actually transmitted, not the smaller v1
+ * frame. Was 348300 ns against v1; the v1 figure is still pinned just
+ * below for anyone building a v1-only frame, unchanged since it is real
+ * arithmetic over a real (if no longer routine) frame length. */
+static void test_max_arm_ns_is_263594(void)
 {
-	CHECK(CCP_SCHED_MAX_ARM_NS == 348300u);
+	CHECK(CCP_SCHED_MAX_ARM_NS == 263594u);
 
 	uint32_t full_ccp = CCP_SCHED_SHR_NS +
-			    CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN);
+			    CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN_V2);
 
 	CHECK(CCP_SCHED_CAP_PREAMBLE_NS - CCP_SCHED_BEACON_END_NS - full_ccp ==
 	      CCP_SCHED_MAX_ARM_NS);
 }
 
-/* The CCP's total airtime and its share of a superframe. Quoted in
- * docs/anchor-sync-measurement.md section 2, so pin it here rather than letting
- * the doc drift. Unchanged by Option B -- the frame itself did not change
- * size, only when it is transmitted and what it carries. */
-static void test_airtime_share_is_recorded(void)
+/* The v1 frame's own airtime, pinned on its own terms (not part of
+ * CCP_SCHED_MAX_ARM_NS anymore, see above) since ccp_frame_build() can
+ * still build one and it is worth having a number to check it against. */
+static void test_v1_airtime_share_is_recorded(void)
 {
 	uint32_t full = CCP_SCHED_SHR_NS +
 			CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN);
@@ -68,11 +73,27 @@ static void test_airtime_share_is_recorded(void)
 			 MAC_UUS_TO_NS(T_SUPERFRAME_UUS)) == 64u);
 }
 
+/* The v2 frame's airtime and its share of a superframe -- what is ACTUALLY
+ * sent every superframe since B14 Fase B. Quoted in
+ * docs/anchor-sync-measurement.md section 2, so pin it here rather than
+ * letting the doc drift. */
+static void test_v2_airtime_share_is_recorded(void)
+{
+	uint32_t full = CCP_SCHED_SHR_NS +
+			CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN_V2);
+
+	CHECK(full == 1373723u);
+	/* 0.687% of a 200 ms superframe, to a tenth of a per mille. */
+	CHECK((uint32_t)((uint64_t)full * 10000u /
+			 MAC_UUS_TO_NS(T_SUPERFRAME_UUS)) == 68u);
+}
+
 int main(void)
 {
 	test_derived_quantities_are_pinned();
-	test_max_arm_ns_is_348300();
-	test_airtime_share_is_recorded();
+	test_max_arm_ns_is_263594();
+	test_v1_airtime_share_is_recorded();
+	test_v2_airtime_share_is_recorded();
 
 	if (failures) {
 		printf("FAILED %d\n", failures);

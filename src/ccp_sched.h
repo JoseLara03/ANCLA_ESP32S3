@@ -128,7 +128,19 @@
  * MAC contract's guard sizing, independent of how fast any one arm sequence
  * happens to run.
  *
- * Evaluates to 2026728 - 1289017 - 389411 = 348300 today. */
+ * Sized against CCP_FRAME_LEN_V2 (30 bytes), not the original CCP_FRAME_LEN
+ * (21): since B14 Fase B (2026-09-24, src/ccp_master.c) every ordinary
+ * per-superframe CCP is a v2 frame -- v1 is no longer the routine case this
+ * budget has to protect. Using the shorter v1 length here would have been a
+ * live-looking constant nothing actually being transmitted honours anymore,
+ * the same trap this project's own CLAUDE.md already flags for a stale
+ * schedule constant. ccp_master.c's own runtime overlap check mirrors this:
+ * it measures against the ACTUAL built length, not a compile-time constant,
+ * for the same reason.
+ *
+ * Evaluates to 2026728 - 1373723 - 389411 = 263594 today (was 348300
+ * against the smaller v1 frame; 9 extra bytes cost ~84706 ns of airtime,
+ * still leaving ample margin -- see tests/ccp_sched/'s pinned figures). */
 /* Computed in a SIGNED 64-bit type deliberately: every term above is a
  * uint32_t, and an unsigned subtraction that goes negative WRAPS to a huge
  * positive value rather than failing the assert below -- exactly the kind of
@@ -138,7 +150,7 @@
  * instead of vanishing. */
 #define CCP_SCHED_MAX_ARM_NS                                                   \
 	((int64_t)CCP_SCHED_CAP_PREAMBLE_NS -                                  \
-	 (int64_t)(CCP_SCHED_SHR_NS + CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN)) - \
+	 (int64_t)(CCP_SCHED_SHR_NS + CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN_V2)) - \
 	 (int64_t)CCP_SCHED_BEACON_END_NS)
 
 /* The guard window must be wide enough to host one whole CCP frame after the
