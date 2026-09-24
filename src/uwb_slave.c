@@ -379,7 +379,8 @@ void uwb_slave_run(const uwb_config_t *cfg)
 
 		if (ccp_slave_on_rx(rx_buf, plen, rx_ts,
 				    uwb_config_short_addr(cfg),
-				    twr_tau_mode_active)) {
+				    twr_tau_mode_active,
+				    cfg->sync_tau_dtu)) {
 			rx_arm();
 			continue;
 		}

@@ -72,9 +72,18 @@ void ccp_slave_init(void);
  * always runs on every v2 frame addressed to this anchor regardless of
  * this flag, so switching INTO twr/auto mode never has to "warm up" --
  * only whether its output is actually APPLIED (ccp_slave_set_tau()) is
- * gated on it. */
+ * gated on it.
+ *
+ * `survey_tau_dtu` (B14 Fase B, Task 5, FR-9) is `cfg->sync_tau_dtu` --
+ * where a stale TWR value degrades BACK to, checked once per parsed CCP
+ * regardless of that frame's own content (see ccp_slave.c's
+ * check_twr_freshness()). Passed rather than read from uwb_config here
+ * for the same config-agnostic reason as the two parameters above. Always
+ * safe to pass even when TWR was never live: the check is a no-op unless
+ * the currently-applied tau IS TWR-sourced. */
 bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
-		     uint16_t own_short_addr, bool twr_tau_mode_active);
+		     uint16_t own_short_addr, bool twr_tau_mode_active,
+		     int32_t survey_tau_dtu);
 
 /* The live model, for the `sync` shell command. Read-only: on a SLAVE, main()
  * is left at the default (preemptible) priority -- see main.c's comment on why

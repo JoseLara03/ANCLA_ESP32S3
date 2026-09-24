@@ -1249,12 +1249,12 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   run on hardware** — the plan's own risk framing for this task ("mayor
   riesgo, como el CCP mismo en su momento") is about real superframe/CFP
   timing, and nothing here has been verified with a sniffer or against a
-  live beacon yet. **Task 4 (anchor-side EMA + NLOS + jump-detection
-  filter actually consuming `tau_meas_*`) is now also done** — see
-  `src/tau_filter.{c,h}`'s own Layout entry. Task 5 (freshness/degrade
-  wired into `uwb_config_sync_tau_effective()`'s TWR/AUTO stub) and Task 7
-  (final host tests / build verification) remain; Task 6's console
-  telemetry (FR-10) landed as part of Task 4 rather than separately.
+  live beacon yet. **Tasks 4-7 are now all also done** — see
+  `src/tau_filter.{c,h}`'s and `src/ccp_slave.c`'s own Layout entries for
+  the anchor-side filter (Task 4) and freshness degrade (Task 5); Task 6's
+  console telemetry (FR-10) landed as part of Task 4 rather than
+  separately; Task 7's final host-test/build sweep is recorded in the top
+  of this section.
 - `src/ccp_sched.h` — where the CCP falls in the superframe. Header-only, no
   `.c`, same pattern as `uwb_mac.h`; host-tested in `tests/ccp_sched/` where
   **including the header is the test**. Carries the design-history writeup for
@@ -1383,6 +1383,32 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   public `ccp_slave_set_tau()`, distinguished so `sync tau show` can
   report which source — console or TWR — is actually live) and the FR-10
   telemetry getters.
+
+  **Task 5 (FR-9, same session): `check_twr_freshness()`, checked once per
+  parsed CCP** regardless of that frame's own content — a CCP arrives
+  roughly every superframe whenever the sync link is healthy at all, which
+  is exactly the traffic class this concern cares about; a link dead
+  enough that NO CCP arrives is already caught far faster by
+  `sync_model`'s own `SYNC_MISS_MAX` (~5 s), so this 60 s window never has
+  to fire for that case. A no-op unless the currently-applied tau IS
+  TWR-sourced (`twr_is_source`); past `TAU_FRESHNESS_MAX_MS` (60000,
+  FR-9's own number, taken as given — no measured basis yet to tune it)
+  it reverts via the PUBLIC `ccp_slave_set_tau()` (the same call a console
+  `sync tau set` makes, including clearing `twr_is_source`) to
+  `survey_tau_dtu`, a new `ccp_slave_on_rx()` parameter resolved by
+  `uwb_slave.c` (`cfg->sync_tau_dtu`) for the same config-agnostic reason
+  as the other two. Deliberately does NOT reset `tau_filter`'s own learned
+  state — FR-9 is about which source is APPLIED, not about discarding
+  what the filter knows; a genuine relocation during the outage is
+  `tau_filter.c`'s own jump detection to re-confirm once measurements
+  resume, the same as any other jump. **Deviates from the plan's literal
+  text, which says to wire this into
+  `uwb_config_sync_tau_effective()`** — that function is pure and has no
+  way to observe TWR freshness, which lives entirely in this file's
+  runtime state; `uwb_config.h`'s `enum sync_tau_mode` comment carries the
+  same note so the two files cannot disagree about why. Both firmware
+  images build clean, `dram0_0_seg` unchanged (no new persistent state,
+  only a constant and a function).
 - `src/sync_shell.c` — the `sync` command tree. Prints the gate's verdict
   itself, because the natural mistake here (reading `rms` as if it were the
   jitter) rejects hardware that passes. Registered unconditionally, including
@@ -3058,24 +3084,36 @@ that said no remote was configured — true once, not since.
   holding, `rx_cal.py` residuals under 0.5 ns/anchor) has not been attempted.
   Fase B (on-air TWR measurement of tau, so a moved gateway is tracked rather
   than requiring a re-survey) is designed in the same plan doc.
-  **Status 2026-09-24: Tasks 1-4 of 7 done, host-tested and build-verified,
-  NOT yet run on hardware** — CCP v2 wire format (Task 1); the master
+  **Status 2026-09-24: all 7 tasks done, host-tested and build-verified,
+  NOT yet run on hardware.** CCP v2 wire format (Task 1); the master
   transmitting it every superframe carrying an automatic round-robin
   self-tau measurement (Tasks 2+3, reusing `src/gw_selftau.c`'s
   hardware-proven step machine rather than building the plan's literal "2
   reserved MAC slots" — see that file's and `src/ccp_frame.c`'s own
   entries for the full reasoning, approved as a documented deviation
-  before implementing); and the anchor now actually CONSUMING it (Task 4,
+  before implementing); the anchor consuming it (Task 4,
   `src/tau_filter.{c,h}` + `src/ccp_slave.c` — NLOS/quality gate, EMA
   alpha=0.05, jump detection, feeding `sync_model_set_tau()` live, gated
-  on `sync_tau_mode` being TWR/AUTO). FR-10's console telemetry
-  (`tau_source`, `tau_twr_dtu`, `tau_twr_age_s`, `twr_quality`,
-  `tau_jump_events`) landed as part of Task 4 rather than waiting for the
-  originally-separate Task 6, once the filter made every one of those
-  fields honestly answerable — see `src/tau_filter.{c,h}`'s own entry
-  below. Tasks 5-7 (freshness/degrade wired into
-  `uwb_config_sync_tau_effective()`'s TWR/AUTO stub, any remaining console
-  polish, final tests/build) remain.
+  on `sync_tau_mode` being TWR/AUTO), with FR-10's console telemetry
+  folded in the same task once the filter made every field honestly
+  answerable (originally planned as a separate Task 6); and FR-9's
+  freshness degrade (Task 5, `ccp_slave.c`'s `check_twr_freshness()` — a
+  TWR-sourced tau reverting to the survey value after 60 s with no fresh
+  accepted sample, checked on every parsed CCP). **Task 5 is itself a
+  second documented deviation from the plan's literal text**, smaller
+  than Tasks 2+3's: the plan says to wire this into
+  `uwb_config_sync_tau_effective()`, but that function is pure
+  (`const uwb_config_t *` in, a DTU out) and has no way to know whether a
+  live TWR measurement is fresh — that state lives in `ccp_slave.c`'s
+  runtime, not in config. `uwb_config_sync_tau_effective()` is therefore
+  UNCHANGED (still what a mode ENTRY starts from) and the degrade instead
+  lives where the freshness state already is — see `uwb_config.h`'s
+  `enum sync_tau_mode` comment and `ccp_slave.c`'s own entry for the full
+  reasoning. Final Task 7 sweep: every host suite touched by Fase B
+  (`ccp_frame`, `ccp_sched`, `gw_selftau`, `tau_filter`, plus the full
+  existing suite) passes, and both firmware images build clean with the
+  complete Fase B changeset. What remains for B14 as a whole is unchanged
+  from before this phase: nothing in Fase B has run on a board yet.
 
 - **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
   gate NOT yet met, TWO independent bias sources found the same session by

@@ -53,11 +53,24 @@ enum uwb_cell_mode {
  * what tau_dtu corrects and docs/superpowers/plans/2026-09-22-b14-flight-compensation.md
  * for the full derivation.
  *
- * TWR and AUTO are Fase B stubs: this board has no on-air tau measurement
- * yet, so uwb_config_sync_tau_effective() resolves both of them to the same
- * stored survey value SURVEY uses. That is not a placeholder bug -- it is
- * FR-9's documented degrade-on-no-source behaviour, just permanently true
- * until Fase B ships a TWR source to degrade FROM. */
+ * ---- 2026-09-24 update: TWR and AUTO now have a real on-air source -----
+ *
+ * uwb_config_sync_tau_effective() below still resolves TWR and AUTO to the
+ * SAME stored survey value SURVEY uses, and that is now deliberate rather
+ * than a stub: this function is pure (a `const uwb_config_t *` in, a DTU
+ * out) and this struct carries no notion of "is there a fresh live TWR
+ * measurement right now" -- that state lives in src/ccp_slave.c/
+ * src/tau_filter.c, which is stateful, radio-fed and per-anchor-runtime,
+ * not config. So this function is ONLY ever consulted at a mode ENTRY or
+ * an explicit `sync tau set` (sync_shell.c's apply_tau_live()); it answers
+ * "what should TWR/AUTO mode START from", correctly the survey value,
+ * cold-start-safe. The ONGOING behaviour -- adopting a fresh TWR
+ * measurement the moment one passes the quality gate, and degrading BACK
+ * to the survey value after FR-9's 60 s of staleness -- happens entirely
+ * inside ccp_slave.c via direct sync_model_set_tau() writes that bypass
+ * this resolver, since that is where the runtime state this decision
+ * actually needs already lives. See ccp_slave.c's `check_twr_freshness()`
+ * and CLAUDE.md's B14 Fase B Task 5 entry for the full reasoning. */
 enum sync_tau_mode {
 	SYNC_TAU_MODE_LEGACY = 0, /* tau forced to 0 -- FR-11 rollback, bit-exact
 				   * pre-B14-fix behaviour regardless of the
@@ -115,9 +128,12 @@ bool uwb_config_sync_tau_mode_from_name(const char *name, uint8_t *out);
  * NULL. */
 const char *uwb_config_sync_tau_mode_name(uint8_t mode);
 
-/* Resolves FR-3's source priority into the DTU value the sync model should
- * actually apply. TWR and AUTO currently resolve identically to SURVEY --
- * see enum sync_tau_mode's comment for why that is not a bug. */
+/* Resolves FR-3's source priority into the DTU value a mode ENTRY (or an
+ * explicit `sync tau set`) should apply. TWR and AUTO resolve identically
+ * to SURVEY here -- see enum sync_tau_mode's comment for why this is the
+ * correct cold-start value, not the whole FR-9 story: the ONGOING adopt/
+ * degrade behaviour once a mode is live is ccp_slave.c's job, not this
+ * function's. */
 int32_t uwb_config_sync_tau_effective(const uwb_config_t *c);
 
 /* "slave" / "gateway", matched exactly. Returns false and leaves *out

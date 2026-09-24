@@ -71,6 +71,13 @@ static bool     twr_have_last_ms;
 static uint32_t twr_last_ms;
 static uint8_t  twr_last_quality;
 
+/* B14 Fase B, Task 5, FR-9: how long a TWR-sourced tau may go without a
+ * fresh accepted sample before it is reverted to the survey value. The
+ * plan's own number, unrounded -- there is no measured basis yet to tune
+ * it tighter or looser (see tau_filter.h's own note on not inventing
+ * unvalidated thresholds), so it is taken as given rather than re-derived. */
+#define TAU_FRESHNESS_MAX_MS  60000u
+
 /* sync_model_init() plus re-applying the configured tau, so no call site can
  * forget the second half. */
 static void reinit_model(void)
@@ -121,6 +128,41 @@ static void twr_consume(int32_t raw_tau_dtu, uint8_t quality, bool apply)
 	if (apply) {
 		apply_twr_tau(filtered);
 	}
+}
+
+/* B14 Fase B, Task 5 (FR-9): checked on every parsed CCP, regardless of
+ * that frame's own content -- a CCP arrives roughly every superframe
+ * whenever the sync link itself is healthy, which is exactly the traffic
+ * class this check cares about (see this file's own module comment for
+ * why a totally DEAD link is a separate, faster-tripping concern:
+ * sync_model's own SYNC_MISS_MAX invalidates the whole model in ~5 s, long
+ * before this 60 s freshness window would ever matter). A no-op unless
+ * the tau CURRENTLY applied is TWR-sourced, so this costs one branch on
+ * every other call. Calls the PUBLIC ccp_slave_set_tau() rather than
+ * apply_twr_tau(): reverting to survey is exactly what a console
+ * `sync tau set`/mode-entry write already does, including clearing
+ * twr_is_source, so there is no reason for a third code path. Does NOT
+ * reset the TWR filter's own learned state -- FR-9 is about which SOURCE
+ * is applied, not about discarding what the filter has learned; if
+ * something physically moved during the outage, tau_filter.c's own jump
+ * detection (tau_filter.h) is what re-confirms the new value once
+ * measurements resume, exactly as it would for any other jump. */
+static void check_twr_freshness(int32_t survey_tau_dtu)
+{
+	if (!twr_is_source || !twr_have_last_ms) {
+		return;
+	}
+
+	uint32_t age_ms = k_uptime_get_32() - twr_last_ms;
+
+	if (age_ms <= TAU_FRESHNESS_MAX_MS) {
+		return;
+	}
+
+	LOG_WRN("{\"ccp_slave\":{\"tau_degrade\":1,\"age_ms\":%u,"
+		"\"reverted_survey_dtu\":%d}}",
+		age_ms, survey_tau_dtu);
+	ccp_slave_set_tau(survey_tau_dtu);
 }
 
 /* A genuine forward run of `intervals` observations should show local elapsed
@@ -218,7 +260,8 @@ void ccp_slave_init(void)
 }
 
 bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
-		     uint16_t own_short_addr, bool twr_tau_mode_active)
+		     uint16_t own_short_addr, bool twr_tau_mode_active,
+		     int32_t survey_tau_dtu)
 {
 	struct ccp_frame f;
 
@@ -244,6 +287,13 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
 	uint64_t this_rx_ts = rx_ts & SYNC_DTU_MASK;
 
 	n_rx++;
+
+	/* B14 Fase B, Task 5 (FR-9): checked BEFORE this frame's own content
+	 * is consumed below, so it reflects staleness as of the PREVIOUS
+	 * state -- if this same frame also carries a fresh measurement for
+	 * this anchor, twr_consume() re-promotes it right back to TWR
+	 * afterward, which is correct either way. */
+	check_twr_freshness(survey_tau_dtu);
 
 	/* B14 Fase B (Task 4): independent of the deferred-timestamp pairing
 	 * below -- a v2 tau_meas_* payload describes a measurement
