@@ -3510,6 +3510,35 @@ that said no remote was configured — true once, not since.
   this session. That half of T6's acceptance stays open until physical
   access is possible.
 
+  **2026-09-25: `sync stats` finally read on an anchor's own console
+  (`0x0004`, USB-connected to charge) across a GATEWAY `kernel reboot
+  cold` -- the physical access this paragraph was waiting on.** Confirms
+  the two things `rebaselines`/`verdict` can show: `rebaselines` went
+  0->1, exactly once, both across an immediate post-reboot read and a
+  second reboot captured later the same session -- never drifting to 2
+  from a single reboot. `verdict` dropped only as far as it already was
+  pre-reboot (`"insufficient"`, which turned out to be about `count < 400`
+  residual samples on a freshly-reflashed board, not about baseline
+  convergence -- worth not conflating the two causes of that string) and
+  climbed to `"pass"` on the very first post-reboot reading taken (~18 s
+  later by wall clock). No crash, console stayed responsive throughout.
+  **Still could NOT catch the fine-grained `sigma_dtu` rise-then-fall
+  shape** -- every reading, including ones taken as fast as an operator
+  could type `sync stats` repeatedly, already showed a flat, converged
+  `sigma_dtu` (9-10 DTU). Given `SYNC_SKEW_MAX_AGE_DTU` budgets the
+  carried-skew window at ~0.5 s (`sync_model.h`), the transient this half
+  of T6 wants to see almost certainly resolves faster than a human can
+  send a second console command after triggering the reboot -- manual
+  polling is very likely the wrong tool for this specific number, not a
+  failed attempt. Catching it for real would need scripted polling
+  started before or synchronized with the reboot command, not typed by
+  hand. **Unplanned bonus finding from the same capture**: a later
+  reading showed `n_obs` drop from 125 to 70 with `rebaselines` UNCHANGED
+  -- not a second discontinuity, but `SYNC_BASELINE_MAX`'s (128) own
+  roll-forward-onto-midpoint behaviour (`sync_model.h`), previously only
+  host-tested, now observed live on hardware for the first time,
+  incidentally, during an otherwise ordinary polling run.
+
   `0x0002`'s ~487 mm surveyed-position error is STILL open and unfixed --
   it simply cost little at these two particular tag locations, which is a
   property of where the tag stood (this array's GDOP amplification runs
