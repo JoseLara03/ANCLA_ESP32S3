@@ -1509,9 +1509,11 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   call site instead of through `cfg`; `own_short_addr` correctly keeps
   reading the snapshot (an anchor's address changing live was never
   intended — that one genuinely needs a reboot, same as `anchor id`
-  always has). Both firmware images build clean. **Not yet re-verified on
-  hardware with the fix applied** — caught and fixed in the same session
-  the original bug surfaced.
+  always has). Both firmware images build clean. **Re-verified on
+  hardware 2026-09-25, same session, same anchor (`0x0004`): reflashed,
+  repeated `sync tau mode twr` -> converge -> `sync tau mode survey`, and
+  `tau_used_dtu` reverted to 796 with `tau_source:"survey"` immediately
+  and stayed there — confirms the fix.**
 - `src/uwb_gateway.c` — GATEWAY mode: TDMA beacon plus the CAP seat protocol.
   MAC-only for *ranging*; it does not answer ranging polls. It does decode
   `0xEA` POS frames and hand them to `pos_sink`.
@@ -3236,11 +3238,19 @@ that said no remote was configured — true once, not since.
   console print insisting they had. `0x0004` kept applying TWR-sourced
   values indefinitely regardless of what mode the operator switched to,
   until reboot. Both firmware images rebuilt clean after this second fix.
-  **Neither fix has been re-verified on hardware yet** -- the original
-  degrade test, the tau_source display bug, and the mode-gating bug were
-  all caught and fixed in the same session; the next `0x0004` (or any
-  TWR-mode anchor) session should confirm `sync tau mode survey` now
-  actually stops a live TWR value from being re-applied.
+  **Both fixes re-verified on hardware, same session, `0x0004`:** the
+  tau_source display and the mode-gating bug were both caught, fixed and
+  then confirmed on the same board by repeating `sync tau mode twr` ->
+  converge -> `sync tau mode survey` -> `sync tau show` immediately
+  reading `tau_used_dtu:796`, `tau_source:"survey"`, staying stable.
+  **B14 Fase B (all 7 tasks) is now hardware-confirmed end to end on at
+  least one anchor** (`0x0004`) plus the gateway-only CCP v2 timing run
+  (46 min, `0x0001`, `0x0002`, `0x0003` unverified individually but
+  structurally identical code path). Still open: a run with all four
+  anchors up SIMULTANEOUSLY (only ever tested one at a time so far,
+  batteries permitting), and the jump-detector's behaviour under an
+  actual physical relocation has not been deliberately exercised (only
+  observed as ordinary EMA convergence so far).
 
 - **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
   gate NOT yet met, TWO independent bias sources found the same session by
