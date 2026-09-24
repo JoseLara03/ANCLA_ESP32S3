@@ -3539,6 +3539,50 @@ that said no remote was configured — true once, not since.
   host-tested, now observed live on hardware for the first time,
   incidentally, during an otherwise ordinary polling run.
 
+  **Separate, more concerning finding from the same polling session, NOT
+  chased to a root cause, logged here rather than dropped: an ordinary
+  (not-rebaselined) `n_gap`/`sync_gaps` jump of 12 produced
+  physically-impossible numbers.** One `sync stats` read `"pass"`
+  (`drift_ppb:1592`); the very next read, with `sync_gaps` having gone
+  0->12 and `rebaselines` UNCHANGED (still the ordinary
+  `sync_model_miss()`-coasting path, not a re-baseline), showed
+  `drift_ppb:8130944` (~200x past the documented +/-40000 ppb crystal-pair
+  bound), `rms_dtu:131071` (`2^17-1`, looks like a saturating clamp, not
+  an honest RMS), `max_dtu:3950155968` (billions of DTU -- physically
+  nonsensical for any real residual), `verdict:"fail"`. It then decayed
+  smoothly back toward normal over the next ~10 reads (`drift_ppb`
+  8130944 -> 7558209 -> ... -> 5313027, `n_obs` climbing normally the
+  whole time) -- the SHAPE of one corrupted value slowly diluting out of
+  `l_acc`/`m_acc`'s running sums as fresh good observations accumulate,
+  not a crash or a stuck state. **A host-test repro of exactly this
+  scenario (13-interval gap: 12x `sync_model_miss()` then one resumed
+  `sync_model_observe()`, against a converged baseline, via
+  `sync_model.c` directly) does NOT reproduce it** -- `drift_ppb` stays a
+  clean 1600, `res_max` stays at 63 DTU. So either the real gap was
+  longer than the apparent 12 (`intervals = (uint8_t)(prev_seq -
+  last_obs_seq)` wraps at 256 -- a true gap of, say, ~269 intervals reads
+  identically to 13, and SHOULD be caught by `CCP_SLAVE_GAP_TOL_FACTOR`'s
+  local-clock plausibility check and re-baselined instead, which did NOT
+  happen here, or something else about the real conditions (actual
+  jitter, an interaction with a concurrent `SYNC_BASELINE_MAX` rollover)
+  differs from the clean simulation. **The raw console log around the
+  event was not captured** (scrolled out of the terminal's buffer during
+  the same rapid `sync stats` polling that found it), so the one thing
+  that would settle it -- whether a `{"ccp_slave":{"seq_discontinuity":
+  1,...}}` line fired and was mishandled, or never fired at all -- is
+  unavailable. **Deliberately NOT pursued further**: the operator judged
+  the impact low (the inflated `sigma_dtu` correctly signals
+  "don't trust this anchor's observation right now" to anything
+  downstream that weights by it, even though the number's own magnitude
+  looks broken rather than merely large) and reproducing it on purpose
+  (blocking/moving an antenna for ~30 s while polling) was judged not
+  worth the session time against what is already a long day of testing.
+  **Pre-existing code, not part of B14 Fase A or B** -- `sync_model.c`
+  and `ccp_slave.c`'s gap-handling logic were not touched by this
+  session's work; if this recurs and matters, `CCP_SLAVE_GAP_TOL_FACTOR`
+  and the `intervals` computation in `ccp_slave.c` are where to look
+  first.
+
   `0x0002`'s ~487 mm surveyed-position error is STILL open and unfixed --
   it simply cost little at these two particular tag locations, which is a
   property of where the tag stood (this array's GDOP amplification runs
