@@ -78,7 +78,14 @@ int ccp_frame_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
 	if (!buf || !f) {
 		return -EINVAL;
 	}
-	if (buf_len < CCP_FRAME_LEN) {
+	if (f->version != CCP_VERSION_V1 && f->version != CCP_VERSION_V2) {
+		return -EINVAL;
+	}
+
+	size_t wire_len = (f->version == CCP_VERSION_V2) ?
+		CCP_FRAME_LEN_V2 : CCP_FRAME_LEN;
+
+	if (buf_len < wire_len) {
 		return -EMSGSIZE;
 	}
 	/* A timestamp with bits above 40 set is a caller bug -- most likely a
@@ -104,7 +111,15 @@ int ccp_frame_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
 	put_u40(&buf[CCP_OFF_TX_DTU], f->tx_dtu);
 	put_u32(&buf[CCP_OFF_ROOT_ID], f->root_id);
 
-	return (int)CCP_FRAME_LEN;
+	if (f->version == CCP_VERSION_V2) {
+		buf[CCP_OFF_VERSION] = CCP_VERSION_V2;
+		buf[CCP_OFF_TIER] = f->tier;
+		put_u32(&buf[CCP_OFF_TAU_MEAS_DTU], (uint32_t)f->tau_meas_dtu);
+		put_u16(&buf[CCP_OFF_TAU_MEAS_ANCHOR], f->tau_meas_anchor);
+		buf[CCP_OFF_TWR_QUALITY] = f->twr_quality;
+	}
+
+	return (int)wire_len;
 }
 
 bool ccp_frame_is_ccp(const uint8_t *buf, size_t len)
@@ -142,5 +157,21 @@ int ccp_frame_parse(const uint8_t *buf, size_t len, struct ccp_frame *out)
 	out->tx_dtu   = get_u40(&buf[CCP_OFF_TX_DTU]);
 	out->root_id  = get_u32(&buf[CCP_OFF_ROOT_ID]);
 	out->src_addr = get_u16(&buf[OFF_SRC]);
+
+	/* v2: only when the frame is actually long enough to carry it AND
+	 * says so at CCP_OFF_VERSION. Anything else -- a v1-length frame, or
+	 * a longer frame whose version byte this build does not recognise --
+	 * parses as v1; see this function's own doc comment in the header for
+	 * why that is deliberate rather than a rejection. */
+	if (len >= CCP_FRAME_LEN_V2 &&
+	    buf[CCP_OFF_VERSION] == CCP_VERSION_V2) {
+		out->version         = CCP_VERSION_V2;
+		out->tier            = buf[CCP_OFF_TIER];
+		out->tau_meas_dtu    = (int32_t)get_u32(&buf[CCP_OFF_TAU_MEAS_DTU]);
+		out->tau_meas_anchor = get_u16(&buf[CCP_OFF_TAU_MEAS_ANCHOR]);
+		out->twr_quality     = buf[CCP_OFF_TWR_QUALITY];
+	} else {
+		out->version = CCP_VERSION_V1;
+	}
 	return 0;
 }

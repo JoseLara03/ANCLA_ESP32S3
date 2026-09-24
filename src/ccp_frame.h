@@ -75,6 +75,46 @@
 #define CCP_OFF_ROOT_ID      17u
 #define CCP_FRAME_LEN        21u
 
+/* ---- v2 extension (B14 Fase B, docs/superpowers/plans/2026-09-22-b14-flight-compensation.md
+ * FR-7/D7): the master's periodic SS-TWR flight-time measurement to ONE
+ * anchor, piggybacked on the next few ordinary CCPs rather than costing a
+ * frame of its own. Appended after the v1 layout, not a new function code --
+ * `ccp_frame_is_ccp()`'s `len >=` check and `ccp_frame_parse()` never
+ * reading past CCP_OFF_ROOT_ID+4 mean a v1 receiver already ignores these
+ * bytes with NO code change on its side; that is what makes this
+ * "versioned" rather than "a new frame type" -- a v1 anchor on an otherwise
+ * upgraded fleet keeps working, it just never receives a TWR-sourced tau.
+ *
+ *   21      version        0/absent = v1 (21-byte frame); 2 = this extension
+ *   22      tier           reserved, always 0 -- see D8's multi-hop hook
+ *   23..26  tau_meas_dtu   signed, this anchor's flight time from the
+ *                          master, same sign/units as sync_model_set_tau()
+ *   27..28  tau_meas_anchor  which anchor this measurement is FOR (short
+ *                          addr, e.g. 0x0001..0x0004); 0x0000 (the
+ *                          gateway's own reserved address, never a valid
+ *                          anchor) is the sentinel for "no measurement
+ *                          completed yet" -- same "reserved value as
+ *                          absence" convention as CCP's own tx_dtu==0
+ *   29      twr_quality    0..255, opaque to the wire format; the filter
+ *                          consuming it (FR-8) defines the scale
+ */
+#define CCP_OFF_VERSION           21u
+#define CCP_OFF_TIER              22u
+#define CCP_OFF_TAU_MEAS_DTU      23u
+#define CCP_OFF_TAU_MEAS_ANCHOR   27u
+#define CCP_OFF_TWR_QUALITY       29u
+#define CCP_FRAME_LEN_V2          30u
+
+#define CCP_VERSION_V1            0u
+#define CCP_VERSION_V2            2u
+
+/* Reserved gateway address (UWB_ADDR_GATEWAY_RESERVED in uwb_config.h, not
+ * included here to keep this file dependency-free) repeated as a literal:
+ * no anchor can ever hold it, so it is the sentinel for "this CCP carries
+ * no TWR measurement yet" -- a cold-booted master, or one that has not
+ * completed a first round-robin pass. */
+#define CCP_TAU_MEAS_ANCHOR_NONE  0x0000u
+
 /* Hop 0 is the root. A slave adopting a master at hop N publishes N+1, so the
  * tree depth is visible on air without any topology protocol. */
 #define CCP_HOP_ROOT         0u
@@ -98,12 +138,31 @@ struct ccp_frame {
     uint64_t tx_dtu;      /* 40-bit; the top 24 bits of this field are zero */
     uint32_t root_id;
     uint16_t src_addr;    /* filled by the parser from the header */
+
+    /* v2 fields, all zero-value-safe: a caller that never sets them (an
+     * ordinary `struct ccp_frame f = {0};`) builds an unchanged v1 frame,
+     * because `version` defaults to CCP_VERSION_V1. Parsing a v1 frame
+     * leaves these at their CALLER-supplied `out` values untouched except
+     * `version`, which parse() always sets -- check `version` before
+     * reading any of the rest. */
+    uint8_t  version;         /* CCP_VERSION_V1 or CCP_VERSION_V2 */
+    uint8_t  tier;            /* reserved, always 0 for now */
+    int32_t  tau_meas_dtu;
+    uint16_t tau_meas_anchor; /* CCP_TAU_MEAS_ANCHOR_NONE if not present */
+    uint8_t  twr_quality;
 };
 
 /* Build. Returns bytes written (excl. FCS) or a negative errno. `tx_dtu` is
  * masked to 40 bits; a value with high bits set is a caller bug and is
  * rejected rather than silently truncated, because a truncated timestamp would
- * produce a plausible-looking but wrong sync observation. */
+ * produce a plausible-looking but wrong sync observation.
+ *
+ * `f->version` selects the wire length: CCP_VERSION_V1 (the default on a
+ * zero-initialized struct) writes the original CCP_FRAME_LEN bytes and
+ * touches none of the v2 fields; CCP_VERSION_V2 writes CCP_FRAME_LEN_V2 and
+ * requires `buf_len` to cover it. Any other value is rejected -- a version
+ * this build doesn't know how to write is a caller bug, not something to
+ * silently downgrade. */
 int  ccp_frame_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
                      uint8_t frame_seq, const struct ccp_frame *f);
 
@@ -111,7 +170,17 @@ int  ccp_frame_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
 bool ccp_frame_is_ccp(const uint8_t *buf, size_t len);
 
 /* Parse. Returns 0 or a negative errno. Rejects a hop this node must not adopt,
- * so the caller cannot forget to check. */
+ * so the caller cannot forget to check.
+ *
+ * Always sets `out->version`: CCP_VERSION_V2 when `len` covers
+ * CCP_FRAME_LEN_V2 and `buf[CCP_OFF_VERSION] == CCP_VERSION_V2`, else
+ * CCP_VERSION_V1 -- ANY other on-air value at that offset (a future v3, a
+ * corrupt frame, or simply a shorter v1 frame with nothing there) parses as
+ * v1, deliberately: the v1 fields it already validated are still correct
+ * and safe to use, and refusing the whole frame over an extension this
+ * build cannot read would be strictly worse than ignoring the extension.
+ * The v2 fields are populated only when `out->version == CCP_VERSION_V2`;
+ * a caller must check that before reading `tau_meas_dtu` and friends. */
 int  ccp_frame_parse(const uint8_t *buf, size_t len, struct ccp_frame *out);
 
 /* True if `hop` may be adopted as a time source by a node at this depth. */

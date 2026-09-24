@@ -216,6 +216,124 @@ static void test_airtime_is_recorded(void)
 	       " superframe\n", airtime_us, (double)airtime_us / 2000.0);
 }
 
+/* ---- v2 (B14 Fase B piggyback) ---- */
+
+static void test_v2_wire_constants(void)
+{
+	CHECK(CCP_VERSION_V1 == 0);
+	CHECK(CCP_VERSION_V2 == 2);
+	CHECK(CCP_OFF_VERSION == CCP_FRAME_LEN);       /* appended, not overlapping v1 */
+	CHECK(CCP_OFF_TIER == CCP_OFF_VERSION + 1);
+	CHECK(CCP_OFF_TAU_MEAS_DTU == CCP_OFF_TIER + 1);
+	CHECK(CCP_OFF_TAU_MEAS_ANCHOR == CCP_OFF_TAU_MEAS_DTU + 4);
+	CHECK(CCP_OFF_TWR_QUALITY == CCP_OFF_TAU_MEAS_ANCHOR + 2);
+	CHECK(CCP_FRAME_LEN_V2 == CCP_OFF_TWR_QUALITY + 1);
+	CHECK(CCP_TAU_MEAS_ANCHOR_NONE == 0x0000);
+}
+
+/* A caller that never touches the v2 fields (an ordinary `= {0}` struct, or
+ * every existing call site before Fase B wires them in) must keep building
+ * the exact same v1 frame it always did -- this is the regression pin for
+ * that. */
+static void test_v1_default_is_unchanged(void)
+{
+	uint8_t buf[CCP_FRAME_LEN_V2];
+	struct ccp_frame in = { .seq = 9, .hop = 0, .tx_dtu = 123, .root_id = 4 };
+	struct ccp_frame out;
+
+	memset(buf, 0xA5, sizeof(buf));
+	CHECK(in.version == CCP_VERSION_V1);   /* zero-init default */
+	CHECK(ccp_frame_build(buf, sizeof(buf), 1, 0, &in) == (int)CCP_FRAME_LEN);
+	CHECK(ccp_frame_parse(buf, CCP_FRAME_LEN, &out) == 0);
+	CHECK(out.version == CCP_VERSION_V1);
+	CHECK(out.tx_dtu == 123);
+}
+
+static void test_v2_roundtrip(void)
+{
+	uint8_t buf[CCP_FRAME_LEN_V2];
+	struct ccp_frame in = {
+		.seq = 5, .hop = 0, .tx_dtu = 77, .root_id = 1,
+		.version = CCP_VERSION_V2,
+		.tier = 0,
+		.tau_meas_dtu = -12345,
+		.tau_meas_anchor = 0x0003,
+		.twr_quality = 200,
+	};
+	struct ccp_frame out;
+
+	CHECK(ccp_frame_build(buf, sizeof(buf), 1, 0, &in) == (int)CCP_FRAME_LEN_V2);
+	CHECK(ccp_frame_is_ccp(buf, sizeof(buf)));
+	CHECK(ccp_frame_parse(buf, sizeof(buf), &out) == 0);
+
+	CHECK(out.version == CCP_VERSION_V2);
+	CHECK(out.tier == 0);
+	CHECK(out.tau_meas_dtu == -12345);
+	CHECK(out.tau_meas_anchor == 0x0003);
+	CHECK(out.twr_quality == 200);
+	/* v1 fields still round-trip through the same build/parse. */
+	CHECK(out.tx_dtu == 77 && out.root_id == 1);
+}
+
+/* The whole point of D7's versioning: an OLD parser physically incapable of
+ * reading past CCP_FRAME_LEN still gets a fully valid v1 parse from the
+ * PREFIX of a v2 frame -- simulated here by handing parse() only the first
+ * CCP_FRAME_LEN bytes of a v2-built buffer, exactly what a v1 receiver's own
+ * fixed-size read would see. */
+static void test_v1_prefix_of_v2_frame_still_parses(void)
+{
+	uint8_t buf[CCP_FRAME_LEN_V2];
+	struct ccp_frame in = {
+		.seq = 1, .hop = 0, .tx_dtu = 55, .root_id = 9,
+		.version = CCP_VERSION_V2, .tau_meas_dtu = 1, .twr_quality = 1,
+	};
+	struct ccp_frame out;
+
+	CHECK(ccp_frame_build(buf, sizeof(buf), 1, 0, &in) == (int)CCP_FRAME_LEN_V2);
+	CHECK(ccp_frame_is_ccp(buf, CCP_FRAME_LEN));
+	CHECK(ccp_frame_parse(buf, CCP_FRAME_LEN, &out) == 0);
+	CHECK(out.version == CCP_VERSION_V1);
+	CHECK(out.tx_dtu == 55 && out.root_id == 9);
+}
+
+/* A future v3, or a corrupted version byte, on an otherwise long-enough
+ * frame parses as v1 rather than being refused -- see ccp_frame_parse()'s
+ * own doc comment for why refusing the whole frame would be worse. */
+static void test_unrecognized_version_parses_as_v1(void)
+{
+	uint8_t buf[CCP_FRAME_LEN_V2];
+	struct ccp_frame in = {
+		.seq = 1, .hop = 0, .tx_dtu = 1, .root_id = 1,
+		.version = CCP_VERSION_V2,
+	};
+	struct ccp_frame out;
+
+	CHECK(ccp_frame_build(buf, sizeof(buf), 1, 0, &in) > 0);
+	buf[CCP_OFF_VERSION] = 3;   /* pretend a future v3 wrote this */
+	CHECK(ccp_frame_parse(buf, sizeof(buf), &out) == 0);
+	CHECK(out.version == CCP_VERSION_V1);
+}
+
+static void test_v2_build_rejections(void)
+{
+	uint8_t buf[CCP_FRAME_LEN_V2];
+	struct ccp_frame in = {
+		.seq = 1, .hop = 0, .tx_dtu = 1, .root_id = 1,
+		.version = CCP_VERSION_V2,
+	};
+
+	/* An unknown version is a caller bug -- rejected, not downgraded. */
+	in.version = 3;
+	CHECK(ccp_frame_build(buf, sizeof(buf), 1, 0, &in) == -EINVAL);
+
+	/* A buffer sized for v1 is too small for a v2 build, even though it
+	 * would have been plenty for v1. */
+	in.version = CCP_VERSION_V2;
+	CHECK(ccp_frame_build(buf, CCP_FRAME_LEN, 1, 0, &in) == -EMSGSIZE);
+	CHECK(ccp_frame_build(buf, CCP_FRAME_LEN_V2 - 1, 1, 0, &in) == -EMSGSIZE);
+	CHECK(ccp_frame_build(buf, CCP_FRAME_LEN_V2, 1, 0, &in) > 0);
+}
+
 int main(void)
 {
 	test_wire_constants();
@@ -227,6 +345,12 @@ int main(void)
 	test_length_tolerates_the_fcs();
 	test_rejects_foreign_frames();
 	test_airtime_is_recorded();
+	test_v2_wire_constants();
+	test_v1_default_is_unchanged();
+	test_v2_roundtrip();
+	test_v1_prefix_of_v2_frame_still_parses();
+	test_unrecognized_version_parses_as_v1();
+	test_v2_build_rejections();
 
 	if (failures) {
 		printf("\n%d CHECK(s) FAILED\n", failures);

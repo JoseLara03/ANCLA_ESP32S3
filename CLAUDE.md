@@ -1156,6 +1156,30 @@ sync tau result                last `sync tau measure` run, as JSON
   C, host-tested in `tests/ccp_frame/`. **`0xEF` is the LAST free code in the
   `0xEx` range** — the allocation table is in its header, and anything after
   this needs a subtype byte under an existing code rather than a new one.
+
+  **B14 Fase B, Task 1 of N (2026-09-24): CCP v2, appended not replaced.**
+  9 bytes (`version, tier, tau_meas_dtu, tau_meas_anchor, twr_quality`)
+  tacked on after the existing 21-byte v1 layout, per the plan's D7/FR-7 —
+  the master's periodic sync-TWR measurement (Fase B's actual on-air work,
+  not yet implemented) piggybacked on the CCP that already goes out every
+  superframe, rather than costing a frame of its own. This is the ONE
+  reason `ccp_frame_is_ccp()`'s existing `len >=` check (not `==`) and
+  `ccp_frame_parse()` never reading past `CCP_OFF_ROOT_ID+4` matter beyond
+  tolerating the FCS: together they mean a v1 receiver needs ZERO code
+  changes to safely ignore a v2 frame's extra bytes — confirmed by test
+  (`test_v1_prefix_of_v2_frame_still_parses`), not just asserted. An
+  unrecognised version byte (a hypothetical v3, or corruption) parses as
+  v1 rather than being refused — the v1 fields already validated are still
+  correct, and dropping the whole frame over an extension this build
+  cannot read would be strictly worse. `ccp_master.c`/`ccp_slave.c` are
+  UNTOUCHED by this task on purpose — every existing call site still
+  builds plain v1 frames (`version` defaults to `CCP_VERSION_V1` on a
+  zero-initialised struct), so this lands with **zero behaviour change**
+  until a later task wires the master into actually sending v2. Both
+  firmware images build clean, `dram0_0_seg` UNCHANGED (dead code until
+  wired). Host-tested in `tests/ccp_frame/` (6 new cases); needed its own
+  errno shim to build on this host at all, see the Host Tests section
+  below for why.
 - `src/ccp_sched.h` — where the CCP falls in the superframe. Header-only, no
   `.c`, same pattern as `uwb_mac.h`; host-tested in `tests/ccp_sched/` where
   **including the header is the test**. Carries the design-history writeup for
@@ -2728,7 +2752,7 @@ gcc -Wall -Wextra -Isrc -o tests/mac_budget/test_mac_budget.exe tests/mac_budget
 gcc -Wall -Wextra -Isrc -o tests/sync_model/test_sync_model.exe tests/sync_model/test_sync_model.c src/sync_model.c
 ./tests/sync_model/test_sync_model.exe          # ALL TESTS PASSED, exits 0
 
-gcc -Wall -Wextra -Isrc -o tests/ccp_frame/test_ccp_frame.exe tests/ccp_frame/test_ccp_frame.c src/ccp_frame.c
+gcc -Wall -Wextra -Isrc -Itests/ccp_frame/shim -o tests/ccp_frame/test_ccp_frame.exe tests/ccp_frame/test_ccp_frame.c src/ccp_frame.c
 ./tests/ccp_frame/test_ccp_frame.exe            # ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -o tests/blink_frame/test_blink_frame.exe tests/blink_frame/test_blink_frame.c src/blink_frame.c
@@ -2782,6 +2806,20 @@ waiting for a Zephyr build. `tests/ccp_sched/` needs the same shim for the same
 reason: it includes `src/ccp_sched.h`, whose `BUILD_ASSERT`s check where the CCP
 sits against the beacon's own frame length. Same shim pattern as the tag's
 `tests/uwb_radio_owner/shim`.
+
+`tests/ccp_frame/shim` is a DIFFERENT kind of shim -- not a missing Zephyr
+header, but a genuinely incomplete host `<errno.h>` (this project's own
+`ancla-build-env-fixes` memory: the default `gcc` on at least one dev
+machine is a 32-bit mingw.org toolchain whose errno.h lacks `EMSGSIZE`/
+`EPROTO`/`EBADMSG`/`ENODATA`, which `ccp_frame.c` uses). `#include_next
+<errno.h>` chains to the real header and only *adds* the missing macros
+under `#ifndef`, so it is a no-op on a host that already has them --
+harmless to keep in the canonical build line above rather than making it
+machine-conditional. The same gap affects `uwb_frame`/`apos_geom`/
+`apos_table`/`apos_frame`/`blink_frame` on that machine and is deliberately
+NOT shimmed for those -- patching every affected suite was already flagged
+once as a real decision, not a one-liner; this one got a shim because Fase B
+work was actively extending `ccp_frame.c` and needed the suite runnable.
 
 ## Repo
 
