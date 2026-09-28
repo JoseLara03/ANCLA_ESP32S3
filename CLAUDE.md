@@ -3287,6 +3287,62 @@ that said no remote was configured — true once, not since.
   Not chased further this session — logged as real, working, but needing
   more tuning work, not blocking.
 
+- **Gate B item 1 (τ_twr vs τ_survey, <0.5 ns/anchor) attempted with all
+  four anchors up simultaneously for the first time, 2026-09-28: 3 of 4
+  PASS, the 4th is genuinely inconclusive, not failing.** Reference
+  τ_survey computed from a fresh laser gateway-anchor distance per anchor
+  (NOT via the survey's stored (x,y) coordinates, which are known-bad for
+  `0x0002`/`0x0003` -- see below), matching the same methodology Fase A's
+  own field session used and for the same reason:
+
+  | anchor | laser dist | τ_survey (DTU) | τ_twr (DTU) | diff |
+  |---|---|---|---|---|
+  | 0x0001 | 3.219 m | 686 | 698 | 12 |
+  | 0x0002 | 0.975 m | 208 | 227 | 19 |
+  | 0x0003 | 1.322 m | 282 | 287 | 5 |
+  | 0x0004 | 3.559 m | 759 | 796 | 37 (over the 32 DTU / 0.5 ns bar) |
+
+  **0x0001/0x0002/0x0003 pass cleanly.** `0x0004`'s 37 DTU miss is NOT
+  trusted as a real failure: `sync tau show` on it read
+  `tau_source:"twr"`, `tau_twr_dtu:796` (identical to its OLD pre-move
+  Fase A survey seed -- suspicious on its own) with `tau_twr_age_s:132`,
+  i.e. **more than double `TAU_FRESHNESS_MAX_MS` (60000) with no
+  degrade having fired.** Re-read `check_twr_freshness()`
+  (`src/ccp_slave.c`) line by line to check for a fourth bug in the same
+  area this session already found two real ones in: it runs
+  UNCONDITIONALLY on every parsed CCP, before any early return, and
+  `sync stats` on the same board confirmed CCP reception itself was
+  completely healthy (`rx:2620`, `paired:2618`, climbing normally,
+  `rebaselines:1` only) -- so a dead link is ruled out, and by the code's
+  own logic the degrade SHOULD have fired well before 132 s. **Could not
+  be resolved and was NOT chased further**: the `sync stats` reading
+  itself required physically UNMOUNTING `0x0004` to reach its USB port
+  (this deployment's anchors are wall/ceiling-mounted, out of console
+  reach once installed, height and gateway-computer distance both cited
+  as the reason -- a constraint already on record for T6's fine transient
+  and repeated again this session), so the 796/132 s reading and the
+  `sync stats` reading are two snapshots of DIFFERENT physical states,
+  not one continuous observation a repeat poll could safely disambiguate.
+  **Left open, access-blocked, same class of gap as T6's fine transient**
+  -- a clean answer needs either a long console/USB cable reaching the
+  mounted anchor, or a deliberate un-mount-remount test cycle budgeted as
+  its own session, not a side effect of taking one diagnostic reading.
+  `0x0004`'s elevated `jitter_est_dtu` in that same `sync stats` read (65
+  DTU / ~1 ns, `"fail"` verdict, versus this same anchor's own ~28-31 DTU
+  earlier the same day) is also most likely an artifact of having just
+  been handled/moved to reach its USB port, not a new standing defect --
+  recorded here rather than asserted as one.
+
+  Also confirmed, as a side effect of triangulating the reference
+  distances above from all four laser measurements at once (not just the
+  two historically-clean anchors used previously): **`0x0002`'s
+  already-documented ~487 mm surveyed-position error reproduces again,
+  independently, at ~512 mm** (predicted distance from the
+  triangulated gateway position vs. this session's own laser
+  measurement) -- consistent with, not contradicting, the existing
+  finding; still open, still unfixed, still not this session's job to
+  fix.
+
 - **First Gate A field run (2026-09-23, "P1 centro"): real improvement,
   gate NOT yet met, TWO independent bias sources found the same session by
   cross-checking `gw_selftau` against a laser distance meter -- not one, and
