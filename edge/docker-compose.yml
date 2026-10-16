@@ -1,0 +1,19 @@
+# Edge TDoA server: consumes the anchors' blink observations from the LOCAL broker,
+# solves and filters positions, and publishes them with the frozen platform payload.
+#
+#   docker compose up --build -d
+#   docker compose logs -f tdoa-server
+#
+# Configuration lives in .env (git-ignored; copy .env.example). On a Raspberry Pi
+# the same file runs unchanged (arm64 image), with LOCAL_HOST pointing at the Pi's
+# own Mosquitto.
+services:
+  tdoa-server:
+    build: .
+    image: ancla/tdoa-server:dev
+    env_file: .env
+    restart: unless-stopped
+    # Reach a broker published on the Docker HOST (Docker Desktop resolves this
+    # name already; the mapping makes it work on Linux/Raspberry Pi as well).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
