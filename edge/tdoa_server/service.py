@@ -135,7 +135,8 @@ class Service:
         self.pipe = Pipeline(
             anchors, self.tag_z,
             sigma_max=int(_env("SIGMA_MAX_DTU", "1000")),
-            offsets_dtu={int(k): int(v) for k, v in json.loads(offsets).items()} if offsets else None)
+            offsets_dtu={int(k): int(v) for k, v in json.loads(offsets).items()} if offsets else None,
+            hull_margin_m=float(_env("HULL_MARGIN_M", "0.5")))
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.n_pub = 0

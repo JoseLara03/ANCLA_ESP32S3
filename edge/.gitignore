@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 tools/xcheck
 tools/xcheck.exe
+.env.bak*

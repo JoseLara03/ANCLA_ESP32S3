@@ -258,6 +258,57 @@ class Protections(unittest.TestCase):
         self.assertEqual(out[0].t_dtu, tdoa.DTU_MODULO - 50)
 
 
+class HullLimit(unittest.TestCase):
+    """A solve far outside the anchors' box is an artefact: hold the last position, or drop."""
+
+    def feed_at(self, p, xy, k):
+        emit = 9_000_000_000 + k * 12_780_000_000
+        for a in ANCHORS:
+            p.ingest(tdoa.Obs(256, k % 256, a, dtu_for(xy, ANCHORS[a], emit) % tdoa.DTU_MODULO, 0, 20), k * 200.0)
+        return p.step(k * 200.0 + 1.0)
+
+    def test_box_is_anchors_plus_margin(self):
+        p = tdoa.Pipeline(ANCHORS, TAG_Z, hull_margin_m=0.5)
+        self.assertEqual(p._hull, (-0.51, 3.84, -0.5, 2.92))
+
+    def test_inside_is_untouched(self):
+        p = tdoa.Pipeline(ANCHORS, TAG_Z, hull_margin_m=0.5)
+        fixes = [f for k in range(20) for f in self.feed_at(p, (2.0, 2.4), k)]
+        self.assertEqual(len(fixes), 20)
+        self.assertEqual(p.stats["hull_held"] + p.stats["hull_drop"], 0)
+
+    def test_outside_with_a_fresh_position_holds_it(self):
+        p = tdoa.Pipeline(ANCHORS, TAG_Z, hull_margin_m=0.5)
+        for k in range(10):
+            self.feed_at(p, (2.0, 2.4), k)
+        held = self.feed_at(p, (2.0, 4.6), 10)                # 2.2 m past the top edge
+        self.assertEqual(p.stats["hull_held"], 1)
+        self.assertEqual(len(held), 1)                          # still publishes: the display stays fluid
+        self.assertLess(abs(held[0].y - 2.4), 0.3)              # and stays near the last position
+
+    def test_outside_without_a_fresh_position_is_dropped(self):
+        p = tdoa.Pipeline(ANCHORS, TAG_Z, hull_margin_m=0.5)
+        self.assertEqual(self.feed_at(p, (2.0, 4.6), 0), [])    # nothing to hold yet
+        self.assertEqual(p.stats["hull_drop"], 1)
+        for k in range(1, 6):
+            self.feed_at(p, (2.0, 2.4), k)
+        # a position older than SEED_AGE_MS is no longer held either
+        late = 5 + 20
+        self.assertEqual(self.feed_at(p, (2.0, 4.6), late), [])
+        self.assertEqual(p.stats["hull_drop"], 2)
+
+    def test_zero_margin_disables_it(self):
+        p = tdoa.Pipeline(ANCHORS, TAG_Z)
+        self.assertIsNone(p._hull)
+        self.assertEqual(len(self.feed_at(p, (2.0, 4.6), 0)), 1)
+
+    def test_set_anchors_rebuilds_the_box(self):
+        p = tdoa.Pipeline({}, TAG_Z, hull_margin_m=0.5)
+        self.assertIsNone(p._hull)
+        p.set_anchors(ANCHORS)
+        self.assertIsNotNone(p._hull)
+
+
 class Parsing(unittest.TestCase):
     def test_parse_obs(self):
         o = parse_obs(b'{"a":2,"t":256,"s":46,"ts":"379107328198","q":223,"b":36,"f":1,"e":42}')
