@@ -158,7 +158,8 @@ One `dwt_config_t phy_cfg = UWB_PHY_CONFIG_INITIALIZER` (`uwb_radio.c:24`),
 one `dwt_configure()` (`:87`), called once at boot from `main()`. No frame
 type reconfigures the PHY; BCN, CCP and BLINK all share it. The contract is
 compile-time (`uwb_phy.h`): channel 5, PLEN_1024, PAC32, code 9, SFD type 3,
-850 kbps, STS off, PDOA M0.
+850 kbps, STS off, PDOA M0 (as of this audit; the PHY has since moved to
+PLEN_256/PAC16, 2026-10-12).
 
 → **B7 REJECTED.**
 

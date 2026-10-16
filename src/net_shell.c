@@ -11,6 +11,7 @@
  * pasted into a bug report.
  */
 
+#include "cmd_key.h"
 #include "net_config.h"
 #include "net_store.h"
 #include "net_uplink.h"
@@ -46,6 +47,7 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 {
 	const net_config_t *c = net_config_get();
 	char ip[NET_IPV4_ADDR_LEN];
+	char fp[9];
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
@@ -53,13 +55,15 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 	if (!net_uplink_get_ip(ip, sizeof(ip))) {
 		strcpy(ip, "none");
 	}
+	cmd_key_fingerprint(fp);
 
 	shell_print(sh,
 		    "{\"ssid\":\"%s\",\"psk\":\"%s\",\"broker\":\"%s\",\"port\":%u,"
-		    "\"user\":\"%s\",\"mqttpass\":\"%s\",\"provisioned\":%u,"
+		    "\"user\":\"%s\",\"mqttpass\":\"%s\",\"cmdkey\":\"%s\",\"provisioned\":%u,"
 		    "\"state\":\"%s\",\"ip\":\"%s\"}",
 		    c->ssid, secret_state(c->psk), c->broker, c->port,
 		    c->mqtt_user, secret_state(c->mqtt_pass),
+		    cmd_key_is_set() ? fp : "<unset>",
 		    net_config_is_provisioned(c) ? 1u : 0u,
 		    net_uplink_state_str(), ip);
 	return 0;
@@ -186,6 +190,65 @@ static int cmd_mqttpass(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+/* net cmdkey <hex>|clear -- the per-site secret that authenticates remote MQTT commands
+ * (cmd_proto.h). 32-64 hex characters (16-32 bytes). Never echoed back. */
+static int cmd_cmdkey(const struct shell *sh, size_t argc, char **argv)
+{
+	uint8_t key[CMD_KEY_MAX];
+	size_t hexlen;
+	int ret;
+
+	ARG_UNUSED(argc);
+
+	if (strcmp(argv[1], "clear") == 0) {
+		ret = cmd_key_clear();
+		if (ret) {
+			shell_error(sh, "error: could not erase the key (errno %d)", -ret);
+			return ret;
+		}
+		shell_print(sh, "ok: command key erased — remote commands are now REFUSED");
+		return 0;
+	}
+
+	hexlen = strlen(argv[1]);
+	/* EXACTLY 32 bytes. Accepting a shorter key is how a pasted line that lost characters to the
+	 * shell's RX buffer (it dropped them silently on 2026-10-16: 30 bytes stored instead of 32)
+	 * becomes a key that no longer matches the server's, with nothing to say so. */
+	if (hexlen != 2u * CMD_KEY_MAX) {
+		shell_error(sh, "error: the key must be exactly %u hex characters (%u bytes), got %u. "
+				"If you pasted it, characters were probably lost to the shell's input "
+				"buffer: paste it again and compare the fingerprint it prints.",
+			    2u * CMD_KEY_MAX, CMD_KEY_MAX, (unsigned int)hexlen);
+		return -EINVAL;
+	}
+	for (size_t i = 0; i < hexlen / 2u; i++) {
+		char pair[3] = { argv[1][2 * i], argv[1][2 * i + 1], '\0' };
+		char *end = NULL;
+		unsigned long v = strtoul(pair, &end, 16);
+
+		if (end == NULL || *end != '\0') {
+			shell_error(sh, "error: not hexadecimal");
+			return -EINVAL;
+		}
+		key[i] = (uint8_t)v;
+	}
+	ret = cmd_key_set(key, hexlen / 2u);
+	memset(key, 0, sizeof(key));
+	if (ret) {
+		shell_error(sh, "error: key NOT stored (errno %d)", -ret);
+		return ret;
+	}
+	{
+		char fp[9];
+
+		cmd_key_fingerprint(fp);
+		shell_print(sh, "ok: command key stored (%u bytes), fingerprint %s — it must equal the one "
+				"`nodecmd.py genkey` printed. Remote commands enabled.",
+			    (unsigned int)(hexlen / 2u), fp);
+	}
+	return 0;
+}
+
 static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 {
 	int ret;
@@ -220,6 +283,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_net,
 		      cmd_user,     2, 0),
 	SHELL_CMD_ARG(mqttpass, NULL, "mqttpass <password> — set the MQTT password",
 		      cmd_mqttpass, 2, 0),
+	SHELL_CMD_ARG(cmdkey,   NULL, "cmdkey <hex>|clear — secret authenticating remote MQTT commands",
+		      cmd_cmdkey,   2, 0),
 	SHELL_CMD_ARG(reset,    NULL, "Restore the network defaults and persist them",
 		      cmd_reset,    1, 0),
 	SHELL_SUBCMD_SET_END

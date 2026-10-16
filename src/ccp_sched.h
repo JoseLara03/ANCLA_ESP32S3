@@ -25,7 +25,8 @@
  * (CCP_SCHED_BEACON_END_NS, 389411 ns). That is well inside the ~1.538 ms
  * CCP_OFFSET_UUS gave the arm to complete in -- comfortably early against the
  * CCP's own RMARKER. But a frame's RMARKER sits at the END of its own SHR
- * (CCP_SCHED_SHR_NS, 1050194 ns at PLEN_1024): the CCP's PREAMBLE had to start
+ * (CCP_SCHED_SHR_NS, 1050194 ns at PLEN_1024 -- historical; 268654 ns at
+ * the current PLEN_256): the CCP's PREAMBLE had to start
  * at 1538461 - 1050194 = 488267 ns after the beacon's RMARKER, and the arm
  * routinely finished 190218 ns (worst case) AFTER that. So the arm was late
  * for the preamble it needed to schedule, by up to ~190 us, while being
@@ -138,8 +139,10 @@
  * it measures against the ACTUAL built length, not a compile-time constant,
  * for the same reason.
  *
- * Evaluates to 2026728 - 1373723 - 389411 = 263594 today (was 348300
- * against the smaller v1 frame; 9 extra bytes cost ~84706 ns of airtime,
+ * At the original PLEN_1024 this evaluated to 2026728 - 1373723 - 389411 =
+ * 263594 (HISTORICAL; 348300 against the smaller v1 frame). At the current
+ * PLEN_256 it evaluates to 1826674 ns (hand-checked; tests/ccp_sched/ pins
+ * it). The remark that follows is the PLEN_1024 figure: 9 extra bytes cost ~84706 ns of airtime,
  * still leaving ample margin -- see tests/ccp_sched/'s pinned figures). */
 /* Computed in a SIGNED 64-bit type deliberately: every term above is a
  * uint32_t, and an unsigned subtraction that goes negative WRAPS to a huge
@@ -162,5 +165,82 @@
  * design could not settle this way. */
 BUILD_ASSERT(CCP_SCHED_MAX_ARM_NS > 0,
 	     "no room left in the post-beacon guard window for the CCP frame");
+
+/* ---- Deliberate CCP delay, added 2026-10-13 --------------------------------
+ *
+ * Time from the beacon's RMARKER to the START of the CCP's preamble.
+ *
+ * At PLEN_1024 a slave that was still busy with the beacon (665-870 us
+ * measured, until it is listening again) still caught the CCP, because the
+ * preamble lasted ~1050 us. At PLEN_256 the preamble lasts ~269 us and starts
+ * ~560-600 us after the beacon's RMARKER when sent immediately, so it was over
+ * before most slaves were listening: measured 16.9% of CCPs received, a sharp
+ * cliff at 800 us of slave re-arm latency and 0% from 850 us (`cia stats`,
+ * src/uwb_slave.c). Late arming also meant the CIA integrated ~47 of 256
+ * preamble symbols on the CCPs that DID arrive, which hurts their timestamp.
+ *
+ * 1.2 ms puts the preamble's start past the slowest re-arm measured (871 us)
+ * with ~330 us to spare, so the receiver is armed for the whole preamble. The
+ * frame then ends ~1.79 ms after the beacon's RMARKER, ~1.0 ms short of the
+ * first legitimate slave CAP preamble (asserted below).
+ *
+ * The value is a measured-latency decision, not derived: if slaves get faster
+ * or slower to re-arm, re-measure with `cia stats` on the debug image and move
+ * it. */
+#define CCP_TX_PREAMBLE_DELAY_NS 1200000u
+
+/* The same, in the chip's hi32 ticks (256 DTU = 4.006 ns). */
+#define CCP_TX_DELAY_HI32 \
+	((uint32_t)(((uint64_t)CCP_TX_PREAMBLE_DELAY_NS * 1000u) / 4006u))
+
+/* The CCP cannot start before the beacon has finished, and its whole frame has
+ * to end before the earliest legitimate slave CAP preamble. Both are checked
+ * here because the delay above is a tuned number someone will move. */
+BUILD_ASSERT(CCP_TX_PREAMBLE_DELAY_NS > CCP_SCHED_BEACON_END_NS,
+	     "CCP delay starts the CCP before the beacon has ended");
+BUILD_ASSERT((int64_t)CCP_TX_PREAMBLE_DELAY_NS + (int64_t)CCP_SCHED_SHR_NS +
+			     (int64_t)CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN_V2) <
+		     (int64_t)CCP_SCHED_CAP_PREAMBLE_NS,
+	     "delayed CCP frame runs into the first slave CAP preamble");
+
+/* ---- Earliest gateway TX after the CCP, added 2026-10-14 -------------------
+ *
+ * The same trap as the beacon->CCP pair above, one frame further down the
+ * chain. uwb_gateway.c's survey and self-tau steps run at the top of the
+ * inner loop, and on a quiet network (no tag RX to wake it) the only
+ * iteration per superframe is the one right after ccp_master_after_beacon()
+ * returns. A SURVEY_BEGIN / RANGE_CMD / SETPOS / SETTAU / self-tau poll sent
+ * there leaves ~100 us after the CCP ends, its ~269 us PLEN_256 preamble is
+ * over before a slave that is still reading the CCP's CIR and running
+ * ccp_slave_on_rx() is listening again, and the frame is lost WITHOUT EVEN AN
+ * RX ERROR. Measured 2026-10-14 on A2 (debug image, `cia stats` across four
+ * `apos enum`, i.e. 12 SURVEY_BEGIN): beacon 382, ccp 382, apos 0, err_sfd_to
+ * at its usual ~6 % background, while gateway GRANTs sent mid-superframe in
+ * the same window arrived. At PLEN_1024 the ~1050 us preamble hid this.
+ *
+ * Slave re-arm after the CCP's frame end. Measured after the BEACON: 732-871
+ * us from its RMARKER, i.e. ~0.4-0.55 ms after its frame end; the CCP path
+ * also reads the CIR (~150 us of SPI) and runs ccp_slave_on_rx() before
+ * rx_arm(). 1.0 ms covers that with margin. A measured-latency decision like
+ * CCP_TX_PREAMBLE_DELAY_NS: re-measure if the slave CCP path changes. */
+#define CCP_SCHED_SLAVE_REARM_NS 1000000u
+
+/* Where the CCP's frame ends, relative to the beacon's RMARKER. */
+#define CCP_SCHED_CCP_END_NS                                                   \
+	((uint32_t)CCP_TX_PREAMBLE_DELAY_NS + CCP_SCHED_SHR_NS +               \
+	 CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN_V2))
+
+/* Earliest instant, relative to the beacon's RMARKER, at which the gateway may
+ * START any further transmission (its preamble) and expect the slaves to be
+ * listening for the whole of it. ~2.79 ms at PLEN_256. */
+#define CCP_SCHED_GW_TX_EARLIEST_NS                                            \
+	(CCP_SCHED_CCP_END_NS + CCP_SCHED_SLAVE_REARM_NS)
+
+/* The same, in the chip's hi32 ticks (256 DTU = 4.006 ns). */
+#define CCP_SCHED_GW_TX_EARLIEST_HI32 \
+	((uint32_t)(((uint64_t)CCP_SCHED_GW_TX_EARLIEST_NS * 1000u) / 4006u))
+
+BUILD_ASSERT(CCP_SCHED_GW_TX_EARLIEST_NS > CCP_SCHED_CCP_END_NS,
+	     "gateway TX guard does not clear the CCP frame");
 
 #endif /* CCP_SCHED_H */

@@ -13,8 +13,10 @@ target_sources(app PRIVATE
 	src/apos_frame.c
 	src/apos_geom.c
 	src/apos_gw.c
+	src/apos_links.c
 	src/apos_node.c
 	src/apos_shell.c
+	src/apos_stats.c
 	src/apos_store.c
 	src/apos_table.c
 	src/beacon_guard.c
@@ -28,22 +30,27 @@ target_sources(app PRIVATE
 	src/disc_schedule.c
 	src/gw_core.c
 	src/gw_selftau.c
+	src/cmd_key.c
+	src/cmd_proto.c
+	src/hmac_sha256.c
 	src/mac_budget.c
 	src/main.c
 	src/net_config.c
 	src/net_shell.c
 	src/net_store.c
 	src/net_uplink.c
+	src/node_cmd.c
+	src/node_status.c
 	src/pos_abg.c
 	src/pos_json.c
 	src/pos_residual.c
 	src/pos_sink.c
 	src/pos_solver.c
 	src/ss_initiator.c
+	src/sync_link.c
 	src/sync_model.c
 	src/sync_shell.c
 	src/tag_id.c
-	src/tau_filter.c
 	src/tdoa_collect.c
 	src/tdoa_dtu.c
 	src/tdoa_gw.c

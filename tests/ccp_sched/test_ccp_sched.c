@@ -32,10 +32,14 @@ static int failures;
  * PHY and the guard geometry did not move, only how the CCP is scheduled). */
 static void test_derived_quantities_are_pinned(void)
 {
-	CHECK(CCP_SCHED_SHR_NS == 1050194u);
+	/* PLEN_256 (2026-10-12): SHR = 264 * 1017.63 = 268654 ns (was 1050194
+	 * at PLEN_1024). The beacon's post-RMARKER airtime and the guard
+	 * window do not depend on the preamble, so they are unchanged;
+	 * CAP_PREAMBLE = 3076922 - 268654 = 2808268 (was 2026728). */
+	CHECK(CCP_SCHED_SHR_NS == 268654u);
 	CHECK(CCP_SCHED_BEACON_END_NS == 389411u);
 	CHECK(CCP_SCHED_GUARD_END_NS == 3076922u);
-	CHECK(CCP_SCHED_CAP_PREAMBLE_NS == 2026728u);
+	CHECK(CCP_SCHED_CAP_PREAMBLE_NS == 2808268u);
 }
 
 /* The number this whole redesign turns on: how much of the post-beacon guard
@@ -48,9 +52,11 @@ static void test_derived_quantities_are_pinned(void)
  * frame. Was 348300 ns against v1; the v1 figure is still pinned just
  * below for anyone building a v1-only frame, unchanged since it is real
  * arithmetic over a real (if no longer routine) frame length. */
-static void test_max_arm_ns_is_263594(void)
+static void test_max_arm_ns_is_1826674(void)
 {
-	CHECK(CCP_SCHED_MAX_ARM_NS == 263594u);
+	/* 2808268 - (268654 + 323529) - 389411 = 1826674 at PLEN_256
+	 * (263594 at PLEN_1024; was 348300 against v1 originally). */
+	CHECK(CCP_SCHED_MAX_ARM_NS == 1826674);
 
 	uint32_t full_ccp = CCP_SCHED_SHR_NS +
 			    CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN_V2);
@@ -67,10 +73,11 @@ static void test_v1_airtime_share_is_recorded(void)
 	uint32_t full = CCP_SCHED_SHR_NS +
 			CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN);
 
-	CHECK(full == 1289017u);
-	/* 0.645% of a 200 ms superframe, to a tenth of a per mille. */
+	/* 268654 + 238823 (PHR + 23 B * 8 bit at 850k) = 507477 ns. */
+	CHECK(full == 507477u);
+	/* 0.254% of a 200 ms superframe, to a tenth of a per mille. */
 	CHECK((uint32_t)((uint64_t)full * 10000u /
-			 MAC_UUS_TO_NS(T_SUPERFRAME_UUS)) == 64u);
+			 MAC_UUS_TO_NS(T_SUPERFRAME_UUS)) == 25u);
 }
 
 /* The v2 frame's airtime and its share of a superframe -- what is ACTUALLY
@@ -82,16 +89,40 @@ static void test_v2_airtime_share_is_recorded(void)
 	uint32_t full = CCP_SCHED_SHR_NS +
 			CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN_V2);
 
-	CHECK(full == 1373723u);
-	/* 0.687% of a 200 ms superframe, to a tenth of a per mille. */
+	/* 268654 + 323529 (PHR + 32 B * 8 bit at 850k) = 592183 ns. */
+	CHECK(full == 592183u);
+	/* 0.296% of a 200 ms superframe, to a tenth of a per mille. */
 	CHECK((uint32_t)((uint64_t)full * 10000u /
-			 MAC_UUS_TO_NS(T_SUPERFRAME_UUS)) == 68u);
+			 MAC_UUS_TO_NS(T_SUPERFRAME_UUS)) == 29u);
+}
+
+/* The deliberate delay between the beacon's RMARKER and the CCP's preamble
+ * (2026-10-13). Pinned with its hi32 conversion, and with the margin the two
+ * BUILD_ASSERTs in ccp_sched.h leave: the CCP frame must end before the first
+ * slave CAP preamble, with the slowest measured slave re-arm (871 us) still
+ * ahead of the preamble. */
+static void test_ccp_delay_is_pinned(void)
+{
+	CHECK(CCP_TX_PREAMBLE_DELAY_NS == 1200000u);
+	/* 1200000 ns / 4.006 ns per hi32 tick, truncated. */
+	CHECK(CCP_TX_DELAY_HI32 == 299550u);
+
+	uint32_t frame_end = CCP_TX_PREAMBLE_DELAY_NS + CCP_SCHED_SHR_NS +
+			     CCP_SCHED_POST_RMARKER_NS(CCP_FRAME_LEN_V2);
+
+	/* 1200000 + 268654 + 323529 = 1792183 ns after the beacon's RMARKER. */
+	CHECK(frame_end == 1792183u);
+	/* ~1.016 ms of room before the first slave CAP preamble. */
+	CHECK(CCP_SCHED_CAP_PREAMBLE_NS - frame_end == 1016085u);
+	/* Preamble starts after the slowest slave re-arm measured (871 us). */
+	CHECK(CCP_TX_PREAMBLE_DELAY_NS > 871000u);
 }
 
 int main(void)
 {
 	test_derived_quantities_are_pinned();
-	test_max_arm_ns_is_263594();
+	test_ccp_delay_is_pinned();
+	test_max_arm_ns_is_1826674();
 	test_v1_airtime_share_is_recorded();
 	test_v2_airtime_share_is_recorded();
 

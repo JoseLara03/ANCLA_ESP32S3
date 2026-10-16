@@ -30,4 +30,11 @@ int uwb_store_save_pos(void);
 int uwb_store_save_sync_tau(void);
 int uwb_store_save_sync_tau_mode(void);
 
+/* The installed static sync link (valid flag, generation, root EUI). Written
+ * by apos_node.c AFTER sync_tau, on purpose: a power cut between the two
+ * leaves the old generation recorded against the new tau, which the gateway
+ * sees as a generation mismatch and retries -- the reverse order would leave
+ * a new generation claiming a tau that never landed. */
+int uwb_store_save_sync_link(void);
+
 #endif /* UWB_STORE_H */

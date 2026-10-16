@@ -335,6 +335,75 @@ static void test_seq_is_settable_without_disturbing_the_payload(void)
     CHECK(window == 45);
 }
 
+static void test_settau_round_trip_and_raw_bytes(void)
+{
+    const uint8_t parent[APOS_EUI_LEN] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t out_parent[APOS_EUI_LEN] = {0};
+    uint16_t session = 0;
+    uint8_t version = 0;
+    uint32_t gen = 0;
+    int32_t tau = 0;
+    int n = apos_frame_settau_build(buf, sizeof(buf), 0x0000, 0x0003, 0xBEEF,
+                                    0x01020304u, -1234, parent);
+
+    CHECK(n == (int)APOS_LEN_SETTAU);
+    CHECK(n <= (int)APOS_LEN_MAX);
+    CHECK(buf[9] == APOS_FRAME_TYPE && buf[10] == APOS_SUB_SETTAU);
+    CHECK(apos_frame_dest(buf) == 0x0003);
+    CHECK(apos_frame_is_apos(buf, (size_t)n));
+    /* Wire layout is the contract an older/newer firmware reads: session LE,
+     * version, generation LE, tau as two's complement LE, parent EUI. */
+    CHECK(buf[11] == 0xEF && buf[12] == 0xBE);
+    CHECK(buf[13] == APOS_SETTAU_VERSION);
+    CHECK(buf[14] == 0x04 && buf[15] == 0x03 && buf[16] == 0x02 && buf[17] == 0x01);
+    CHECK(buf[18] == 0x2E && buf[19] == 0xFB && buf[20] == 0xFF && buf[21] == 0xFF);
+    CHECK(memcmp(&buf[22], parent, APOS_EUI_LEN) == 0);
+
+    CHECK(apos_frame_parse_settau(buf, (size_t)n, &session, &version, &gen,
+                                  &tau, out_parent) == 0);
+    CHECK(session == 0xBEEF && version == APOS_SETTAU_VERSION);
+    CHECK(gen == 0x01020304u && tau == -1234);
+    CHECK(memcmp(out_parent, parent, APOS_EUI_LEN) == 0);
+
+    /* Exact length only, like every other subtype. */
+    CHECK(apos_frame_parse_settau(buf, (size_t)n - 1u, &session, &version,
+                                  &gen, &tau, out_parent) == -EINVAL);
+    CHECK(apos_frame_parse_settau(buf, (size_t)n + 2u, &session, &version,
+                                  &gen, &tau, out_parent) == -EINVAL);
+    CHECK(apos_frame_settau_build(buf, 10, 0, 1, 1, 1, 1, parent) == -EMSGSIZE);
+    CHECK(apos_frame_settau_build(buf, sizeof(buf), 0, 1, 1, 1, 1, NULL) == -EINVAL);
+}
+
+static void test_settau_ack_round_trip(void)
+{
+    uint16_t session = 0;
+    uint32_t gen = 0;
+    int32_t tau = 0;
+    uint8_t status = 0xFF;
+    int n = apos_frame_settau_ack_build(buf, sizeof(buf), 0x0003, 0x0000,
+                                        0x1234, 77u, 640, APOS_SETTAU_PERSIST_ERR);
+
+    CHECK(n == (int)APOS_LEN_SETTAU_ACK);
+    CHECK(apos_frame_parse_settau_ack(buf, (size_t)n, &session, &gen, &tau,
+                                      &status) == 0);
+    CHECK(session == 0x1234 && gen == 77u && tau == 640);
+    CHECK(status == APOS_SETTAU_PERSIST_ERR);
+    /* A SETTAU is not an ACK and vice versa. */
+    CHECK(apos_frame_parse_settau(buf, (size_t)n, &session, &(uint8_t){0}, &gen,
+                                  &tau, (uint8_t[APOS_EUI_LEN]){0}) == -EINVAL);
+}
+
+/* The new subtypes must NOT make an old frame parse as something else, and an
+ * unknown subtype just above them must still be refused. */
+static void test_subtype_range_edges(void)
+{
+    apos_frame_survey_begin_build(buf, sizeof(buf), 0x0000, 1, 1);
+    buf[10] = APOS_SUB_SETTAU_ACK;
+    CHECK(apos_frame_is_apos(buf, APOS_LEN_SETTAU_ACK));
+    buf[10] = (uint8_t)(APOS_SUB_SETTAU_ACK + 1u);
+    CHECK(!apos_frame_is_apos(buf, APOS_LEN_SETTAU_ACK));
+}
+
 int main(void)
 {
     test_header_matches_the_network_convention();
@@ -356,6 +425,9 @@ int main(void)
     test_parser_rejects_the_wrong_subtype();
     test_builders_reject_a_short_buffer();
     test_seq_is_settable_without_disturbing_the_payload();
+    test_settau_round_trip_and_raw_bytes();
+    test_settau_ack_round_trip();
+    test_subtype_range_edges();
 
     if (g_fail) {
         printf("%d CHECK(s) FAILED\n", g_fail);

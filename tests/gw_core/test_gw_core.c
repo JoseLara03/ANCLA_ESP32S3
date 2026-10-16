@@ -192,6 +192,42 @@ static void test_keepalive(void)
     CHECK(c.seats[g.seat_id].tier == GW_TIER_IDLE);
 }
 
+/* gw_core_touch(): lease refreshed, tier untouched, unknown address a no-op,
+ * and a seat kept alive by touches alone outlives the bare lease. */
+static void test_touch(void)
+{
+    struct gw_core_ctx c;
+    uint8_t eui[UWB_FRAME_EUI_LEN];
+    struct gw_grant g;
+
+    gw_core_init(&c);
+    mk_eui(eui, 0x20);
+    CHECK(gw_core_join(&c, eui, GW_TIER_IDLE, &g));
+    uint8_t tier = c.seats[g.seat_id].tier;
+
+    for (int i = 0; i < 10; i++) gw_core_superframe_tick(&c);
+    CHECK(gw_core_touch(&c, g.short_addr));
+    CHECK(c.seats[g.seat_id].lease_remaining == GW_LEASE_SF);
+    CHECK(c.seats[g.seat_id].tier == tier);
+
+    CHECK(!gw_core_touch(&c, 0xBEEF));
+
+    /* An IDLE tag blinks every 25 superframes. With no KEEPALIVE at all its
+     * seat must survive several leases on blinks alone. */
+    for (unsigned int sf = 1; sf <= 4u * GW_LEASE_SF; sf++) {
+        gw_core_superframe_tick(&c);
+        if (sf % 25u == 0u) {
+            CHECK(gw_core_touch(&c, g.short_addr));
+        }
+    }
+    CHECK(c.seats[g.seat_id].short_addr == g.short_addr);
+
+    /* Once it stops blinking, the seat expires as before. */
+    for (unsigned int sf = 0; sf < GW_LEASE_SF; sf++) gw_core_superframe_tick(&c);
+    CHECK(c.seats[g.seat_id].short_addr == 0);
+    CHECK(!gw_core_touch(&c, g.short_addr));
+}
+
 static void test_lease_expiry(void)
 {
     struct gw_core_ctx c;
@@ -634,6 +670,7 @@ int main(void)
     test_hundred_tags_fit();
     test_seat_table_full();
     test_keepalive();
+    test_touch();
     test_lease_expiry();
     test_release();
     test_slotmap();

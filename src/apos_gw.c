@@ -10,10 +10,14 @@
 
 #include "apos_frame.h"
 #include "apos_node.h"    /* APOS_MIN_N_OK, APOS_ENUM_* for the gap derivation */
+#include "apos_stats.h"
 #include "apos_store.h"
+#include "gw_selftau.h"   /* GW_SELFTAU_STEP_BUDGET_UUS */
+#include "ss_initiator.h"
 #include "uwb_config.h"
 #include "uwb_dwtime.h"
 
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
@@ -68,9 +72,7 @@ static uint8_t apply_retries;
 static uint8_t applied_ok;
 static uint8_t applied_fail;
 static uint8_t applied_skip;
-static bool apply_ending;   /* all nodes done; SURVEY_END still to send */
 static bool apply_persisted;
-static bool apply_reopen;   /* SURVEY_BEGIN still to re-broadcast, see step_apply */
 
 /* Result judgement, filled by do_solve()/judge_result(). */
 static bool accepted;
@@ -89,6 +91,48 @@ static bool solve_unverified;
  * numbers say nothing about whether the GEOMETRY is over-determined. */
 static int32_t max_recip_mm;
 static uint16_t max_sd_mm;
+/* ---- B14 static survey ---------------------------------------------------
+ *
+ * The gateway is a node of a 3D survey. gw_idx is its index in `tbl` (-1 when
+ * the survey does not include it: a 2D survey, or one not yet through
+ * enumeration). Everything below is touched only from the gateway loop except
+ * where a comment says otherwise. */
+static int8_t gw_idx = -1;
+static uint8_t gw_eui[APOS_EUI_LEN];
+static bool gw_eui_ready;
+
+/* Gateway -> anchor ranging, run locally. One pair at a time. */
+static int32_t local_s[APOS_STATS_MAX];
+static uint8_t local_n_try;
+static uint8_t local_n_ok;
+
+/* Judgement of the last 3D solve. */
+static struct apos_gauge_quality gq;
+static bool gq_valid;
+static bool gauge_degenerate;
+static struct sync_link links[SYNC_LINK_MAX];
+static uint8_t n_links;
+static bool links_verified;
+
+/* Apply bookkeeping beyond what the SETPOS loop already has. */
+enum apply_stage {
+	AP_MARK    = 0, /* persist the apply-in-progress marker, hold fixes */
+	AP_REOPEN  = 1, /* one-shot SURVEY_BEGIN so every window is open */
+	AP_SETPOS  = 2,
+	AP_SETTAU  = 3,
+	AP_COMMIT  = 4, /* persist survey + links, release the hold */
+	AP_END     = 5, /* SURVEY_END and summary */
+};
+static uint8_t apply_stage;
+static bool apply_with_links;     /* this apply installs links (3D + gateway) */
+static uint32_t apply_generation; /* the generation this apply installs */
+static uint32_t applied_generation; /* last one fully installed */
+static uint8_t tau_ok;
+
+/* Fix-publication hold. See apos_gw_publish_hold(). volatile: written on the
+ * gateway loop, read by tdoa_gw on the same loop, but also by the shell. */
+static volatile bool hold;
+static const char *hold_reason = "none";
 
 static uint8_t tx_buf[APOS_LEN_MAX];
 
@@ -117,11 +161,103 @@ void apos_gw_init(void)
 	applied_ok = 0;
 	applied_fail = 0;
 	applied_skip = 0;
-	apply_ending = false;
 	apply_persisted = false;
-	apply_reopen = false;
 	max_recip_mm = 0;
 	max_sd_mm = 0;
+
+	gw_idx = -1;
+	local_n_try = 0;
+	local_n_ok = 0;
+	gq_valid = false;
+	gauge_degenerate = false;
+	n_links = 0;
+	links_verified = false;
+	apply_stage = AP_MARK;
+	apply_with_links = false;
+	apply_generation = 0;
+	tau_ok = 0;
+	applied_generation = apos_store_links()->generation;
+
+	/* This board's own identity, the same source apos_node.c hashes for its
+	 * stagger. Zero-padded for the same reason: the tail is compared for
+	 * identity, so uninitialised bytes would change it between boots. */
+	memset(gw_eui, 0, sizeof(gw_eui));
+	gw_eui_ready = hwinfo_get_device_id(gw_eui, sizeof(gw_eui)) > 0;
+	if (!gw_eui_ready) {
+		LOG_ERR("{\"apos_error\":\"hwinfo_get_device_id failed — this "
+			"gateway has no unique id and cannot be a node of its own "
+			"survey\"}");
+	}
+
+	/* An apply that was started and never finished leaves the anchors holding
+	 * a mix of generations. The marker was persisted BEFORE the first anchor
+	 * was touched, so finding it here -- or finding one that cannot be read --
+	 * means fixes must stay suspended until an apply completes. */
+	hold = false;
+	hold_reason = "none";
+	if (apos_store_apply_pending()) {
+		hold = true;
+		hold_reason = "interrupted-apply";
+		LOG_ERR("{\"apos_error\":\"an `apos apply` (generation %u) was "
+			"started and never finished — the anchors may hold a mix "
+			"of survey generations. Position fixes are SUSPENDED. "
+			"Re-run `apos run` and `apos apply`.\"}",
+			(unsigned int)apos_store_pending_generation());
+	}
+}
+
+bool apos_gw_publish_hold(void)
+{
+	return hold;
+}
+
+const char *apos_gw_hold_reason(void)
+{
+	return hold_reason;
+}
+
+const uint8_t *apos_gw_eui(void)
+{
+	return gw_eui_ready ? gw_eui : NULL;
+}
+
+bool apos_gw_survey_has_gateway(void)
+{
+	return gw_idx >= 0;
+}
+
+uint8_t apos_gw_links(const struct sync_link **out)
+{
+	if (out) {
+		*out = links;
+	}
+	return n_links;
+}
+
+bool apos_gw_gauge_quality(struct apos_gauge_quality *out)
+{
+	if (!gq_valid) {
+		return false;
+	}
+	if (out) {
+		*out = gq;
+	}
+	return true;
+}
+
+bool apos_gw_gauge_degenerate(void)
+{
+	return gauge_degenerate;
+}
+
+bool apos_gw_links_verified(void)
+{
+	return links_verified;
+}
+
+uint32_t apos_gw_generation(void)
+{
+	return applied_generation;
 }
 
 bool apos_gw_busy(void)
@@ -153,6 +289,8 @@ void apos_gw_get_status(struct apos_gw_status *out)
 	out->meas_total = pair_total;
 	out->applied_ok = applied_ok;
 	out->applied_fail = applied_fail;
+	out->gateway_node = gw_idx >= 0;
+	out->hold = hold;
 }
 
 int apos_gw_set_gauge(uint16_t origin, uint16_t xaxis, uint16_t plane,
@@ -235,6 +373,21 @@ static uint16_t new_session(void)
 	return s;
 }
 
+/* Everything a fresh enumeration or run must forget about a previous one, so a
+ * bare `apos enum` after an aborted run cannot inherit a stale gateway node,
+ * link set or gauge verdict. */
+static void reset_static_state(void)
+{
+	gw_idx = -1;
+	local_n_try = 0;
+	local_n_ok = 0;
+	gq_valid = false;
+	gauge_degenerate = false;
+	n_links = 0;
+	links_verified = false;
+	tau_ok = 0;
+}
+
 static void send_survey_begin(uint8_t *seq)
 {
 	int n = apos_frame_survey_begin_build(tx_buf, sizeof(tx_buf),
@@ -272,6 +425,7 @@ int apos_gw_start_enum(void)
 	solve_unverified = false;
 	solve_redundancy = 0;
 	solve_n_edges = 0;
+	reset_static_state();
 
 	phase = APOS_GW_ENUM;
 
@@ -431,6 +585,7 @@ int apos_gw_start_run(void)
 	solve_unverified = false;
 	solve_redundancy = 0;
 	solve_n_edges = 0;
+	reset_static_state();
 	session = new_session();
 	enum_round = 0;
 	next_action_ms = 0;
@@ -506,6 +661,15 @@ static void judge_result(void)
 		   res.worst_edge_m <= APOS_ACCEPT_WORST_FACTOR * res.rms_m +
 				       (float)APOS_ACCEPT_RMS_MM / 1000.0f;
 
+	/* The static install adds two conditions. A degenerate gauge is judged
+	 * here too so `accepted` never reads 1 for it, but it is ALSO a hard
+	 * refusal that `force` cannot override (apos_gw_start_apply()). Links
+	 * that are unchecked or outside the gate fail acceptance and CAN be
+	 * forced, like every other acceptance threshold. */
+	if (res.dim == APOS_GEOM_3D && gw_idx >= 0) {
+		accepted = accepted && !gauge_degenerate && links_verified;
+	}
+
 	LOG_INF("{\"apos_solve\":{\"nodes\":%u,\"placed\":%u,\"ambiguous\":%u,"
 		"\"rms_mm\":%d,\"worst_mm\":%d,\"worst_pair\":[%u,%u],"
 		"\"planarity_mm\":%d,\"gauge_collinearity_permille\":%d,"
@@ -529,6 +693,47 @@ static void judge_result(void)
 			res.node[k].state,
 			(int)(res.node[k].residual_m * 1000.0f));
 	}
+	if (res.dim == APOS_GEOM_3D && gw_idx >= 0) {
+		if (gq_valid) {
+			LOG_INF("{\"apos_gauge\":{\"up_height_mm\":%d,"
+				"\"height_floor_mm\":%d,\"collinearity_permille\":%d,"
+				"\"edge_rms_mm\":%d,\"coplanar\":%u,\"collinear\":%u}}",
+				(int)(gq.up_height_m * 1000.0f),
+				(int)(gq.height_floor_m * 1000.0f),
+				(int)(gq.collinearity * 1000.0f),
+				(int)(gq.edge_rms_m * 1000.0f),
+				gq.coplanar ? 1u : 0u, gq.collinear ? 1u : 0u);
+		}
+		for (uint8_t k = 0; k < n_links; k++) {
+			LOG_INF("{\"apos_link\":{\"child\":\"0x%04X\",\"tau_dtu\":%d,"
+				"\"geom_mm\":%d,\"meas_mm\":%d,\"err_mm\":%d,"
+				"\"checked\":%u,\"within_gate\":%u,\"valid\":%u}}",
+				links[k].child_addr, (int)links[k].tau_dtu,
+				(int)links[k].geom_mm, (int)links[k].meas_mm,
+				(int)links[k].err_mm, links[k].checked ? 1u : 0u,
+				links[k].within_gate ? 1u : 0u,
+				links[k].valid ? 1u : 0u);
+		}
+		if (gauge_degenerate) {
+			LOG_ERR("{\"apos_error\":\"the four gauge anchors do not span a "
+				"3D frame (up %d mm off the origin/xaxis/plane plane, "
+				"noise floor %d mm; collinearity %d/1000). This candidate "
+				"is REFUSED and `apos apply force` will not install it: "
+				"its z would be noise. Mount `origin`, `xaxis` and `plane` "
+				"in one plane and `up` clearly off it, then re-run.\"}",
+				gq_valid ? (int)(gq.up_height_m * 1000.0f) : 0,
+				gq_valid ? (int)(gq.height_floor_m * 1000.0f) : 0,
+				gq_valid ? (int)(gq.collinearity * 1000.0f) : 0);
+		}
+		if (!links_verified) {
+			LOG_WRN("{\"apos_warn\":\"%u of %u gateway links are verified "
+				"(measured directly and within %d mm of the geometry) "
+				"— `apos apply` will refuse unless forced\"}",
+				sync_link_count_good(links, n_links), n_links,
+				(int)SYNC_LINK_GATE_MM);
+		}
+	}
+
 
 	/* The degenerate-redundancy case, said out loud. `accepted` is left
 	 * exactly as the thresholds computed it -- weakening or inverting a
@@ -651,42 +856,51 @@ static void do_solve(void)
 							   res.n_placed));
 	solve_unverified = solve_redundancy <= 0;
 
+	/* The static-install checks, 3D with the gateway as a node only. */
+	gq_valid = false;
+	gauge_degenerate = false;
+	n_links = 0;
+	links_verified = false;
+	if (res.dim == APOS_GEOM_3D && gw_idx >= 0) {
+		float err = (float)max_sd_mm / 1000.0f;
+
+		if (err < APOS_GAUGE_RANGE_ERR_FLOOR_M) {
+			err = APOS_GAUGE_RANGE_ERR_FLOOR_M;
+		}
+		if (apos_geom_gauge_conditioning(&res, &g, err, &gq) == 0) {
+			gq_valid = true;
+			gauge_degenerate = gq.collinear || gq.coplanar;
+		} else {
+			/* A gauge node the solve could not place: that is not a
+			 * "maybe"; the frame does not exist. */
+			gauge_degenerate = true;
+		}
+
+		int nl = sync_link_derive(&tbl, &res, (uint8_t)gw_idx,
+					  (uint8_t)APOS_MIN_N_OK, links,
+					  SYNC_LINK_MAX);
+
+		if (nl > 0) {
+			n_links = (uint8_t)nl;
+			/* Every anchor must have a link, checked against a direct
+			 * measurement and inside the gate. */
+			links_verified = (n_links == (uint8_t)(tbl.n_peers - 1u)) &&
+					 (sync_link_count_good(links, n_links) ==
+					  n_links);
+		}
+	}
+
 	have_result = true;
 	judge_result();
 	phase = APOS_GW_IDLE;
 }
 
-static void on_range_rsp(const uint8_t *buf, uint16_t plen)
+/* One finished pair, from either path: a RANGE_RSP off the air (anchor ->
+ * anchor) or the gateway's own exchanges (gateway -> anchor). The acceptance
+ * rules are shared on purpose -- a thin, non-positive or accepted pair means
+ * the same thing whoever measured it. Uses await_from_addr/await_peer_addr. */
+static void record_pair(int32_t mean, uint16_t sd, uint8_t n_ok)
 {
-	uint16_t sess = 0, peer = 0, sd = 0;
-	int32_t mean = 0;
-	uint8_t n_ok = 0;
-
-	if (apos_frame_parse_range_rsp(buf, plen, &sess, &peer, &mean, &sd,
-				       &n_ok) != 0) {
-		return;
-	}
-	if (sess != session || !awaiting_rsp) {
-		return;
-	}
-	/* Phase, not just session and awaiting_rsp: the session is unchanged
-	 * across a whole run and APPLY also sets awaiting_rsp. apos_node.c
-	 * deliberately RETRANSMITS a RANGE_RSP once when the first TX fails, so
-	 * duplicates are engineered into this protocol rather than exceptional.
-	 * A straggler arriving during APPLY whose (src, peer) happens to match a
-	 * stale await_*_addr would otherwise clear awaiting_rsp and advance
-	 * pair_idx -- which during APPLY means a spurious duplicate SETPOS and a
-	 * corrupted meas_done. Same reasoning as on_enum_rsp()/on_setpos_ack(). */
-	if (phase != APOS_GW_RANGE) {
-		return;
-	}
-	/* Both endpoints must match what we asked for. Without the peer check a
-	 * late reply from the PREVIOUS pair would be recorded against this one,
-	 * which is a wrong edge rather than a missing one -- far worse. */
-	if (apos_frame_src(buf) != await_from_addr || peer != await_peer_addr) {
-		return;
-	}
-
 	int from = apos_table_find_addr(&tbl, await_from_addr);
 	int to = apos_table_find_addr(&tbl, await_peer_addr);
 
@@ -729,6 +943,40 @@ static void on_range_rsp(const uint8_t *buf, uint16_t plen)
 			(unsigned int)pair_total, await_from_addr,
 			await_peer_addr, mean, sd, n_ok);
 	}
+}
+
+static void on_range_rsp(const uint8_t *buf, uint16_t plen)
+{
+	uint16_t sess = 0, peer = 0, sd = 0;
+	int32_t mean = 0;
+	uint8_t n_ok = 0;
+
+	if (apos_frame_parse_range_rsp(buf, plen, &sess, &peer, &mean, &sd,
+				       &n_ok) != 0) {
+		return;
+	}
+	if (sess != session || !awaiting_rsp) {
+		return;
+	}
+	/* Phase, not just session and awaiting_rsp: the session is unchanged
+	 * across a whole run and APPLY also sets awaiting_rsp. apos_node.c
+	 * deliberately RETRANSMITS a RANGE_RSP once when the first TX fails, so
+	 * duplicates are engineered into this protocol rather than exceptional.
+	 * A straggler arriving during APPLY whose (src, peer) happens to match a
+	 * stale await_*_addr would otherwise clear awaiting_rsp and advance
+	 * pair_idx -- which during APPLY means a spurious duplicate SETPOS and a
+	 * corrupted meas_done. Same reasoning as on_enum_rsp()/on_setpos_ack(). */
+	if (phase != APOS_GW_RANGE) {
+		return;
+	}
+	/* Both endpoints must match what we asked for. Without the peer check a
+	 * late reply from the PREVIOUS pair would be recorded against this one,
+	 * which is a wrong edge rather than a missing one -- far worse. */
+	if (apos_frame_src(buf) != await_from_addr || peer != await_peer_addr) {
+		return;
+	}
+
+	record_pair(mean, sd, n_ok);
 
 	awaiting_rsp = false;
 	pair_retries = 0;
@@ -745,6 +993,76 @@ static void retire_pair(const char *why)
 	LOG_WRN("{\"apos_hole\":{\"from\":\"0x%04X\",\"to\":\"0x%04X\","
 		"\"why\":\"%s\"}}", await_from_addr, await_peer_addr, why);
 	awaiting_rsp = false;
+	pair_retries = 0;
+	tx_fails = 0;
+	pair_idx++;
+}
+
+/* Convert a span of the DW3220's hi32 timestamp into uus, the way
+ * uwb_gateway.c's loop does. */
+static uint32_t hi32_span_to_uus(uint32_t span_hi32)
+{
+	return (uint32_t)(((uint64_t)span_hi32 << 8) / UUS_TO_DWT_TIME);
+}
+
+/* The gateway ranging the anchor at the cursor itself: up to
+ * APOS_GW_LOCAL_BURST SS-TWR exchanges per call, each only if one worst-case
+ * exchange (GW_SELFTAU_STEP_BUDGET_UUS) still fits before the beacon must be
+ * armed, with a yield between them so the shell and log threads are not
+ * starved by the cooperative loop.
+ *
+ * Bounded three ways -- the burst cap, the time left, and
+ * APOS_GW_LOCAL_ATTEMPTS per pair -- so no combination of a silent anchor and
+ * a busy superframe can hold the beacon or park the survey on one pair. An
+ * anchor that never answers simply finishes the pair with n_ok below
+ * APOS_MIN_N_OK, which record_pair() reports as a hole by address. */
+static void step_local_range(uint32_t avail_uus)
+{
+	if (avail_uus < GW_SELFTAU_STEP_BUDGET_UUS) {
+		return; /* wait for a roomier step; costs latency only */
+	}
+
+	uint32_t t0 = dwt_readsystimestamphi32();
+	uint8_t wire_id = (uint8_t)(await_peer_addr & 0xFFu);
+
+	for (uint8_t b = 0; b < APOS_GW_LOCAL_BURST &&
+			    local_n_try < APOS_GW_LOCAL_ATTEMPTS; b++) {
+		uint32_t used = hi32_span_to_uus(dwt_readsystimestamphi32() - t0);
+
+		if (avail_uus < used + GW_SELFTAU_STEP_BUDGET_UUS) {
+			break;
+		}
+
+		ss_initiator_enter();
+		int32_t mm = ss_initiator_range(wire_id);
+
+		ss_initiator_leave();
+
+		local_n_try++;
+		if (mm != INT32_MIN && local_n_ok < APOS_STATS_MAX) {
+			local_s[local_n_ok++] = mm;
+		}
+		k_sleep(K_MSEC(1));
+	}
+
+	if (local_n_try < APOS_GW_LOCAL_ATTEMPTS) {
+		return; /* more next step */
+	}
+
+	int32_t mean = 0;
+	uint16_t sd = 0;
+	uint8_t kept = apos_batch_stats(local_s, local_n_ok, &mean, &sd);
+
+	LOG_INF("{\"apos_local_range\":{\"peer\":\"0x%04X\",\"tried\":%u,"
+		"\"ok\":%u,\"kept\":%u,\"mean_mm\":%d,\"sd_mm\":%u}}",
+		await_peer_addr, local_n_try, local_n_ok, kept, mean, sd);
+
+	/* n_ok is the KEPT count, as on the anchor side: the min_n_ok threshold
+	 * is about how many samples the mean rests on. */
+	record_pair(mean, sd, kept);
+
+	local_n_try = 0;
+	local_n_ok = 0;
 	pair_retries = 0;
 	tx_fails = 0;
 	pair_idx++;
@@ -788,8 +1106,24 @@ static void step_range(uint32_t avail_uus, uint8_t *seq)
 	uint8_t from, to;
 
 	pair_of(pair_idx, tbl.n_peers, &from, &to);
+
+	/* anchor -> gateway is NOT measured (see apos_gw.h, "DELIBERATE
+	 * DEVIATION"). Skipped silently and counted as covered: the pair is
+	 * still measured in the other direction, which is the only one this
+	 * design takes, so it is not a hole. */
+	if (gw_idx >= 0 && to == (uint8_t)gw_idx) {
+		pair_idx++;
+		return;
+	}
+
 	await_from_addr = tbl.peer[from].short_addr;
 	await_peer_addr = tbl.peer[to].short_addr;
+
+	/* gateway -> anchor: this board ranges the anchor itself, no frame. */
+	if (gw_idx >= 0 && from == (uint8_t)gw_idx) {
+		step_local_range(avail_uus);
+		return;
+	}
 
 	int n = apos_frame_range_cmd_build(tx_buf, sizeof(tx_buf),
 					  UWB_ADDR_GATEWAY_RESERVED,
@@ -829,8 +1163,41 @@ int apos_gw_start_apply(bool force)
 	if (!have_result) {
 		return -ENODATA;
 	}
+
+	apply_with_links = (res.dim == APOS_GEOM_3D) && (gw_idx >= 0);
+
+	/* A degenerate gauge is refused HARD, before `force` is even looked at.
+	 * `force` overrides acceptance THRESHOLDS; a coplanar or collinear gauge
+	 * is not a threshold, it is a coordinate frame whose z and mirror side are
+	 * noise, and installing it would write that into every anchor and into the
+	 * stored survey. */
+	if (apply_with_links && gauge_degenerate) {
+		return -EDOM;
+	}
 	if (!accepted && !force) {
 		return -EPERM;
+	}
+
+	if (apply_with_links) {
+		/* Even forced, every anchor needs a link that could be COMPUTED.
+		 * "Unverified" (no direct measurement, or outside the gate) is
+		 * what force overrides; "no tau at all" is not something an
+		 * operator can accept. */
+		if (n_links != (uint8_t)(tbl.n_peers - 1u)) {
+			return -ENODATA;
+		}
+		for (uint8_t k = 0; k < n_links; k++) {
+			if (!links[k].valid) {
+				return -ENODATA;
+			}
+		}
+
+		uint32_t g = apos_store_links()->generation;
+
+		if (apos_store_pending_generation() > g) {
+			g = apos_store_pending_generation();
+		}
+		apply_generation = g + 1u;
 	}
 
 	apply_idx = 0;
@@ -838,16 +1205,18 @@ int apos_gw_start_apply(bool force)
 	applied_ok = 0;
 	applied_fail = 0;
 	applied_skip = 0;
-	apply_ending = false;
+	tau_ok = 0;
 	apply_persisted = false;
-	apply_reopen = true;
+	apply_stage = apply_with_links ? AP_MARK : AP_REOPEN;
 	awaiting_rsp = false;
 	tx_fails = 0;
 	next_action_ms = 0;
 	phase = APOS_GW_APPLY;
 
-	LOG_INF("{\"apos\":\"applying\",\"nodes\":%u,\"forced\":%u}",
-		res.n_nodes, force ? 1u : 0u);
+	LOG_INF("{\"apos\":\"applying\",\"nodes\":%u,\"forced\":%u,"
+		"\"links\":%u,\"generation\":%u}",
+		res.n_nodes, force ? 1u : 0u, apply_with_links ? 1u : 0u,
+		(unsigned int)apply_generation);
 
 	/* Repeated HERE, not only at solve time. Apply is the point of no
 	 * return -- it rewrites every anchor's NVS and this gateway's survey --
@@ -882,7 +1251,11 @@ int apos_gw_start_apply(bool force)
  * replaces today's stub anchors payload with the real survey -- will read
  * node[0] as the reference the platform places the map against. The solver's
  * node order is the order anchors answered enumeration in, which is arbitrary,
- * so the origin is moved to the front here rather than being assumed. */
+ * so the origin is moved to the front here rather than being assumed.
+ *
+ * The gateway, when it is a node, is written like any other (short address
+ * 0x0000, its real EUI). It is the origin of nothing -- the gauge is
+ * anchors-only -- so it never lands in node[0]. */
 static bool persist_survey(void)
 {
 	struct apos_survey s;
@@ -949,6 +1322,28 @@ static bool persist_survey(void)
 	return true;
 }
 
+/* The links of this apply, in the persisted form, stamped with the generation
+ * being installed. */
+static int persist_links(void)
+{
+	/* static: the gateway loop runs on the 4096-byte main stack, whose peak is
+	 * already 1748 B inside the solve, and this is ~200 B on top of a settings
+	 * write. Called from one place, never reentrantly. */
+	static struct apos_links l;
+
+	memset(&l, 0, sizeof(l));
+	l.generation = apply_generation;
+	l.n = n_links;
+	for (uint8_t k = 0; k < n_links; k++) {
+		memcpy(l.rec[k].child_eui, links[k].child_eui, APOS_EUI_LEN);
+		memcpy(l.rec[k].parent_eui, links[k].parent_eui, APOS_EUI_LEN);
+		l.rec[k].tau_dtu = links[k].tau_dtu;
+		l.rec[k].valid = links[k].valid;
+		l.rec[k].source = links[k].source;
+	}
+	return apos_store_save_links(&l);
+}
+
 static void on_setpos_ack(const uint8_t *buf, uint16_t plen)
 {
 	uint16_t sess = 0;
@@ -966,8 +1361,10 @@ static void on_setpos_ack(const uint8_t *buf, uint16_t plen)
 	 * across a whole run, and RANGE also sets awaiting_rsp. A SETPOS_ACK
 	 * arriving then -- a duplicate from a previous apply against the same
 	 * session -- would otherwise advance the RANGE cursor past a pair that
-	 * was never measured. Same reasoning as on_enum_rsp(). */
-	if (phase != APOS_GW_APPLY) {
+	 * was never measured. Same reasoning as on_enum_rsp(). The stage matters
+	 * for the same reason inside APPLY: a late SETPOS_ACK must not be taken
+	 * for the answer to a SETTAU. */
+	if (phase != APOS_GW_APPLY || apply_stage != AP_SETPOS) {
 		return;
 	}
 	if (apos_frame_src(buf) != await_from_addr) {
@@ -996,6 +1393,96 @@ static void on_setpos_ack(const uint8_t *buf, uint16_t plen)
 	next_action_ms = 0;
 }
 
+/* The tau the SETTAU in flight carries, to check the ACK echoes it. */
+static int32_t await_tau;
+
+static void on_settau_ack(const uint8_t *buf, uint16_t plen)
+{
+	uint16_t sess = 0;
+	uint32_t gen = 0;
+	int32_t tau = 0;
+	uint8_t status = 0xFFu;
+
+	if (apos_frame_parse_settau_ack(buf, plen, &sess, &gen, &tau, &status)
+	    != 0) {
+		return;
+	}
+	if (sess != session || !awaiting_rsp) {
+		return;
+	}
+	if (phase != APOS_GW_APPLY || apply_stage != AP_SETTAU) {
+		return;
+	}
+	if (apos_frame_src(buf) != await_from_addr) {
+		return;
+	}
+
+	/* The ACK reports what the anchor actually HOLDS, so a generation or tau
+	 * that differs from what was sent is a failure even with status OK: it
+	 * means a stale duplicate or an anchor that stored something else. Not
+	 * retried -- a retry would only restate the same command to a board that
+	 * answered clearly. */
+	if (status == APOS_SETTAU_OK && gen == apply_generation &&
+	    tau == await_tau) {
+		tau_ok++;
+		LOG_INF("{\"apos_settau_ok\":{\"addr\":\"0x%04X\",\"tau_dtu\":%d,"
+			"\"gen\":%u}}", await_from_addr, (int)tau,
+			(unsigned int)gen);
+	} else {
+		applied_fail++;
+		LOG_ERR("{\"apos_error\":\"0x%04X answered SETTAU with status %u, "
+			"generation %u, tau %d (sent generation %u, tau %d) — it "
+			"did NOT take the link\"}", await_from_addr, status,
+			(unsigned int)gen, (int)tau, (unsigned int)apply_generation,
+			(int)await_tau);
+	}
+
+	awaiting_rsp = false;
+	apply_retries = 0;
+	tx_fails = 0;
+	apply_idx++;
+	next_action_ms = 0;
+}
+
+/* The link whose child is node `idx` of the table, or NULL. By EUI. */
+static const struct sync_link *link_for_node(uint8_t idx)
+{
+	for (uint8_t k = 0; k < n_links; k++) {
+		if (memcmp(links[k].child_eui, tbl.peer[idx].eui,
+			   APOS_EUI_LEN) == 0) {
+			return &links[k];
+		}
+	}
+	return NULL;
+}
+
+/* Advance a node cursor past nodes this stage has nothing to send to: the
+ * gateway itself (it is not commanded over the air), and -- for SETPOS only --
+ * unplaced nodes, which are COUNTED so the summary cannot report a clean
+ * `failed:0` for an apply that only covered part of the array. Pushing
+ * (0, 0, 0) to an unplaced node would be exactly the silent-wrong-coordinate
+ * failure this whole design exists to remove. */
+static void skip_nodes(bool count_unplaced)
+{
+	while (apply_idx < res.n_nodes) {
+		if (gw_idx >= 0 && apply_idx == (uint8_t)gw_idx) {
+			apply_idx++;
+			continue;
+		}
+		if (res.node[apply_idx].state == APOS_NODE_UNPLACED) {
+			if (count_unplaced) {
+				LOG_WRN("{\"apos_skip\":{\"addr\":\"0x%04X\","
+					"\"reason\":\"unplaced\"}}",
+					tbl.peer[apply_idx].short_addr);
+				applied_skip++;
+			}
+			apply_idx++;
+			continue;
+		}
+		break;
+	}
+}
+
 static void step_apply(uint32_t avail_uus, uint8_t *seq)
 {
 	int64_t now = k_uptime_get();
@@ -1007,20 +1494,58 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 		if (apply_retries < APOS_GW_APPLY_RETRIES) {
 			apply_retries++;
 			awaiting_rsp = false;
-			LOG_WRN("{\"apos_retry\":{\"setpos\":\"0x%04X\","
-				"\"attempt\":%u}}", await_from_addr,
-				apply_retries);
+			LOG_WRN("{\"apos_retry\":{\"%s\":\"0x%04X\","
+				"\"attempt\":%u}}",
+				(apply_stage == AP_SETTAU) ? "settau" : "setpos",
+				await_from_addr, apply_retries);
 		} else {
 			applied_fail++;
-			LOG_ERR("{\"apos_error\":\"0x%04X never acknowledged "
-				"SETPOS after %u attempts — it is still on its "
-				"OLD coordinates\"}", await_from_addr,
-				APOS_GW_APPLY_RETRIES + 1u);
+			if (apply_stage == AP_SETTAU) {
+				LOG_ERR("{\"apos_error\":\"0x%04X never acknowledged "
+					"SETTAU after %u attempts — incompatible "
+					"firmware (it predates the static link) or out "
+					"of range. It is still on its OLD link.\"}",
+					await_from_addr, APOS_GW_APPLY_RETRIES + 1u);
+			} else {
+				LOG_ERR("{\"apos_error\":\"0x%04X never acknowledged "
+					"SETPOS after %u attempts — it is still on its "
+					"OLD coordinates\"}", await_from_addr,
+					APOS_GW_APPLY_RETRIES + 1u);
+			}
 			awaiting_rsp = false;
 			apply_retries = 0;
 			tx_fails = 0;
 			apply_idx++;
 		}
+		return;
+	}
+
+	/* One-shot, FIRST of a links apply: record that an apply is under way
+	 * BEFORE any anchor is touched, and suspend fixes. If the gateway dies
+	 * from here until the commit, the marker is on flash and the next boot
+	 * knows the anchors may hold a mix of generations.
+	 *
+	 * Gated on the SOLVE budget for the same reason every flash write on this
+	 * loop is: a settings write can stall ALL execution for an NVS sector
+	 * erase (see step_apply's commit below). If the marker cannot be written,
+	 * NOTHING has changed yet and the apply is abandoned cleanly -- the one
+	 * failure here that costs the operator nothing. */
+	if (apply_stage == AP_MARK) {
+		if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
+			return;
+		}
+		int rc = apos_store_set_pending(apply_generation);
+
+		if (rc) {
+			LOG_ERR("{\"apos_error\":\"cannot record the apply-in-progress "
+				"marker (errno %d) — apply ABANDONED before touching "
+				"any anchor\"}", rc);
+			phase = APOS_GW_IDLE;
+			return;
+		}
+		hold = true;
+		hold_reason = "apply-in-progress";
+		apply_stage = AP_REOPEN;
 		return;
 	}
 
@@ -1048,14 +1573,15 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 	 * staggered ENUM_RSPs it provokes are discarded by on_enum_rsp()'s
 	 * `phase != APOS_GW_ENUM` guard -- phase is APOS_GW_APPLY throughout --
 	 * so they cannot append peers or trip the -EADDRINUSE abort. */
-	if (apply_reopen) {
-		apply_reopen = false;
+	if (apply_stage == AP_REOPEN) {
+		apply_stage = AP_SETPOS;
+		apply_idx = 0;
 		send_survey_begin(seq);
 		/* Enough for the worst-case enumeration stagger
 		 * (APOS_ENUM_WINDOW_MS, 768 ms) to drain
 		 * before the first SETPOS competes with it on the air. Not
 		 * retried on TX failure: a SETPOS refused for a closed window is
-		 * already reported per anchor, loudly, by the retry path below. */
+		 * already reported per anchor, loudly, by the retry path above. */
 		next_action_ms = now + APOS_GW_APPLY_SETTLE_MS;
 		return;
 	}
@@ -1067,7 +1593,7 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 		return;
 	}
 
-	if (apply_ending) {
+	if (apply_stage == AP_END) {
 		int n = apos_frame_survey_end_build(tx_buf, sizeof(tx_buf),
 						  UWB_ADDR_GATEWAY_RESERVED,
 						  session);
@@ -1093,111 +1619,224 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 		 * reboot the anchors topic falls back to the stub and the
 		 * platform map disagrees with the solver. */
 		LOG_INF("{\"apos_apply_done\":{\"ok\":%u,\"failed\":%u,"
-			"\"skipped\":%u,\"nodes\":%u,\"persisted\":%u}}",
+			"\"skipped\":%u,\"nodes\":%u,\"persisted\":%u,"
+			"\"links\":%u,\"tau_ok\":%u,\"generation\":%u,"
+			"\"hold\":%u}}",
 			applied_ok, applied_fail, applied_skip, res.n_nodes,
-			apply_persisted ? 1u : 0u);
+			apply_persisted ? 1u : 0u, apply_with_links ? 1u : 0u,
+			tau_ok, (unsigned int)(apply_with_links ? apply_generation : 0u),
+			hold ? 1u : 0u);
 		if (applied_fail || applied_skip) {
 			LOG_ERR("{\"apos_error\":\"%u anchor(s) did NOT take the "
-				"new coordinates — the deployment is "
+				"new coordinates%s — the deployment is "
 				"inconsistent. Re-run `apos apply`.\"}",
-				(unsigned int)(applied_fail + applied_skip));
+				(unsigned int)(applied_fail + applied_skip),
+				apply_with_links ? " or link" : "");
 		}
 		if (!apply_persisted) {
-			LOG_ERR("{\"apos_error\":\"the anchors were updated but "
-				"the gateway did NOT persist the survey — it "
-				"will publish the STUB anchors payload after a "
-				"reboot and the map will disagree with the "
-				"solver. Re-run `apos apply`.\"}");
+			LOG_ERR("{\"apos_error\":\"the gateway did NOT persist the "
+				"survey%s — %s Re-run `apos apply`.\"}",
+				apply_with_links ? " and links" : "",
+				apply_with_links
+				? "position fixes stay SUSPENDED and the previous "
+				  "survey stays active."
+				: "it will publish the STUB anchors payload after "
+				  "a reboot and the map will disagree with the "
+				  "solver.");
 		}
-		apply_ending = false;
+		apply_stage = AP_MARK;
 		phase = APOS_GW_IDLE;
 		return;
 	}
 
-	/* Skip unplaced nodes: there is nothing to push, and pushing (0, 0, 0)
-	 * would be exactly the silent-wrong-coordinate failure this whole
-	 * design exists to remove. Counted, so the summary above cannot report
-	 * a clean `failed:0` for an apply that only covered part of the
-	 * array. */
-	while (apply_idx < res.n_nodes &&
-	       res.node[apply_idx].state == APOS_NODE_UNPLACED) {
-		LOG_WRN("{\"apos_skip\":{\"addr\":\"0x%04X\",\"reason\":"
-			"\"unplaced\"}}", tbl.peer[apply_idx].short_addr);
-		applied_skip++;
-		apply_idx++;
-	}
-
-	if (apply_idx >= res.n_nodes) {
-		/* Persist before SURVEY_END, so a gateway that dies between the
-		 * two still has the survey on flash.
-		 *
-		 * Gated on the SOLVE budget, not the step budget, for the same
-		 * reason the solve is -- and the reason is stronger here,
-		 * because it is not about thread priority at all. This is a
-		 * WROOM-1-N8R2 executing XIP from the same flash apos_store
-		 * writes to: any write or erase disables the instruction cache
-		 * and stalls ALL code execution for its duration. K_PRIO_COOP(0)
-		 * does not protect the gateway loop from that and nothing else
-		 * can either. A settings append is sub-millisecond of
-		 * programming, but an NVS sector rotation erases 4 kB at ~25-45
-		 * ms -- 5-9x BEACON_ARM_MARGIN_UUS. The beacon then arms late,
-		 * its delayed TX times out waiting for TXFRS, beacon_tx_ts is
-		 * left unadvanced, and every slave's beacon_guard starts
-		 * suppressing against a schedule that has shifted underneath it.
-		 * That is a network-wide timing fault, not a dropped frame.
-		 *
-		 * APOS_GW_SOLVE_BUDGET_UUS (150000, ~154 ms) is reused rather
-		 * than a new constant: it is already sized so that only the
-		 * first step after a beacon can satisfy it, which is exactly the
-		 * ~150 ms of clear air this write wants. That covers a typical
-		 * GC erase with room to spare; it does NOT cover a pathological
-		 * one, and no in-loop gate can. The fully correct fix is to stop
-		 * writing flash from this thread at all -- hand the persist to a
-		 * preemptible worker and poll for its completion, the same
-		 * remedy apos_gw.h names for the solve. */
-		if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
+	if (apply_stage == AP_SETPOS) {
+		skip_nodes(true);
+		if (apply_idx >= res.n_nodes) {
+			apply_idx = 0;
+			apply_stage = apply_with_links ? AP_SETTAU : AP_COMMIT;
 			return;
 		}
-		apply_persisted = persist_survey();
-		apply_ending = true;
-		return;
-	}
 
-	await_from_addr = tbl.peer[apply_idx].short_addr;
+		await_from_addr = tbl.peer[apply_idx].short_addr;
 
-	int n = apos_frame_setpos_build(tx_buf, sizeof(tx_buf),
-				       UWB_ADDR_GATEWAY_RESERVED,
-				       await_from_addr, session,
-				       res.node[apply_idx].x,
-				       res.node[apply_idx].y,
-				       res.node[apply_idx].z);
+		int n = apos_frame_setpos_build(tx_buf, sizeof(tx_buf),
+					       UWB_ADDR_GATEWAY_RESERVED,
+					       await_from_addr, session,
+					       res.node[apply_idx].x,
+					       res.node[apply_idx].y,
+					       res.node[apply_idx].z);
 
-	if (n < 0) {
-		LOG_ERR("SETPOS build failed (%d)", n);
-		phase = APOS_GW_IDLE;
-		return;
-	}
-	if (!tx_now((uint16_t)n, seq)) {
-		/* Bounded exactly as step_range()'s RANGE_CMD is: a TX that
-		 * never starts is not this anchor's fault and does not consume
-		 * its retry budget, but a wedged radio must not park APPLY on
-		 * one anchor forever with apply_idx never advancing and nothing
-		 * on the console saying why. */
-		if (++tx_fails >= APOS_GW_TX_FAIL_LIMIT) {
-			applied_fail++;
-			LOG_ERR("{\"apos_error\":\"SETPOS for 0x%04X would not "
-				"transmit — it is still on its OLD "
-				"coordinates\"}", await_from_addr);
-			tx_fails = 0;
-			apply_retries = 0;
-			apply_idx++;
+		if (n < 0) {
+			LOG_ERR("SETPOS build failed (%d)", n);
+			phase = APOS_GW_IDLE;
+			return;
 		}
+		if (!tx_now((uint16_t)n, seq)) {
+			/* Bounded exactly as step_range()'s RANGE_CMD is: a TX that
+			 * never starts is not this anchor's fault and does not consume
+			 * its retry budget, but a wedged radio must not park APPLY on
+			 * one anchor forever with apply_idx never advancing and nothing
+			 * on the console saying why. */
+			if (++tx_fails >= APOS_GW_TX_FAIL_LIMIT) {
+				applied_fail++;
+				LOG_ERR("{\"apos_error\":\"SETPOS for 0x%04X would not "
+					"transmit — it is still on its OLD "
+					"coordinates\"}", await_from_addr);
+				tx_fails = 0;
+				apply_retries = 0;
+				apply_idx++;
+			}
+			return;
+		}
+		tx_fails = 0;
+
+		awaiting_rsp = true;
+		next_action_ms = now + APOS_GW_APPLY_TIMEOUT_MS;
 		return;
 	}
-	tx_fails = 0;
 
-	awaiting_rsp = true;
-	next_action_ms = now + APOS_GW_APPLY_TIMEOUT_MS;
+	if (apply_stage == AP_SETTAU) {
+		skip_nodes(false);
+		if (apply_idx >= res.n_nodes) {
+			apply_stage = AP_COMMIT;
+			return;
+		}
+
+		const struct sync_link *lk = link_for_node(apply_idx);
+
+		if (!lk || !lk->valid) {
+			/* Cannot happen after start_apply()'s checks, but a link
+			 * that is missing here must stop the apply from reporting
+			 * clean rather than silently skip an anchor. */
+			applied_fail++;
+			LOG_ERR("{\"apos_error\":\"no valid link for 0x%04X — it "
+				"keeps its OLD link\"}",
+				tbl.peer[apply_idx].short_addr);
+			apply_idx++;
+			return;
+		}
+
+		await_from_addr = tbl.peer[apply_idx].short_addr;
+		await_tau = lk->tau_dtu;
+
+		int n = apos_frame_settau_build(tx_buf, sizeof(tx_buf),
+						UWB_ADDR_GATEWAY_RESERVED,
+						await_from_addr, session,
+						apply_generation, lk->tau_dtu,
+						lk->parent_eui);
+
+		if (n < 0) {
+			LOG_ERR("SETTAU build failed (%d)", n);
+			phase = APOS_GW_IDLE;
+			return;
+		}
+		if (!tx_now((uint16_t)n, seq)) {
+			if (++tx_fails >= APOS_GW_TX_FAIL_LIMIT) {
+				applied_fail++;
+				LOG_ERR("{\"apos_error\":\"SETTAU for 0x%04X would not "
+					"transmit — it keeps its OLD link\"}",
+					await_from_addr);
+				tx_fails = 0;
+				apply_retries = 0;
+				apply_idx++;
+			}
+			return;
+		}
+		tx_fails = 0;
+
+		awaiting_rsp = true;
+		next_action_ms = now + APOS_GW_APPLY_TIMEOUT_MS;
+		return;
+	}
+
+	/* AP_COMMIT.
+	 *
+	 * Persist before SURVEY_END, so a gateway that dies between the two
+	 * still has the survey on flash.
+	 *
+	 * Gated on the SOLVE budget, not the step budget, for the same
+	 * reason the solve is -- and the reason is stronger here,
+	 * because it is not about thread priority at all. This is a
+	 * WROOM-1-N8R2 executing XIP from the same flash apos_store
+	 * writes to: any write or erase disables the instruction cache
+	 * and stalls ALL code execution for its duration. K_PRIO_COOP(0)
+	 * does not protect the gateway loop from that and nothing else
+	 * can either. A settings append is sub-millisecond of
+	 * programming, but an NVS sector rotation erases 4 kB at ~25-45
+	 * ms -- 5-9x BEACON_ARM_MARGIN_UUS. The beacon then arms late,
+	 * its delayed TX times out waiting for TXFRS, beacon_tx_ts is
+	 * left unadvanced, and every slave's beacon_guard starts
+	 * suppressing against a schedule that has shifted underneath it.
+	 * That is a network-wide timing fault, not a dropped frame.
+	 *
+	 * APOS_GW_SOLVE_BUDGET_UUS (150000, ~154 ms) is reused rather
+	 * than a new constant: it is already sized so that only the
+	 * first step after a beacon can satisfy it, which is exactly the
+	 * ~150 ms of clear air this write wants. That covers a typical
+	 * GC erase with room to spare; it does NOT cover a pathological
+	 * one, and no in-loop gate can. The fully correct fix is to stop
+	 * writing flash from this thread at all -- hand the persist to a
+	 * preemptible worker and poll for its completion, the same
+	 * remedy apos_gw.h names for the solve.
+	 *
+	 * A links apply does up to three writes here (survey, links, marker
+	 * clear) in the one gated step, in an order where a cut at any point
+	 * leaves the marker set. */
+	if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
+		return;
+	}
+
+	if (!apply_with_links) {
+		/* The historical anchors-only flow: persists regardless of
+		 * individual anchor failures, which the summary reports. */
+		apply_persisted = persist_survey();
+		apply_stage = AP_END;
+		return;
+	}
+
+	if (applied_fail == 0u && applied_skip == 0u) {
+		apply_persisted = persist_survey();
+		if (apply_persisted) {
+			int rc = persist_links();
+
+			if (rc) {
+				LOG_ERR("{\"apos_error\":\"links NOT persisted "
+					"(errno %d)\"}", rc);
+				apply_persisted = false;
+			}
+		}
+		if (apply_persisted) {
+			int rc = apos_store_clear_pending();
+
+			if (rc) {
+				LOG_ERR("{\"apos_error\":\"apply marker NOT "
+					"cleared (errno %d) — fixes stay suspended "
+					"until the next successful apply\"}", rc);
+				apply_persisted = false;
+			}
+		}
+		if (apply_persisted) {
+			applied_generation = apply_generation;
+			hold = false;
+			hold_reason = "none";
+			LOG_INF("{\"apos\":\"installed\",\"generation\":%u,"
+				"\"links\":%u}", (unsigned int)apply_generation,
+				n_links);
+		} else {
+			hold = true;
+			hold_reason = "apply-incomplete";
+		}
+	} else {
+		/* Some anchor did not take it. The gateway keeps its PREVIOUS
+		 * survey and links, the marker stays set, and fixes stay
+		 * suspended: the anchors that DID take it now run a generation
+		 * the gateway does not know about. Re-running `apos apply`
+		 * restates the same commands idempotently. */
+		apply_persisted = false;
+		hold = true;
+		hold_reason = "apply-incomplete";
+	}
+	apply_stage = AP_END;
 }
 
 void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
@@ -1221,6 +1860,9 @@ void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
 		break;
 	case APOS_SUB_SETPOS_ACK:
 		on_setpos_ack(buf, plen);
+		break;
+	case APOS_SUB_SETTAU_ACK:
+		on_settau_ack(buf, plen);
 		break;
 	default:
 		/* The remaining subtypes are gateway-to-anchor commands; a
@@ -1264,6 +1906,41 @@ static void step_enum(uint8_t *seq)
 				min_nodes);
 			phase = APOS_GW_IDLE;
 			return;
+		}
+
+		/* A 3D survey is the static-install flow: the gateway joins the
+		 * table as one more node, with its real EUI, exactly once and
+		 * locally -- it is never enumerated over the air and never
+		 * commands itself. A 2D survey is the historical anchors-only
+		 * flow and is left exactly as it was. The gauge itself stays
+		 * anchors-only: apos_gw_set_gauge() refuses 0x0000. */
+		if (min_nodes == APOS_MIN_NODES_3D) {
+			if (!gw_eui_ready) {
+				LOG_ERR("{\"apos_error\":\"this gateway has no EUI-64, "
+					"so it cannot be a node of its own survey\"}");
+				phase = APOS_GW_IDLE;
+				return;
+			}
+			int gi = apos_table_add_peer(&tbl, gw_eui,
+						     UWB_ADDR_GATEWAY_RESERVED,
+						     false, 0.0f, 0.0f, 0.0f);
+
+			if (gi == -ENOSPC) {
+				LOG_ERR("{\"apos_error\":\"%u anchors answered and the "
+					"survey holds at most %u nodes, so the gateway "
+					"cannot be added — it would otherwise be "
+					"silently left out\"}", tbl.n_peers,
+					APOS_MAX_NODES);
+				phase = APOS_GW_IDLE;
+				return;
+			}
+			if (gi < 0) {
+				LOG_ERR("{\"apos_error\":\"could not add the gateway to "
+					"the survey (errno %d)\"}", gi);
+				phase = APOS_GW_IDLE;
+				return;
+			}
+			gw_idx = (int8_t)gi;
 		}
 
 		pair_total = (uint16_t)tbl.n_peers *

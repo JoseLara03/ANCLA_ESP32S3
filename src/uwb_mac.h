@@ -33,11 +33,12 @@
  *   - Physical airtime: both beacon_guard_beacon()'s RX timestamp and
  *     beacon_guard_tx_allowed()'s TX time are referenced to the RMARKER, but
  *     the actual collision window starts at the preamble, which precedes the
- *     RMARKER by ~1042 us at this PHY's PLEN_1024/64 MHz PRF. A guard sized
+ *     RMARKER by ~1042 us at the former PLEN_1024/64 MHz PRF (~269 us at the current
+ *     PLEN_256). A guard sized
  *     only for clock drift under-covers the leading edge by that whole
  *     preamble length, letting a small fraction of responses land on the
  *     beacon's preamble even with the guard "working as designed".
- * 1500 rounds up 1042 us of preamble/airtime margin plus headroom; the drift
+ * 1500 was sized at PLEN_1024 to round up 1042 us of preamble/airtime margin plus headroom; the drift
  * term above is small enough to fold in without pushing this out further.
  * The guard errs wide deliberately either way: suppressing one extra ranging
  * response costs one range, while corrupting one beacon costs every node in
@@ -55,6 +56,17 @@
  * here would charge 4.6 ms of overhead that does not exist and understate the
  * slot count by ~1. */
 #define T_GUARD_UUS          488u   /* 0.5 ms; 488 UUS = 500.5 us */
+
+/* GATEWAY: stop servicing and arm the beacon when this close to it. MAC-only
+ * keeps this small: worst-case service latency is one GRANT (RX_TO_TX_DLY_UUS
+ * + ~1.3 ms airtime + the bounded TXFRS wait), not the nRF5 gateway's 8000,
+ * which had to cover a discovery stagger this node no longer performs.
+ *
+ * Here rather than in uwb_gateway.c because it is also a fact the SLAVES rely
+ * on: the gateway's RX window expires this long before the beacon and does not
+ * reopen until after the CCP, so a frame addressed to the gateway inside that
+ * span is lost without a trace (apos_node.c, gw_rx_wait()). */
+#define BEACON_ARM_MARGIN_UUS 5000u
 
 /* ---- Budget verification --------------------------------------------------
  *
@@ -93,7 +105,7 @@
 					    MAC_PHY_BITRATE)) +                \
 		  100000u))
 
-/* The ranging slots the airtime budget actually affords. Currently 14. */
+/* The ranging slots the airtime budget actually affords. Currently 19 at PLEN_256 (was 14 at PLEN_1024). */
 #define UWB_MAC_CFP_SLOTS_FEASIBLE                                             \
 	(UWB_MAC_CFP_USABLE_NS / UWB_MAC_CFP_SLOT_NS)
 

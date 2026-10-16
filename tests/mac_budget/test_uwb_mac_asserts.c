@@ -40,18 +40,22 @@ int main(void)
 	CHECK(MAC_UUS_TO_NS(T_GUARD_UUS) < 502000u);
 	CHECK(T_GUARD_UUS != BEACON_GUARD_UUS);
 
-	/* One CFP slot = a 4-anchor SS-TWR sweep, ~13.3 ms. */
-	CHECK(UWB_MAC_CFP_SLOT_NS > 13300000u);
-	CHECK(UWB_MAC_CFP_SLOT_NS < 13350000u);
+	/* One CFP slot = a 4-anchor SS-TWR sweep, ~10.2 ms at PLEN_256
+	 * (4 * 2549348 ns; 13.3 ms at PLEN_1024). */
+	CHECK(UWB_MAC_CFP_SLOT_NS > 10190000u);
+	CHECK(UWB_MAC_CFP_SLOT_NS < 10205000u);
 
-	/* ~191.8 ms left for the CFP after beacon, guards and CAP. */
-	CHECK(UWB_MAC_CFP_USABLE_NS > 191000000u);
-	CHECK(UWB_MAC_CFP_USABLE_NS < 193000000u);
+	/* ~195.75 ms left for the CFP after beacon, guards and CAP
+	 * (199999995 - 658066 - 3 * 500512 - 4 * 522771 = 195749309;
+	 * 191.8 ms at PLEN_1024). */
+	CHECK(UWB_MAC_CFP_USABLE_NS > 195700000u);
+	CHECK(UWB_MAC_CFP_USABLE_NS < 195800000u);
 
-	/* The budget affords 14 ranging slots; the wire carries 11. The shipped
-	 * constant is therefore conservative, with 3 slots of headroom -- and
-	 * the BUILD_ASSERT above is what keeps it that way. */
-	CHECK(UWB_MAC_CFP_SLOTS_FEASIBLE == 14u);
+	/* The budget affords 19 ranging slots (195749309 / 10197392 = 19.2);
+	 * the wire carries 11. The shipped constant is therefore
+	 * conservative, with 8 slots of headroom (14 / 3 at PLEN_1024) --
+	 * and the BUILD_ASSERT above is what keeps it that way. */
+	CHECK(UWB_MAC_CFP_SLOTS_FEASIBLE == 19u);
 	CHECK(UWB_FRAME_N_CFP == 11u);
 	CHECK(UWB_FRAME_N_CFP < UWB_MAC_CFP_SLOTS_FEASIBLE);
 

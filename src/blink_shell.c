@@ -37,6 +37,7 @@
  * concluding anything about the numbers beside it.
  */
 
+#include "apos_gw.h"
 #include "blink_rx.h"
 #include "net_uplink.h"
 #include "pos_abg.h"
@@ -78,6 +79,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 	uint32_t s_obs = 0, s_reject = 0, s_fix = 0, s_no_anchor = 0;
 	uint32_t s_implaus = 0, s_solve_fail = 0, s_jump = 0;
 	uint32_t s_dup = 0, s_shed = 0, s_reorder = 0;
+	uint32_t s_held = 0;
 	uint32_t a_seeded = 0, a_dt_reseed = 0, a_filtered = 0;
 	uint32_t a_gate = 0, a_reseed = 0, a_still = 0;
 
@@ -92,17 +94,18 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		      &s_solve_fail, &s_jump);
 	tdoa_gw_reject_detail(&s_dup, &s_shed);
 	s_reorder = tdoa_gw_reorder_count();
+	s_held = tdoa_gw_held_count();
 	tdoa_gw_abg_stats(&a_seeded, &a_dt_reseed, &a_filtered, &a_gate,
 			  &a_reseed, &a_still);
 
 	shell_print(sh,
 		    "{\"blink\":{\"role\":\"%s\","
-		    "\"rx\":%u,\"no_sync\":%u,\"bad\":%u,\"stamped\":%u,"
+		    "\"rx\":%u,\"no_sync\":%u,\"stale\":%u,\"bad\":%u,\"stamped\":%u,"
 		    "\"published\":%u,\"pub_drop\":%u,"
 		    "\"received\":%u,\"rx_drop\":%u,"
 		    "\"rx_drop_oversize\":%u,\"rx_drop_parse\":%u,"
 		    "\"rx_drop_evict\":%u,\"sub_fail\":%u}}",
-		    board_role(), n_rx, n_no_sync, n_bad, n_sent,
+		    board_role(), n_rx, n_no_sync, blink_rx_stale_count(), n_bad, n_sent,
 		    n_pub, n_pub_drop, n_obs_rx, n_obs_drop,
 		    d_oversize, d_parse, d_evict, n_sub_fail);
 
@@ -117,9 +120,10 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		    "\"ingested\":%u,\"rejected\":%u,\"reject_dup\":%u,"
 		    "\"reject_shed\":%u,\"fixes\":%u,\"no_anchor\":%u,"
 		    "\"implausible\":%u,\"solve_fail\":%u,\"jump\":%u,"
-		    "\"reorder\":%u}}",
+		    "\"reorder\":%u,\"held\":%u,\"hold\":\"%s\"}}",
 		    board_role(), s_obs, s_reject, s_dup, s_shed, s_fix,
-		    s_no_anchor, s_implaus, s_solve_fail, s_jump, s_reorder);
+		    s_no_anchor, s_implaus, s_solve_fail, s_jump, s_reorder,
+		    s_held, apos_gw_hold_reason());
 
 	/* The filter's own counters (spec §4.4). Its own line for the same
 	 * reason the solve half got one: without it there is no way to tell
@@ -157,6 +161,14 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 			   (double)tdoa_gw_abg_cfg()->gate_m);
 	}
 
+	if (apos_gw_publish_hold()) {
+		shell_warn(sh, "FIXES ARE SUSPENDED (%s): %u observation(s) were "
+			       "discarded instead of solved. A static-survey apply is in "
+			       "flight or did not complete, so the anchors may hold a mix of "
+			       "survey generations. See `apos show`; re-run `apos run` and "
+			       "`apos apply`.",
+			   apos_gw_hold_reason(), s_held);
+	}
 	if (s_reorder > 0u) {
 		shell_print(sh,
 			    "%u group(s) arrived out of order and were "

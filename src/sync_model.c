@@ -119,6 +119,7 @@ static void clear_baseline(struct sync_model *m)
     m->phase_corr = 0;
     m->n_obs      = 0;
     m->misses     = 0;
+    m->outlier_run = 0;
     m->have_raw   = false;
     m->valid      = false;
 }
@@ -135,6 +136,8 @@ void sync_model_init(struct sync_model *m)
     m->res_max      = 0;
     m->n_rebaseline = 0;
     m->n_miss_total = 0;
+    m->n_outlier    = 0;
+    m->outlier_run  = 0;
     /* Deterministic LEGACY (tau=0) rather than whatever an uninitialised
      * caller's stack held. A caller that owns a configured tau (ccp_slave.c)
      * must call sync_model_set_tau() again after this -- see tau_dtu's own
@@ -177,6 +180,11 @@ uint32_t sync_model_residual_max_dtu(const struct sync_model *m)
 uint32_t sync_model_residual_count(const struct sync_model *m)
 {
     return m->res_n;
+}
+
+uint32_t sync_model_outlier_count(const struct sync_model *m)
+{
+    return m->n_outlier;
 }
 
 void sync_model_residual_reset(struct sync_model *m)
@@ -228,6 +236,37 @@ void sync_model_observe(struct sync_model *m, uint64_t m_dtu, uint64_t l_dtu)
             int64_t residual = sdelta40(m_dtu, pred);
             uint64_t mag = (uint64_t)(residual < 0 ? -residual : residual);
 
+            /* Gross-outlier gate -- see SYNC_OUTLIER_GATE_DTU. Before ANYTHING is
+             * folded in, including the phase EMA on the next line. */
+            if (mag > SYNC_OUTLIER_GATE_DTU) {
+                if (m->n_outlier < UINT32_MAX) m->n_outlier++;
+                if (m->outlier_run < UINT32_MAX) m->outlier_run++;
+
+                if (m->outlier_run < SYNC_OUTLIER_RUN_MAX) {
+                    /* Coast: the raw stamps are untouched, so the next good
+                     * observation differences against the last good one. */
+                    if (m->misses < UINT32_MAX) m->misses++;
+                    {
+                        int64_t num, den;
+
+                        m->valid = effective_skew(m, &num, &den);
+                    }
+                    return;
+                }
+
+                /* A run this long is a real, unannounced discontinuity: restart
+                 * from this observation instead of coasting forever. The skew is
+                 * NOT carried -- we no longer know which side of the step was
+                 * right. */
+                sync_model_rebaseline(m, false);
+                m->outlier_run = 0;
+                m->l_raw    = l_dtu;
+                m->m_raw    = m_dtu;
+                m->have_raw = true;
+                return;
+            }
+            m->outlier_run = 0;
+
             m->phase_corr += residual >> SYNC_PHASE_EMA_SHIFT;
 
             /* Accumulated BEFORE the correction is applied, so the statistic
@@ -251,6 +290,13 @@ void sync_model_observe(struct sync_model *m, uint64_t m_dtu, uint64_t l_dtu)
                 m->res_sq_sum += mag * mag;
                 m->res_n++;
                 if (mag > m->res_max) m->res_max = (uint32_t)mag;
+
+                /* Windowed, not lifetime -- see SYNC_RES_WINDOW. */
+                if (m->res_n >= SYNC_RES_WINDOW) {
+                    m->res_sq_sum >>= 1;
+                    m->res_n      >>= 1;
+                    m->res_max    >>= 1;
+                }
             }
         }
     }

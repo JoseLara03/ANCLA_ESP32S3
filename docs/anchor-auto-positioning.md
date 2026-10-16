@@ -119,7 +119,17 @@ Check `anchor show` on each board for `ant_tx != 16385` before you start.
   calibration image (`cal.conf`) is a different procedure and must not be on air
   at the same time.
 
-## 2. The gateway is not a survey node
+## 2. The gateway is not a survey node (2D / historical flow) — and IS one in the 3D static install
+
+> **Updated 2026-10-12.** In a **3D** survey (`apos gauge` with all of
+> `origin= xaxis= plane= up=`) the gateway **is** a node: it joins the table
+> with its own EUI-64, ranges every anchor itself (gateway → anchor, SS-TWR, no
+> frame), is solved as the fifth node, and `apos apply` installs a static sync
+> link on every anchor. The gauge is still **anchors only** — the gateway can
+> never be `origin`/`xaxis`/`plane`/`up`. See `docs/static-survey-install.md`
+> (procedure) and `docs/sync-multihop-design.md` (design, including why the
+> anchor → gateway direction is not measured). The text below is the **2D /
+> anchors-only flow**, which is unchanged, and is kept as written for history.
 
 The gateway is MAC-only for ranging: it holds the reserved short address
 `0x0000`, consumes no `anchor_id`, and **never answers a ranging poll**. Nothing

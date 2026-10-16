@@ -28,12 +28,15 @@ LOG_MODULE_REGISTER(ss_initiator, LOG_LEVEL_INF);
 
 /* RX opens this long after our poll finishes. The response preamble cannot
  * arrive sooner: the peer's RMARKER is 2000 uus after its own poll_rx_ts and
- * the PLEN_1024 preamble runs ~1.05 ms ahead of that. */
+ * the preamble runs ahead of that (~1.05 ms at the former PLEN_1024, ~0.27 ms
+ * at the current PLEN_256). */
 #define RX_AFTER_TX_UUS 300U
 
 /* RX window. Both peer types turn around in 2000 uus (the DWM3001CDK's stock
- * 450 is raised to match -- at PLEN_1024, 450 is shorter than the preamble and
- * physically impossible), so one window covers both. */
+ * 450 is raised to match -- at the former PLEN_1024, 450 was shorter than the
+ * preamble and physically impossible; at PLEN_256 the turnaround floor is
+ * 613 us, so 450 uus (~460 us) would still be too short -- 2000 is merely no
+ * longer tight), so one window covers both. */
 #define RESP_TIMEOUT_UUS 4000U
 
 #define TX_DONE_TIMEOUT_MS 10U

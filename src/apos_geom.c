@@ -1004,3 +1004,65 @@ int apos_geom_solve(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes
 	}
 	return apos_geom_refine(e, n_edges, g, out);
 }
+
+int apos_geom_gauge_conditioning(const struct apos_result *r,
+				 const struct apos_gauge *g, float range_err_m,
+				 struct apos_gauge_quality *q)
+{
+	if (!r || !g || !q || g->dim != APOS_GEOM_3D ||
+	    !apos_geom_gauge_valid(g, r->n_nodes) || !(range_err_m >= 0.0f)) {
+		return -EINVAL;
+	}
+
+	const uint8_t idx[4] = {g->origin, g->xaxis, g->plane, g->up};
+
+	for (int k = 0; k < 4; k++) {
+		if (r->node[idx[k]].state == APOS_NODE_UNPLACED) {
+			return -EINVAL;
+		}
+	}
+
+	float o[3], x[3], p[3], u[3];
+
+	node_xyz(r, g->origin, o);
+	node_xyz(r, g->xaxis, x);
+	node_xyz(r, g->plane, p);
+	node_xyz(r, g->up, u);
+
+	float a[3], b[3], c[3], n[3];
+
+	vsub(x, o, a);
+	vsub(p, o, b);
+	vsub(u, o, c);
+
+	/* n = a x b */
+	n[0] = a[1] * b[2] - a[2] * b[1];
+	n[1] = a[2] * b[0] - a[0] * b[2];
+	n[2] = a[0] * b[1] - a[1] * b[0];
+
+	float na = vnorm(a);
+	float nn = vnorm(n);
+
+	q->collinearity = (na > EPS) ? nn / (na * na) : 0.0f;
+	q->up_height_m = (nn > EPS) ? fabsf(vdot(c, n)) / nn : 0.0f;
+
+	float sum = 0.0f;
+
+	for (int i = 0; i < 4; i++) {
+		for (int j = i + 1; j < 4; j++) {
+			float pi[3], pj[3], d[3];
+
+			node_xyz(r, idx[i], pi);
+			node_xyz(r, idx[j], pj);
+			vsub(pi, pj, d);
+			sum += vdot(d, d);
+		}
+	}
+	q->edge_rms_m = sqrtf(sum / 6.0f);
+
+	q->height_floor_m = APOS_GAUGE_UP_NOISE_K *
+			    sqrtf(q->edge_rms_m * range_err_m);
+	q->collinear = q->collinearity < APOS_GAUGE_COLLINEARITY_MIN;
+	q->coplanar = q->up_height_m < q->height_floor_m;
+	return 0;
+}

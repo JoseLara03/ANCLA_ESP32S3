@@ -31,6 +31,21 @@ config ANCLA_RANGING_DEBUG
 	  per-frame logging and the heartbeat's extra SPI read both cost time
 	  on the SLAVE loop.
 
+config ANCLA_UPLINK_WIFI_PS_OFF
+	bool "Disable WiFi modem sleep on the MQTT uplink"
+	default n
+	help
+	  Calls NET_REQUEST_WIFI_PS (WIFI_PS_DISABLED) once the link has an
+	  address, so the radio no longer sleeps between AP beacons.
+
+	  OFF by default (the gateway always disables it regardless). The
+	  ESP-IDF default (modem sleep) delays DOWNLINK
+	  frames to the next DTIM, but uplink publishes are unaffected once
+	  TCP_NODELAY is set (net_uplink.c), so this is not needed for
+	  low-latency uplink and costs roughly 70-100 mA of average current.
+	  Measured 2026-10-15: with it ON, anchors on a ~3.8 V cell browned out
+	  and dropped off the broker; USB-powered or fully charged ones did not.
+
 config ANCLA_DEBUG_FORCE_HIGH_SEAT
 	bool "Pre-fill low seat ids with dummy IDLE seats (bench-only)"
 	default n

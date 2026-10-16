@@ -81,8 +81,16 @@ static void test_n_slots_matches_current_estimate(void)
 	 * plan's own instruction ("anotar el numero real... es la cifra de
 	 * BLINK_N_SLOTS para el resto de este plan"), the measured figure is
 	 * what counts, not the doc's pre-code guess -- so the range here is
-	 * centered on the measured value, not the earlier estimate. */
-	CHECK(n >= 100u && n <= 150u);
+	 * centered on the measured value, not the earlier estimate.
+	 *
+	 * 2026-10-12: the PHY moved to PLEN_256/PAC16. Hand check: slot =
+	 * blink frame (268654 SHR + 22353 PHR + 16 B * 8 / 850k = 150588 ns
+	 * = 441595 ns) + 100 uus guard (102564 ns) = 544159 ns; usable =
+	 * 199999995 - 658066 - 3 * 500000 - 4 * 522771 = 195750845 ns;
+	 * 195750845 / 544159 = 359.7 -> 359 slots (was 144 at PLEN_1024).
+	 * That is MORE than GW_MAX_SEATS (128) -- the seat table, not the
+	 * blink schedule, is the cap, as it already was at 144. */
+	CHECK(n >= 340u && n <= 380u);
 }
 
 static void test_n_slots_shrinks_with_more_guard(void)

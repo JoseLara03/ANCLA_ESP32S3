@@ -214,10 +214,23 @@
  * ASSUMPTION (~100 ps) the tables above are built on; the Fase 2 hardware
  * measurement came in at 782 ps to 1.53 ns, so using it as a fallback would
  * hand a consumer a sigma ~15x too confident during exactly the window where
- * the model is least trustworthy. 96 DTU is the measured 3 m figure. The
- * fallback errs pessimistic on purpose: a sigma that is too large costs some
- * down-weighting, a sigma that is too small is silent overconfidence. */
-#define SYNC_JITTER_FALLBACK_DTU   96u
+ * the model is least trustworthy. The fallback errs pessimistic on purpose: a
+ * sigma that is too large costs some down-weighting, a sigma that is too small
+ * is silent overconfidence.
+ *
+ * History of the value. 96 DTU was the measured 3 m figure at PLEN_1024
+ * (2026-08-26, before the B13 estimator fix, the PA rework and the move to
+ * PLEN_256). At PLEN_256, >3 m from a USB-C gateway (2026-10-13), all four
+ * anchors measured 18 / 21 / 20 / 19 DTU, except that A3 first measured 85 DTU
+ * (max_dtu 4031) and re-measured at 19 DTU on a later run, cause not
+ * established (placement or multipath suspected).
+ *
+ * 50 DTU (~780 ps) is the OPERATOR'S CHOICE, not a measurement: about 2.5x the
+ * typical 18-21 and deliberately BELOW the 85 DTU transient seen once, i.e. it
+ * does not cover that case. Accepted explicitly ("if it fails, let it fail"):
+ * a sigma under-reported by up to ~1.7x for an anchor in that state, during the
+ * window before it has gathered SYNC_JITTER_EST_MIN_N residuals of its own. */
+#define SYNC_JITTER_FALLBACK_DTU   50u
 
 /* Residual samples below which sync_model_jitter_est_dtu() is too noisy to
  * stand in for the fallback above. Matches the baseline threshold rather than
@@ -229,6 +242,47 @@
  * drift) be tracked rather than averaged away over the anchor's uptime -- the
  * same reason beacon_sched_core bounds BSCHED_BASELINE_MAX. */
 #define SYNC_BASELINE_MAX     128u
+
+/* ---- Gross-outlier gate (2026-10-15) ------------------------------------
+ *
+ * One observation whose master/local pair does not belong together -- a CCP
+ * paired with the wrong announcement after a gap or a gateway reboot is the
+ * mechanism suspected -- used to be folded in like any other. Measured on a
+ * 3.5 h anchor (A0): residual max 4 224 040 127 DTU, i.e. one CCP interval
+ * (1.278e10 DTU) modulo 2^32 give or take half a millisecond, which sat in the
+ * lifetime sum of squares forever: jitter_est 84 561 DTU, sigma_dtu 29 941, and a
+ * published sigma that told the gateway to distrust a healthy anchor. A second
+ * effect is the same sample entering the phase EMA (residual >> 3) and the rate
+ * baseline, which steps every conversion until it rolls out (~13-25 s).
+ *
+ * The gate compares the prediction residual against SYNC_OUTLIER_GATE_DTU BEFORE
+ * anything is folded in. A residual beyond it is not noise: this link's measured
+ * jitter is 15-80 DTU and the simulation sweeps in tests/sync_model go to 3200,
+ * i.e. residuals up to ~6400. 16384 DTU (256 ns, 77 m of light) clears all of that
+ * by 2.5x and is still 6 orders below the one-interval error it exists for.
+ *
+ * Rejected means: not folded into l_acc/m_acc/phase/statistics and counted as a
+ * miss for staleness (the model coasts on its last good state). SYNC_OUTLIER_RUN_MAX
+ * consecutive rejections are NOT an outlier but a real discontinuity the caller
+ * did not announce (a reboot that kept the sequence numbering): the baseline is then
+ * restarted from the observation that finally broke the streak.
+ *
+ * Overridable (#ifndef) so a host test can sweep it, like SYNC_PHASE_EMA_SHIFT. */
+#ifndef SYNC_OUTLIER_GATE_DTU
+#define SYNC_OUTLIER_GATE_DTU  16384u
+#endif
+#ifndef SYNC_OUTLIER_RUN_MAX
+#define SYNC_OUTLIER_RUN_MAX   5u
+#endif
+
+/* The residual statistics used to be lifetime sums, so a single bad sample
+ * poisoned `jitter_est` until someone typed `sync reset` -- which on a mounted
+ * anchor nobody can. Every SYNC_RES_WINDOW folded residuals the sums are halved
+ * (and the max decays), so old history ages out in ~2 windows: 4096 CCPs is 13.7
+ * minutes at 5 Hz. */
+#ifndef SYNC_RES_WINDOW
+#define SYNC_RES_WINDOW        4096u
+#endif
 
 /* Residual EMA shift: correction = residual >> SYNC_PHASE_EMA_SHIFT. A shift of
  * 3 averages the phase over ~8 observations, cutting reference noise by ~sqrt(8)
@@ -292,6 +346,37 @@
  * valid would silently poison every position it converts. */
 #define SYNC_MISS_MAX         25u
 
+/* ---- Clock freshness by TIME, not by counted gaps -------------------------
+ *
+ * SYNC_MISS_MAX above only advances when a CCP ARRIVES with a sequence gap in
+ * front of it (ccp_slave.c counts the missed ones at that moment). With the
+ * link completely silent nothing arrives, no gap is ever counted, and
+ * sync_model_to_master() goes on extrapolating the last model indefinitely --
+ * so a BLINK heard minutes after the last CCP converts "successfully" into a
+ * time that has drifted by however far the two crystals walked apart. The
+ * silence has to invalidate the clock BEFORE the next CCP shows up.
+ *
+ * The limit is the SAME holdover policy expressed in time, not a new number:
+ * SYNC_MISS_MAX superframes of SYNC_CCP_INTERVAL_DTU each. At the 200 ms
+ * superframe that is 5 s -- long enough to ride out a gateway reboot's CCP
+ * gap or a few lost frames (which the model already coasts through), short
+ * enough that a dead link stops producing converted timestamps within a
+ * fraction of the time a tag takes to cross the cell. 63897600 DTU per ms is
+ * 63.8976 DTU/ns x 1e6; SYNC_DTU_PER_NS (64) is rounded for budgeting and is
+ * not used for a bound. */
+#define SYNC_DTU_PER_MS       63897600ULL
+#define SYNC_CLOCK_MAX_AGE_MS \
+    ((uint32_t)(((uint64_t)SYNC_MISS_MAX * SYNC_CCP_INTERVAL_DTU) / SYNC_DTU_PER_MS))
+
+/* True when a clock last refreshed `age_ms` ago may still convert. The caller
+ * passes an UNSIGNED k_uptime_get_32() difference, which is correct across the
+ * ~49-day wrap by construction; UINT32_MAX (nothing ever received) is refused.
+ * The boundary is inclusive: exactly SYNC_CLOCK_MAX_AGE_MS is still fresh. */
+static inline bool sync_clock_age_ok(uint32_t age_ms)
+{
+    return age_ms <= SYNC_CLOCK_MAX_AGE_MS;
+}
+
 struct sync_model {
     /* Raw 40-bit stamps of the most recent observation, for differencing. */
     uint64_t l_raw;
@@ -336,6 +421,8 @@ struct sync_model {
      * re-baseline resets cannot measure re-baselines. */
     uint32_t n_rebaseline;
     uint32_t n_miss_total;
+    uint32_t n_outlier;      /* observations rejected by the gross-outlier gate */
+    uint32_t outlier_run;    /* consecutive rejections right now */
     /* B14 flight-time compensation: this anchor's own flight time from the
      * sync master, in signed DTU (positive when the master is farther away).
      * See sync_model_set_tau()'s doc comment for the algebra. Survives every
@@ -533,6 +620,9 @@ uint32_t sync_model_residual_rms_dtu(const struct sync_model *m);
 uint32_t sync_model_residual_max_dtu(const struct sync_model *m);
 uint32_t sync_model_residual_count(const struct sync_model *m);
 void     sync_model_residual_reset(struct sync_model *m);
+
+/* Observations rejected by the gross-outlier gate since sync_model_init(). */
+uint32_t sync_model_outlier_count(const struct sync_model *m);
 
 /* Per-observation timestamp jitter inferred from the residuals. THIS is the
  * number to compare against the sweep table at the top of this header, and the

@@ -65,7 +65,7 @@
  *
  * 64 slots x 12 ms bounds the worst-case reply delay at 63 * 12 = 756 ms and
  * the whole window at APOS_ENUM_WINDOW_MS (768 ms). Two things set the 12 ms:
- * an ENUM_RSP's ~1.6 ms of airtime (a PLEN_1024 preamble alone is ~1.05 ms)
+ * an ENUM_RSP's ~1.6 ms of airtime (a PLEN_1024 preamble alone was ~1.05 ms; PLEN_256, current, is ~0.27 ms)
  * plus the SPI writes around dwt_starttx(); and CONFIG_SYS_CLOCK_TICKS_PER_SEC
  * is 1000 on this SoC, so a slot much below 10 ms starts quantising into its
  * neighbours. A FAILED TX is the one case that overruns a slot --

@@ -77,8 +77,11 @@ enum sync_tau_mode {
 				   * stored survey value */
 	SYNC_TAU_MODE_SURVEY = 1, /* use sync_tau_dtu, from a one-time survey
 				   * computation pushed over the console */
-	SYNC_TAU_MODE_TWR    = 2, /* Fase B, not yet implemented */
-	SYNC_TAU_MODE_AUTO   = 3, /* Fase B, not yet implemented */
+	SYNC_TAU_MODE_TWR    = 2, /* RETIRED 2026-10-12: values kept so a stored
+				   * record still decodes, but never selectable --
+				   * uwb_config_set_sync_tau_mode() refuses it and
+				   * a stored 2/3 is migrated to SURVEY on load */
+	SYNC_TAU_MODE_AUTO   = 3, /* RETIRED, see TWR above */
 	SYNC_TAU_MODE_COUNT
 };
 
@@ -94,6 +97,13 @@ typedef struct {
 	bool     position_valid; /* false until coordinates are set */
 	int32_t  sync_tau_dtu;   /* SURVEY source value, signed DTU */
 	uint8_t  sync_tau_mode;  /* enum sync_tau_mode */
+	/* Static sync link installed by `apos apply` (B14 static survey). Only
+	 * sync_link_valid says tau was INSTALLED by a survey: sync_tau_dtu == 0 is
+	 * also a legal calibrated value, so it cannot be the flag. A board with
+	 * !sync_link_valid reports needs_survey rather than "calibrated". */
+	bool     sync_link_valid;
+	uint32_t sync_link_gen;  /* survey generation that installed it */
+	uint8_t  sync_parent_eui[8]; /* CCP root (the gateway) it was derived for */
 } uwb_config_t;
 
 /* Overwrite *c with the documented defaults: SLAVE, id 0, 16385/16385,
@@ -119,6 +129,19 @@ void uwb_config_set_pos(uwb_config_t *c, float x, float y, float z);
 void uwb_config_set_sync_tau(uwb_config_t *c, int32_t tau_dtu);
 
 bool uwb_config_set_sync_tau_mode(uwb_config_t *c, uint8_t mode);
+
+/* Install / clear the static sync link record. set() marks it valid and stores
+ * which survey generation and which root it was derived for; the tau itself is
+ * written separately with uwb_config_set_sync_tau(). */
+void uwb_config_set_sync_link(uwb_config_t *c, uint32_t generation,
+			      const uint8_t parent_eui[8]);
+void uwb_config_clear_sync_link(uwb_config_t *c);
+
+/* A stored sync_tau_mode may predate the retirement of TWR/AUTO. Returns the
+ * mode to actually use: unchanged for LEGACY/SURVEY, SURVEY for the retired
+ * TWR/AUTO (*migrated set true), and SURVEY with *migrated true for anything
+ * out of range. Pure, so the load path in uwb_store.c is host-testable. */
+uint8_t uwb_config_migrate_sync_tau_mode(uint8_t stored, bool *migrated);
 
 /* "legacy" / "survey" / "twr" / "auto", matched exactly. Returns false and
  * leaves *out untouched on an unknown name. */

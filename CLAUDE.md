@@ -18,6 +18,117 @@ before any position is worth reading. Both are now written, built and
 code-reviewed; **neither has been run on hardware**, and until they have, the
 residuals recorded below are still the current measurement.
 
+## 2026-10-13: PHY moved to PLEN_256/PAC16 (read before trusting any number below)
+
+The PHY is now **channel 5, PLEN_256, PAC16, code 9, 850 kbps** (SFD timeout
+249, TX power `0xfdfdfdfd`); it was PLEN_1024/PAC32 and `0xfafafafa`. Every
+latency/capacity figure below that is quoted "at PLEN_1024" (SHR 1050194 ns,
+SS-TWR exchange 3330.9 us, 13.32 ms sweep, 14 feasible slots, turnaround floor
+1394.9 us, `CCP_SCHED_MAX_ARM_NS` 263594, `BLINK_N_SLOTS` 144, CCP airtime
+0.687 %) is **historical**. Current, hand-checked, host tests pass: SHR
+268654 ns; exchange 2549.3 us; 4-anchor sweep 10.20 ms;
+`UWB_MAC_CFP_SLOTS_FEASIBLE` 19; turnaround floor 613.4 us
+(`POLL_RX_TO_RESP_TX_DLY_UUS` stays 2000, no longer tight; 1000 would also
+clear it, undecided); `CCP_SCHED_MAX_ARM_NS` 1826674; beacon frame 658066 ns;
+CCP v2 airtime 592183 ns (0.296 % of a superframe); `BLINK_N_SLOTS` 359, but
+`GW_MAX_SEATS` (128) and the uint8 `seat_id` remain the binding cap and
+`tdoa_gw`'s ingest/solve caps (~8 tags at 5 Hz over 4 anchors) the downstream
+limit.
+
+- **Antenna-delay calibration is INVALIDATED** by this change (per
+  `uwb_phy.h`'s own header): `cal ref`/`cal peer` results and the DWM3001CDK
+  reference node were done at PLEN_1024. The operator is redoing it; do not
+  claim any stored `ant_tx`/`ant_rx` is current.
+- **New mechanism:** `ccp_master_after_beacon()` now holds the CCP back until
+  `CCP_TX_PREAMBLE_DELAY_NS` (1.2 ms, `src/ccp_sched.h`, two `BUILD_ASSERT`s)
+  after the beacon RMARKER; `src/uwb_slave.c` re-arms RX right after reading
+  data+timestamp for a beacon. See the hard-won fact "Shortening the preamble
+  removes the slack ..." Anchor-side result measured; **gateway-side
+  confirmation (`sync master` offsets, absence of `cap_overlap`) NOT yet
+  captured.**
+- **Sync at PLEN_256**, >3 m from a USB-C gateway, all four anchors:
+  `jitter_est_dtu` A0 18, A1 21, A2 20, A3 19 (A3 first read 85 with
+  `max_dtu` 4031, then 19 on a re-run; transient, cause not established).
+  The PLEN_1024 results (50 DTU at 30 cm, 92-98 at 3 m, `fail`) predate the B13
+  estimator fix, the PA rework and the TX power change, so the improvement is
+  NOT attributable to PLEN_256 alone. `err_sfd_to` is ~5-6 % of rx events on
+  anchors, unexplained (not the re-arm issue).
+- `SYNC_JITTER_FALLBACK_DTU` is **50**, an operator decision, below the 85-DTU
+  A3 transient ("if it fails, let it fail").
+- **Known latent defect, not fixed:** `ccp_slave.c`'s signed 40-bit local delta
+  (~lines 329-338) aliases past ~8.6 s, so a real CCP gap >= 8.6 s is logged as
+  `seq_discontinuity` and rebaselined. Irrelevant while reception is ~100 %,
+  but fragile.
+
+## 2026-10-12: static survey + static sync links (supersedes the B14 Fase B text below)
+
+**Implemented on `codex/b14-static-survey` (cut from `da3bfab`); host-tested and
+build-verified (production and calibration images). NOT run on hardware — every
+acceptance gate in `docs/static-survey-install.md` §6 is `NO EJECUTADO`.** Plan:
+`docs/superpowers/plans/2026-10-12-b14-static-survey-multihop.md`; design and the
+multi-hop contract: `docs/sync-multihop-design.md`; procedure:
+`docs/static-survey-install.md`.
+
+What the code now does, and what it no longer does:
+
+- **The gateway is a node of a 3D survey** (EUI-64 from `hwinfo`, short address
+  `0x0000`), solved as the fifth node. The gauge is **four anchors only**
+  (`apos gauge origin= xaxis= plane= up=`); `apos_gw_set_gauge()` refuses `0x0000`
+  in every slot. The 2D survey (no `up=`) is the historical flow, unchanged: no
+  gateway node, no links, no hold.
+- **Gateway edges are ONE-WAY (gateway → anchor), a deliberate deviation from the
+  plan's "both directions".** SS-TWR antenna-delay error is exactly reciprocal, so
+  the reverse direction would cancel none of it, and it would cost a new
+  production responder path on the beacon-owning loop. Rationale in
+  `docs/sync-multihop-design.md` §3. The gateway must itself have passed `cal ref`.
+- **`apos apply` installs a static link per anchor**: `tau_dtu =
+  round(distance_3d / 4.690 mm)` (`src/sync_link.c`), delivered with new APOS
+  subtypes `SETTAU 0x08` / `SETTAU_ACK 0x09` (`src/apos_frame.c`), applied live,
+  persisted tau → mode → link record. An anchor on older firmware drops the
+  subtype, never ACKs, and is reported by address.
+- **Apply is a sequence with a hold, not an atomic commit.** Marker persisted
+  first, `apos_gw_publish_hold()` suspends fixes (`tdoa_gw` drains and counts
+  `held`), SETPOS then SETTAU to every anchor, and only if every one ACKed does
+  the gateway persist its survey and links and clear the marker. Otherwise the
+  previous survey stays active and fixes stay suspended, across reboots, until a
+  later apply completes. Anchors are not rolled back; recovery is re-apply with a
+  new monotonic generation.
+- **A degenerate gauge is refused and `apos apply force` cannot override it.**
+  "Non-zero volume" is not a test: noise alone makes a coplanar gauge reconstruct
+  ~0.35 m tall (`sqrt(2·L·δ)`). `apos_geom_gauge_conditioning()` judges `up`'s
+  height against that noise floor (factor 2.0, tuned in
+  `tests/apos_gauge_quality/`). +Z points toward `up`.
+- **The automatic TWR round-robin is gone.** `gw_selftau` is the manual
+  `sync tau measure` only (applies nothing); `ccp_master` still sends CCP v2 but
+  always "no measurement" (frame size and the measured `arm_cost` margin are
+  unchanged); `ccp_slave` ignores `tau_meas_*`; `tau_filter` is no longer built;
+  `sync_tau_mode` `twr`/`auto` are refused and a stored 2/3 is migrated to
+  `survey`; `sync tau auto on` is refused. A binary rollback to the B14 build
+  brings the auto round-robin back ON.
+- **A converted BLINK now requires a FRESH clock**, not just a converged model:
+  `blink_rx` refuses once the last accepted CCP is older than
+  `SYNC_CLOCK_MAX_AGE_MS` (5000 ms = `SYNC_MISS_MAX` superframes, derived).
+  Previously a silent link kept converting indefinitely, because the gap counter
+  only advances when a CCP arrives. `blink stats` carries `stale`.
+- **`needs_survey`**: `uwb_config_t.sync_link_valid` is the only thing that says a
+  survey installed tau. `tau == 0` is a legal calibrated value, so it cannot be
+  the flag; an anchor without a link reports `needs_survey`, and `legacy` is a
+  rollback, not a calibrated state.
+- Persistence: `apos/links` and `apos/pending` use a versioned, fixed-offset codec
+  (`src/apos_links.c`); an unknown version is rejected and **not erased**. The
+  older survey blob is untouched.
+- `tdoa_gw` counts **receivers**, not survey nodes, for early release (five
+  nodes still mean four observations), and `pos_json_anchors()` omits the gateway
+  from the retained payload while keeping the origin anchor as the reference.
+
+What this does NOT establish: nothing above has been timed against the beacon on
+a board (the local-ranging bursts and the three-write COMMIT are the two new
+things on the `K_PRIO_COOP(0)` loop), main-stack headroom on the new COMMIT path is
+unmeasured, and the gateway's own `cal ref` state is assumed. `tests/apos_gw/`
+runs the real `apos_gw.c` against a fake radio/anchors/NVS and was
+mutation-checked (12 deliberate defects, all caught) — that is evidence about the
+sequencing logic, not about the radio.
+
 ## URGENT next work
 
 ### 1. Antenna delay calibration
@@ -300,8 +411,9 @@ checked at the same time as the ownership note changes.
 
 **What is NOT done, and is the actual blocker on the 100-tags-at-5Hz
 objective: Task 4B, capacity.** The BLINK as shipped by Task 7 occupies the
-*same* 13.32 ms slot a full TWR exchange used — a 1.223 ms frame sitting in a
-slot sized for something 10.9x longer. The tag saves battery; **the network
+*same* 13.32 ms slot a full TWR exchange used (10.20 ms at the current
+PLEN_256; all PLEN_1024 figures in this section are historical) — a 1.223 ms
+frame sitting in a slot sized for something 10.9x longer. The tag saves battery; **the network
 gains zero capacity** and still serves the same ~11 tags TWR always did. This
 is now fully designed — `docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md`
 resolves all five open questions the original Task 4B stub left (slot
@@ -337,7 +449,12 @@ board, only its pieces.**
 - **Task 3** (`src/blink_sched.{c,h}`, ANCLA, host-tested): done, and its
   headline number MOVED with Task 2's measured guard.
   `blink_sched_n_slots()` on the frozen PHY with the now-measured
-  `BLINK_SLOT_GUARD_UUS = 100` gives **`BLINK_N_SLOTS = 144`** (`tests/blink_sched/`,
+  `BLINK_SLOT_GUARD_UUS = 100` gave **`BLINK_N_SLOTS = 144`** at PLEN_1024 —
+  **SUPERSEDED: 359 at the current PLEN_256** (slot 544159 ns including the
+  100 uus guard); `GW_MAX_SEATS` (128) and the uint8 `seat_id` remain the
+  binding cap, and the downstream limit is `tdoa_gw`'s ingest/solve caps
+  (~8 tags at 5 Hz over 4 anchors). The 144 text below is as written then
+  (`tests/blink_sched/`,
   PASSED) — up from the 134 the 200 us provisional guard gave, and now
   **greater than `GW_MAX_SEATS` (128)**: the seat table's fixed array size,
   not the blink schedule, is the binding cap on this build. The overflow-band
@@ -382,7 +499,9 @@ board, only its pieces.**
   tag's fixed per-superframe overhead (`T_BEACON_MS`/`T_GUARD_MS`/
   `T_MINISLOT_MS`) is rounded UP to whole milliseconds, a TWR-era choice
   harmless against a 24 ms ranging slot and NOT harmless against a BLINK
-  slot. The "roughly 132-133 of 134" figure this bullet used to carry was
+  slot. **(All of the 132-133/134/144 numbers here are PLEN_1024-era and
+  superseded by 359 slots at PLEN_256; the tag-side re-derivation is still
+  unstarted.)** The "roughly 132-133 of 134" figure this bullet used to carry was
   computed against the 200 us provisional guard; Task 2 moved the guard to
   100 us and `BLINK_N_SLOTS` to 144 (see above), which changes both the
   per-slot airtime and the superframe slack the tag's ~3.8 ms of extra
@@ -659,8 +778,12 @@ west flash -d build_dbg
 Quote the `-D`: PowerShell splits an unquoted `-DEXTRA_CONF_FILE=debug.conf` at
 the dot and the build fails looking for a file named `debug`. `debug.conf` sets
 `CONFIG_ANCLA_RANGING_DEBUG=y`, which compiles in a per-DISCOVERY and per-WAVE
-verdict line, a per-second SLAVE RX heartbeat, and the beacon-guard state behind
-every suppression. It changes no frame, no timing constant and no gate, so a
+verdict line, the beacon-guard state behind every suppression, and the `cia`
+shell command (`cia stats` / `cia reset`: per-class CIA accum/power/f1, error
+breakdown `err_phr/err_rs/err_fcs/err_sfd_to/err_cia`, beacon re-arm latency,
+`ccp_off_ns` and a `ccp_vs_rearm` table). The old per-second `slave_hb`
+heartbeat was REMOVED 2026-10-13 (it cost the CCP behind every fifth beacon);
+`docs/discovery-silent-anchor-debug.md` still describes it, with a note. It changes no frame, no timing constant and no gate, so a
 debug board is an ordinary peer on air and mixes with production boards — but it
 is not a deployment image (per-frame console traffic plus one extra SPI read per
 second on the SLAVE loop). See `docs/discovery-silent-anchor-debug.md`.
@@ -791,16 +914,20 @@ sync reset                     clear the residual statistics without
                                touching the lock or the baseline
 sync master                    transmit half — CCP sent/dropped counts as
                                JSON; meaningful on a GATEWAY
-sync tau mode <legacy|survey|twr|auto>
+sync tau mode <legacy|survey>
                                select the B14 flight-compensation source;
                                persists, applies LIVE (not gated behind a
-                               reboot like `ant_delay`). twr/auto currently
-                               degrade to survey (no Fase B source yet)
+                               reboot like `ant_delay`). twr/auto are RETIRED
+                               (2026-10-12): refused, a stored 2/3 is
+                               migrated to survey on load
 sync tau set <dtu>             write tau_survey_dtu (signed DTU); persists,
                                applies live if mode uses it
-sync tau show                  mode, configured and live tau as JSON —
-                               meaningful on a SLAVE (this is where tau is
-                               APPLIED)
+sync tau show                  mode, tau, link (installed|needs_survey),
+                               generation, parent EUI, clock_fresh and
+                               clock_age_ms as JSON — meaningful on a SLAVE
+                               (this is where tau is APPLIED). `needs_survey`
+                               means no `apos apply` installed it: tau 0 is
+                               then UNSET, not calibrated
 sync tau measure <id> [n]      GATEWAY-only: range THIS gateway directly to
                                anchor <id> over SS-TWR, averaged over n
                                exchanges (default 8, max 32) — computes
@@ -808,19 +935,13 @@ sync tau measure <id> [n]      GATEWAY-only: range THIS gateway directly to
                                measurement of the gateway's own position.
                                Queues (spreads over up to n superframes so
                                the beacon is never held); read with
-                               `sync tau result`. The printed tau_dtu is
-                               for anchor <id>'s OWN `sync tau set` — this
-                               command applies nothing locally
+                               `sync tau result`. DIAGNOSTIC ONLY since
+                               2026-10-12: nothing is applied or persisted;
+                               the installed link comes from `apos apply`
 sync tau result                last `sync tau measure` run, as JSON
-sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
-                               automatic round-robin tau measurement
-                               (default ON). Reuses gw_selftau's step
-                               machine to measure one anchor per
-                               superframe, feeding CCP v2's tau_meas_*
-                               fields with no operator action needed.
-                               `off` reverts to sending
-                               CCP_TAU_MEAS_ANCHOR_NONE every superframe;
-                               `sync tau measure` is unaffected either way
+sync tau auto [off]            RETIRED 2026-10-12: the automatic TWR
+                               round-robin no longer exists; prints
+                               `retired`, and `on` is refused
 ```
 
 ## Layout
@@ -1232,7 +1353,8 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   Re-derived, not left stale: `src/ccp_sched.h`'s `CCP_SCHED_MAX_ARM_NS`
   was sized against `CCP_FRAME_LEN` (21 bytes, v1) — wrong now that v2 (30
   bytes) is the frame actually transmitted every superframe. Moved to
-  `CCP_FRAME_LEN_V2`: **263594 ns** (was 348300), still comfortably
+  `CCP_FRAME_LEN_V2`: **263594 ns** (was 348300; both PLEN_1024 figures —
+  **1826674 ns at the current PLEN_256**), still comfortably
   positive — 9 extra bytes cost ~84706 ns of airtime against a guard
   window with ample headroom. `ccp_master.c`'s own runtime CAP-overlap
   check now measures against the frame's ACTUAL built length (the `n`
@@ -1240,7 +1362,8 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   the same reason. `tests/ccp_sched/` re-pinned for both the v2 budget
   and the v1 frame's own airtime (kept, since `ccp_frame_build()` can
   still build a v1 frame on request). CCP airtime share of the 200 ms
-  superframe: 0.687% now (was 0.645%), still far under NFR-1's <1%
+  superframe: 0.687% at PLEN_1024 (was 0.645% for v1; **0.296% at PLEN_256**,
+  v2 airtime 592183 ns), still far under NFR-1's <1%
   target — recorded here since `docs/anchor-sync-measurement.md` §2
   quotes the old figure and has not been updated to match.
 
@@ -1252,7 +1375,8 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   test) — the plan's own flagged risk ("mayor riesgo, como el CCP mismo en
   su momento") is CLEARED.** `sync master` after ~46 min (13759 CCPs):
   `dropped:0`, `arm_cost_ns_last:229550` against the v2 budget of
-  `263594` — **34044 ns (13%) of measured margin, positive**, tighter
+  `263594` (PLEN_1024 run, HISTORICAL: the PHY and the CCP mechanism have
+  both changed since, see the 2026-10-13 note) — **34044 ns (13%) of measured margin, positive**, tighter
   than v1's but real and sustained, not a compile-time guess.
   `offset_ns_min/max` spread only 76619 ns, far inside that margin, so
   this is a stable number, not a near-miss. No
@@ -1291,7 +1415,8 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   timestamp — see `ccp_master.{c,h}`) has no scheduled RMARKER left to police
   at compile time, so `CCP_OFFSET_UUS` and the two old asserts are GONE, not
   merely unused — a live-looking constant nothing honours is worse than none.
-  What remains is `CCP_SCHED_MAX_ARM_NS` (348300 ns) — the whole post-beacon
+  What remains is `CCP_SCHED_MAX_ARM_NS` (348300 ns for v1 at PLEN_1024;
+  **1826674 ns for v2 at the current PLEN_256**) — the whole post-beacon
   guard window minus the CCP's own full airtime minus the beacon's own
   airtime — and one `BUILD_ASSERT` that it is positive, i.e. that the guard
   window is even wide enough to host the CCP's whole frame at all. That is a
@@ -1299,8 +1424,23 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   sizing; whether any one arm sequence is fast enough to use the resulting
   margin is now a measured, runtime question — see `ccp_master.c`'s
   `arm_cost_ns_last`, checked against this same constant every superframe.
+  **Since 2026-10-13 it also carries `CCP_TX_PREAMBLE_DELAY_NS` (1.2 ms from
+  the beacon's RMARKER to the CCP's preamble start) with two `BUILD_ASSERT`s**
+  (the frame must still end before the first slave CAP preamble, ~1.0 ms to
+  spare); the value is a measured-latency decision, not derived. See the
+  hard-won fact on the preamble slack.
 - `src/ccp_master.{c,h}` — the CCP transmitter on the GATEWAY, root of the sync
-  tree (hop 0). On the gateway deliberately: it already schedules one delayed
+  tree (hop 0). **2026-10-13 update: `ccp_master_after_beacon()` no longer
+  transmits right behind the beacon. It reads the chip clock ONCE, then
+  `k_busy_wait()`s until `CCP_TX_PREAMBLE_DELAY_NS` after the beacon RMARKER,
+  then `DWT_START_TX_IMMEDIATE` as before (a first version that polled the chip
+  clock in a loop ran to its 2500 us timeout and landed the CCP ~1.9 ms late
+  and was replaced). `arm_cost_ns_last` now INCLUDES that deliberate delay: a
+  healthy value is ~0.81 ms, not the ~140-230 us of the arm alone. Measured
+  from the ANCHOR side: CCP RMARKER 1.504 ms after the beacon's with ~1 us
+  spread. Gateway-side (`sync master`) confirmation NOT yet captured.** The
+  text that follows describes the immediate-TX design and is otherwise
+  current. On the gateway deliberately: it already schedules one delayed
   TX per superframe (the beacon), and the clock that beacon is scheduled from
   **is** the time base. A master role on a slave would have added an
   unsolicited TX path to a production image. Transmits each CCP with
@@ -1485,7 +1625,13 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
 - `src/uwb_phy.h` — the fixed PHY contract. Not runtime-configurable.
 - `src/anchor_shell.c` — the `anchor` console command tree.
 - `src/uwb_slave.c` — SLAVE mode: interrupt-driven SS-TWR responder, beacon
-  observe, and beacon-collision TX suppression.
+  observe, and beacon-collision TX suppression. **Since 2026-10-13 a beacon
+  takes a short path: RX is re-armed right after reading data+timestamp,
+  BEFORE `read_cir()` and beacon processing (production skips `read_cir()` on
+  the beacon; the debug image reads it after the re-arm), so the slave is
+  listening for the CCP behind it.** Measured re-arm: 665-870 us after the
+  beacon RMARKER. Debug image only: the 1 Hz `slave_hb` heartbeat is gone
+  (replaced by the `cia stats`/`cia reset` shell command).
 
   **`uwb_slave_run()` snapshots `cfg` at mode-entry (`cfg_snapshot`) on
   purpose, so `anchor id`/`ant`/`pos` only take effect on reboot — and B14
@@ -1904,6 +2050,21 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   RANGE_CMD, RANGE_RSP, SETPOS, SETPOS_ACK, SURVEY_END). Deliberately *not*
   added to `uwb_frame_802_15_4z.c`, which must stay byte-identical to the tag's
   copy. Pure C, host-tested in `tests/apos_frame/`.
+- `src/apos_links.{c,h}` — the persisted static sync links (`apos/links`) and the
+  apply-in-progress marker (`apos/pending`), as an explicit **versioned,
+  fixed-offset, little-endian codec**, not a struct memcpy: an unknown version, a
+  length that disagrees with `n`, trailing bytes or a non-0/1 `valid` byte is
+  rejected and **never reinterpreted or erased**. Pure C, host-tested in
+  `tests/apos_links/` (every truncation, version, corruption, zero tau stays
+  valid). Lookups are by EUI. See `docs/sync-multihop-design.md` §4.
+- `src/sync_link.{c,h}` — derives one static link per peer from an ACCEPTED solved
+  geometry: `tau = round(distance_3d / 4.690 mm)` (the same conversion
+  `gw_selftau` uses), keyed by child/parent EUI, plus the direct one-way range as
+  evidence and the Gate B heritage check (`SYNC_LINK_GATE_MM` = 150). The measured
+  range **never rewrites tau**. Pure C, `tests/sync_link/`.
+- `src/apos_stats.{c,h}` — the median-absolute-deviation filter and sd that used
+  to be private to `apos_node.c`, shared so a gateway edge and an anchor edge of
+  equal quality carry equal weight. `tests/apos_stats/`.
 - `src/apos_geom.{c,h}` — the sparse geometry solver, 2D or 3D: a closed-form
   seed then a gauge-constrained Levenberg-Marquardt refine over a flat edge
   list, with residual, planarity (3D) / gauge-collinearity (2D) and
@@ -1993,6 +2154,44 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   stale number. No build-time or test-time check ties the two together.
 
 ## Hard-won facts (do not re-derive)
+
+- **Shortening the preamble removes the slack the back-to-back beacon->CCP
+  exchange silently relied on (PLEN_1024 -> PLEN_256, 2026-10-13).** At
+  PLEN_1024 the CCP's ~1050 us preamble outlasted the 665-870 us a slave needs
+  after the beacon RMARKER to be listening again, so sending the CCP
+  immediately behind the beacon worked by accident. At PLEN_256 the preamble is
+  ~269 us and was over before most slaves were armed: only 16.9 % of CCPs were
+  received, 0 % when slave re-arm >= 850 us (sharp cliff near 800 us). Fixes:
+  (1) the slave re-arms RX before `read_cir()`/beacon processing
+  (`uwb_slave.c`); (2) the gateway holds the CCP until
+  `CCP_TX_PREAMBLE_DELAY_NS` = 1.2 ms after the beacon RMARKER (`ccp_sched.h`)
+  by ONE chip-clock read then `k_busy_wait()`, then `DWT_START_TX_IMMEDIATE`.
+  A first version polled the chip clock inside the wait loop; it ran to its
+  2500 us timeout and landed the CCP ~1.9 ms late (replaced; do not poll the
+  chip clock there). Measured from the ANCHOR side after the fix: CCP received
+  on ~100 % of beacons (1650/1650, 1283/1284), CCP RMARKER 1.504 ms after the
+  beacon's with ~1 us spread, CCP CIA accum ~225 of 256 symbols (same as the
+  beacon; ~47 when armed late). **Gateway-side confirmation (`sync master`
+  offsets, no `cap_overlap`) has NOT been captured.** The 1 Hz `slave_hb`
+  heartbeat also had to go: it cost the CCP behind every fifth beacon
+  (replaced by `cia stats`/`cia reset` on the debug image). General lesson:
+  any chain of back-to-back frames tuned at one PHY silently depends on the
+  preamble length; re-measure receiver availability, not just airtime.
+
+- **PLEN_256 also put the survey's RANGE_RSP on top of the beacon
+  (2026-10-16).** A 40-exchange `RANGE_CMD` batch is ~4.85 ms/exchange at
+  PLEN_256 (SHR + 2 ms turnaround + tail + SPI + the 2 ms inter-exchange
+  sleep), ~194 ms in all, so the reply left ~197 ms after the command, i.e.
+  ON the next beacon, inside the span the gateway is deaf (RX expires
+  `BEACON_ARM_MARGIN_UUS` before the beacon, reopens after the CCP). At
+  PLEN_1024 the batch was ~228 ms and the reply landed 30 ms clear. Symptom:
+  `apos_hole ... "no RANGE_RSP"` on whole runs of pairs, any anchor, retries
+  failing identically (a retry re-sends at the same superframe phase).
+  Fix: `apos_node.c`'s `gw_rx_wait()` holds every anchor->gateway APOS frame
+  out of `[beacon - GW_DEAF_BEFORE_UUS, beacon + GW_DEAF_AFTER_UUS]`;
+  `BEACON_ARM_MARGIN_UUS` moved to `uwb_mac.h` for it. Build-verified, **not
+  yet run on hardware.** Same general lesson as the bullet above: a batch
+  length tuned at one PHY silently fixes where its reply lands.
 
 - **`dwt_initialise()` must be the first register access after `dwt_probe()`.**
   It is what assigns `dw->priv`; anything else first — including
@@ -2343,20 +2542,24 @@ sync tau auto [on|off]         GATEWAY-only: show or toggle the Fase B
   RMARKER**, and the RMARKER sits at the *end* of its own SHR, so the poll's
   payload and the whole response SHR both fall **inside** the turnaround
   window rather than beside it. The correct span is `poll SHR + turnaround +
-  (response PHR + payload + FCS)` = **3330.9 us**, so a 4-anchor sweep is
-  **13.32 ms**, not the 18.1 ms the naive form gives. This matters because the
+  (response PHR + payload + FCS)` = **3330.9 us at PLEN_1024 (2549.3 us at the
+  current PLEN_256)**, so a 4-anchor sweep is **13.32 ms (10.20 ms at
+  PLEN_256)**, not the 18.1 ms the naive form gives. This matters because the
   wrong figure makes `N_CFP = 11` look like it barely fits (10.5 slots) when
-  the budget actually affords **14** and the shipped constant is conservative
-  with 3 slots of headroom. Encoded in `MAC_SSTWR_EXCHANGE_PS()`
+  the budget actually affords **14 (19 at PLEN_256)** and the shipped constant
+  is conservative with 3 slots of headroom (8 at PLEN_256). Encoded in `MAC_SSTWR_EXCHANGE_PS()`
   (`src/mac_budget.h`) and pinned both ways — correct and naive — by
   `test_sstwr_exchange()`. The MAC contract's own hand estimate of
   `T_slot ~= 15 ms` was right; it was the design spec's first draft that got
   this wrong, and the model is what caught it.
 - **The DWM3001CDK reference node used for antenna-delay calibration must run
   `POLL_RX_TO_RESP_TX_DLY_UUS = 2000`, not the Qorvo `ss_twr_responder`
-  example's stock 450.** At PLEN_1024 the preamble alone takes ~1.05 ms, so a
+  example's stock 450.** At PLEN_1024 the preamble alone took ~1.05 ms, so a
   450 uus turnaround would require the response to leave before the poll's
-  preamble finished decoding — physically impossible. ANCLA's own responder
+  preamble finished decoding — physically impossible. At the current PLEN_256
+  the turnaround floor is 613.4 us (was 1394.9 us), so 450 uus is STILL too
+  short but 2000 is no longer tight (1000 uus would also clear the floor;
+  undecided, unchanged). ANCLA's own responder
   already turns around at 2000 uus; matching it on the reference node is what
   lets `ss_initiator.c` use a single RX window for both peer types. See
   `docs/antenna-delay-calibration.md` §1.1.
@@ -2907,8 +3110,10 @@ figure.
 ## System context
 
 Ranging is Two-Way Ranging (TWR); distance is computed on the tag, not the
-anchor. The PHY contract every node must match — **channel 5, PLEN_1024, PAC32,
-code 9, 850 kbps, SFD_IEEE_4Z, STS/PDoA off** — and the 802.15.4z wire format
+anchor. The PHY contract every node must match — **channel 5, PLEN_256, PAC16,
+code 9, 850 kbps, SFD_IEEE_4Z, STS/PDoA off** (SFD timeout 257+8-16 = 249,
+TX power `0xfdfdfdfd`; changed 2026-10-12 from PLEN_1024/PAC32 and
+`0xfafafafa`, see the 2026-10-13 PHY note near the top) — and the 802.15.4z wire format
 live in the sibling ESP-IDF anchor project at
 `../../../PlatformIO/Projects/ESP32S3UWB` (see its `CLAUDE.md`). That project is
 the working reference implementation for ranging; the SLAVE responder here
@@ -3016,7 +3221,26 @@ gcc -Wall -Wextra -Isrc -o tests/gw_selftau/test_gw_selftau.exe tests/gw_selftau
 ./tests/gw_selftau/test_gw_selftau.exe          # gw_selftau: ALL TESTS PASSED, exits 0
 
 gcc -Wall -Wextra -Isrc -o tests/tau_filter/test_tau_filter.exe tests/tau_filter/test_tau_filter.c src/tau_filter.c
-./tests/tau_filter/test_tau_filter.exe          # tau_filter: ALL TESTS PASSED, exits 0
+./tests/tau_filter/test_tau_filter.exe          # tau_filter: ALL TESTS PASSED, exits 0 (unbuilt in firmware since 2026-10-12)
+
+# 2026-10-12 static survey. On a host whose default gcc is the 32-bit mingw.org one, add
+# -Itests/ccp_frame/shim (it supplies ENODATA/EADDRINUSE/ENOTSUP/EBADMSG/EMSGSIZE/EPROTO).
+gcc -Wall -Wextra -Isrc -Itests/ccp_frame/shim -o tests/apos_gauge_quality/t.exe tests/apos_gauge_quality/test_apos_gauge_quality.c src/apos_geom.c -lm
+./tests/apos_gauge_quality/t.exe                # apos_gauge_quality: ALL TESTS PASSED
+
+gcc -Wall -Wextra -Isrc -Itests/ccp_frame/shim -o tests/sync_link/t.exe tests/sync_link/test_sync_link.c src/sync_link.c src/apos_table.c src/apos_geom.c -lm
+./tests/sync_link/t.exe                         # sync_link: ALL TESTS PASSED
+
+gcc -Wall -Wextra -Isrc -Itests/ccp_frame/shim -o tests/apos_links/t.exe tests/apos_links/test_apos_links.c src/apos_links.c
+./tests/apos_links/t.exe                        # apos_links: ALL TESTS PASSED
+
+gcc -Wall -Wextra -Isrc -o tests/apos_stats/t.exe tests/apos_stats/test_apos_stats.c src/apos_stats.c
+./tests/apos_stats/t.exe                        # apos_stats: ALL TESTS PASSED
+
+# The real apos_gw.c against a fake radio, fake anchors, fake NVS (injectable write
+# failures) and a fake clock -- shims in tests/apos_gw/shim/.
+gcc -Wall -Wextra -Itests/apos_gw/shim -Itests/mac_budget/shim -Itests/ccp_frame/shim -Isrc -o tests/apos_gw/t.exe tests/apos_gw/test_apos_gw.c src/apos_gw.c src/apos_frame.c src/apos_geom.c src/apos_table.c src/apos_stats.c src/apos_links.c src/sync_link.c src/uwb_config.c -lm
+./tests/apos_gw/t.exe                           # apos_gw: ALL TESTS PASSED
 ```
 
 `tests/pos_ekf/` was removed with the EKF on 2026-09-06 (the tag's own copy
@@ -3727,7 +3951,9 @@ that said no remote was configured — true once, not since.
   trap `docs/anchor-sync-measurement.md` §4.1 records (an un-reset 30 cm
   reading came back 188 DTU against a true 50); and `sync_model_error_dtu()`
   is now built from the anchor's own MEASURED jitter with a pessimistic
-  fallback (`SYNC_JITTER_FALLBACK_DTU`, 96 DTU) rather than the 15x-optimistic
+  fallback (`SYNC_JITTER_FALLBACK_DTU`, 96 DTU when this was written; **now 50,
+  an operator decision** — below the 85-DTU A3 transient measured at PLEN_256,
+  "if it fails, let it fail") rather than the 15x-optimistic
   `SYNC_JITTER_DTU` design assumption, which is why `blink_rx.c` no longer has
   to reach past it for `jitter_est_dtu()`. **Verified in software only** —
   host suites pass, both images link clean, production `dram0_0_seg`

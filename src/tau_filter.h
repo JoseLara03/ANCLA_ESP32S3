@@ -3,6 +3,12 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
+ * NOT BUILT INTO THE FIRMWARE since 2026-10-12: the automatic TWR round-robin
+ * this filter smoothed was retired (the flight-time compensation is now a
+ * static per-link value installed by `apos apply`, src/sync_link.c). The
+ * source and tests/tau_filter/ are kept, unreferenced by CMakeLists.txt, as the
+ * record of the Fase B design; a future dynamic source could revive them.
+ *
  * B14 Fase B, Task 4 (docs/superpowers/plans/2026-09-22-b14-flight-compensation.md
  * FR-8): the anchor-side filter that turns a stream of raw, unaveraged,
  * per-superframe TWR tau measurements (src/gw_selftau.c's auto round-robin,

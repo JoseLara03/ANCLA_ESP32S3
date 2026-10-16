@@ -203,9 +203,10 @@ static void test_rejects_foreign_frames(void)
 }
 
 /* Airtime, so the cost of running CCPs is on the record rather than discovered
- * later. At PLEN_1024 / 850 kbps a 21-byte payload is ~1.29 ms, which against a
- * 200 ms superframe is 0.65 % -- cheap, but it is one more frame competing with
- * the beacon and Phase 3's superframe layout has to budget for it. */
+ * later. This test is a HISTORICAL record at the former PLEN_1024 / 850 kbps
+ * (a 21-byte payload ~1.29 ms, 0.65 % of a 200 ms superframe); the hard-coded
+ * 1042 us preamble is NOT the current PHY. At the current PLEN_256 the v1 frame
+ * is ~0.52 ms and the v2 frame 592183 ns (0.296 %), pinned in tests/ccp_sched/. */
 static void test_airtime_is_recorded(void)
 {
 	/* preamble 1042 us + SFD 8 + PHR 22 + (21+2) bytes at 9.41 us/byte. */

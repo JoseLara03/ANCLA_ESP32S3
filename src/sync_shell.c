@@ -132,6 +132,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		    "\"paired\":%u,\"no_announce\":%u,\"gaps\":%u,"
 		    "\"rejected\":%u,\"count\":%u,\"valid\":%u,"
 		    "\"n_obs\":%u,\"rebaselines\":%u,\"sync_gaps\":%u,"
+		    "\"outliers\":%u,"
 		    "\"sigma_dtu\":%u,\"sigma_ps\":%u,"
 		    "\"jitter_est_dtu\":%u,\"jitter_est_ps\":%u,"
 		    "\"rms_dtu\":%u,\"max_dtu\":%u,\"drift_ppb\":%d,"
@@ -139,6 +140,7 @@ static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 		    board_role(), root, rx, paired, no_announce, gap, reject,
 		    cnt, valid ? 1u : 0u,
 		    n_obs, rebaselines, sync_model_miss_count(m),
+		    sync_model_outlier_count(m),
 		    sigma, (uint32_t)(((uint64_t)sigma * 1565u) / 100u),
 		    jit, jit_ps,
 		    sync_model_residual_rms_dtu(m),
@@ -319,10 +321,19 @@ static int cmd_tau_mode(const struct shell *sh, size_t argc, char **argv)
 
 	if (!uwb_config_sync_tau_mode_from_name(argv[1], &mode)) {
 		shell_error(sh, "sync tau mode: unknown mode \"%s\" (want "
-				"legacy|survey|twr|auto)", argv[1]);
+				"legacy|survey)", argv[1]);
 		return -EINVAL;
 	}
-	uwb_config_set_sync_tau_mode(cfg, mode);
+	if (!uwb_config_set_sync_tau_mode(cfg, mode)) {
+		/* twr and auto still PARSE so this can say what happened instead of
+		 * "unknown mode". */
+		shell_error(sh, "sync tau mode: \"%s\" is RETIRED. The automatic TWR "
+				"measurement was removed 2026-10-12: the flight-time "
+				"compensation is a static per-link value installed by "
+				"`apos apply` on the gateway. Use legacy|survey.",
+			    argv[1]);
+		return -ENOTSUP;
+	}
 	if (uwb_store_save_sync_tau_mode()) {
 		shell_warn(sh, "mode applied but NOT persisted — will revert "
 				"to \"%s\" on reboot",
@@ -332,21 +343,11 @@ static int cmd_tau_mode(const struct shell *sh, size_t argc, char **argv)
 	shell_print(sh, "{\"sync_tau\":{\"mode\":\"%s\",\"tau_used_dtu\":%d}}",
 		    uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
 		    ccp_slave_get_tau());
-	if (mode == SYNC_TAU_MODE_TWR || mode == SYNC_TAU_MODE_AUTO) {
-		shell_warn(sh, "\"%s\" starts on the stored SURVEY value "
-				"(tau_survey_dtu) and switches to the live "
-				"on-air TWR measurement (src/gw_selftau.c + "
-				"src/tau_filter.c) the moment this anchor's "
-				"next v2 CCP measurement passes the quality "
-				"gate — usually within a few round-robin "
-				"turns. `sync tau show`'s \"tau_source\" says "
-				"which one is actually live right now. NOT "
-				"yet implemented: FR-9's freshness degrade — "
-				"a TWR value that goes stale (this anchor "
-				"stops being addressed, or the master goes "
-				"quiet) is currently kept forever rather than "
-				"reverting to survey after 60 s.",
-			   uwb_config_sync_tau_mode_name(mode));
+	if (mode == SYNC_TAU_MODE_LEGACY) {
+		shell_warn(sh, "legacy forces tau to 0 (the pre-B14 behaviour). This "
+			       "is a ROLLBACK, not a calibrated state: BLINK "
+			       "timestamps are early by this anchor's distance from the "
+			       "gateway.");
 	}
 	return 0;
 }
@@ -378,8 +379,21 @@ static int cmd_tau_set(const struct shell *sh, size_t argc, char **argv)
 		    ccp_slave_get_tau());
 	if (cfg->sync_tau_mode == SYNC_TAU_MODE_LEGACY) {
 		shell_warn(sh, "mode is \"legacy\" — this value is stored but "
-				"has NO effect until `sync tau mode survey` "
-				"(or twr/auto).");
+				"has NO effect until `sync tau mode survey`.");
+	}
+	/* A hand-set tau is no longer the one a survey installed, so the link
+	 * record must stop vouching for it: leaving it valid would report
+	 * "installed" for a value nobody derived. The tau stays applied --
+	 * this is an explicit operator override -- and `needs_survey` says the
+	 * truth until the next `apos apply`. */
+	if (cfg->sync_link_valid) {
+		uwb_config_clear_sync_link(cfg);
+		if (uwb_store_save_sync_link()) {
+			shell_warn(sh, "link record cleared in RAM but NOT persisted");
+		}
+		shell_warn(sh, "this overrides the tau a survey installed: the "
+			       "link is now reported as needs_survey until the next "
+			       "`apos apply`.");
 	}
 	return 0;
 }
@@ -392,79 +406,47 @@ static int cmd_tau_show(const struct shell *sh, size_t argc, char **argv)
 	const uwb_config_t *cfg = uwb_config_get();
 
 	/* tau_used_dtu is read from the LIVE model (ccp_slave_get_tau()), not
-	 * recomputed from cfg here, so this command shows what is actually
-	 * being applied, not merely what is configured -- the two can differ
-	 * for one superframe if a caller changed cfg without going through
-	 * this file's apply_tau_live().
+	 * recomputed from cfg, so this shows what is actually being applied.
 	 *
-	 * tau_source (FR-10) is "twr" only while the TWR filter's own output
-	 * is the value actually live right now (ccp_slave_twr_is_source()) --
-	 * NOT merely "mode is twr/auto", since that mode can still be
-	 * running on a cold-start or degraded (Task 5, not yet wired) value.
-	 * tau_twr_dtu/twr_quality/tau_twr_age_s report the filter's state
-	 * REGARDLESS of source or mode, so an operator can preview what TWR
-	 * would give even while parked on survey/legacy -- rendered as
-	 * literal JSON `null` (not the string "null") until a first sample
-	 * has ever been accepted, via small snprintf'd sub-buffers since
-	 * shell_print() has no conditional-format facility of its own. */
-	bool twr_have = false;
-	int32_t twr_dtu = 0;
-	uint32_t twr_age_ms = ccp_slave_twr_age_ms();
-	char twr_dtu_buf[16];
-	char twr_age_buf[16];
-	char twr_q_buf[8];
+	 * link says WHERE that value came from, because tau == 0 reads the same
+	 * whether it was calibrated or never set:
+	 *   installed    -- a survey installed it (generation and root below)
+	 *   needs_survey -- nothing did; the stored tau, if any, was typed by hand
+	 *                   or predates the static links. NOT calibrated.
+	 * clock_age_ms is the time since the last accepted CCP; BLINKs convert
+	 * only while it is within SYNC_CLOCK_MAX_AGE_MS, whatever tau says. */
+	const char *link = cfg->sync_link_valid ? "installed" : "needs_survey";
+	const char *src = (cfg->sync_tau_mode == SYNC_TAU_MODE_LEGACY)
+			  ? "legacy"
+			  : (cfg->sync_link_valid ? "static-survey" : "unsurveyed");
+	uint32_t age = ccp_slave_clock_age_ms();
+	char age_buf[16];
 
-	ccp_slave_twr_tau(&twr_have, &twr_dtu);
-
-	if (twr_have) {
-		snprintf(twr_dtu_buf, sizeof(twr_dtu_buf), "%d", twr_dtu);
+	if (age == UINT32_MAX) {
+		snprintf(age_buf, sizeof(age_buf), "null");
 	} else {
-		snprintf(twr_dtu_buf, sizeof(twr_dtu_buf), "null");
-	}
-	if (twr_age_ms != UINT32_MAX) {
-		snprintf(twr_age_buf, sizeof(twr_age_buf), "%u",
-			 twr_age_ms / 1000u);
-		snprintf(twr_q_buf, sizeof(twr_q_buf), "%u",
-			 (unsigned int)ccp_slave_twr_last_quality());
-	} else {
-		snprintf(twr_age_buf, sizeof(twr_age_buf), "null");
-		snprintf(twr_q_buf, sizeof(twr_q_buf), "null");
-	}
-
-	/* Caught on hardware 2026-09-25: printing uwb_config_sync_tau_mode_name()
-	 * as the "not TWR-sourced" fallback is wrong specifically under mode
-	 * TWR itself -- that mode's own NAME is the string "twr", identical
-	 * to the sentinel this field uses for "the applied value actually
-	 * came from the live filter". So a degrade (Task 5) correctly reverted
-	 * tau_used_dtu to the survey value and correctly cleared
-	 * ccp_slave_twr_is_source(), but this line still printed
-	 * "tau_source":"twr" -- reporting the MODE, not the actual
-	 * provenance, and looking exactly like the degrade had silently
-	 * failed. The provenance of a NOT-twr-sourced tau_used_dtu is always
-	 * "legacy" (forced 0) under LEGACY mode and "survey" under every
-	 * other mode -- survey mode uses it directly, and TWR/AUTO mode uses
-	 * it as the cold-start seed and the Task 5 degrade target, never
-	 * anything else -- so that is what belongs here, independent of the
-	 * mode's own name. */
-	const char *tau_source;
-
-	if (ccp_slave_twr_is_source()) {
-		tau_source = "twr";
-	} else if (cfg->sync_tau_mode == SYNC_TAU_MODE_LEGACY) {
-		tau_source = "legacy";
-	} else {
-		tau_source = "survey";
+		snprintf(age_buf, sizeof(age_buf), "%u", age);
 	}
 
 	shell_print(sh,
 		    "{\"sync_tau\":{\"mode\":\"%s\",\"tau_survey_dtu\":%d,"
-		    "\"tau_used_dtu\":%d,\"tau_source\":\"%s\","
-		    "\"tau_twr_dtu\":%s,\"tau_twr_age_s\":%s,"
-		    "\"twr_quality\":%s,\"tau_jump_events\":%u}}",
+		    "\"tau_used_dtu\":%d,\"tau_source\":\"%s\",\"link\":\"%s\","
+		    "\"generation\":%u,\"parent\":\"%02X%02X%02X%02X%02X%02X%02X%02X\","
+		    "\"clock_fresh\":%u,\"clock_age_ms\":%s,\"clock_max_age_ms\":%u}}",
 		    uwb_config_sync_tau_mode_name(cfg->sync_tau_mode),
-		    cfg->sync_tau_dtu, ccp_slave_get_tau(), tau_source,
-		    twr_dtu_buf, twr_age_buf, twr_q_buf,
-		    ccp_slave_twr_jump_count());
+		    cfg->sync_tau_dtu, ccp_slave_get_tau(), src, link,
+		    (unsigned int)cfg->sync_link_gen,
+		    cfg->sync_parent_eui[0], cfg->sync_parent_eui[1],
+		    cfg->sync_parent_eui[2], cfg->sync_parent_eui[3],
+		    cfg->sync_parent_eui[4], cfg->sync_parent_eui[5],
+		    cfg->sync_parent_eui[6], cfg->sync_parent_eui[7],
+		    ccp_slave_clock_fresh() ? 1u : 0u, age_buf,
+		    (unsigned int)SYNC_CLOCK_MAX_AGE_MS);
+	if (!cfg->sync_link_valid) {
+		shell_warn(sh, "needs_survey: no `apos apply` has installed a link on "
+			       "this anchor. tau_used_dtu is NOT a calibrated value "
+			       "(0 here means unset, not \"zero flight time\").");
+	}
 	return 0;
 }
 
@@ -589,73 +571,45 @@ static int cmd_tau_result(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	if (r.done && r.valid == r.attempted && r.valid > 0u) {
-		shell_print(sh, "copy `sync tau set %d` into anchor %u's OWN "
-				"console -- this value is not applied here, "
-				"it describes THAT anchor's distance from "
-				"this gateway",
+		shell_print(sh, "DIAGNOSTIC ONLY: tau_dtu %d describes anchor %u's "
+				"distance from this gateway. Nothing was applied or "
+				"persisted. The installed link comes from `apos apply`; "
+				"compare this against that anchor's installed tau "
+				"(`sync tau show` on it, or `apos show` here).",
 			    r.tau_dtu, r.anchor_id);
 	}
 	return 0;
 }
 
+/* The automatic round-robin is RETIRED (2026-10-12). The command is kept so
+ * an old runbook gets a clear answer instead of "command not found", and so
+ * `on` cannot be mistaken for having worked. */
 static int cmd_tau_auto(const struct shell *sh, size_t argc, char **argv)
 {
-	if (strcmp(board_role(), "gateway") != 0) {
-		shell_error(sh, "sync tau auto: gateway mode only (this board "
-				"is \"%s\")", board_role());
+	if (argc > 1 && strcmp(argv[1], "on") == 0) {
+		shell_error(sh, "sync tau auto on: RETIRED. The automatic TWR "
+				"measurement no longer exists in this firmware. "
+				"The flight-time compensation is installed once by "
+				"`apos apply`; use `sync tau measure` for a manual "
+				"diagnostic.");
 		return -ENOTSUP;
 	}
-
-	if (argc > 1) {
-		if (strcmp(argv[1], "on") == 0) {
-			gw_selftau_auto_set_enabled(true);
-		} else if (strcmp(argv[1], "off") == 0) {
-			gw_selftau_auto_set_enabled(false);
-		} else {
-			shell_error(sh, "sync tau auto: want on|off, or no "
-					"argument to show");
-			return -EINVAL;
-		}
-	}
-
-	shell_print(sh, "{\"sync_tau_auto\":{\"enabled\":%d}}",
-		    gw_selftau_auto_get_enabled() ? 1 : 0);
-
-	for (uint8_t i = 0; i < UWB_MAX_ANCHORS; i++) {
-		bool valid;
-		int32_t tau;
-		uint8_t q;
-
-		gw_selftau_auto_get_anchor(i, &valid, &tau, &q);
-		shell_print(sh,
-			    "{\"sync_tau_auto\":{\"anchor_id\":%u,"
-			    "\"anchor_addr\":\"0x%04X\",\"valid\":%d,"
-			    "\"tau_dtu\":%d,\"quality\":%u}}",
-			    i, (unsigned int)(UWB_ANCHOR_ADDR_BASE + i),
-			    valid ? 1 : 0, tau, q);
-	}
-
-	if (!gw_selftau_auto_get_enabled()) {
-		shell_warn(sh, "auto round-robin is OFF -- every CCP v2 "
-				"announces CCP_TAU_MEAS_ANCHOR_NONE and no "
-				"anchor's tau tracks a moved gateway "
-				"automatically. `sync tau measure` still "
-				"works manually regardless of this setting.");
-	}
+	shell_print(sh, "{\"sync_tau_auto\":{\"enabled\":0,\"retired\":1}}");
 	return 0;
 }
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync_tau,
 	SHELL_CMD_ARG(mode, NULL,
-		      "mode <legacy|survey|twr|auto> — select the B14 tau "
-		      "source, persist, apply live",
+		      "mode <legacy|survey> — select the B14 tau source, "
+		      "persist, apply live (twr and auto are retired)",
 		      cmd_tau_mode, 2, 0),
 	SHELL_CMD_ARG(set, NULL,
 		      "set <dtu> — write tau_survey_dtu (signed DTU, from the "
 		      "survey tool), persist, apply live",
 		      cmd_tau_set, 2, 0),
 	SHELL_CMD_ARG(show, NULL,
-		      "show — mode, configured and live tau as JSON",
+		      "show — mode, tau, whether a survey installed it (link) "
+		      "and clock freshness, as JSON",
 		      cmd_tau_show, 1, 0),
 	SHELL_CMD_ARG(measure, NULL,
 		      "measure <id> [n] — GATEWAY-only: range this gateway "
@@ -668,9 +622,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_sync_tau,
 		      "result — the last `sync tau measure` run, as JSON",
 		      cmd_tau_result, 1, 0),
 	SHELL_CMD_ARG(auto, NULL,
-		      "auto [on|off] — GATEWAY-only: show or toggle the Fase B "
-		      "automatic round-robin tau measurement (default ON), "
-		      "which feeds CCP v2's tau_meas_* fields",
+		      "auto — RETIRED: the automatic TWR round-robin no longer "
+		      "exists; `on` is refused",
 		      cmd_tau_auto, 1, 1),
 	SHELL_SUBCMD_SET_END
 );

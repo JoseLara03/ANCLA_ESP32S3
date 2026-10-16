@@ -113,7 +113,10 @@ void uwb_config_set_sync_tau(uwb_config_t *c, int32_t tau_dtu)
 
 bool uwb_config_set_sync_tau_mode(uwb_config_t *c, uint8_t mode)
 {
-	if (mode >= SYNC_TAU_MODE_COUNT) {
+	/* TWR and AUTO are retired (2026-10-12): there is no on-air source left to
+	 * track, and accepting them would let a stored or typed value select a
+	 * mode that silently behaves as SURVEY. */
+	if (mode != SYNC_TAU_MODE_LEGACY && mode != SYNC_TAU_MODE_SURVEY) {
 		return false;
 	}
 	c->sync_tau_mode = mode;
@@ -204,4 +207,34 @@ uint16_t uwb_config_short_addr(const uwb_config_t *c)
 		return UWB_ADDR_GATEWAY_RESERVED;
 	}
 	return (uint16_t)(UWB_ANCHOR_ADDR_BASE + c->anchor_id);
+}
+
+void uwb_config_set_sync_link(uwb_config_t *c, uint32_t generation,
+			      const uint8_t parent_eui[8])
+{
+	c->sync_link_valid = true;
+	c->sync_link_gen = generation;
+	memcpy(c->sync_parent_eui, parent_eui, sizeof(c->sync_parent_eui));
+}
+
+void uwb_config_clear_sync_link(uwb_config_t *c)
+{
+	c->sync_link_valid = false;
+	c->sync_link_gen = 0;
+	memset(c->sync_parent_eui, 0, sizeof(c->sync_parent_eui));
+}
+
+uint8_t uwb_config_migrate_sync_tau_mode(uint8_t stored, bool *migrated)
+{
+	bool m = false;
+	uint8_t out = stored;
+
+	if (stored != SYNC_TAU_MODE_LEGACY && stored != SYNC_TAU_MODE_SURVEY) {
+		out = SYNC_TAU_MODE_SURVEY;
+		m = true;
+	}
+	if (migrated) {
+		*migrated = m;
+	}
+	return out;
 }

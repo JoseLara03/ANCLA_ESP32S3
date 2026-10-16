@@ -28,84 +28,11 @@ static struct {
 
 static struct gw_selftau_result last;
 
-/* ---- Fase B: automatic round-robin ---------------------------------- */
-
-/* volatile: written from the shell thread (gw_selftau_auto_set_enabled()),
- * read from the gateway loop (gw_selftau_step()/gw_selftau_has_work()) --
- * same single-flag-signal precedent as ccp_master.c's txtest_pending. */
-static volatile bool auto_enabled = true;
-
-/* Both touched ONLY from the gateway's K_PRIO_COOP(0) loop -- no fence
- * needed, same reasoning gw_selftau_get_result()'s own doc comment gives
- * for `last`. */
-static uint8_t auto_next_anchor;
-static bool    auto_armed_this_sf;
-
-struct auto_entry {
-	bool     valid;   /* an auto exchange has ever succeeded for this anchor */
-	bool     fresh;   /* completed since the last gw_selftau_auto_take() */
-	int32_t  tau_dtu;
-	uint8_t  quality;
-};
-static struct auto_entry auto_latest[UWB_MAX_ANCHORS];
-
-bool gw_selftau_auto_get_enabled(void)
-{
-	return auto_enabled;
-}
-
-void gw_selftau_auto_set_enabled(bool on)
-{
-	auto_enabled = on;
-}
-
-void gw_selftau_auto_new_superframe(void)
-{
-	auto_armed_this_sf = false;
-}
-
-bool gw_selftau_has_work(void)
-{
-	return st.pending || (auto_enabled && !auto_armed_this_sf);
-}
-
-bool gw_selftau_auto_take(uint16_t *anchor_addr, int32_t *tau_dtu,
-			  uint8_t *quality)
-{
-	for (uint8_t i = 0; i < UWB_MAX_ANCHORS; i++) {
-		if (auto_latest[i].fresh) {
-			auto_latest[i].fresh = false;
-			if (anchor_addr) {
-				*anchor_addr = (uint16_t)(UWB_ANCHOR_ADDR_BASE + i);
-			}
-			if (tau_dtu) {
-				*tau_dtu = auto_latest[i].tau_dtu;
-			}
-			if (quality) {
-				*quality = auto_latest[i].quality;
-			}
-			return true;
-		}
-	}
-	return false;
-}
-
-void gw_selftau_auto_get_anchor(uint8_t anchor_id, bool *valid,
-				int32_t *tau_dtu, uint8_t *quality)
-{
-	if (anchor_id >= UWB_MAX_ANCHORS) {
-		if (valid) { *valid = false; }
-		if (tau_dtu) { *tau_dtu = 0; }
-		if (quality) { *quality = 0; }
-		return;
-	}
-
-	const struct auto_entry *e = &auto_latest[anchor_id];
-
-	if (valid) { *valid = e->valid; }
-	if (tau_dtu) { *tau_dtu = e->tau_dtu; }
-	if (quality) { *quality = e->quality; }
-}
+/* The automatic round-robin that used to live here (B14 Fase B) was RETIRED
+ * 2026-10-12: the flight-time compensation is now a static per-link value
+ * installed by `apos apply` (src/sync_link.c), not measured continuously on
+ * the air. This module is the MANUAL diagnostic only: `sync tau measure`
+ * ranges one anchor on request and applies nothing. */
 
 bool gw_selftau_request(uint8_t anchor_id, uint32_t n)
 {
@@ -175,66 +102,6 @@ static void finalize(void)
 		last.min_mm, last.max_mm, last.tau_dtu);
 }
 
-/* One auto turn: exactly one exchange against the current round-robin
- * anchor, unaveraged (see gw_selftau.h's Fase B header comment for why).
- * Broken out of gw_selftau_step() only for readability -- it has exactly
- * one call site. */
-static void auto_step(void)
-{
-	auto_armed_this_sf = true;
-
-	uint8_t anchor_id = auto_next_anchor;
-
-	auto_next_anchor = (uint8_t)((auto_next_anchor + 1u) % UWB_MAX_ANCHORS);
-
-	int16_t rssi_q8;
-	int32_t mm;
-
-	/* Same bracketing as the manual path below and every other
-	 * ss_initiator_range() call site in this tree. */
-	ss_initiator_enter();
-	mm = ss_initiator_range_ex((uint8_t)(UWB_ANCHOR_ADDR_BASE + anchor_id),
-				   &rssi_q8);
-	ss_initiator_leave();
-
-	if (mm == INT32_MIN) {
-		/* No response this turn -- leave the cached entry (if any)
-		 * exactly as it was. An unanswered exchange must not
-		 * overwrite a good measurement, and must not mark `fresh`:
-		 * there is nothing new for a CCP to announce. This anchor
-		 * simply gets no fresher tau until its NEXT turn, N
-		 * superframes from now. */
-		return;
-	}
-
-	struct auto_entry *e = &auto_latest[anchor_id];
-	/* dBm = rssi_q8/256. Shifted into a small positive byte (roughly
-	 * "dBm + 100") rather than passed through raw: CCP v2's twr_quality
-	 * is one unsigned byte. This is a PLACEHOLDER encoding, not a
-	 * calibrated confidence score -- CLAUDE.md already records that this
-	 * project does not yet know whether a DW3000 quality figure carries
-	 * real information at fixed PLEN (the ipatovAccumCount entry). It
-	 * exists so Fase B's next task (the anchor-side EMA/jump-detect
-	 * filter, FR-8) has a real, monotonic, already-hardware-validated
-	 * signal to start from instead of a constant nobody could tune. */
-	int32_t q = (int32_t)(rssi_q8 >> 8) + 100;
-
-	if (rssi_q8 == SS_INITIATOR_RSSI_INVALID) {
-		e->quality = GW_SELFTAU_AUTO_QUALITY_NONE;
-	} else {
-		if (q < 1) {
-			q = 1;
-		} else if (q > 255) {
-			q = 255;
-		}
-		e->quality = (uint8_t)q;
-	}
-
-	e->valid   = true;
-	e->fresh   = true;
-	e->tau_dtu = gw_selftau_mm_to_dtu(mm);
-}
-
 void gw_selftau_step(void)
 {
 	if (st.pending) {
@@ -266,11 +133,6 @@ void gw_selftau_step(void)
 		}
 		return;
 	}
-
-	if (!auto_enabled || auto_armed_this_sf) {
-		return;
-	}
-	auto_step();
 }
 
 void gw_selftau_get_result(struct gw_selftau_result *out)

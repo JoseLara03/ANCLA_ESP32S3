@@ -163,9 +163,11 @@
 void tdoa_gw_init(void);
 
 /* Ingest up to TDOA_GW_INGEST_MAX observations and publish up to
- * TDOA_GW_SOLVE_MAX fixes. `ctx` is the live seat table, read-only, for the
- * EUI lookup that Tid needs; `now_ms` is k_uptime_get_32(). */
-void tdoa_gw_step(const struct gw_core_ctx *ctx, uint32_t now_ms);
+ * TDOA_GW_SOLVE_MAX fixes. `ctx` is the live seat table: read for the EUI
+ * lookup that Tid needs, and written only to refresh the lease of a tag that
+ * is still blinking (gw_core_touch(), see its header); `now_ms` is
+ * k_uptime_get_32(). */
+void tdoa_gw_step(struct gw_core_ctx *ctx, uint32_t now_ms);
 
 /* ---- What this module does NOT read: out->residual_m at three anchors -----
  *
@@ -224,6 +226,12 @@ void tdoa_gw_reject_detail(uint32_t *n_dup, uint32_t *n_shed);
  * a count approaching `fixes` means the backhaul is reordering heavily and the
  * published stream carries far less of the data than `ingested` suggests. */
 uint32_t tdoa_gw_reorder_count(void);
+
+/* Observations and groups DISCARDED because fix publication is suspended
+ * (apos_gw_publish_hold()). Not a subset of any counter above: a held
+ * observation never reaches the collector. Nonzero means a static-survey apply
+ * is in flight or did not complete -- `apos show` says which. */
+uint32_t tdoa_gw_held_count(void);
 
 /* The filter's own counters, the third `blink stats` line. Publish identity
  * that MUST hold, and that tools/pos_trace.py checks:

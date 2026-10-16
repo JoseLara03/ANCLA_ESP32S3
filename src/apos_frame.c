@@ -103,7 +103,7 @@ static int write_hdr(uint8_t *buf, size_t buf_len, size_t need, uint16_t dest,
 
 static bool known_subtype(uint8_t s)
 {
-	return s >= APOS_SUB_SURVEY_BEGIN && s <= APOS_SUB_SURVEY_END;
+	return s >= APOS_SUB_SURVEY_BEGIN && s <= APOS_SUB_SETTAU_ACK;
 }
 
 bool apos_frame_is_apos(const uint8_t *buf, size_t len)
@@ -393,5 +393,88 @@ int apos_frame_parse_survey_end(const uint8_t *buf, size_t len,
 		return rc ? rc : -EINVAL;
 	}
 	*session = get_u16(&buf[OFF_PAYLOAD]);
+	return 0;
+}
+
+/* ---- SETTAU ---- */
+int apos_frame_settau_build(uint8_t *buf, size_t buf_len, uint16_t src,
+			    uint16_t dest, uint16_t session, uint32_t generation,
+			    int32_t tau_dtu,
+			    const uint8_t parent_eui[APOS_EUI_LEN])
+{
+	if (!parent_eui) {
+		return -EINVAL;
+	}
+
+	int rc = write_hdr(buf, buf_len, APOS_LEN_SETTAU, dest, src,
+			   APOS_SUB_SETTAU);
+
+	if (rc) {
+		return rc;
+	}
+	put_u16(&buf[OFF_PAYLOAD], session);
+	buf[OFF_PAYLOAD + 2] = APOS_SETTAU_VERSION;
+	put_u32(&buf[OFF_PAYLOAD + 3], generation);
+	put_u32(&buf[OFF_PAYLOAD + 7], (uint32_t)tau_dtu);
+	memcpy(&buf[OFF_PAYLOAD + 11], parent_eui, APOS_EUI_LEN);
+	return (int)APOS_LEN_SETTAU;
+}
+
+int apos_frame_parse_settau(const uint8_t *buf, size_t len, uint16_t *session,
+			    uint8_t *version, uint32_t *generation,
+			    int32_t *tau_dtu, uint8_t parent_eui[APOS_EUI_LEN])
+{
+	int rc = parse_check(buf, len, APOS_SUB_SETTAU, APOS_LEN_SETTAU);
+
+	if (rc) {
+		return rc;
+	}
+	if (!session || !version || !generation || !tau_dtu || !parent_eui) {
+		return -EINVAL;
+	}
+	*session = get_u16(&buf[OFF_PAYLOAD]);
+	*version = buf[OFF_PAYLOAD + 2];
+	*generation = get_u32(&buf[OFF_PAYLOAD + 3]);
+	*tau_dtu = (int32_t)get_u32(&buf[OFF_PAYLOAD + 7]);
+	memcpy(parent_eui, &buf[OFF_PAYLOAD + 11], APOS_EUI_LEN);
+	return 0;
+}
+
+/* ---- SETTAU_ACK ---- */
+int apos_frame_settau_ack_build(uint8_t *buf, size_t buf_len, uint16_t src,
+				uint16_t dest, uint16_t session,
+				uint32_t generation, int32_t tau_dtu,
+				uint8_t status)
+{
+	int rc = write_hdr(buf, buf_len, APOS_LEN_SETTAU_ACK, dest, src,
+			   APOS_SUB_SETTAU_ACK);
+
+	if (rc) {
+		return rc;
+	}
+	put_u16(&buf[OFF_PAYLOAD], session);
+	put_u32(&buf[OFF_PAYLOAD + 2], generation);
+	put_u32(&buf[OFF_PAYLOAD + 6], (uint32_t)tau_dtu);
+	buf[OFF_PAYLOAD + 10] = status;
+	return (int)APOS_LEN_SETTAU_ACK;
+}
+
+int apos_frame_parse_settau_ack(const uint8_t *buf, size_t len,
+				uint16_t *session, uint32_t *generation,
+				int32_t *tau_dtu, uint8_t *status)
+{
+	int rc = parse_check(buf, len, APOS_SUB_SETTAU_ACK,
+			     APOS_LEN_SETTAU_ACK);
+
+	if (rc) {
+		return rc;
+	}
+	if (!session || !generation || !tau_dtu || !status) {
+		return -EINVAL;
+	}
+	*session = get_u16(&buf[OFF_PAYLOAD]);
+	*generation = get_u32(&buf[OFF_PAYLOAD + 2]);
+	*tau_dtu = (int32_t)get_u32(&buf[OFF_PAYLOAD + 6]);
+	*status = buf[OFF_PAYLOAD + 10];
 	return 0;
 }

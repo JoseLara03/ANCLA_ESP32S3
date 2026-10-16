@@ -135,11 +135,14 @@ static void test_sync_tau_mode(void)
 
     CHECK(uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_LEGACY));
     CHECK(c.sync_tau_mode == SYNC_TAU_MODE_LEGACY);
-    CHECK(uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_AUTO));
-    CHECK(c.sync_tau_mode == SYNC_TAU_MODE_AUTO);
+    CHECK(uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_SURVEY));
+    CHECK(c.sync_tau_mode == SYNC_TAU_MODE_SURVEY);
 
+    /* TWR and AUTO are RETIRED: refused, and the mode is left untouched. */
+    CHECK(!uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_TWR));
+    CHECK(!uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_AUTO));
     CHECK(!uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_COUNT));
-    CHECK(c.sync_tau_mode == SYNC_TAU_MODE_AUTO); /* unchanged on rejection */
+    CHECK(c.sync_tau_mode == SYNC_TAU_MODE_SURVEY); /* unchanged on rejection */
 }
 
 static void test_sync_tau_mode_names(void)
@@ -183,11 +186,46 @@ static void test_sync_tau_effective_priority(void)
     CHECK(uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_SURVEY));
     CHECK(uwb_config_sync_tau_effective(&c) == 9000);
 
-    CHECK(uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_TWR));
+    /* A retired mode forced in by hand (a corrupt record that bypassed the
+     * setter) still resolves to the survey value, never to something else. */
+    c.sync_tau_mode = SYNC_TAU_MODE_TWR;
     CHECK(uwb_config_sync_tau_effective(&c) == 9000);
+    c.sync_tau_mode = SYNC_TAU_MODE_AUTO;
+    CHECK(uwb_config_sync_tau_effective(&c) == 9000);
+}
 
-    CHECK(uwb_config_set_sync_tau_mode(&c, SYNC_TAU_MODE_AUTO));
-    CHECK(uwb_config_sync_tau_effective(&c) == 9000);
+static void test_retired_modes_migrate_to_survey(void)
+{
+    bool m = true;
+
+    CHECK(uwb_config_migrate_sync_tau_mode(SYNC_TAU_MODE_LEGACY, &m) == SYNC_TAU_MODE_LEGACY && !m);
+    CHECK(uwb_config_migrate_sync_tau_mode(SYNC_TAU_MODE_SURVEY, &m) == SYNC_TAU_MODE_SURVEY && !m);
+    CHECK(uwb_config_migrate_sync_tau_mode(SYNC_TAU_MODE_TWR, &m) == SYNC_TAU_MODE_SURVEY && m);
+    CHECK(uwb_config_migrate_sync_tau_mode(SYNC_TAU_MODE_AUTO, &m) == SYNC_TAU_MODE_SURVEY && m);
+    CHECK(uwb_config_migrate_sync_tau_mode(77, &m) == SYNC_TAU_MODE_SURVEY && m);
+    CHECK(uwb_config_migrate_sync_tau_mode(SYNC_TAU_MODE_TWR, NULL) == SYNC_TAU_MODE_SURVEY);
+}
+
+static void test_sync_link_record(void)
+{
+    uwb_config_t c;
+    const uint8_t eui[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+    uwb_config_set_defaults(&c);
+    /* Factory state: tau is 0 but NOT calibrated -- the flag is what says so. */
+    CHECK(!c.sync_link_valid && c.sync_link_gen == 0);
+    CHECK(c.sync_tau_dtu == 0);
+
+    uwb_config_set_sync_tau(&c, 0);
+    uwb_config_set_sync_link(&c, 42u, eui);
+    CHECK(c.sync_link_valid && c.sync_link_gen == 42u);
+    CHECK(memcmp(c.sync_parent_eui, eui, 8) == 0);
+    /* A legal zero tau is still a valid, installed link. */
+    CHECK(c.sync_tau_dtu == 0 && c.sync_link_valid);
+
+    uwb_config_clear_sync_link(&c);
+    CHECK(!c.sync_link_valid && c.sync_link_gen == 0);
+    CHECK(c.sync_parent_eui[0] == 0 && c.sync_parent_eui[7] == 0);
 }
 
 static void test_singleton_starts_at_defaults(void)
@@ -253,6 +291,8 @@ int main(void)
     test_sync_tau_mode();
     test_sync_tau_mode_names();
     test_sync_tau_effective_priority();
+    test_retired_modes_migrate_to_survey();
+    test_sync_link_record();
     test_singleton_starts_at_defaults();
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;

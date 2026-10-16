@@ -101,7 +101,14 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq);
  * one dwt_setdelayedtrxtime() call an immediate TX no longer needs) took
  * between the beacon's frame ending and this CCP's preamble starting. This is
  * the number to compare directly against ccp_sched.h's CCP_SCHED_MAX_ARM_NS
- * (348300 ns) -- the compile-time-checked budget for exactly this quantity. */
+ * (1826674 ns at PLEN_256; 348300 ns for v1 at the former PLEN_1024) -- the
+ * compile-time-checked budget for exactly this quantity.
+ *
+ * Since 2026-10-13 arm_cost_ns_last INCLUDES the deliberate
+ * CCP_TX_PREAMBLE_DELAY_NS wait (ccp_sched.h) that holds the CCP back until
+ * 1.2 ms after the beacon's RMARKER, so it is no longer just the arm
+ * sequence: a healthy value is ~0.81 ms, not the ~140-230 us of the arm alone.
+ * Gateway-side confirmation of that figure has not been captured yet. */
 void ccp_master_stats(uint32_t *sent, uint32_t *dropped, uint32_t *root_id,
 		      int32_t *offset_ns_min, int32_t *offset_ns_max,
 		      int32_t *offset_ns_last, int32_t *arm_cost_ns_last);

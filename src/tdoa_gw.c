@@ -6,6 +6,7 @@
 
 #include "tdoa_gw.h"
 
+#include "apos_gw.h"      /* apos_gw_publish_hold() */
 #include "apos_store.h"
 #include "blink_frame.h"   /* BLINK_FLAG_MOVING */
 #include "net_uplink.h"
@@ -118,6 +119,8 @@ static uint32_t n_jump;
  * TDOA_DT_REORDER_MAX_MS. Not a subset of any other counter: such a group
  * is never solved, so `tdoa.fixes` does not count it, and it is not a
  * solve_fail either. */
+static uint32_t n_held;
+static bool warned_held;
 static uint32_t n_reorder;
 static bool warned_reorder;
 
@@ -163,6 +166,8 @@ void tdoa_gw_init(void)
 	n_shed        = 0u;
 	n_fix_out     = 0u;
 	n_no_anchor   = 0u;
+	n_held        = 0u;
+	warned_held   = false;
 	n_implausible = 0u;
 	n_solve_fail  = 0u;
 	n_jump        = 0u;
@@ -297,7 +302,7 @@ static bool refusal_is_shedding(const struct tdoa_obs *o)
 
 /* One observation from the uplink into the collector. Returns false only when
  * the queue was empty, so the caller can stop early. */
-static bool ingest_one(uint32_t now_ms)
+static bool ingest_one(struct gw_core_ctx *ctx, uint32_t now_ms)
 {
 	struct pos_blink_obs obs;
 	struct tdoa_obs t;
@@ -306,6 +311,28 @@ static bool ingest_one(uint32_t now_ms)
 
 	if (!net_uplink_get_obs(&obs)) {
 		return false;
+	}
+
+	/* An anchor heard this tag blink, so the tag is alive: keep its seat,
+	 * whatever happened to its KEEPALIVE. First, before every filter below
+	 * -- liveness does not depend on the survey, the hold or the solve. */
+	(void)gw_core_touch(ctx, obs.tag_addr);
+
+	/* An apply is in flight, or was interrupted or incomplete: the anchors may
+	 * hold a mix of survey generations, so geometry and tau cannot be assumed
+	 * to belong together and any fix built from them could look valid while
+	 * being wrong. Drained and counted -- never queued behind the hold, which
+	 * would replay stale observations the moment it lifts. */
+	if (apos_gw_publish_hold()) {
+		n_held++;
+		if (!warned_held) {
+			warned_held = true;
+			LOG_WRN("observations are being DISCARDED, not solved: "
+				"fixes are suspended (%s). Warned ONCE; `blink stats` "
+				"carries the count and `apos show` the reason",
+				apos_gw_hold_reason());
+		}
+		return true;
 	}
 
 	if (!anchor_xyz(obs.anchor_id, &t.meas.x, &t.meas.y, &z)) {
@@ -511,6 +538,14 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 
 	if (!tdoa_collect_take_ready(&collect, now_ms, m, &n, &tag_addr)) {
 		return false;
+	}
+
+	/* A group collected before the hold started is discarded for the same
+	 * reason ingest_one() drains: it was measured against a geometry that may
+	 * no longer be the one the anchors run. */
+	if (apos_gw_publish_hold()) {
+		n_held++;
+		return true;
 	}
 
 	/* The instant of this fix: the reference anchor's ABSOLUTE 40-bit
@@ -726,7 +761,7 @@ static bool solve_one(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	return true;
 }
 
-void tdoa_gw_step(const struct gw_core_ctx *ctx, uint32_t now_ms)
+void tdoa_gw_step(struct gw_core_ctx *ctx, uint32_t now_ms)
 {
 	unsigned int i;
 	const struct apos_survey *s = apos_store_get();
@@ -742,11 +777,23 @@ void tdoa_gw_step(const struct gw_core_ctx *ctx, uint32_t now_ms)
 	 * observation in that state via anchor_xyz() -- there is no anchor
 	 * count to set expectations from yet. */
 	if (s != NULL && s->valid) {
-		tdoa_collect_set_expected(&collect, s->n_nodes);
+		/* RECEIVERS, not survey nodes: the gateway is a node of the survey
+		 * (its short address is 0x0000) but never hears a BLINK, so five
+		 * nodes still mean four observations per blink. Counting it would
+		 * leave every group waiting out the full window for an anchor that
+		 * does not exist. */
+		uint8_t receivers = 0u;
+
+		for (uint8_t k = 0u; k < s->n_nodes; k++) {
+			if (s->node[k].short_addr != POS_JSON_GATEWAY_ADDR) {
+				receivers++;
+			}
+		}
+		tdoa_collect_set_expected(&collect, receivers);
 	}
 
 	for (i = 0u; i < TDOA_GW_INGEST_MAX; i++) {
-		if (!ingest_one(now_ms)) {
+		if (!ingest_one(ctx, now_ms)) {
 			break;
 		}
 	}
@@ -848,4 +895,9 @@ void tdoa_gw_abg_set_reset_after(uint8_t n)
 	k_sched_lock();
 	abg_cfg.reset_after = n;
 	k_sched_unlock();
+}
+
+uint32_t tdoa_gw_held_count(void)
+{
+	return n_held;
 }

@@ -62,24 +62,28 @@ static void test_preamble_and_frames(void)
 
 	mac_phy_frozen(&phy);
 
-	/* PLEN_1024 + 8-symbol SFD at 64 MHz PRF. CLAUDE.md states the
-	 * preamble alone is "~1.05 ms", which is the number that made a
-	 * 450 uus turnaround on the DWM3001CDK physically impossible. */
-	CHECK_NEAR(mac_shr_ns(&phy), 1050194, 500);
+	/* PLEN_256 + 8-symbol SFD at 64 MHz PRF: (256 + 8) * 1017.63 ns =
+	 * 268654 ns. (It was (1024 + 8) * 1017.63 = 1050194 ns at PLEN_1024,
+	 * the "~1.05 ms" that once made a 450 uus turnaround on the
+	 * DWM3001CDK physically impossible; see test_turnaround_floor for
+	 * what the shorter SHR does to that.) */
+	CHECK_NEAR(mac_shr_ns(&phy), 268654, 500);
 
 	/* The beacon must fit inside BEACON_OCCUPANCY_UUS. That constant was
 	 * set by hand at 1500 uus; this is the first time it has been checked
 	 * against the actual frame. */
 	uint32_t beacon_ns = mac_frame_ns(&phy, UWB_FRAME_LEN_BEACON);
 
-	CHECK_NEAR(beacon_ns, 1439606, 1000);
+	/* SHR 268654 + PHR 22353 + 39 B (312 bit) 367059 ns */
+	CHECK_NEAR(beacon_ns, 658066, 1000);
 	CHECK(beacon_ns < MAC_UUS_TO_NS(BEACON_OCCUPANCY_UUS));
 
 	/* ...and by a sane margin, not by 1 ns. */
 	CHECK(MAC_UUS_TO_NS(BEACON_OCCUPANCY_UUS) - beacon_ns > 50000u);
 
 	/* A response frame, for the exchange model below. */
-	CHECK_NEAR(mac_frame_ns(&phy, UWB_FRAME_LEN_RESP), 1279413, 1000);
+	/* SHR 268654 + PHR 22353 + 22 B (176 bit) 207059 ns */
+	CHECK_NEAR(mac_frame_ns(&phy, UWB_FRAME_LEN_RESP), 498066, 1000);
 }
 
 /* ---- 2. The SFD-timeout divergence this work found ------------------- */
@@ -90,10 +94,12 @@ static void test_sfd_timeout(void)
 
 	mac_phy_frozen(&phy);
 
-	/* uwb_phy.h carries (1025 + 8 - 32) = 1001. The tag carried
+	/* uwb_phy.h now carries (256 + 1 + 8 - 16) = 249 (PLEN_256/PAC16).
+	 * At PLEN_1024/PAC32 it was (1025 + 8 - 32) = 1001; the tag carried
 	 * (1024 + 1 + 8 - 8) = 1025 while ALSO running PAC32, which is the
-	 * divergence corrected on 2026-08-25. 1001 is the derivable value. */
-	CHECK(mac_sfd_timeout_sym(&phy) == 1001u);
+	 * divergence corrected on 2026-08-25. */
+	CHECK(mac_sfd_timeout_sym(&phy) == 249u);
+	CHECK(MAC_SFD_TIMEOUT_SYM(1024u, 8u, 32u) == 1001u);
 
 	/* The wrong value, pinned so nobody "restores" it: it is what you get
 	 * by subtracting PAC8 from a PAC32 configuration. */
@@ -115,18 +121,20 @@ static void test_turnaround_floor(void)
 						    RX_TO_TX_OVERHEAD_NS);
 	uint32_t actual_ns = MAC_UUS_TO_NS(POLL_RX_TO_RESP_TX_DLY_UUS);
 
-	/* ~1395 us: poll PHR+payload+FCS after the RMARKER (~145 us), SPI and
-	 * compute (~200 us), then the response's own SHR (~1050 us), which must
-	 * go out before the response RMARKER lands. */
-	CHECK_NEAR(floor_ns, 1394900, 3000);
+	/* ~613 us: poll PHR+payload+FCS after the RMARKER (~145 us), SPI and
+	 * compute (200 us), then the response's own SHR (~269 us), which must
+	 * go out before the response RMARKER lands. (1395 us at PLEN_1024.) */
+	CHECK_NEAR(floor_ns, 613360, 3000);
 
 	/* The shipped 2000 uus clears it -- this is the first time that has
 	 * been demonstrated rather than asserted. */
 	CHECK(actual_ns > floor_ns);
 
-	/* Margin, ~656 us. Enough to be safe, and small enough that halving
-	 * the constant would NOT be. */
-	CHECK_NEAR(actual_ns - floor_ns, 656400, 4000);
+	/* Margin, ~1438 us (was ~656 us at PLEN_1024). At PLEN_256 the
+	 * 2000 uus constant is no longer tight: 1000 uus (1026 us) would also
+	 * clear the floor. The constant is deliberately unchanged here;
+	 * shortening it is a separate decision. */
+	CHECK_NEAR(actual_ns - floor_ns, 1437922, 4000);
 
 	/* The Qorvo ss_twr_responder stock value cannot work here, which is
 	 * exactly what CLAUDE.md says about the DWM3001CDK reference node. */
@@ -144,29 +152,30 @@ static void test_sstwr_exchange(void)
 	uint32_t exch = mac_sstwr_exchange_ns(&phy, UWB_FRAME_LEN_RESP,
 					      POLL_RX_TO_RESP_TX_DLY_UUS);
 
-	/* ~3331 us: poll SHR + turnaround + the response's PHR/payload/FCS. */
-	CHECK_NEAR(exch, 3330900, 3000);
+	/* ~2549 us: poll SHR (268654) + turnaround (2051282) + the response's
+	 * PHR/payload/FCS (229412). (3331 us at PLEN_1024.) */
+	CHECK_NEAR(exch, 2549348, 3000);
 
 	/* The naive form -- poll_frame + turnaround + resp_frame -- comes out
-	 * ~1050 us too high because it charges BOTH SHRs on top of a
+	 * too high (by exactly the poll's whole frame: ~413 us at PLEN_256,
+	 * ~1194 us at PLEN_1024) because it charges BOTH SHRs on top of a
 	 * turnaround that already contains one of them. Pinned here because
 	 * the design spec was first written with exactly this error, and it
-	 * inflated the 4-anchor slot from 13.3 ms to 18.1 ms.
+	 * inflated the 4-anchor slot from 13.3 ms to 18.1 ms (at PLEN_1024).
 	 */
 	uint32_t naive = mac_frame_ns(&phy, POS_POLL_LEN) +
 			 MAC_UUS_TO_NS(POLL_RX_TO_RESP_TX_DLY_UUS) +
 			 mac_frame_ns(&phy, UWB_FRAME_LEN_RESP);
 
 	CHECK(naive > exch);
-	CHECK_NEAR(naive - exch, 1194000, 5000);
+	CHECK_NEAR(naive - exch, 413360, 5000);
 
 	/* A 4-anchor sweep, which is what one CFP slot must hold. The MAC
-	 * contract section 2.1 estimated T_slot at ~15 ms by hand; the model
-	 * says 13.3 ms, so the contract's estimate was sound and slightly
-	 * conservative. */
+	 * contract section 2.1 estimated T_slot at ~15 ms by hand (PLEN_1024);
+	 * the model said 13.3 ms there and says 10.2 ms at PLEN_256. */
 	uint32_t slot4 = 4u * exch;
 
-	CHECK_NEAR(slot4, 13323600, 12000);
+	CHECK_NEAR(slot4, 10197392, 12000);
 	CHECK(slot4 < 15000000u);
 }
 
@@ -201,12 +210,12 @@ static void test_n_cfp_is_feasible(void)
 						     POLL_RX_TO_RESP_TX_DLY_UUS);
 	uint16_t maxs   = mac_cell_max_slots(&cell, slot);
 
-	CHECK(usable > 190000000u);   /* ~191 ms */
+	CHECK(usable > 190000000u);   /* ~195.75 ms */
 
-	/* 14 slots fit. The shipped N_CFP is 11, so the constant is
+	/* 19 slots fit (195.75 ms / 10.197 ms = 19.2; 14 at PLEN_1024). The shipped N_CFP is 11, so the constant is
 	 * CONSERVATIVE, not optimistic -- and this is the assertion A2 puts
 	 * behind a BUILD_ASSERT in uwb_mac.h. */
-	CHECK(maxs == 14u);
+	CHECK(maxs == 19u);
 	CHECK(UWB_FRAME_N_CFP <= maxs);
 
 	/* Sanity on the other side: 11 slots really do fit with room left. */
@@ -259,37 +268,41 @@ static void test_capacity_100_tags(void)
 	uint32_t blink_slot = mac_frame_ns(&phy, BLINK_LEN) + BLINK_GUARD_NS;
 	uint16_t blink_max  = mac_cell_max_slots(&cell, blink_slot);
 
-	CHECK_NEAR(blink_slot, 1323200, 3000);
+	/* 441595 ns frame (14 B + FCS = 16 B) + 100000 ns guard */
+	CHECK_NEAR(blink_slot, 541595, 3000);
 
-	/* ~144 blink slots per superframe at the FROZEN PHY -- no preamble
-	 * shortening needed. */
-	CHECK(blink_max >= 140u && blink_max <= 148u);
+	/* 195750845 / 541595 = 361 blink slots per superframe at the frozen
+	 * PLEN_256 PHY (~144 at PLEN_1024). */
+	CHECK(blink_max >= 355u && blink_max <= 367u);
 
 	uint32_t tdoa_cap = mac_capacity_slot_sf(blink_max, WINDOW_SF);
 
 	/* The shift-change case fits with room to spare. */
 	CHECK(demand_5hz < tdoa_cap);
 
-	/* Specifically: 100 tags at 5 Hz uses ~70% of one superframe's slots,
-	 * so the headroom is real and not marginal. */
-	CHECK(TAGS_TARGET * 100u / blink_max >= 65u);
-	CHECK(TAGS_TARGET * 100u / blink_max <= 75u);
+	/* Specifically: 100 tags at 5 Hz uses ~28% of one superframe's slots
+	 * (~70% at PLEN_1024), so the headroom is real and not marginal. */
+	CHECK(TAGS_TARGET * 100u / blink_max >= 25u);
+	CHECK(TAGS_TARGET * 100u / blink_max <= 30u);
 
 	/* TDoA beats TWR by an order of magnitude in simultaneous movers. */
 	CHECK(blink_max > UWB_FRAME_N_CFP * 10u);
 }
 
-/* ---- 7. Why the PHY was frozen rather than shortened ---------------- */
+/* ---- 7. PLEN_256 vs the previous PLEN_1024 PHY ---------------------- */
 
-static void test_shortening_plen_is_unnecessary(void)
+static void test_shortening_plen_buys_capacity(void)
 {
 	struct mac_phy p256, p1024;
 	struct mac_cell c256, c1024;
 
-	mac_phy_frozen(&p1024);
-	p256 = p1024;
-	p256.plen_sym = 256u;
-	p256.pac_sym  = 8u;
+	/* The frozen PHY is now PLEN_256/PAC16; PLEN_1024/PAC32 is the previous
+	 * contract, spelled out explicitly as the comparison point. */
+	mac_phy_frozen(&p256);
+	CHECK(p256.plen_sym == 256u && p256.pac_sym == 16u);
+	p1024 = p256;
+	p1024.plen_sym = 1024u;
+	p1024.pac_sym  = 32u;
 
 	frozen_cell(&c1024, &p1024);
 	frozen_cell(&c256, &p256);
@@ -303,15 +316,16 @@ static void test_shortening_plen_is_unnecessary(void)
 	/* Shortening the preamble really does buy a lot of airtime... */
 	CHECK(max_256 > max_1024 * 2u);
 
-	/* ...but PLEN_1024 ALREADY clears the 100-tag target at 5 Hz, so the
-	 * extra capacity buys nothing the product needs, while the shorter
-	 * preamble would cost 6 dB of integration gain against metal and NLOS.
-	 * That asymmetry is the whole argument for freezing the PHY. */
+	/* ...PLEN_1024 already cleared the 100-tag target at 5 Hz, so the
+	 * extra capacity is headroom, paid for with ~6 dB of preamble
+	 * integration gain against metal and NLOS. */
 	CHECK(max_1024 > TAGS_TARGET);
+	CHECK(max_256 > TAGS_TARGET);
 
 	/* And the PAC must track PLEN, or the SFD timeout goes wrong the same
 	 * way the tag's did. */
-	CHECK(mac_sfd_timeout_sym(&p256) == 257u);
+	CHECK(mac_sfd_timeout_sym(&p256) == 249u);
+	CHECK(mac_sfd_timeout_sym(&p1024) == 1001u);
 }
 
 int main(void)
@@ -322,7 +336,7 @@ int main(void)
 	test_sstwr_exchange();
 	test_n_cfp_is_feasible();
 	test_capacity_100_tags();
-	test_shortening_plen_is_unnecessary();
+	test_shortening_plen_buys_capacity();
 
 	if (failures) {
 		printf("\n%d CHECK(s) FAILED\n", failures);

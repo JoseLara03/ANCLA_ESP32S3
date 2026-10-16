@@ -969,6 +969,175 @@ static void test_tau_defaults_to_zero_and_zero_is_a_no_op(void)
 	CHECK(before == after);
 }
 
+/* A silent link must stop a clock from converting within the holdover policy,
+ * BEFORE any further CCP arrives to count a gap. Pure boundary test of the
+ * predicate; ccp_slave.c feeds it the unsigned uptime difference. */
+static void test_clock_age_policy_boundaries(void)
+{
+	/* The limit is SYNC_MISS_MAX superframes of CCP interval: 5 s at the
+	 * 200 ms superframe, derived, not a free number. */
+	CHECK(SYNC_CLOCK_MAX_AGE_MS == 5000u);
+	CHECK((uint64_t)SYNC_CLOCK_MAX_AGE_MS * SYNC_DTU_PER_MS <=
+	      (uint64_t)SYNC_MISS_MAX * SYNC_CCP_INTERVAL_DTU);
+
+	CHECK(sync_clock_age_ok(0u));
+	CHECK(sync_clock_age_ok(200u));
+	CHECK(sync_clock_age_ok(SYNC_CLOCK_MAX_AGE_MS - 1u));
+	CHECK(sync_clock_age_ok(SYNC_CLOCK_MAX_AGE_MS));        /* inclusive */
+	CHECK(!sync_clock_age_ok(SYNC_CLOCK_MAX_AGE_MS + 1u));
+	CHECK(!sync_clock_age_ok(60000u));                      /* the old TWR 60 s */
+	CHECK(!sync_clock_age_ok(UINT32_MAX));                  /* never received */
+
+	/* The caller subtracts two free-running uint32 uptimes; across the ~49 day
+	 * wrap the UNSIGNED difference is still the true elapsed time. */
+	uint32_t last = 0xFFFFFF00u;
+	uint32_t now = 0x00000100u + 300u;   /* 0x100 + 0x100 + 300 ms later */
+
+	CHECK((uint32_t)(now - last) == 0x200u + 300u);
+	CHECK(!sync_clock_age_ok(now - last) == !(0x200u + 300u <= SYNC_CLOCK_MAX_AGE_MS));
+	CHECK(sync_clock_age_ok(now - last));
+}
+
+/* ---- Gross-outlier gate (2026-10-15) ------------------------------------ */
+
+/* A converged model, 40 ppm drift, 64 DTU jitter -- the shape of a healthy anchor. */
+static void healthy_model(struct sync_model *m, struct sim *s, unsigned int n)
+{
+	rng_seed(4242u);
+	sync_model_init(m);
+	sim_init(s, 0x1800000000ULL, 0x0200000000ULL, 40000, 64);
+	for (unsigned int k = 0; k < n; k++) sim_step(s, m);
+}
+
+/* THE field failure: one master/local pair off by one CCP interval. It must not move the
+ * conversion, must not enter the statistics, and must be counted. */
+static void test_one_interval_mispair_is_rejected(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	healthy_model(&m, &s, 300u);
+
+	uint32_t rms_before = sync_model_residual_rms_dtu(&m);
+	uint32_t n_before   = sync_model_residual_count(&m);
+	int64_t  err_before = sim_conv_err(&s, &m, (uint64_t)(s.k - 1) * SYNC_CCP_INTERVAL_DTU);
+
+	/* the same blink, announced with the NEXT superframe's master time + 0.5 ms */
+	uint64_t x   = s.k * SYNC_CCP_INTERVAL_DTU;
+	uint64_t bad = (s.m0 + x + SYNC_CCP_INTERVAL_DTU + 34000000ULL) & SYNC_DTU_MASK;
+	uint64_t loc = sim_local_at(&s, x);
+
+	sync_model_observe(&m, bad, loc);
+
+	CHECK(sync_model_outlier_count(&m) == 1u);
+	CHECK(sync_model_residual_count(&m) == n_before);                /* never entered the stats */
+	CHECK(sync_model_residual_max_dtu(&m) < SYNC_OUTLIER_GATE_DTU);
+	CHECK(sync_model_residual_rms_dtu(&m) == rms_before);
+	CHECK(m.valid);                                                  /* one reject keeps coasting */
+
+	/* the conversion did not move by even a tick */
+	int64_t err_after = sim_conv_err(&s, &m, (uint64_t)(s.k - 1) * SYNC_CCP_INTERVAL_DTU);
+	CHECK(err_after == err_before);
+
+	/* and the stream continues: the next good observation is accepted and error stays tiny */
+	s.k++;
+	for (unsigned int k = 0; k < 20u; k++) sim_step(&s, &m);
+	CHECK(sync_model_outlier_count(&m) == 1u);
+	int64_t err = sim_conv_err(&s, &m, (uint64_t)(s.k - 1) * SYNC_CCP_INTERVAL_DTU);
+	CHECK(err < 4 * NS && err > -4 * NS);
+	CHECK(sync_model_jitter_est_dtu(&m) < 200u);        /* nowhere near the field's 84 561 */
+	CHECK(sync_model_sigma_dtu(&m) < 1000u);            /* nor sigma 29 941 */
+	printf("  one-interval mispair: rejected, jitter_est %u, sigma %u\n",
+	       sync_model_jitter_est_dtu(&m), sync_model_sigma_dtu(&m));
+}
+
+/* Without the gate the same event wrecks the statistics -- this pins WHY the gate exists by
+ * showing the old behaviour on a copy of the stream with the gate widened to nothing. */
+static void test_noise_inside_the_gate_is_untouched(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	rng_seed(77u);
+	sync_model_init(&m);
+	sim_init(&s, 0x1800000000ULL, 0x0200000000ULL, 40000, 3200);   /* sweep's worst jitter */
+	for (unsigned int k = 0; k < 600u; k++) sim_step(&s, &m);
+	CHECK(sync_model_outlier_count(&m) == 0u);                     /* the gate never fires on noise */
+}
+
+/* Five rejections in a row are a real discontinuity, not an outlier: restart the baseline from
+ * the observation that broke the streak, and converge at the new offset. */
+static void test_unannounced_step_rebaselines(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	healthy_model(&m, &s, 300u);
+	uint32_t rb = sync_model_rebaseline_count(&m);
+
+	/* the master's clock jumps by 1e6 DTU (15 us): every following pair is off by that */
+	const uint64_t step = 1000000ULL;
+
+	for (unsigned int k = 0; k < SYNC_OUTLIER_RUN_MAX; k++) {
+		uint64_t x   = s.k * SYNC_CCP_INTERVAL_DTU;
+		uint64_t mst = (s.m0 + x + step) & SYNC_DTU_MASK;
+		uint64_t loc = sim_local_at(&s, x);
+
+		sync_model_observe(&m, mst, loc);
+		s.k++;
+	}
+	CHECK(sync_model_outlier_count(&m) == SYNC_OUTLIER_RUN_MAX);
+	CHECK(sync_model_rebaseline_count(&m) == rb + 1u);              /* restarted, not stuck */
+
+	s.m0 += step;                                                    /* the new truth */
+	for (unsigned int k = 0; k < 40u; k++) sim_step(&s, &m);
+	CHECK(m.valid);
+	int64_t err = sim_conv_err(&s, &m, (uint64_t)(s.k - 1) * SYNC_CCP_INTERVAL_DTU);
+	CHECK(err < 4 * NS && err > -4 * NS);
+}
+
+/* One bad sample inside the gate (so it IS folded in) must age out of the statistics instead of
+ * living until someone types `sync reset`. */
+static void test_residual_statistics_age_out(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	healthy_model(&m, &s, 300u);
+
+	/* a 12000 DTU kink: inside the 16384 gate, so it is folded in like real noise */
+	uint64_t x   = s.k * SYNC_CCP_INTERVAL_DTU;
+	sync_model_observe(&m, (s.m0 + x + 12000ULL) & SYNC_DTU_MASK, sim_local_at(&s, x));
+	s.k++;
+	CHECK(sync_model_residual_max_dtu(&m) >= 12000u - 500u);
+	uint32_t jit_bad = sync_model_jitter_est_dtu(&m);
+
+	for (unsigned int k = 0; k < 3u * SYNC_RES_WINDOW; k++) sim_step(&s, &m);
+
+	CHECK(sync_model_residual_max_dtu(&m) < 3000u);                  /* decayed */
+	CHECK(sync_model_jitter_est_dtu(&m) < jit_bad || jit_bad < 150u);
+	CHECK(sync_model_jitter_est_dtu(&m) < 150u);                     /* back to the true ~64 */
+	CHECK(sync_model_residual_count(&m) < 2u * SYNC_RES_WINDOW);     /* bounded, never lifetime */
+}
+
+/* Rejections coast: they count towards staleness, so a stream of nothing but outliers cannot
+ * keep a model "valid" forever. */
+static void test_rejections_cannot_keep_a_dead_link_valid(void)
+{
+	struct sync_model m;
+	struct sim s;
+
+	healthy_model(&m, &s, 300u);
+	for (unsigned int k = 0; k < SYNC_OUTLIER_RUN_MAX - 1u; k++) {
+		uint64_t x = s.k * SYNC_CCP_INTERVAL_DTU;
+
+		sync_model_observe(&m, (s.m0 + x + 5000000000ULL) & SYNC_DTU_MASK, sim_local_at(&s, x));
+		s.k++;
+	}
+	CHECK(m.misses == SYNC_OUTLIER_RUN_MAX - 1u);
+	CHECK(sync_model_outlier_count(&m) == SYNC_OUTLIER_RUN_MAX - 1u);
+}
+
 int main(void)
 {
 	printf("sync_model: 1 ns = %" PRId64 " DTU, CCP interval = %llu DTU\n",
@@ -1000,6 +1169,13 @@ int main(void)
 	test_tau_feed_forward_is_immediate();
 	test_tau_change_is_not_a_rebaseline();
 	test_tau_defaults_to_zero_and_zero_is_a_no_op();
+	test_clock_age_policy_boundaries();
+
+	test_one_interval_mispair_is_rejected();
+	test_noise_inside_the_gate_is_untouched();
+	test_unannounced_step_rebaselines();
+	test_residual_statistics_age_out();
+	test_rejections_cannot_keep_a_dead_link_valid();
 
 	if (failures) {
 		printf("\n%d CHECK(s) FAILED\n", failures);

@@ -23,16 +23,20 @@ already known good, to compare every ANCLA anchor against. This is a
 DWM3001CDK running Qorvo's stock `ss_twr_responder` example, modified as
 follows:
 
-- **PHY matched to `src/uwb_phy.h`**: channel 5, PLEN_1024, PAC32, code 9,
-  850 kbps, SFD_IEEE_4Z, STS and PDoA off. If the DWM's PHY does not match
+- **PHY matched to `src/uwb_phy.h`**: channel 5, PLEN_256, PAC16, code 9,
+  850 kbps, SFD_IEEE_4Z, STS and PDoA off. (Changed from PLEN_1024/PAC32 on
+  2026-10-12: that INVALIDATES every previous `cal ref`/`cal peer` result and
+  the reference node's own PHY must be rebuilt to match; the operator is
+  redoing the calibration, do not treat stored delays as current.) If the DWM's PHY does not match
   exactly, the exchange will not decode at all (see Troubleshooting,
   `-ENODATA`).
 - **Antenna delay loaded from OTP**, not the example's hardcoded `16385`. The
   whole point of using this board as a reference is that its delay is
   factory-known; leaving the example's default defeats that.
-- **`POLL_RX_TO_RESP_TX_DLY_UUS` raised from 450 to 2000.** At PLEN_1024 the
-  preamble alone takes ~1.05 ms, so the example's stock 450 uus turnaround is
-  physically impossible — the response would have to leave before the poll's
+- **`POLL_RX_TO_RESP_TX_DLY_UUS` raised from 450 to 2000.** At the former PLEN_1024 the
+  preamble alone took ~1.05 ms, so the example's stock 450 uus turnaround was
+  physically impossible (at the current PLEN_256 the turnaround floor is
+  613 us, so 450 uus is still too short; 2000 is merely no longer tight) — the response would have to leave before the poll's
   preamble finished. ANCLA's own responder (`anchor_respond.c`) already turns
   around at 2000 uus; matching it here is what lets `cal_initiator.c` use a
   single RX window for both peer types.

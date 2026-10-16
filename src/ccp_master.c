@@ -8,7 +8,6 @@
 
 #include "ccp_frame.h"
 #include "ccp_sched.h"
-#include "gw_selftau.h"
 #include "sync_model.h"
 #include "tag_id.h"
 #include "uwb_config.h"
@@ -30,7 +29,8 @@ LOG_MODULE_REGISTER(ccp_master, ANCLA_LOG_LEVEL);
  * design, an IMMEDIATE TX's frame is on air essentially as soon as
  * dwt_starttx() returns -- there is no scheduled delay left to wait out, only
  * the CCP's own airtime (CCP_SCHED_SHR_NS + CCP_SCHED_POST_RMARKER_NS,
- * ~1.29 ms total, ccp_sched.h) plus whatever the arm sequence itself costs.
+ * ~0.59 ms total for the v2 frame at PLEN_256; ~1.29 ms for v1 at the former
+ * PLEN_1024, ccp_sched.h) plus whatever the arm sequence itself costs.
  * 8 ms clears that with ample margin and is kept unchanged from the delayed-TX
  * design's value rather than re-derived down, since this path is still newly
  * measured and a generous bound costs nothing on a K_PRIO_COOP(0) loop that
@@ -40,6 +40,14 @@ LOG_MODULE_REGISTER(ccp_master, ANCLA_LOG_LEVEL);
  * and anchor_respond.c's (18). All three cover different worst cases and
  * CLAUDE.md already records one bug caused by conflating two of them. */
 #define CCP_MASTER_TX_TIMEOUT_MS 8
+
+/* Wall-clock bound on the pre-TX spin in ccp_master_after_beacon(): the
+ * deliberate delay is CCP_TX_PREAMBLE_DELAY_NS (1.2 ms) minus the ~0.4-0.6 ms
+ * the beacon's own airtime and the arm sequence already consumed, so the real
+ * wait is under 1 ms. 2500 us is that with generous margin and still tiny
+ * against the 5 ms BEACON_ARM_MARGIN_UUS the loop keeps in hand, because the
+ * next beacon is a whole superframe away at this point. */
+#define CCP_MASTER_SPIN_MAX_US 2500u
 
 /* Rate limit for the production-visible drop/offset summary below. Per-event
  * detail stays at LOG_DBG -- compiled out at ANCLA_LOG_LEVEL == LOG_LEVEL_INF
@@ -98,10 +106,22 @@ static int32_t offset_ns_last;
 static bool have_offset_sample;
 
 /* offset_ns_last with the CCP's own SHR and the beacon's own post-RMARKER
- * airtime subtracted -- i.e. how long the arm sequence itself took between the
- * beacon's frame ending and this CCP's preamble starting. This is the number
- * to compare against ccp_sched.h's CCP_SCHED_MAX_ARM_NS (348300 ns today). */
+ * airtime subtracted -- i.e. how long passed between the beacon's frame ending
+ * and this CCP's preamble starting. Since 2026-10-13 that INCLUDES the
+ * deliberate CCP_TX_PREAMBLE_DELAY_NS wait, so a healthy value is now about
+ * CCP_TX_PREAMBLE_DELAY_NS - CCP_SCHED_BEACON_END_NS (~810 us) plus a few tens
+ * of microseconds of spin-poll granularity, instead of the ~140-230 us the arm
+ * sequence alone used to cost. Still compared against ccp_sched.h's
+ * CCP_SCHED_MAX_ARM_NS (1826674 ns at PLEN_256): that is the room the guard
+ * window has for the CCP, and the number must stay well under it. */
 static int32_t arm_cost_ns_last;
+
+/* What the pre-TX wait saw on its last pass: the single chip-clock read's
+ * distance to the target (hi32 ticks; <= 0 means already past, nothing waited)
+ * and the microseconds actually waited. Reported with the cap_overlap warning
+ * so a late CCP can be told apart from a wait that never ran. */
+static int32_t spin_ahead0_ticks;
+static uint32_t spin_wait_us;
 
 /* D3: the one-shot on-demand probe ("sync txtest"). Separate state from
  * everything above so the bench probe can never be confused with, or perturb,
@@ -209,22 +229,19 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 	 * refuses to pair anything against seq 0xFF (see ccp_slave.c). */
 	uint64_t announce_tx_dtu = have_prev_tx ? prev_tx_dtu : 0u;
 
-	/* B14 Fase B (2026-09-24): every ordinary CCP is v2 now, piggybacking
-	 * gw_selftau.c's automatic round-robin measurement on top of the
-	 * deferred-timestamp payload that was already going out every
-	 * superframe -- see ccp_frame.h's v2 comment for why this costs no
-	 * extra frame. gw_selftau_auto_take() returns false on a superframe
-	 * where no auto exchange has completed since the last CCP (the round
-	 * -robin period is N_ANCHORS superframes, the CCP period is one), in
-	 * which case CCP_TAU_MEAS_ANCHOR_NONE goes out -- ccp_slave.c already
-	 * ignores an unrecognised/absent measurement by construction (see its
-	 * own header), so this is silent on every anchor until Fase B's next
-	 * task (the anchor-side filter) is wired to actually read it. */
+	/* Every ordinary CCP is still v2 (the wire format is unchanged and an
+	 * older receiver still ignores the extra bytes), but it carries NO
+	 * measurement any more: the automatic TWR round-robin that used to fill
+	 * these fields was retired 2026-10-12 and the flight-time compensation
+	 * is a static per-link value installed by `apos apply`. The fields go
+	 * out as "no measurement" -- CCP_TAU_MEAS_ANCHOR_NONE -- on every
+	 * superframe, which is exactly what ccp_slave.c already reads as
+	 * "nothing to adopt". Deliberately NOT a v1 frame: the payload size, and
+	 * so the CCP_SCHED_MAX_ARM_NS margin measured on hardware 2026-09-25,
+	 * stays what was verified. */
 	uint16_t tau_anchor = CCP_TAU_MEAS_ANCHOR_NONE;
 	int32_t  tau_meas_dtu = 0;
 	uint8_t  tau_quality = 0;
-
-	(void)gw_selftau_auto_take(&tau_anchor, &tau_meas_dtu, &tau_quality);
 
 	struct ccp_frame f = {
 		.seq = ccp_seq,
@@ -278,6 +295,52 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 
 	dwt_writetxdata((uint16_t)n, tx_buf, 0);
 	dwt_writetxfctrl((uint16_t)(n + FCS_LEN), 0, 0);
+
+	/* Hold the CCP's PREAMBLE back until CCP_TX_PREAMBLE_DELAY_NS after the
+	 * beacon's RMARKER (ccp_sched.h explains why). At PLEN_256 the CCP's SHR
+	 * is only ~269 us long, and a slave needs 665-870 us after the beacon's
+	 * RMARKER to be listening again -- sent right behind the beacon the CCP
+	 * was over before most slaves could hear it (measured 2026-10-13: 16.9%
+	 * received, 0% once the slave took 850 us or more).
+	 *
+	 * This is still DWT_START_TX_IMMEDIATE below. The wait is a spin on the
+	 * chip's own clock BEFORE the command is issued, so there is still no
+	 * scheduled TX time that arm jitter could miss -- the failure the
+	 * delayed-TX design died of. The frame's actual RMARKER is read back
+	 * after TXFRS exactly as before.
+	 *
+	 * The chip clock is read ONCE, to learn how far ahead the target is; the
+	 * wait itself is k_busy_wait() on Zephyr's own clock. A first version
+	 * polled the chip clock in the loop and, on the bench (2026-10-13), the
+	 * CCP landed ~1.9 ms LATE every superframe -- its RMARKER ~3.38 ms after
+	 * the beacon instead of ~1.47 ms -- which is what a loop that always ran
+	 * to its 2500 us timeout looks like. Why polling the chip never
+	 * satisfied the target is not established; not depending on it inside the
+	 * loop is. spin_ahead0_ticks / spin_wait_us are kept for the cap_overlap
+	 * warning so the next run can say what the single read actually returned.
+	 *
+	 * Bounded, because this runs on K_PRIO_COOP(0): only waits when the
+	 * target is a plausible distance ahead (at most 2 x the delay), so the
+	 * wait cannot exceed CCP_MASTER_SPIN_MAX_US. Missing the target costs a
+	 * CCP the slaves may not hear, never a hang. */
+	{
+		const uint32_t target_hi32 = beacon_hi32 + CCP_TX_DELAY_HI32;
+		const int32_t ahead =
+			(int32_t)(target_hi32 - dwt_readsystimestamphi32());
+
+		spin_ahead0_ticks = ahead;
+		spin_wait_us = 0u;
+		if (ahead > 0 && ahead <= (int32_t)(2u * CCP_TX_DELAY_HI32)) {
+			uint32_t wait_us =
+				(uint32_t)(((uint64_t)ahead * 4006u) / 1000000u);
+
+			if (wait_us > CCP_MASTER_SPIN_MAX_US) {
+				wait_us = CCP_MASTER_SPIN_MAX_US;
+			}
+			spin_wait_us = wait_us;
+			k_busy_wait(wait_us);
+		}
+	}
 
 	/* No dwt_setdelayedtrxtime() call: this is the whole point of the
 	 * redesign. An immediate TX has no scheduled RMARKER to arm against,
@@ -386,9 +449,11 @@ void ccp_master_after_beacon(uint32_t beacon_hi32, uint8_t *frame_seq)
 			sf_since_overlap_report = 0;
 			LOG_WRN("{\"ccp_master\":{\"cap_overlap\":1,"
 				"\"frame_end_ns\":%d,"
-				"\"cap_preamble_ns\":%u}}",
+				"\"cap_preamble_ns\":%u,"
+				"\"spin_ahead0_ticks\":%d,\"spin_wait_us\":%u}}",
 				(int)frame_end_ns,
-				(unsigned int)CCP_SCHED_CAP_PREAMBLE_NS);
+				(unsigned int)CCP_SCHED_CAP_PREAMBLE_NS,
+				(int)spin_ahead0_ticks, (unsigned int)spin_wait_us);
 		}
 	}
 }

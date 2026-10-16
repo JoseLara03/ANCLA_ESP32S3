@@ -19,6 +19,7 @@
 #define APOS_STORE_H
 
 #include "apos_geom.h"    /* APOS_MAX_NODES */
+#include "apos_links.h"   /* struct apos_links */
 #include "apos_table.h"   /* APOS_EUI_LEN   */
 
 #include <stdbool.h>
@@ -124,6 +125,30 @@ int apos_store_set_ref(double lat, double lon);
  * sign convention and for why a uniform value does not cancel out. Stored
  * under its own key, so it survives `apos apply` and apos_store_clear(). */
 int apos_store_set_tag_z(float z);
+
+/* ---- Static sync links (B14 static survey) ------------------------------ */
+
+/* The links the last APPLIED survey installed. Never NULL; ->n == 0 means none
+ * (a gateway upgraded from firmware that predates them, or never surveyed):
+ * report `needs_survey`, do not treat tau == 0 as calibrated. */
+const struct apos_links *apos_store_links(void);
+
+/* A links record was found on flash but could not be read (unknown version,
+ * truncated, corrupt). The record is NOT erased; links read as absent. */
+bool apos_store_links_rejected(void);
+
+/* Persist the links. Cache updated only after the write succeeds. */
+int apos_store_save_links(const struct apos_links *l);
+
+/* "An apply was started and never finished", persisted BEFORE the first anchor
+ * is touched and cleared only after every anchor acknowledged and the gateway's
+ * own survey and links are on flash. True also when the marker is unreadable,
+ * because "cannot tell" must read as "interrupted". While true the anchors may
+ * hold a mix of generations, so fixes must not be published as valid. */
+bool apos_store_apply_pending(void);
+uint32_t apos_store_pending_generation(void);
+int apos_store_set_pending(uint32_t generation);
+int apos_store_clear_pending(void);
 
 /* Invalidate and erase. `apos_store_get()->valid` becomes false, so the anchors
  * payload falls back to the stub. Returns 0 or a negative errno. */

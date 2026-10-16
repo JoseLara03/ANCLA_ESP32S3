@@ -16,6 +16,8 @@
 
 #include "apos_store.h"
 
+#include "apos_links.h"
+
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 
@@ -27,6 +29,8 @@ LOG_MODULE_REGISTER(apos_store, LOG_LEVEL_INF);
 #define KEY_SURVEY "apos/survey"
 #define KEY_REF    "apos/ref"
 #define KEY_TAGZ   "apos/tagz"
+#define KEY_LINKS   "apos/links"
+#define KEY_PENDING "apos/pending"
 
 /* Only the geometry, so adding a field to struct apos_survey does not silently
  * change the stored layout: this record is what is written, and the size check
@@ -53,6 +57,15 @@ struct stored_tagz {
 };
 
 static struct apos_survey g_survey;
+
+/* The static sync links and the apply-in-progress marker. Separate keys and a
+ * separate, versioned codec (apos_links.c): the survey blob above is validated
+ * by sizeof alone and is deliberately left byte-for-byte as it was, so a board
+ * upgraded in place keeps its survey. */
+static struct apos_links g_links;
+static struct apos_pending g_pending;
+static bool g_links_rejected;   /* a record was stored but could not be read */
+static bool g_pending_rejected;
 
 static int read_val(settings_read_cb read_cb, void *cb_arg, void *dst,
 		    size_t len)
@@ -124,6 +137,65 @@ static int apos_settings_set(const char *key, size_t len,
 			return -EINVAL;
 		}
 		g_survey.tag_z_m = t.z;
+		return 0;
+	}
+
+	if (strcmp(key, "links") == 0) {
+		uint8_t buf[APOS_LINKS_MAX_LEN + 1];
+		struct apos_links tmp;
+
+		/* One byte more than the largest legal record, so an over-long one
+		 * is READ as over-long and refused by the length check rather than
+		 * silently truncated to a plausible size. */
+		if (len > sizeof(buf)) {
+			g_links_rejected = true;
+			LOG_ERR("{\"apos_store\":\"stored links record is %u bytes, "
+				"larger than any this firmware writes — ignored, "
+				"NOT erased\"}", (unsigned int)len);
+			return 0;
+		}
+		if (read_val(read_cb, cb_arg, buf, len)) {
+			return -EINVAL;
+		}
+		int rc = apos_links_decode(buf, len, &tmp);
+
+		if (rc) {
+			/* Rejected, kept on flash, and said out loud: an unknown
+			 * version is the case a rollback of this firmware would hit,
+			 * and wiping it would destroy the install. */
+			g_links_rejected = true;
+			LOG_ERR("{\"apos_store\":\"stored links record unreadable "
+				"(%d) — links treated as ABSENT (needs_survey), the "
+				"record is left on flash\"}", rc);
+			return 0;
+		}
+		g_links = tmp;
+		g_links_rejected = false;
+		return 0;
+	}
+
+	if (strcmp(key, "pending") == 0) {
+		uint8_t buf[APOS_PENDING_LEN + 1];
+		struct apos_pending tmp;
+
+		if (len > sizeof(buf)) {
+			g_pending_rejected = true;
+			return 0;
+		}
+		if (read_val(read_cb, cb_arg, buf, len)) {
+			return -EINVAL;
+		}
+		if (apos_pending_decode(buf, len, &tmp) != 0) {
+			/* An unreadable marker is treated as PENDING: the safe reading
+			 * of "I cannot tell whether an apply was interrupted" is that
+			 * it was. */
+			g_pending_rejected = true;
+			LOG_ERR("{\"apos_store\":\"stored apply marker unreadable — "
+				"treated as an INTERRUPTED apply\"}");
+			return 0;
+		}
+		g_pending = tmp;
+		g_pending_rejected = false;
 		return 0;
 	}
 
@@ -238,5 +310,90 @@ int apos_store_clear(void)
 	memset(g_survey.node, 0, sizeof(g_survey.node));
 	g_survey.n_nodes = 0;
 	g_survey.valid = false;
+	return 0;
+}
+
+const struct apos_links *apos_store_links(void)
+{
+	return &g_links;
+}
+
+bool apos_store_links_rejected(void)
+{
+	return g_links_rejected;
+}
+
+int apos_store_save_links(const struct apos_links *l)
+{
+	uint8_t buf[APOS_LINKS_MAX_LEN];
+	int n = apos_links_encode(l, buf, sizeof(buf));
+
+	if (n < 0) {
+		return n;
+	}
+
+	int ret = settings_save_one(KEY_LINKS, buf, (size_t)n);
+
+	if (ret) {
+		LOG_ERR("failed to persist %s (%d)", KEY_LINKS, ret);
+		return ret;
+	}
+	/* Cache only after the write succeeded, same discipline as the survey. */
+	g_links = *l;
+	g_links_rejected = false;
+	return 0;
+}
+
+bool apos_store_apply_pending(void)
+{
+	return g_pending_rejected || g_pending.state == APOS_PENDING_APPLYING;
+}
+
+uint32_t apos_store_pending_generation(void)
+{
+	return g_pending.generation;
+}
+
+int apos_store_set_pending(uint32_t generation)
+{
+	struct apos_pending p = {.generation = generation,
+				 .state = APOS_PENDING_APPLYING};
+	uint8_t buf[APOS_PENDING_LEN];
+	int n = apos_pending_encode(&p, buf, sizeof(buf));
+
+	if (n < 0) {
+		return n;
+	}
+
+	int ret = settings_save_one(KEY_PENDING, buf, (size_t)n);
+
+	if (ret) {
+		LOG_ERR("failed to persist %s (%d)", KEY_PENDING, ret);
+		return ret;
+	}
+	g_pending = p;
+	g_pending_rejected = false;
+	return 0;
+}
+
+int apos_store_clear_pending(void)
+{
+	struct apos_pending p = {.generation = g_pending.generation,
+				 .state = APOS_PENDING_NONE};
+	uint8_t buf[APOS_PENDING_LEN];
+	int n = apos_pending_encode(&p, buf, sizeof(buf));
+
+	if (n < 0) {
+		return n;
+	}
+
+	int ret = settings_save_one(KEY_PENDING, buf, (size_t)n);
+
+	if (ret) {
+		LOG_ERR("failed to clear %s (%d)", KEY_PENDING, ret);
+		return ret;
+	}
+	g_pending = p;
+	g_pending_rejected = false;
 	return 0;
 }

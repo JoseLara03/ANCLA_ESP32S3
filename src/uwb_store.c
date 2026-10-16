@@ -31,6 +31,12 @@ LOG_MODULE_REGISTER(uwb_store, LOG_LEVEL_INF);
 #define KEY_POS       "anchor/pos"
 #define KEY_SYNC_TAU      "anchor/sync_tau"
 #define KEY_SYNC_TAU_MODE "anchor/sync_tau_mode"
+#define KEY_SYNC_LINK     "anchor/sync_link"
+
+/* Static sync link: valid(1) + generation(4, LE) + parent EUI(8) = 13 bytes,
+ * serialised by hand so struct padding never decides the stored layout. A
+ * separate key from sync_tau on purpose -- see uwb_store_save_sync_link(). */
+#define SYNC_LINK_REC_LEN 13u
 
 /* Written as one record so x, y, z and the valid flag can never disagree. */
 struct stored_pos {
@@ -172,9 +178,48 @@ static int anchor_settings_set(const char *key, size_t len,
 		if (read_val(read_cb, cb_arg, &v, sizeof(v))) {
 			return -EINVAL;
 		}
-		if (!uwb_config_set_sync_tau_mode(cfg, v)) {
-			LOG_WRN("stored sync_tau_mode %u invalid — keeping %s", v,
+		bool migrated;
+		uint8_t use = uwb_config_migrate_sync_tau_mode(v, &migrated);
+
+		/* TWR/AUTO were retired 2026-10-12. A record written by older
+		 * firmware is read for MIGRATION only: it becomes SURVEY in RAM, the
+		 * stored tau is kept (it was a survey value all along), and nothing
+		 * on the air is started on its account. Not re-persisted here -- a
+		 * settings write inside the load callback is not safe -- so it is
+		 * migrated again, identically, on every boot until the next
+		 * `sync tau mode` or `apos apply` rewrites it. */
+		if (migrated) {
+			LOG_WRN("stored sync_tau_mode %u is retired or invalid — using "
+				"survey (the stored tau is kept; run `apos apply` to "
+				"install a surveyed link)", v);
+		}
+		if (!uwb_config_set_sync_tau_mode(cfg, use)) {
+			LOG_WRN("stored sync_tau_mode %u invalid — keeping %s", use,
 				uwb_config_sync_tau_mode_name(cfg->sync_tau_mode));
+		}
+		return 0;
+	}
+
+	if (strcmp(key, "sync_link") == 0) {
+		uint8_t rec[SYNC_LINK_REC_LEN];
+
+		if (len != sizeof(rec)) {
+			LOG_WRN("stored sync_link size %u invalid — expected %u, "
+				"treating as no installed link",
+				(unsigned int)len, (unsigned int)sizeof(rec));
+			return -EINVAL;
+		}
+		if (read_val(read_cb, cb_arg, rec, sizeof(rec))) {
+			return -EINVAL;
+		}
+		if (rec[0] == 1u) {
+			uint32_t gen = (uint32_t)rec[1] | ((uint32_t)rec[2] << 8) |
+				       ((uint32_t)rec[3] << 16) |
+				       ((uint32_t)rec[4] << 24);
+
+			uwb_config_set_sync_link(cfg, gen, &rec[5]);
+		} else {
+			uwb_config_clear_sync_link(cfg);
 		}
 		return 0;
 	}
@@ -274,4 +319,19 @@ int uwb_store_save_sync_tau_mode(void)
 	const uwb_config_t *cfg = uwb_config_get();
 
 	return save_one(KEY_SYNC_TAU_MODE, &cfg->sync_tau_mode, sizeof(cfg->sync_tau_mode));
+}
+
+int uwb_store_save_sync_link(void)
+{
+	const uwb_config_t *cfg = uwb_config_get();
+	uint8_t rec[SYNC_LINK_REC_LEN];
+
+	rec[0] = cfg->sync_link_valid ? 1u : 0u;
+	rec[1] = (uint8_t)cfg->sync_link_gen;
+	rec[2] = (uint8_t)(cfg->sync_link_gen >> 8);
+	rec[3] = (uint8_t)(cfg->sync_link_gen >> 16);
+	rec[4] = (uint8_t)(cfg->sync_link_gen >> 24);
+	memcpy(&rec[5], cfg->sync_parent_eui, 8);
+
+	return save_one(KEY_SYNC_LINK, rec, sizeof(rec));
 }

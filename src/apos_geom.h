@@ -198,4 +198,52 @@ int apos_geom_refine(const struct apos_edge *e, uint16_t n_edges,
 int apos_geom_solve(const struct apos_edge *e, uint16_t n_edges, uint8_t n_nodes,
 		    const struct apos_gauge *g, struct apos_result *out);
 
+/* ---- 3D gauge conditioning --------------------------------------------- */
+
+/* The solved tetrahedron of the four gauge anchors is the frame the whole
+ * survey is expressed in, so it must be non-degenerate, and "non-zero volume"
+ * is NOT a sufficient test: ranging noise alone makes an exactly coplanar
+ * quadrilateral reconstruct with a non-zero apparent height. From the
+ * Cayley-Menger relation, an edge error of delta on a gauge of characteristic
+ * size L moves the apparent height `up` stands off the plane by roughly
+ * sqrt(2 * L * delta) -- a SQUARE-ROOT law, so for L = 2 m and delta = 30 mm
+ * a flat array can read ~0.35 m "tall". A bare "h > epsilon" check therefore
+ * accepts the very coplanar installs it exists to refuse.
+ *
+ * apos_geom_gauge_conditioning() judges h against that noise floor instead:
+ * h >= APOS_GAUGE_UP_NOISE_K * sqrt(L * range_err_m). The factor was chosen
+ * with tests/apos_gauge_quality/, which feeds the solver noisy coplanar and
+
+ * genuinely 3D layouts and counts false accepts and false rejects: at 2.0
+ * 0 of 240 noisy coplanar gauges (30 mm edge noise, gateway 1.4 m off the
+ * plane) were accepted and 2 of 387 tall ones (up 0.8 m) were refused; 1.0
+ * accepted 3 coplanar, 2.5 refused 12 % of the 0.8 m gauges. */
+#ifndef APOS_GAUGE_UP_NOISE_K
+#define APOS_GAUGE_UP_NOISE_K 2.0f
+#endif
+
+/* Same 0.10 as APOS_ACCEPT_GAUGE_COLLINEARITY, restated here so the pure
+ * module does not depend on the gateway header. */
+#define APOS_GAUGE_COLLINEARITY_MIN 0.10f
+
+struct apos_gauge_quality {
+	float collinearity;   /* |xaxis x plane| / |xaxis|^2 about origin;
+			       * = |plane.y| / xaxis.x in the gauge frame */
+	float up_height_m;    /* distance of `up` from the origin/xaxis/plane plane */
+	float edge_rms_m;     /* RMS length of the six gauge edges, L above */
+	float height_floor_m; /* the noise floor up_height_m is judged against */
+	bool  collinear;      /* collinearity < APOS_GAUGE_COLLINEARITY_MIN */
+	bool  coplanar;       /* up_height_m < height_floor_m */
+};
+
+/* Judge the four gauge nodes of a SOLVED 3D result. range_err_m is the
+ * expected per-edge ranging error (callers pass the larger of the measured sd
+ * and a systematic floor). Returns 0, or -EINVAL on a NULL argument, a 2D
+ * gauge, an invalid gauge or a gauge node the solve left unplaced. A
+ * degenerate gauge is NOT an error return: it is reported through the flags,
+ * because the caller must show the operator why. */
+int apos_geom_gauge_conditioning(const struct apos_result *r,
+				 const struct apos_gauge *g, float range_err_m,
+				 struct apos_gauge_quality *q);
+
 #endif /* APOS_GEOM_H */

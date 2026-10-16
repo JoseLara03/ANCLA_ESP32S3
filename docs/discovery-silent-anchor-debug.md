@@ -95,6 +95,13 @@ detect that locally — this line is the only place it becomes visible.
 
 ### Per-second heartbeat — `src/uwb_slave.c`
 
+> **REMOVED 2026-10-13.** The `slave_hb` heartbeat described in this section no
+> longer exists: at PLEN_256 it cost the CCP behind every fifth beacon. The
+> debug image now offers the shell commands `cia stats` / `cia reset` instead
+> (per-class CIA accum/power/f1, error breakdown, beacon re-arm latency). The
+> text below is kept as the record of how the original diagnosis worked; do not
+> expect to see `slave_hb` lines.
+
 ```json
 {"slave_hb":{"id":1,"addr":"0x0002","pos_valid":1,"rx_ok":31,"rx_err":2,
   "wave":18,"disc":5,"beacon":5,"apos":0,"other":1,

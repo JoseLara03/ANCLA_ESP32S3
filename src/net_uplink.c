@@ -17,10 +17,19 @@
 #ifdef CONFIG_NETWORKING
 
 #include "apos_store.h"
+#include "blink_rx.h"
+#include "ccp_master.h"
+#include "ccp_slave.h"
 #include "net_config.h"
+#include "cmd_key.h"
+#include "cmd_proto.h"
+#include "node_cmd.h"
+#include "node_status.h"
 #include "pos_json.h"
+#include "sync_model.h"
 #include "uwb_config.h"
 
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 /* net_if.h must precede dhcpv4.h: in this Zephyr version dhcpv4.h does not
@@ -35,6 +44,7 @@
 #include <zephyr/net/mqtt.h>
 #include <zephyr/net/net_compat.h>
 #include <zephyr/net/socket.h>
+#include <zephyr/sys/reboot.h>
 
 #include <errno.h>
 #include <stdio.h>
@@ -117,6 +127,25 @@ K_MSGQ_DEFINE(obs_q,   sizeof(struct pos_blink_obs), OBS_QUEUE_DEPTH, 4);
 
 static uint32_t n_obs_pub;
 static uint32_t n_obs_pub_drop;
+
+/* Node status report (node_status.c). Lifetime counters of link events, and the reset cause
+ * captured once at start -- hwinfo's flags are cleared after reading, so it cannot be asked
+ * twice. */
+static uint32_t n_wifi_up;
+static uint32_t n_mqtt_up;
+static const char *reset_name = "?";
+static char status_topic[48];
+static char will_msg[48];
+
+/* Remote commands. handle_publish() runs inside mqtt_input(), so it only COPIES the payload and sets
+ * a flag; the uplink loop does the work (HMAC, flash writes, a reboot) outside the callback. One
+ * slot: a second command arriving before the first is processed is dropped, and the sender's
+ * missing ack says so. */
+static char cmd_topic[56];
+static char ack_topic[56];
+static uint8_t cmd_payload[CMD_MAX_LEN];
+static size_t cmd_len;
+static volatile bool cmd_pending;
 static uint32_t n_obs_rx;
 /* Three reasons a received observation is dropped, counted separately: an
  * oversized payload (a publisher newer than this gateway), a parse failure (a
@@ -346,6 +375,7 @@ static bool wifi_connect(const net_config_t *cfg)
 		return false;
 	}
 
+	n_wifi_up++;
 	net_dhcpv4_start(iface);
 
 	/* 30 s covers association plus a DHCP exchange on a slow AP. Failing
@@ -353,6 +383,29 @@ static bool wifi_connect(const net_config_t *cfg)
 	if (k_sem_take(&ip_sem, K_SECONDS(30)) != 0) {
 		LOG_WRN("no IPv4 address within 30 s");
 		return false;
+	}
+
+	/* WiFi modem sleep OFF: always on the GATEWAY, optional elsewhere
+	 * (CONFIG_ANCLA_UPLINK_WIFI_PS_OFF, default OFF).
+	 *
+	 * The ESP-IDF default sleeps the radio between AP beacons, so every
+	 * DOWNLINK frame waits for the next DTIM (~100-300 ms). The gateway is
+	 * mains powered and SUBSCRIBES -- every anchor's observation is downlink
+	 * for it -- so it must not sleep. An anchor only PUBLISHES, and with
+	 * TCP_NODELAY (mqtt_bring_up()) its uploads no longer wait for a late ACK,
+	 * so it can sleep; keeping it off costs roughly 70-100 mA, which browned
+	 * out anchors on a ~3.8 V cell (2026-10-15). Failure is non-fatal: the
+	 * link works, only the latency suffers. */
+	if (IS_ENABLED(CONFIG_ANCLA_UPLINK_WIFI_PS_OFF) || is_gateway) {
+		struct wifi_ps_params ps = {
+			.type    = WIFI_PS_PARAM_STATE,
+			.enabled = WIFI_PS_DISABLED,
+		};
+		int ps_ret = net_mgmt(NET_REQUEST_WIFI_PS, iface, &ps, sizeof(ps));
+
+		if (ps_ret != 0) {
+			LOG_WRN("could not disable WiFi power save (%d)", ps_ret);
+		}
 	}
 
 	g_state = ST_WIFI_CONNECTED;
@@ -390,6 +443,48 @@ static void handle_publish(struct mqtt_client *c,
 	struct pos_blink_obs obs;
 	struct pos_blink_obs discarded;
 	uint32_t len = p->message.payload.len;
+
+	/* A remote command: copy it out and let the uplink loop act on it. */
+	if (p->message.topic.topic.size == strlen(cmd_topic) &&
+	    memcmp(p->message.topic.topic.utf8, cmd_topic, p->message.topic.topic.size) == 0) {
+		bool fits = len > 0u && len <= sizeof(cmd_payload) && !cmd_pending;
+
+		if (fits) {
+			if (mqtt_readall_publish_payload(c, cmd_payload, len) < 0) {
+				mqtt_connected = false;
+				return;
+			}
+			cmd_len = len;
+			cmd_pending = true;
+			return;
+		}
+		/* Oversize, empty, or one is already waiting: drain so the stream stays in sync. */
+		while (len > 0u) {
+			uint32_t chunk = MIN(len, (uint32_t)sizeof(obs_payload));
+
+			if (mqtt_readall_publish_payload(c, obs_payload, chunk) < 0) {
+				mqtt_connected = false;
+				return;
+			}
+			len -= chunk;
+		}
+		return;
+	}
+
+	/* Anything else is only meaningful to the gateway (the observation topic). An anchor drains
+	 * and ignores it. */
+	if (!is_gateway) {
+		while (len > 0u) {
+			uint32_t chunk = MIN(len, (uint32_t)sizeof(obs_payload));
+
+			if (mqtt_readall_publish_payload(c, obs_payload, chunk) < 0) {
+				mqtt_connected = false;
+				return;
+			}
+			len -= chunk;
+		}
+		return;
+	}
 
 	/* The payload is ALWAYS drained from the socket, whether it fits or
 	 * not: leaving bytes unread desynchronises the MQTT stream and takes
@@ -536,6 +631,138 @@ static int publish(const char *topic, const char *msg, enum mqtt_qos qos,
 	return mqtt_publish(&client, &p);
 }
 
+
+/* ---- Node status report -------------------------------------------------- */
+
+static const char *reset_cause_name(uint32_t cause)
+{
+	if (cause & RESET_BROWNOUT)    { return "brownout"; }
+	if (cause & RESET_WATCHDOG)    { return "watchdog"; }
+	if (cause & RESET_CPU_LOCKUP)  { return "lockup"; }
+	if (cause & RESET_POR)         { return "power"; }
+	if (cause & RESET_SOFTWARE)    { return "software"; }
+	if (cause & RESET_PIN)         { return "pin"; }
+	return cause == 0u ? "unknown" : "other";
+}
+
+/* Topic, last-will payload and reset cause. Once per boot: the cause is cleared on read. */
+static void status_identity_init(void)
+{
+	const uwb_config_t *u = uwb_config_get();
+	uint32_t cause = 0u;
+
+	if (is_gateway) {
+		snprintf(status_topic, sizeof(status_topic), POS_JSON_TOPIC_STATUS "gw");
+	} else {
+		snprintf(status_topic, sizeof(status_topic), POS_JSON_TOPIC_STATUS "%u",
+			 (unsigned int)u->anchor_id);
+	}
+	(void)node_status_offline_json(will_msg, sizeof(will_msg), is_gateway, u->anchor_id);
+	if (is_gateway) {
+		snprintf(cmd_topic, sizeof(cmd_topic), POS_JSON_TOPIC_CMD "gw");
+		snprintf(ack_topic, sizeof(ack_topic), POS_JSON_TOPIC_ACK "gw");
+	} else {
+		snprintf(cmd_topic, sizeof(cmd_topic), POS_JSON_TOPIC_CMD "%u", (unsigned int)u->anchor_id);
+		snprintf(ack_topic, sizeof(ack_topic), POS_JSON_TOPIC_ACK "%u", (unsigned int)u->anchor_id);
+	}
+	node_cmd_init(is_gateway, u->anchor_id);
+
+	if (hwinfo_get_reset_cause(&cause) == 0) {
+		reset_name = reset_cause_name(cause);
+		(void)hwinfo_clear_reset_cause();
+	}
+}
+
+/* Gather what `sync stats`, `sync tau show` and `net show` print into one struct. Reads other
+ * modules' counters from this thread without locking: each is a single word that only grows,
+ * and a report that is one tick stale is not a defect. */
+static void status_collect(struct node_status *s)
+{
+	const uwb_config_t *u = uwb_config_get();
+
+	memset(s, 0, sizeof(*s));
+	s->is_gateway = is_gateway;
+	s->anchor_id  = u->anchor_id;
+	s->short_addr = uwb_config_short_addr(u);
+	s->uptime_s   = (uint32_t)(k_uptime_get() / 1000);
+	s->reset      = reset_name;
+	s->fw         = __DATE__ " " __TIME__;
+
+	struct net_if *iface = net_if_get_first_wifi();
+
+	if (iface != NULL) {
+		struct wifi_iface_status st = {0};
+
+		if (net_mgmt(NET_REQUEST_WIFI_IFACE_STATUS, iface, &st, sizeof(st)) == 0 &&
+		    st.state >= WIFI_STATE_ASSOCIATED) {
+			s->has_rssi = true;
+			s->rssi_dbm = st.rssi;
+		}
+	}
+	s->cmd_enabled = cmd_key_is_set();
+	s->challenge   = node_cmd_challenge();
+	s->wifi_up  = n_wifi_up;
+	s->mqtt_up  = n_mqtt_up;
+	s->obs_pub  = n_obs_pub;
+	s->obs_drop = n_obs_pub_drop;
+
+	if (is_gateway) {
+		uint32_t root = 0u;
+		int32_t omin = 0, omax = 0, olast = 0, arm = 0;
+
+		s->has_master = true;
+		ccp_master_stats(&s->ccp_sent, &s->ccp_dropped, &root, &omin, &omax, &olast, &arm);
+		return;
+	}
+
+	const struct sync_model *m = ccp_slave_model();
+	uint32_t gap = 0u, paired = 0u, no_ann = 0u, ccp_root = 0u;
+
+	s->has_sync     = true;
+	s->sync_valid   = sync_model_error_dtu(m, 0u) != UINT32_MAX;
+	s->sigma_dtu    = sync_model_sigma_dtu(m);
+	s->jitter_dtu   = sync_model_jitter_est_dtu(m);
+	s->rms_dtu      = sync_model_residual_rms_dtu(m);
+	s->max_dtu      = sync_model_residual_max_dtu(m);
+	s->n_obs        = sync_model_n_obs(m);
+	s->rebaselines  = sync_model_rebaseline_count(m);
+	s->sync_gaps    = sync_model_miss_count(m);
+	s->outliers     = sync_model_outlier_count(m);
+	s->drift_ppb    = sync_model_drift_ppb(m);
+	ccp_slave_stats(&s->ccp_rx, &gap, &s->ccp_rejected, &ccp_root);
+	ccp_slave_stats_ex(&paired, &no_ann);
+	s->clock_fresh  = ccp_slave_clock_fresh();
+	s->tau_used_dtu = ccp_slave_get_tau();
+	s->tau_mode     = uwb_config_sync_tau_mode_name(u->sync_tau_mode);
+	s->tau_link     = u->sync_link_valid;
+
+	uint32_t bad = 0u;
+
+	blink_rx_stats(&s->blink_rx, &s->blink_no_sync, &bad, &s->blink_sent);
+	s->blink_stale = blink_rx_stale_count();
+}
+
+/* Publish one status report. Retained, QoS 0: it is state, not an event, and the last-will
+ * (QoS 1, retained) overwrites it with online=0 if this node vanishes. Returns false if the
+ * connection died, like every other publisher here. */
+static bool status_publish(void)
+{
+	struct node_status s;
+
+	status_collect(&s);
+	int n = node_status_json(payload_buf, sizeof(payload_buf), &s);
+
+	if (n < 0) {
+		LOG_ERR("status report does not fit — not published");
+		return true;                 /* a formatting bug, not a network failure */
+	}
+	if (publish(status_topic, payload_buf, MQTT_QOS_0_AT_MOST_ONCE, true) != 0) {
+		LOG_WRN("status publish failed - reconnecting");
+		return false;
+	}
+	return true;
+}
+
 /* Subscribe to the observation topic. GATEWAY only.
  *
  * Called from mqtt_bring_up(), which is what makes RE-subscribing after a
@@ -598,6 +825,77 @@ static bool subscribe_observations(void)
 	}
 
 	LOG_INF("subscribed to %s", POS_JSON_TOPIC_BLINK);
+	return true;
+}
+
+
+/* Subscribe to this node's command topic. BEST EFFORT, unlike subscribe_observations(): a node
+ * that cannot be commanded is a degraded node, not a deaf one -- it still measures and publishes,
+ * so a broker ACL that refuses the topic must not put it into a reconnect loop. */
+static void subscribe_commands(void)
+{
+	struct mqtt_topic topic = {
+		.topic = {
+			.utf8 = (uint8_t *)cmd_topic,
+			.size = strlen(cmd_topic),
+		},
+		.qos = MQTT_QOS_0_AT_MOST_ONCE,
+	};
+	struct mqtt_subscription_list list = {
+		.list        = &topic,
+		.list_count  = 1u,
+		.message_id  = next_msg_id++,
+	};
+
+	if (next_msg_id == 0u) {
+		next_msg_id = 1u;
+	}
+	suback_seen = false;
+	if (mqtt_subscribe(&client, &list) != 0) {
+		LOG_WRN("command subscription failed - remote commands unavailable");
+		return;
+	}
+	for (int i = 0; i < 30 && !suback_seen && mqtt_connected; i++) {
+		struct zsock_pollfd fds = {
+			.fd     = client.transport.tls.sock,
+			.events = ZSOCK_POLLIN,
+		};
+
+		if (zsock_poll(&fds, 1, 100) > 0 && mqtt_input(&client) != 0) {
+			break;
+		}
+	}
+	if (suback_seen) {
+		LOG_INF("subscribed to %s", cmd_topic);
+	} else {
+		LOG_WRN("no SUBACK for %s - remote commands may be unavailable", cmd_topic);
+	}
+}
+
+/* Act on a command the receive callback parked. Returns false only if the connection died. */
+static bool process_command(void)
+{
+	char ack[96];
+
+	if (!cmd_pending) {
+		return true;
+	}
+	struct node_cmd_result r = node_cmd_handle((const char *)cmd_payload, cmd_len, ack, sizeof(ack));
+
+	cmd_pending = false;
+	if (r.ack_len > 0 && publish(ack_topic, ack, MQTT_QOS_0_AT_MOST_ONCE, false) != 0) {
+		LOG_WRN("ack publish failed - reconnecting");
+		return false;
+	}
+	if (r.status_now && !status_publish()) {
+		return false;
+	}
+	if (r.reboot) {
+		LOG_WRN("remote reboot requested");
+		/* The ack and the final status must leave the socket before the chip resets. */
+		k_msleep(500);
+		sys_reboot(SYS_REBOOT_COLD);
+	}
 	return true;
 }
 
@@ -664,10 +962,44 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 		client.password = NULL;
 	}
 
+	/* Last will: the broker publishes online=0 on our status topic if the connection dies
+	 * without a DISCONNECT -- which is how a node that lost power or crashed becomes visible
+	 * to the server. Retained, so it also answers a subscriber that arrives later. */
+	{
+		static struct mqtt_topic will_topic;
+		static struct mqtt_utf8 will_message;
+
+		will_topic.topic.utf8 = (uint8_t *)status_topic;
+		will_topic.topic.size = strlen(status_topic);
+		will_topic.qos        = MQTT_QOS_1_AT_LEAST_ONCE;
+		will_message.utf8     = (uint8_t *)will_msg;
+		will_message.size     = strlen(will_msg);
+		client.will_topic     = &will_topic;
+		client.will_message   = &will_message;
+		client.will_retain    = 1u;
+	}
+
 	ret = mqtt_connect(&client);
 	if (ret) {
 		LOG_WRN("mqtt_connect failed (%d)", ret);
 		return false;
+	}
+
+	/* TCP_NODELAY. Zephyr's TCP implements Nagle (tcp.c: tcp_send_queued_data)
+	 * and holds a sub-MSS segment while earlier data is un-ACKed. Every
+	 * publish here is one small record (~100 B) and observations are 5 Hz
+	 * per anchor, so a late ACK delays the next publish and releases it in a
+	 * burst with its neighbours. The TLS socket forwards non-TLS option
+	 * levels to the underlying TCP socket (sockets_tls.c). Non-fatal: if it
+	 * fails the link still works with the old latency. */
+	{
+		int one = 1;
+		int nd = zsock_setsockopt(client.transport.tls.sock, IPPROTO_TCP,
+					  TCP_NODELAY, &one, sizeof(one));
+
+		if (nd != 0) {
+			LOG_WRN("TCP_NODELAY not set (%d)", errno);
+		}
 	}
 
 	/* Wait for CONNACK, pumping the socket. 10 s is generous for a LAN
@@ -705,7 +1037,10 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 		return false;
 	}
 
+	subscribe_commands();
+
 	g_state = ST_CONNECTED;
+	n_mqtt_up++;
 	return true;
 }
 
@@ -798,6 +1133,7 @@ static void uplink_thread(void *a, void *b, void *c)
 	ARG_UNUSED(c);
 
 	is_gateway = (uwb_config_get()->mode == UWB_MODE_GATEWAY);
+	status_identity_init();
 
 	if (!net_config_is_provisioned(cfg)) {
 		/* Logged exactly once. An unprovisioned gateway is a normal
@@ -865,6 +1201,10 @@ static void uplink_thread(void *a, void *b, void *c)
 				publish_anchor_map();
 			}
 
+			/* First status report right away (it overwrites the last-will's
+			 * online=0 from a previous drop), then every NODE_STATUS_PERIOD_S. */
+			int64_t next_status_ms = k_uptime_get();
+
 			while (mqtt_connected && wifi_associated) {
 				struct zsock_pollfd fds = {
 					.fd = client.transport.tls.sock,
@@ -896,6 +1236,21 @@ static void uplink_thread(void *a, void *b, void *c)
 					}
 				} else if (!drain_blink_queue()) {
 					break;
+				}
+
+				if (!process_command()) {
+					break;
+				}
+
+				if (k_uptime_get() >= next_status_ms) {
+					next_status_ms = k_uptime_get() +
+							 (int64_t)NODE_STATUS_PERIOD_S * 1000;
+					/* A new challenge with every periodic report, so a signed command
+					 * stays valid for at most two periods and a captured one is dead. */
+					node_cmd_rotate();
+					if (!status_publish()) {
+						break;
+					}
 				}
 			}
 

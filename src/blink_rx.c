@@ -27,6 +27,7 @@ static uint32_t n_blink_rx;
 static uint32_t n_blink_no_sync;
 static uint32_t n_blink_bad;
 static uint32_t n_blink_sent;
+static uint32_t n_blink_stale;
 
 void blink_rx_init(const uwb_config_t *cfg)
 {
@@ -35,6 +36,12 @@ void blink_rx_init(const uwb_config_t *cfg)
 	n_blink_no_sync  = 0u;
 	n_blink_bad      = 0u;
 	n_blink_sent     = 0u;
+	n_blink_stale    = 0u;
+}
+
+uint32_t blink_rx_stale_count(void)
+{
+	return n_blink_stale;
 }
 
 bool blink_rx_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
@@ -53,6 +60,23 @@ bool blink_rx_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
 	if (blink_frame_parse(buf, plen, &bf) != 0) {
 		n_blink_bad++;
 		LOG_DBG("{\"blink\":{\"verdict\":\"malformed\"}}");
+		return true;
+	}
+
+	/* The clock must be FRESH, not just present. sync_model_to_master() keeps
+	 * extrapolating a converged model for as long as no CCP arrives to count a
+	 * gap, so a link that has been silent for minutes still converts here
+	 * "successfully" into a time that has drifted by however far the two
+	 * crystals walked apart. The age bound is the existing holdover policy
+	 * (SYNC_MISS_MAX superframes) expressed in time. A stale refusal also
+	 * counts as no_sync, so `no_sync == rx` still reads as "CCP link down";
+	 * `stale` says it was silence rather than a model that never converged. */
+	if (!ccp_slave_clock_fresh()) {
+		n_blink_no_sync++;
+		n_blink_stale++;
+		LOG_DBG("{\"blink\":{\"tag\":\"0x%04X\",\"seq\":%u,"
+			"\"verdict\":\"stale clock (%u ms since the last CCP) -- "
+			"dropped\"}}", bf.src_addr, bf.seq, ccp_slave_clock_age_ms());
 		return true;
 	}
 

@@ -91,6 +91,14 @@ int apos_table_find_eui(const struct apos_table *t,
 int apos_table_add_meas(struct apos_table *t, uint8_t from, uint8_t to,
 			int32_t mean_mm, uint16_t sd_mm, uint8_t n_ok);
 
+/* The raw directed measurement (from -> to), if one exists with at least
+ * min_n_ok kept samples and a positive mean. Unlike symmetrise() this does not
+ * average the two directions, which is what a one-way link (the gateway ranging
+ * an anchor itself) needs: the number it reports is that exchange alone. Either
+ * output pointer may be NULL. */
+bool apos_table_get_meas(const struct apos_table *t, uint8_t from, uint8_t to,
+			 uint8_t min_n_ok, int32_t *mean_mm, uint16_t *sd_mm);
+
 /* Reduce the directed measurements to undirected edges in metres.
  *
  * Measurements with n_ok < min_n_ok are discarded as too thin to trust. A pair

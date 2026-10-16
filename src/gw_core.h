@@ -150,7 +150,8 @@
  * those 11 only ever coexisted with zero other tags. That is not a regression
  * introduced here -- it is the pre-existing physical limit finally being
  * allocated deliberately instead of by arrival order. It is also more evidence
- * for the TDoA migration, where ~144 blink slots make the tension vanish.
+ * for the TDoA migration, where ~359 blink slots (BLINK_N_SLOTS at PLEN_256; it was 144 at PLEN_1024)
+ * make the tension vanish -- GW_MAX_SEATS (128) is the binding cap either way.
  *
  * This replaces an earlier GW_SCHED_OVERSUB_SF hack, which allowed a bounded
  * overshoot for IDLE joins. That was papering over this problem: it let a few
@@ -276,6 +277,19 @@ bool gw_core_join(struct gw_core_ctx *c, const uint8_t eui[UWB_FRAME_EUI_LEN],
  * got. */
 void gw_core_keepalive(struct gw_core_ctx *c, uint16_t short_addr,
                        uint8_t req_tier, struct gw_grant *out);
+
+/* Refresh a live seat's lease WITHOUT re-tiering: proof of life that is not a
+ * KEEPALIVE. tdoa_gw calls it for every BLINK observation an anchor reports,
+ * because in a BLINK cell the KEEPALIVE is a single unacknowledged CAP frame
+ * and one loss expires an IDLE seat: the tag renews at 50 superframes against
+ * a 75-superframe lease, so it gets exactly one chance per lease. A tag that
+ * is still blinking is alive, whatever happened to its KEEPALIVE.
+ *
+ * Only the seat currently holding `short_addr` is touched. Addresses are
+ * quarantined (alloc_short_addr()), so a straggler observation from an
+ * expired address finds no seat and is a no-op, never someone else's lease.
+ * Returns whether a seat was found. */
+bool gw_core_touch(struct gw_core_ctx *c, uint16_t short_addr);
 
 void gw_core_release(struct gw_core_ctx *c, uint16_t short_addr);
 

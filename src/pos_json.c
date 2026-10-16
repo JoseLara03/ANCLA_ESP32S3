@@ -165,8 +165,20 @@ int pos_json_anchors(char *buf, size_t len, const struct apos_survey *s)
 	}
 	off = (size_t)n;
 
+	uint8_t emitted = 0;
+
 	for (uint8_t k = 0; k < s->n_nodes; k++) {
 		bool is_ref = (k == 0);
+
+		/* The gateway takes part in the survey geometry (short address
+		 * 0x0000, the CCP root) but it is NOT a BLINK receiver and not an
+		 * anchor the platform should draw: publishing it would add a phantom
+		 * anchor that never reports. It stays in the stored survey because the
+		 * static sync links are derived from its position. node[0] is always
+		 * the gauge origin, which is an anchor, so is_ref is never skipped. */
+		if (s->node[k].short_addr == POS_JSON_GATEWAY_ADDR) {
+			continue;
+		}
 
 		/* node[0] is the gauge origin by construction (apos_store.h),
 		 * so it is the axis anchor and the only one carrying a real
@@ -188,7 +200,7 @@ int pos_json_anchors(char *buf, size_t len, const struct apos_survey *s)
 			     "\"isAxis\":%s,\"isReferenceAxis\":%s,"
 			     "\"latitude\":%.8f,\"longitude\":%.8f,"
 			     "\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}",
-			     (k == 0) ? "" : ",",
+			     (emitted == 0) ? "" : ",",
 			     (unsigned int)s->node[k].short_addr,
 			     is_ref ? "true" : "false",
 			     is_ref ? "true" : "false",
@@ -201,6 +213,7 @@ int pos_json_anchors(char *buf, size_t len, const struct apos_survey *s)
 			return -1;
 		}
 		off += (size_t)n;
+		emitted++;
 	}
 
 	n = snprintf(buf + off, len - off, "]}");

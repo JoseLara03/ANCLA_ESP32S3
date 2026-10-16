@@ -23,6 +23,7 @@
 #include "apos_gw.h"
 #include "blink_sched.h"
 #include "ccp_master.h"
+#include "ccp_sched.h"
 #include "gw_core.h"
 #include "gw_selftau.h"
 #include "mac_budget.h"
@@ -51,11 +52,14 @@ LOG_MODULE_REGISTER(uwb_gateway, ANCLA_LOG_LEVEL);
  * than the nRF5 anchor's 2000. */
 #define RX_TO_TX_DLY_UUS 2000u
 
-/* Stop servicing and arm the beacon when this close to it. MAC-only keeps this
- * small: worst-case service latency is one GRANT (RX_TO_TX_DLY_UUS + ~1.3 ms
- * airtime + the bounded TXFRS wait), not the nRF5 gateway's 8000, which had to
- * cover a discovery stagger this node no longer performs. */
-#define BEACON_ARM_MARGIN_UUS 5000u
+/* BEACON_ARM_MARGIN_UUS lives in uwb_mac.h: apos_node.c needs it too, to keep
+ * an anchor's survey replies out of the window in which this loop is deaf. */
+
+/* The survey / self-tau steps must find room between the post-CCP TX guard
+ * (ccp_sched.h, CCP_SCHED_GW_TX_EARLIEST_NS) and the beacon arm. */
+BUILD_ASSERT(CCP_SCHED_GW_TX_EARLIEST_NS / 1000u + APOS_GW_STEP_BUDGET_UUS +
+		     BEACON_ARM_MARGIN_UUS < T_SUPERFRAME_UUS,
+	     "no room in the superframe for a survey step after the CCP guard");
 
 /* Bound for the post-dwt_starttx() TXFRS wait, shared by both tx_beacon()'s
  * and send_grant()'s delayed TX. Covers the scheduled delay itself plus
@@ -606,22 +610,23 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 		 * watchdog without a reason. */
 		tdoa_gw_step(&ctx, k_uptime_get_32());
 
-		/* B14 Fase B: resets the "already took an auto tau turn this
-		 * superframe" latch. Same placement reasoning as tdoa_gw_step()
-		 * just above -- once per superframe, here rather than in the
-		 * inner for(;;), which runs several times per superframe and
-		 * would otherwise let the round-robin race far ahead of its
-		 * intended ~1 exchange/anchor/N-superframes rate. */
-		gw_selftau_auto_new_superframe();
-
 		int64_t loop_entry_ms = k_uptime_get();
 		uint32_t loop_entry_systime = dwt_readsystimestamphi32();
+
+		/* No survey or self-tau transmission before this instant: the
+		 * slaves are still busy with the CCP and would miss the whole
+		 * PLEN_256 preamble (ccp_sched.h, CCP_SCHED_GW_TX_EARLIEST_NS).
+		 * beacon_tx_ts is the beacon that just went out -- or, after a
+		 * missed beacon, "now", which only makes the guard later. */
+		uint32_t gw_tx_ok = (uint32_t)(beacon_tx_ts >> 8) +
+				    CCP_SCHED_GW_TX_EARLIEST_HI32;
 
 		for (;;) {
 			CRUMB(GW_CRUMB_LOOP_TOP);
 
 			uint32_t now = dwt_readsystimestamphi32();
 			int32_t to_beacon = (int32_t)(next_beacon - now);
+			int32_t to_tx_ok = (int32_t)(gw_tx_ok - now);
 
 			/* Stall watchdog, BEFORE the break test it exists to
 			 * catch failing. */
@@ -674,8 +679,16 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 			 * needed before the step; it is re-read afterwards
 			 * because the step may have transmitted, and arming
 			 * the RX window from a stale figure would push its
-			 * expiry past the beacon. */
-			if (apos_gw_busy()) {
+			 * expiry past the beacon.
+			 *
+			 * Neither step may transmit before gw_tx_ok (the slaves
+			 * are still finishing the CCP); the RX window below is
+			 * cut short so the loop comes back exactly then. */
+			bool step_wanted = apos_gw_busy() || gw_selftau_busy();
+
+			if (to_tx_ok > 0) {
+				/* Too soon after the CCP: wait for the RX window. */
+			} else if (apos_gw_busy()) {
 				int32_t reserve = (int32_t)UUS_TO_HI32(
 					BEACON_ARM_MARGIN_UUS +
 					APOS_GW_STEP_BUDGET_UUS);
@@ -696,7 +709,7 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 						break;
 					}
 				}
-			} else if (gw_selftau_has_work()) {
+			} else if (gw_selftau_busy()) {
 				/* `else`: at most one of the two on any given
 				 * iteration, same as this loop already does for
 				 * every other transmit site. gw_selftau_step()'s
@@ -704,12 +717,10 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 				 * exchange), unlike apos_gw_step()'s variable
 				 * budget above, so the reserve check alone is
 				 * enough -- there is no "avail_uus" to compute.
-				 * gw_selftau_has_work(), not gw_selftau_busy():
-				 * since B14 Fase B, gw_selftau_step() also
-				 * drives the automatic round-robin, which
-				 * gw_selftau_busy() (manual-only, by design --
-				 * `sync tau measure`'s busy check must not trip
-				 * on it) does not see. */
+				 * Gated on gw_selftau_busy(): only a MANUAL
+				 * `sync tau measure` ever has work now -- the
+				 * automatic round-robin was retired 2026-10-12, so
+				 * an idle gateway transmits no ranging poll at all. */
 				int32_t reserve = (int32_t)UUS_TO_HI32(
 					BEACON_ARM_MARGIN_UUS +
 					GW_SELFTAU_STEP_BUDGET_UUS);
@@ -734,8 +745,21 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 			 * every time. */
 			uint32_t span_hi32 =
 				(uint32_t)to_beacon - UUS_TO_HI32(BEACON_ARM_MARGIN_UUS);
+
+			/* A step is waiting on the post-CCP guard: expire the
+			 * window at gw_tx_ok instead, or on a quiet network the
+			 * next loop top would only come after the beacon. */
+			if (step_wanted && to_tx_ok > 0 &&
+			    (uint32_t)to_tx_ok < span_hi32) {
+				span_hi32 = (uint32_t)to_tx_ok;
+			}
 			uint32_t rx_to_uus =
 				(uint32_t)(((uint64_t)span_hi32 << 8) / UUS_TO_DWT_TIME);
+
+			/* 0 would disable the timeout altogether. */
+			if (rx_to_uus == 0u) {
+				rx_to_uus = 1u;
+			}
 
 			CRUMB(GW_CRUMB_RX_ARM);
 			dwt_setpreambledetecttimeout(0);

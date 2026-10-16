@@ -32,4 +32,11 @@
 #define ENODATA 61
 #endif
 
+#ifndef ENOTSUP
+#define ENOTSUP 129
+#endif
+#ifndef EADDRINUSE
+#define EADDRINUSE 100
+#endif
+
 #endif /* ANCLA_CCP_FRAME_TEST_ERRNO_SHIM_H */

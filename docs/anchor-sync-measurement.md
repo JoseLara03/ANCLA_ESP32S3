@@ -83,8 +83,9 @@ five noise amplitudes, so the factor cannot drift unnoticed.
   precisely what would inflate the jitter.
 - **Clear of metal**, and **all tags powered off**, for the same reason as the
   calibration procedure: interference corrupts individual samples.
-- The PHY is the frozen one (channel 5, PLEN_1024, PAC32, code 9, 850 kbps,
-  SFD 4z, STS off). Both boards run it by construction; nothing to configure.
+- The PHY is the frozen one (channel 5, PLEN_256, PAC16, code 9, 850 kbps,
+  SFD 4z, STS off; it was PLEN_1024/PAC32 until 2026-10-12, and every
+  measurement below dated before that was taken at PLEN_1024). Both boards run it by construction; nothing to configure.
 
 ## 2. What is implemented, and what is not
 

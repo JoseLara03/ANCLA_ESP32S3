@@ -346,6 +346,15 @@ void gw_core_keepalive(struct gw_core_ctx *c, uint16_t short_addr,
     }
 }
 
+bool gw_core_touch(struct gw_core_ctx *c, uint16_t short_addr)
+{
+    int idx = find_seat_by_addr(c, short_addr);
+
+    if (idx < 0) return false;
+    c->seats[idx].lease_remaining = GW_LEASE_SF;
+    return true;
+}
+
 void gw_core_release(struct gw_core_ctx *c, uint16_t short_addr)
 {
     int idx = find_seat_by_addr(c, short_addr);

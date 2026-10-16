@@ -77,7 +77,7 @@
  * the poll's SHR to the last chip of the response's FCS.
  *
  * Deliberately NOT `poll_frame + turnaround + resp_frame`. That form
- * DOUBLE-COUNTS both SHRs and inflates the result by ~2.1 ms at PLEN_1024 --
+ * DOUBLE-COUNTS both SHRs and inflates the result by ~2.1 ms at PLEN_1024 (~0.54 ms at PLEN_256) --
  * it is the error the design spec was first written with. The turnaround
  * constant (POLL_RX_TO_RESP_TX_DLY_UUS) is measured RMARKER to RMARKER, and
  * each RMARKER is already at the end of its own SHR, so the span is:
@@ -123,14 +123,13 @@
 
 /* ---- The frozen PHY ----------------------------------------------------
  *
- * Mirrors uwb_phy.h. Frozen 2026-08-25: TDoA carries the capacity target at
- * PLEN_1024, so there is no reason to spend the 6 dB of preamble integration
- * gain that shortening it would cost. Freezing also keeps every unit's
- * antenna-delay calibration valid.
+ * Mirrors uwb_phy.h. Frozen 2026-08-25 at PLEN_1024/PAC32; changed 2026-10-12
+ * to PLEN_256/PAC16 (shortens the SHR to ~268.7 us, trading ~6 dB of preamble
+ * integration gain for airtime and capacity). Must track uwb_phy.h.
  */
-#define MAC_PHY_PLEN_SYM    1024u
+#define MAC_PHY_PLEN_SYM    256u
 #define MAC_PHY_SFD_SYM     8u
-#define MAC_PHY_PAC_SYM     32u
+#define MAC_PHY_PAC_SYM     16u
 #define MAC_PHY_BITRATE     850000u
 
 /* ---- Runtime / host-test API -------------------------------------------

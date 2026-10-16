@@ -25,6 +25,7 @@
 #include "apos_geom.h"
 #include "apos_node.h"   /* APOS_ENUM_WINDOW_MS */
 #include "apos_table.h"
+#include "sync_link.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -97,9 +98,10 @@ enum apos_gw_phase {
  *   - airtime of the largest APOS frame this module transmits. That is
  *     APOS_LEN_SETPOS (25 bytes) + FCS_LEN once Task 12 lands, not today's
  *     15-byte SURVEY_BEGIN -- sized for the largest so the constant does not
- *     need revisiting. At PLEN_1024 the preamble alone is ~1.05 ms and 27
- *     bytes at 850 kbps with 4z overhead is ~0.4 ms: ~1.45 ms -> ~1420 uus,
- *     rounded to 1500.
+ *     need revisiting. Sized at PLEN_1024 (preamble ~1.05 ms, 27
+ *     bytes at 850 kbps with 4z overhead ~0.4 ms: ~1.45 ms -> ~1420 uus,
+ *     rounded to 1500); at the current PLEN_256 the preamble is ~0.27 ms,
+ *     so 1500 is now conservative. Not re-derived or tightened.
  *   - 700 uus of margin for the SPI register writes around the TX and for
  *     rounding.
  * 7800 + 1500 + 700 = 10000 uus (~10.3 ms), against a 200 ms superframe.
@@ -226,6 +228,38 @@ enum apos_gw_phase {
  * solved y by 5x, with rms_mm staying at 0. */
 #define APOS_ACCEPT_GAUGE_COLLINEARITY 0.10f
 
+/* ---- B14 static survey: the gateway as a node of its own survey ----------
+ *
+ * In a 3D survey the gateway (CCP root, short address 0x0000) is a fifth node.
+ * It ranges every anchor ITSELF -- gateway -> anchor over SS-TWR, the primitive
+ * gw_selftau already proved on hardware -- so no RANGE_CMD frame and no new
+ * responder path on the gateway exist for it.
+ *
+ * DELIBERATE DEVIATION from "measure both directions of every pair": the
+ * anchor -> gateway direction is NOT measured. It would need the gateway to
+ * answer an anchor's poll with a delayed TX from the loop that owns the
+ * beacon -- a new production responder path, with its own beacon-collision
+ * hazard, on the one board whose timing everything else is derived from. What
+ * the reverse direction buys is smaller than it looks: antenna-delay error is
+ * EXACTLY reciprocal in SS-TWR (swapping initiator and responder gives the
+ * identical expression), so a second direction cancels none of it; it would
+ * cancel only the residual clock-offset error. A gateway edge is therefore
+ * one-way, carries apos_table's one-way sd inflation, and the fit's redundancy
+ * is unchanged (10 edges against 9 free parameters for five nodes).
+ * See docs/sync-multihop-design.md. */
+
+/* Exchanges the gateway attempts per anchor, and the most it runs in one
+ * apos_gw_step() call. A burst is bounded by the time left before the beacon
+ * (one exchange needs GW_SELFTAU_STEP_BUDGET_UUS in hand), and yields between
+ * exchanges so the shell and log threads are not starved. */
+#define APOS_GW_LOCAL_ATTEMPTS 30u
+#define APOS_GW_LOCAL_BURST    8u
+
+/* Per-edge ranging error assumed when judging the gauge tetrahedron: the larger
+ * of the measured sd and this systematic floor (antenna-delay residual), in
+ * metres. See apos_geom.h's APOS_GAUGE_UP_NOISE_K. */
+#define APOS_GAUGE_RANGE_ERR_FLOOR_M 0.03f
+
 struct apos_gw_status {
 	uint8_t  phase;        /* enum apos_gw_phase */
 	uint16_t session;
@@ -235,6 +269,8 @@ struct apos_gw_status {
 	uint8_t  applied_ok;
 	uint8_t  applied_fail;
 	bool     have_result;
+	bool     gateway_node;  /* this survey includes the gateway */
+	bool     hold;          /* fix publication suspended, see apos_gw_publish_hold() */
 };
 
 void apos_gw_init(void);
@@ -343,11 +379,65 @@ int apos_gw_result_redundancy(void);
  * -EBUSY if a survey runs, -ENODATA if there is no result to apply, or
  * -EPERM if the result failed acceptance and force was not given.
  *
+ * Static-install flow (3D, gateway a node of the survey), in this order:
+ *   1. an apply-in-progress marker is persisted and fix publication is SUSPENDED
+ *      (apos_gw_publish_hold()) -- before any anchor is touched;
+ *   2. SETPOS to every anchor, then SETTAU (the static sync link) to every
+ *      anchor, each acknowledged and checked against what was sent;
+ *   3. only if EVERY anchor acknowledged: the gateway persists its survey and
+ *      links and clears the marker, and the hold lifts. Otherwise the gateway
+ *      keeps its PREVIOUS survey, the marker stays set and fixes stay suspended
+ *      until a later apply completes. The anchors are NOT rolled back -- there is
+ *      no distributed atomicity here -- so recovery is to re-apply, which is
+ *      idempotent, with a new generation.
+ * Additional returns in this flow: -EDOM when the four gauge anchors do not
+ * span a 3D frame (coplanar or collinear), which `force` does NOT override, and
+ * -ENODATA also when a link could not be derived for every anchor.
+ *
  * `force` overrides ACCEPTANCE only. It does not, and must not, suppress the
  * unverified-mesh warning: that condition is a property of the array's edge
  * count, not an operator decision, and it is loudest exactly where the result
  * looks best. See apos_gw_result_unverified(). */
 int apos_gw_start_apply(bool force);
+
+
+/* ---- static survey outputs ---------------------------------------------- */
+
+/* True while position fixes must NOT be published as valid: an apply is in
+ * flight, an apply was interrupted or incomplete (anchors may hold a mix of
+ * survey generations, so a fix would combine geometry and tau from different
+ * ones), or the marker saying so is unreadable. Cleared only by an apply that
+ * every anchor acknowledged and whose result the gateway then persisted.
+ * Consulted by tdoa_gw; safe to call from any thread (plain flag reads). */
+bool apos_gw_publish_hold(void);
+
+/* Why, for the console and for `blink stats`: "none", "apply-in-progress",
+ * "apply-incomplete", or "interrupted-apply" (found on flash at boot). Never
+ * NULL. */
+const char *apos_gw_hold_reason(void);
+
+/* This gateway's own EUI-64 (8 bytes), or NULL when the board has none. */
+const uint8_t *apos_gw_eui(void);
+
+/* Whether the last/current survey included the gateway as a node. */
+bool apos_gw_survey_has_gateway(void);
+
+/* The links derived from the last solve (not yet applied), n of them. */
+uint8_t apos_gw_links(const struct sync_link **out);
+
+/* The gauge tetrahedron's quality for the last 3D solve. Returns false when
+ * there was none. A degenerate gauge (coplanar or collinear) is a HARD refusal:
+ * `apos apply force` does not override it, because forcing it would install a
+ * coordinate frame whose z (and whose mirror side) is noise. */
+bool apos_gw_gauge_quality(struct apos_gauge_quality *out);
+bool apos_gw_gauge_degenerate(void);
+
+/* Whether every derived link was checked against a direct measurement and
+ * agreed within SYNC_LINK_GATE_MM. A property of the last solve. */
+bool apos_gw_links_verified(void);
+
+/* Generation the last successful apply installed (0 = none). */
+uint32_t apos_gw_generation(void);
 
 /* Shift z on every subsequent solve, moving z = 0 off the plane through the
  * three gauge anchors and onto the floor. Applied at solve time, so changing it

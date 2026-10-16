@@ -59,31 +59,12 @@ void ccp_slave_init(void);
  * whole DTU, and handing it a hi32 value would throw away the bottom 8 bits --
  * 255 DTU, ~4 ns, against a 1 ns gate.
  *
- * `own_short_addr` (B14 Fase B, Task 4) is this anchor's own wire address
- * (uwb_config_short_addr()) -- needed to tell whether a v2 CCP's
- * tau_meas_anchor is addressed to THIS board, since ccp_slave.c otherwise
- * carries no uwb_config dependency at all (deliberately -- see the
- * module comment). `twr_tau_mode_active` is whether the CURRENT
- * sync_tau_mode is TWR or AUTO (uwb_config_get()->sync_tau_mode ==
- * SYNC_TAU_MODE_TWR/_AUTO), resolved by the CALLER for the same reason:
- * this file stays config-agnostic, matching how ccp_slave_set_tau()'s
- * value is already resolved externally (sync_shell.c's apply_tau_live())
- * rather than read from uwb_config here. The filter itself (tau_filter.c)
- * always runs on every v2 frame addressed to this anchor regardless of
- * this flag, so switching INTO twr/auto mode never has to "warm up" --
- * only whether its output is actually APPLIED (ccp_slave_set_tau()) is
- * gated on it.
- *
- * `survey_tau_dtu` (B14 Fase B, Task 5, FR-9) is `cfg->sync_tau_dtu` --
- * where a stale TWR value degrades BACK to, checked once per parsed CCP
- * regardless of that frame's own content (see ccp_slave.c's
- * check_twr_freshness()). Passed rather than read from uwb_config here
- * for the same config-agnostic reason as the two parameters above. Always
- * safe to pass even when TWR was never live: the check is a no-op unless
- * the currently-applied tau IS TWR-sourced. */
-bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
-		     uint16_t own_short_addr, bool twr_tau_mode_active,
-		     int32_t survey_tau_dtu);
+ * The CCP v2 `tau_meas_*` fields are NOT consumed: the automatic TWR round-robin
+ * was retired 2026-10-12 and the flight-time compensation is the static link
+ * installed by `apos apply` (apos_node.c -> ccp_slave_set_tau()). Accepting a
+ * measurement off the air would let a stray or older master move a calibrated
+ * installation. */
+bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts);
 
 /* The live model, for the `sync` shell command. Read-only: on a SLAVE, main()
  * is left at the default (preemptible) priority -- see main.c's comment on why
@@ -183,41 +164,17 @@ void ccp_slave_set_tau(int32_t tau_dtu);
 /* The tau currently applied to the live model. */
 int32_t ccp_slave_get_tau(void);
 
-/* ---- B14 Fase B, Task 4: TWR filter telemetry (FR-10) -------------------
+/* ---- Clock freshness ----------------------------------------------------
  *
- * All read-only, all safe from the shell thread with no locking: each is a
- * single plain-old-data field the SLAVE loop only ever REPLACES wholesale
- * (never partially updates across multiple stores), same reasoning
- * ccp_slave_model()'s own comment gives for why a const read needs no
- * fence here.
- */
+ * Whether the last ACCEPTED CCP is recent enough for a BLINK to be converted
+ * into the master's time base (sync_clock_age_ok(), sync_model.h). A correct
+ * tau does not authorise converting with a clock nobody has refreshed: with the
+ * link silent, sync_model_to_master() keeps extrapolating, and the silence only
+ * becomes visible to it when a CCP finally arrives to count the gap. Read by
+ * blink_rx.c on every BLINK, from the SLAVE loop itself. */
+bool ccp_slave_clock_fresh(void);
 
-/* True if this anchor's tau IS CURRENTLY the TWR filter's output (i.e. the
- * live value applied via ccp_slave_get_tau() came from tau_filter.c, not
- * from a `sync tau set`/mode-entry console write) -- "tau_source" in
- * FR-10's telemetry list, as a bool rather than a string so the shell
- * layer owns the string mapping. */
-bool ccp_slave_twr_is_source(void);
-
-/* The TWR filter's own current estimate, independent of sync_tau_mode or
- * whether it has ever been applied -- lets an operator preview what TWR
- * would give even while parked in survey/legacy mode. *have is false (and
- * *tau_dtu 0) if no v2 measurement addressed to this anchor has ever
- * passed the quality gate. */
-void ccp_slave_twr_tau(bool *have, int32_t *tau_dtu);
-
-/* Milliseconds since the last ACCEPTED (quality-gate-passed) TWR sample,
- * from k_uptime_get_32() -- UINT32_MAX if none yet. FR-10's
- * "tau_twr_age_s" is this divided by 1000 at the shell layer, matching
- * every other *_s console field's convention in this project. */
-uint32_t ccp_slave_twr_age_ms(void);
-
-/* The quality byte of the last ACCEPTED TWR sample (undefined, reads 0, if
- * none yet -- check ccp_slave_twr_tau()'s *have first). */
-uint8_t ccp_slave_twr_last_quality(void);
-
-/* Completed "controlled transition" events (tau_filter.h's
- * TAU_FILTER_JUMPED) since boot -- FR-10's "tau_jump_events". */
-uint32_t ccp_slave_twr_jump_count(void);
+/* Milliseconds since the last accepted CCP, UINT32_MAX if none yet. */
+uint32_t ccp_slave_clock_age_ms(void);
 
 #endif /* CCP_SLAVE_H */

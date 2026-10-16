@@ -458,6 +458,41 @@ static void test_anchors_refuses_a_short_buffer(void)
     CHECK(pos_json_anchors(small, sizeof(small), &s) == -1);
 }
 
+/* The gateway is a node of the stored survey (the static sync links are derived
+ * from its position) but must never reach the platform as an anchor: it does
+ * not receive BLINKs and would be drawn as a phantom that never reports. */
+static void test_anchors_omit_the_gateway_node(void)
+{
+    char buf[POS_JSON_MAX_LEN];
+    struct apos_survey s;
+
+    memset(&s, 0, sizeof(s));
+    s.valid = true;
+    s.n_nodes = 5;
+    s.node[0].short_addr = 0x0001;                         /* gauge origin */
+    s.node[1].short_addr = 0x0002; s.node[1].x = 2.0f;
+    s.node[2].short_addr = POS_JSON_GATEWAY_ADDR;          /* the gateway */
+    s.node[2].x = 1.0f; s.node[2].y = 1.0f; s.node[2].z = -1.4f;
+    s.node[3].short_addr = 0x0003; s.node[3].y = 3.0f;
+    s.node[4].short_addr = 0x0004; s.node[4].x = 2.0f; s.node[4].y = 3.0f;
+    s.ref_valid = true;
+    s.ref_lat = 21.0; s.ref_lon = -89.6;
+
+    int n = pos_json_anchors(buf, sizeof(buf), &s);
+
+    CHECK(n > 0 && n == (int)strlen(buf));
+    CHECK(strstr(buf, "ANC-LOBBY-000") == NULL);
+    CHECK(strstr(buf, "\"z\":-1.40") == NULL);
+    CHECK(strstr(buf, "ANC-LOBBY-001") != NULL);
+    CHECK(strstr(buf, "ANC-LOBBY-004") != NULL);
+    CHECK(strstr(buf, ",,") == NULL && strstr(buf, "[,") == NULL);
+    /* still exactly one reference anchor, and it is the origin anchor */
+    CHECK(strstr(buf, "\"isReferenceAxis\":true") != NULL);
+    CHECK(strstr(strstr(buf, "\"isReferenceAxis\":true") + 1,
+                 "\"isReferenceAxis\":true") == NULL);
+    CHECK(POS_JSON_GATEWAY_ADDR == 0x0000u);
+}
+
 int main(void)
 {
     test_fix_exact_contract();
@@ -478,6 +513,7 @@ int main(void)
     test_anchors_well_formed_across_node_counts();
     test_anchors_refuses_a_nonfinite_coordinate();
     test_anchors_refuses_a_nonfinite_reference();
+    test_anchors_omit_the_gateway_node();
     printf(g_fail ? "FAILED (%d)\n" : "PASSED\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -67,4 +67,10 @@ bool blink_rx_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
 void blink_rx_stats(uint32_t *n_rx, uint32_t *n_no_sync, uint32_t *n_bad,
 		    uint32_t *n_sent);
 
+/* BLINKs refused because the last CCP was older than SYNC_CLOCK_MAX_AGE_MS --
+ * a SUBSET of n_no_sync (those are counted there too). A climbing `stale`
+ * with a model that once converged is a CCP link that went quiet; `no_sync`
+ * alone also covers a model that never converged. */
+uint32_t blink_rx_stale_count(void);
+
 #endif /* BLINK_RX_H */

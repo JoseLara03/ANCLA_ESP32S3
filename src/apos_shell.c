@@ -170,6 +170,14 @@ static int cmd_gauge(const struct shell *sh, size_t argc, char **argv)
 			"\"plane\":%d,\"up\":%d,\"dim\":\"%s\"}}",
 		    val[0], val[1], val[2], val[3],
 		    (val[3] == -1) ? "2D" : "3D");
+	if (val[3] == -1) {
+		shell_warn(sh, "2D (3-anchor) survey: the historical anchors-only flow. "
+			       "It does NOT include the gateway and installs NO sync "
+			       "links, so it cannot give the static-install result. For "
+			       "that, give all four: origin= xaxis= plane= up= -- four "
+			       "ANCHORS (never the gateway), the first three in one "
+			       "plane and `up` clearly off it.");
+	}
 	return 0;
 }
 
@@ -207,6 +215,66 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 				"\"spare_edges\":%d,\"rms_meaningful\":%u}",
 			    recip, sd, apos_gw_result_redundancy(),
 			    apos_gw_result_unverified() ? 0u : 1u);
+	}
+
+	/* The static-install state, always printed: whether fixes are being
+	 * published at all is the first thing an operator needs after an apply,
+	 * and `needs_survey` is what a gateway upgraded from firmware that
+	 * predates the links must say instead of looking calibrated. */
+	{
+		const uint8_t *ge = apos_gw_eui();
+		const struct apos_links *sl = apos_store_links();
+
+		shell_print(sh, "{\"gateway\":{\"eui\":\"%02X%02X%02X%02X%02X%02X%02X%02X\","
+				"\"in_survey\":%u},\"hold\":\"%s\",\"generation\":%u,"
+				"\"links\":\"%s\"}",
+			    ge ? ge[0] : 0, ge ? ge[1] : 0, ge ? ge[2] : 0,
+			    ge ? ge[3] : 0, ge ? ge[4] : 0, ge ? ge[5] : 0,
+			    ge ? ge[6] : 0, ge ? ge[7] : 0,
+			    apos_gw_survey_has_gateway() ? 1u : 0u,
+			    apos_gw_hold_reason(), (unsigned int)sl->generation,
+			    apos_store_links_rejected() ? "unreadable"
+			    : (sl->n == 0 ? "needs_survey" : "installed"));
+		if (apos_store_links_rejected()) {
+			shell_warn(sh, "a stored links record could not be read "
+				       "(unknown version or corrupt). It was NOT "
+				       "erased; links read as absent. Re-run "
+				       "`apos run` and `apos apply`.");
+		}
+		for (uint8_t k = 0; k < sl->n; k++) {
+			shell_print(sh, "  {\"link\":{\"child\":\"%02X%02X%02X%02X%02X%02X%02X%02X\","
+					"\"tau_dtu\":%d,\"valid\":%u,\"source\":%u}}",
+				    sl->rec[k].child_eui[0], sl->rec[k].child_eui[1],
+				    sl->rec[k].child_eui[2], sl->rec[k].child_eui[3],
+				    sl->rec[k].child_eui[4], sl->rec[k].child_eui[5],
+				    sl->rec[k].child_eui[6], sl->rec[k].child_eui[7],
+				    (int)sl->rec[k].tau_dtu, sl->rec[k].valid ? 1u : 0u,
+				    sl->rec[k].source);
+		}
+		if (st.have_result) {
+			struct apos_gauge_quality q;
+			const struct sync_link *lk;
+			uint8_t nl = apos_gw_links(&lk);
+
+			if (apos_gw_gauge_quality(&q)) {
+				shell_print(sh, "{\"gauge\":{\"up_height_mm\":%d,"
+						"\"height_floor_mm\":%d,"
+						"\"collinearity_permille\":%d,"
+						"\"degenerate\":%u}}",
+					    (int)(q.up_height_m * 1000.0f),
+					    (int)(q.height_floor_m * 1000.0f),
+					    (int)(q.collinearity * 1000.0f),
+					    apos_gw_gauge_degenerate() ? 1u : 0u);
+			}
+			for (uint8_t k = 0; k < nl; k++) {
+				shell_print(sh, "  {\"candidate_link\":{\"child\":\"0x%04X\","
+						"\"tau_dtu\":%d,\"geom_mm\":%d,\"meas_mm\":%d,"
+						"\"err_mm\":%d,\"within_gate\":%u}}",
+					    lk[k].child_addr, (int)lk[k].tau_dtu,
+					    (int)lk[k].geom_mm, (int)lk[k].meas_mm,
+					    (int)lk[k].err_mm, lk[k].within_gate ? 1u : 0u);
+			}
+		}
 	}
 
 	shell_print(sh, "enumerated (%u):", t->n_peers);
@@ -438,7 +506,35 @@ static int cmd_apply(const struct shell *sh, size_t argc, char **argv)
 		return rc;
 	}
 	if (rc == -ENODATA) {
-		shell_error(sh, "error: no result to apply — run `apos run` first");
+		struct apos_gw_status st;
+
+		apos_gw_get_status(&st);
+		if (!st.have_result) {
+			shell_error(sh, "error: no result to apply — run `apos run` first");
+		} else {
+			shell_error(sh, "error: a sync link could not be derived for every "
+					"anchor (an anchor the solve left unplaced, or a gateway "
+					"pair that was never measured). Nothing was changed. See "
+					"`apos show`, fix the geometry and re-run `apos run`.");
+		}
+		return rc;
+	}
+	if (rc == -EDOM) {
+		struct apos_gauge_quality q;
+
+		shell_error(sh, "error: REFUSED — the four gauge anchors do not span a 3D "
+				"frame, and `force` does not override this. Its z (and which "
+				"side is up) would be noise written into every anchor.");
+		if (apos_gw_gauge_quality(&q)) {
+			shell_error(sh, "  up is %d mm off the origin/xaxis/plane plane "
+					"(needs > %d mm for this ranging noise); "
+					"collinearity %d/1000 (needs >= %d). Mount origin, "
+					"xaxis and plane in one plane and `up` clearly off it.",
+				    (int)(q.up_height_m * 1000.0f),
+				    (int)(q.height_floor_m * 1000.0f),
+				    (int)(q.collinearity * 1000.0f),
+				    (int)(APOS_GAUGE_COLLINEARITY_MIN * 1000.0f));
+		}
 		return rc;
 	}
 	if (rc == -EPERM) {
@@ -464,6 +560,12 @@ static int cmd_apply(const struct shell *sh, size_t argc, char **argv)
 
 	shell_print(sh, "applying — each anchor is pushed its coordinates and "
 			"must acknowledge; watch for apos_apply_done");
+	if (apos_gw_survey_has_gateway()) {
+		shell_warn(sh, "Position fixes are SUSPENDED from now until every anchor "
+			       "has acknowledged AND the gateway has persisted the result. "
+			       "If anything fails they STAY suspended (`blink stats` says "
+			       "so) until a later `apos apply` completes.");
+	}
 	return 0;
 }
 

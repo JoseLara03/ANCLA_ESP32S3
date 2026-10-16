@@ -48,7 +48,8 @@ anchor-to-anchor link buys ~2 dB, not the 12 dB that separates 30 m from
 
 ## 1. What the budget predicts
 
-Sensitivity floor: **-93 dBm** at 850 kbps / PLEN_1024, the figure
+Sensitivity floor: **-93 dBm** at 850 kbps / PLEN_1024 (the PHY at the time; now PLEN_256, whose
+sensitivity floor has not been re-derived here), the figure
 `uwb_radio.c` itself uses (frames landing at -90..-92 dBm cost ~40 % of
 DISCOVERY responses).
 

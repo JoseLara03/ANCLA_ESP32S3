@@ -38,6 +38,12 @@
 #define APOS_SUB_SETPOS       0x05u
 #define APOS_SUB_SETPOS_ACK   0x06u
 #define APOS_SUB_SURVEY_END   0x07u
+/* Static sync-link extension (2026-10-12, B14 static survey). Older anchor
+ * firmware does not know these subtypes, drops them in apos_frame_is_apos(),
+ * and therefore never ACKs: the gateway reports the anchor by address as
+ * incompatible instead of the survey silently half-applying. */
+#define APOS_SUB_SETTAU       0x08u
+#define APOS_SUB_SETTAU_ACK   0x09u
 
 /* 10 common header bytes plus the subtype. */
 #define APOS_HDR_LEN 11u
@@ -52,9 +58,18 @@
 #define APOS_LEN_SETPOS       (APOS_HDR_LEN + 14u) /* session, xyz          */
 #define APOS_LEN_SETPOS_ACK   (APOS_HDR_LEN + 15u) /* session, xyz, ok      */
 #define APOS_LEN_SURVEY_END   (APOS_HDR_LEN + 2u)  /* session               */
+#define APOS_SETTAU_VERSION   1u
+#define APOS_LEN_SETTAU       (APOS_HDR_LEN + 19u) /* session, ver, gen, tau,
+						    * parent eui            */
+#define APOS_LEN_SETTAU_ACK   (APOS_HDR_LEN + 11u) /* session, gen, tau, status */
+
+/* SETTAU_ACK status. Anything non-zero means the link was NOT stored. */
+#define APOS_SETTAU_OK          0u
+#define APOS_SETTAU_PERSIST_ERR 1u /* applied in RAM, NVS write failed */
+#define APOS_SETTAU_BAD_VERSION 2u
 
 /* Largest of the above, for RX buffer sizing. */
-#define APOS_LEN_MAX APOS_LEN_ENUM_RSP
+#define APOS_LEN_MAX APOS_LEN_ENUM_RSP /* 34, still the largest (SETTAU is 30) */
 
 /* Broadcast destination, matching UWB_FRAME_ADDR_BCAST. Redeclared rather than
  * included so this module stays free of the shared codec's header. */
@@ -92,6 +107,14 @@ int apos_frame_setpos_ack_build(uint8_t *buf, size_t buf_len, uint16_t src,
 				float x, float y, float z, bool ok);
 int apos_frame_survey_end_build(uint8_t *buf, size_t buf_len, uint16_t src,
 				uint16_t session);
+int apos_frame_settau_build(uint8_t *buf, size_t buf_len, uint16_t src,
+			    uint16_t dest, uint16_t session, uint32_t generation,
+			    int32_t tau_dtu,
+			    const uint8_t parent_eui[APOS_EUI_LEN]);
+int apos_frame_settau_ack_build(uint8_t *buf, size_t buf_len, uint16_t src,
+				uint16_t dest, uint16_t session,
+				uint32_t generation, int32_t tau_dtu,
+				uint8_t status);
 
 /* Parsers return 0, or -EINVAL on a NULL pointer, a length that does not match
  * the subtype exactly, or a subtype mismatch. Out parameters are untouched on
@@ -113,5 +136,14 @@ int apos_frame_parse_setpos_ack(const uint8_t *buf, size_t len,
 				bool *ok);
 int apos_frame_parse_survey_end(const uint8_t *buf, size_t len,
 				uint16_t *session);
+/* A SETTAU of an unknown version parses with -ENOTSUP-like behaviour NOT
+ * hidden: *version is returned so the receiver can ACK APOS_SETTAU_BAD_VERSION
+ * instead of silently dropping, which would look like a lost frame. */
+int apos_frame_parse_settau(const uint8_t *buf, size_t len, uint16_t *session,
+			    uint8_t *version, uint32_t *generation,
+			    int32_t *tau_dtu, uint8_t parent_eui[APOS_EUI_LEN]);
+int apos_frame_parse_settau_ack(const uint8_t *buf, size_t len,
+				uint16_t *session, uint32_t *generation,
+				int32_t *tau_dtu, uint8_t *status);
 
 #endif /* APOS_FRAME_H */

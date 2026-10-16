@@ -137,6 +137,27 @@ static const struct apos_dir_meas *find_meas(const struct apos_table *t,
 	return NULL;
 }
 
+bool apos_table_get_meas(const struct apos_table *t, uint8_t from, uint8_t to,
+			 uint8_t min_n_ok, int32_t *mean_mm, uint16_t *sd_mm)
+{
+	if (!t || from >= t->n_peers || to >= t->n_peers) {
+		return false;
+	}
+
+	const struct apos_dir_meas *m = find_meas(t, from, to, min_n_ok);
+
+	if (!m) {
+		return false;
+	}
+	if (mean_mm) {
+		*mean_mm = m->mean_mm;
+	}
+	if (sd_mm) {
+		*sd_mm = m->sd_mm;
+	}
+	return true;
+}
+
 static float sd_m_of(const struct apos_dir_meas *m)
 {
 	uint16_t sd = (m->sd_mm >= APOS_SD_FLOOR_MM) ? m->sd_mm

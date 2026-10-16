@@ -24,6 +24,11 @@
  * anchors topic instead. */
 #define POS_JSON_ZONE_NAME "852541"
 
+/* Short address of the gateway in a stored survey (the CCP root). Restated
+ * here, not included from uwb_config.h, so this file stays host-buildable on
+ * its own; it is UWB_ADDR_GATEWAY_RESERVED and tests/pos_json/ pins that. */
+#define POS_JSON_GATEWAY_ADDR 0x0000u
+
 /* Topic the survey trigger will arrive on. Declared here with the other topics,
  * composed from POS_JSON_ZONE_NAME, so a topic can never disagree with the zone
  * in its payload -- the same rule the position and anchors topics follow.
@@ -41,6 +46,17 @@
  * UNLIKE POS_JSON_TOPIC_SURVEY, this one IS subscribed -- net_uplink.c gained a
  * subscribe path in Phase 3 Task 5. */
 #define POS_JSON_TOPIC_BLINK "uwb/anchor/blink/" POS_JSON_ZONE_NAME
+
+/* Periodic node status (src/node_status.c): one RETAINED topic per node,
+ * POS_JSON_TOPIC_STATUS "<anchor id>" or "gw". Anchors cannot be reached once mounted,
+ * so this is how `sync stats`, tau and the reset cause are read in the field. */
+#define POS_JSON_TOPIC_STATUS "uwb/anchor/status/" POS_JSON_ZONE_NAME "/"
+
+/* Remote commands (src/node_cmd.c, wire format in cmd_proto.h): each node subscribes to
+ * POS_JSON_TOPIC_CMD "<anchor id>|gw" and answers on POS_JSON_TOPIC_ACK "<same>". Commands are
+ * HMAC-signed against the challenge the node publishes in its status report. */
+#define POS_JSON_TOPIC_CMD "uwb/anchor/cmd/" POS_JSON_ZONE_NAME "/"
+#define POS_JSON_TOPIC_ACK "uwb/anchor/ack/" POS_JSON_ZONE_NAME "/"
 
 /* One observation: which anchor heard which BLINK and when, already in the
  * master's time base. Produced by blink_rx.c on the anchor and consumed by the

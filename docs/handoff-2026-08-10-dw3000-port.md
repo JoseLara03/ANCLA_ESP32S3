@@ -81,7 +81,9 @@ generated an interrupt yet. That is the one integrated path still unproven, and
 proving it is the natural next task:
 
 1. Configure the PHY. It must match every node in the system: **channel 5,
-   PLEN_1024, PAC32, code 9, 850 kbps, SFD_IEEE_4Z, STS/PDoA off.** The
+   PLEN_1024, PAC32, code 9, 850 kbps, SFD_IEEE_4Z, STS/PDoA off.** (As of
+   this handoff; the PHY is now PLEN_256/PAC16 since 2026-10-12, see
+   `src/uwb_phy.h`.) The
    authoritative copy of this contract is the sibling anchor project's
    `CLAUDE.md` (`../../../PlatformIO/Projects/ESP32S3UWB`).
 2. Transmit a frame, receive it on a second node (or the sibling ESP-IDF anchor,

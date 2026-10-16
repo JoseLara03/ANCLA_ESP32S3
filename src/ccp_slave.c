@@ -7,7 +7,6 @@
 #include "ccp_slave.h"
 
 #include "ccp_frame.h"
-#include "tau_filter.h"
 #include "uwb_debug.h"
 
 #include <zephyr/kernel.h>
@@ -59,24 +58,15 @@ static uint32_t n_no_announce;
  * path below, not just ccp_slave_init() itself. */
 static int32_t configured_tau_dtu;
 
-/* B14 Fase B, Task 4: the anchor-side TWR filter (NLOS/quality gate -> EMA
- * -> jump detection, see tau_filter.h) and the telemetry ccp_slave.h's
- * getters expose from it (FR-10). Fed on EVERY v2 CCP addressed to this
- * anchor regardless of sync_tau_mode -- only whether the result is
- * actually APPLIED (apply_twr_tau() below) is mode-gated, so switching
- * INTO twr/auto never starts cold. */
-static struct tau_filter twr_filter;
-static bool     twr_is_source;   /* is the LIVE tau currently TWR-sourced? */
-static bool     twr_have_last_ms;
-static uint32_t twr_last_ms;
-static uint8_t  twr_last_quality;
-
-/* B14 Fase B, Task 5, FR-9: how long a TWR-sourced tau may go without a
- * fresh accepted sample before it is reverted to the survey value. The
- * plan's own number, unrounded -- there is no measured basis yet to tune
- * it tighter or looser (see tau_filter.h's own note on not inventing
- * unvalidated thresholds), so it is taken as given rather than re-derived. */
-#define TAU_FRESHNESS_MAX_MS  60000u
+/* When the last CCP of the adopted root was accepted, by the kernel's uptime
+ * (ms). The conversion of a BLINK to the master's time base must refuse once
+ * this is older than SYNC_CLOCK_MAX_AGE_MS (sync_model.h), because
+ * sync_model_to_master() alone keeps extrapolating a model for as long as no
+ * CCP arrives to count a gap -- the silence is invisible to it until the link
+ * comes back. Uptime rather than the DW3220's 40-bit clock, which wraps every
+ * 17.2 s and could not tell a 12 s silence from a 5 s one. */
+static uint32_t last_ccp_ms;
+static bool     have_last_ccp;
 
 /* sync_model_init() plus re-applying the configured tau, so no call site can
  * forget the second half. */
@@ -84,85 +74,6 @@ static void reinit_model(void)
 {
 	sync_model_init(&model);
 	sync_model_set_tau(&model, configured_tau_dtu);
-}
-
-/* The TWR filter's INTERNAL apply path, distinct from the public
- * ccp_slave_set_tau() the shell calls: both end up writing the same
- * configured_tau_dtu/model.tau_dtu, but only this one sets twr_is_source,
- * so `sync tau show` can report which source is actually live right now. */
-static void apply_twr_tau(int32_t tau_dtu)
-{
-	k_sched_lock();
-	configured_tau_dtu = tau_dtu;
-	sync_model_set_tau(&model, tau_dtu);
-	k_sched_unlock();
-	twr_is_source = true;
-}
-
-/* Feed one v2 CCP's tau_meas_* payload, already confirmed addressed to this
- * anchor, through the filter -- and, when `apply` (sync_tau_mode is TWR or
- * AUTO), adopt its output live. Broken out of ccp_slave_on_rx() only for
- * readability; it has exactly one call site. */
-static void twr_consume(int32_t raw_tau_dtu, uint8_t quality, bool apply)
-{
-	int32_t filtered = 0;
-	enum tau_filter_outcome oc =
-		tau_filter_step(&twr_filter, raw_tau_dtu, quality, &filtered);
-
-	if (oc == TAU_FILTER_REJECTED_QUALITY) {
-		return;
-	}
-
-	twr_last_ms = k_uptime_get_32();
-	twr_have_last_ms = true;
-	twr_last_quality = quality;
-
-	if (oc == TAU_FILTER_JUMPED) {
-		/* FR-8's "evento de log": a genuine relocation, not a
-		 * re-baseline -- the skew stays valid, only the phase moves,
-		 * see sync_model_set_tau()'s own doc comment. */
-		LOG_WRN("{\"ccp_slave\":{\"tau_jump\":1,\"tau_dtu\":%d}}",
-			filtered);
-	}
-
-	if (apply) {
-		apply_twr_tau(filtered);
-	}
-}
-
-/* B14 Fase B, Task 5 (FR-9): checked on every parsed CCP, regardless of
- * that frame's own content -- a CCP arrives roughly every superframe
- * whenever the sync link itself is healthy, which is exactly the traffic
- * class this check cares about (see this file's own module comment for
- * why a totally DEAD link is a separate, faster-tripping concern:
- * sync_model's own SYNC_MISS_MAX invalidates the whole model in ~5 s, long
- * before this 60 s freshness window would ever matter). A no-op unless
- * the tau CURRENTLY applied is TWR-sourced, so this costs one branch on
- * every other call. Calls the PUBLIC ccp_slave_set_tau() rather than
- * apply_twr_tau(): reverting to survey is exactly what a console
- * `sync tau set`/mode-entry write already does, including clearing
- * twr_is_source, so there is no reason for a third code path. Does NOT
- * reset the TWR filter's own learned state -- FR-9 is about which SOURCE
- * is applied, not about discarding what the filter has learned; if
- * something physically moved during the outage, tau_filter.c's own jump
- * detection (tau_filter.h) is what re-confirms the new value once
- * measurements resume, exactly as it would for any other jump. */
-static void check_twr_freshness(int32_t survey_tau_dtu)
-{
-	if (!twr_is_source || !twr_have_last_ms) {
-		return;
-	}
-
-	uint32_t age_ms = k_uptime_get_32() - twr_last_ms;
-
-	if (age_ms <= TAU_FRESHNESS_MAX_MS) {
-		return;
-	}
-
-	LOG_WRN("{\"ccp_slave\":{\"tau_degrade\":1,\"age_ms\":%u,"
-		"\"reverted_survey_dtu\":%d}}",
-		age_ms, survey_tau_dtu);
-	ccp_slave_set_tau(survey_tau_dtu);
 }
 
 /* A genuine forward run of `intervals` observations should show local elapsed
@@ -252,16 +163,11 @@ void ccp_slave_init(void)
 	n_reject = 0u;
 	n_no_announce = 0u;
 
-	tau_filter_init(&twr_filter);
-	twr_is_source = false;
-	twr_have_last_ms = false;
-	twr_last_ms = 0u;
-	twr_last_quality = 0u;
+	have_last_ccp = false;
+	last_ccp_ms = 0u;
 }
 
-bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
-		     uint16_t own_short_addr, bool twr_tau_mode_active,
-		     int32_t survey_tau_dtu)
+bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts)
 {
 	struct ccp_frame f;
 
@@ -288,23 +194,17 @@ bool ccp_slave_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
 
 	n_rx++;
 
-	/* B14 Fase B, Task 5 (FR-9): checked BEFORE this frame's own content
-	 * is consumed below, so it reflects staleness as of the PREVIOUS
-	 * state -- if this same frame also carries a fresh measurement for
-	 * this anchor, twr_consume() re-promotes it right back to TWR
-	 * afterward, which is correct either way. */
-	check_twr_freshness(survey_tau_dtu);
+	/* The CCP v2 tau_meas_* fields are IGNORED: the automatic TWR
+	 * measurement they carried was retired 2026-10-12, and the master
+	 * announces "no measurement" on every frame. The flight-time
+	 * compensation is the static link installed by `apos apply`
+	 * (apos_node.c) and applied through ccp_slave_set_tau(); a measurement
+	 * arriving over the air -- from an older gateway still running the
+	 * round-robin, say -- must not be able to move it. */
 
-	/* B14 Fase B (Task 4): independent of the deferred-timestamp pairing
-	 * below -- a v2 tau_meas_* payload describes a measurement
-	 * gw_selftau.c's auto round-robin completed at most a few
-	 * superframes ago, not "the previous frame" the way tx_dtu does, so
-	 * it must be consumed on EVERY parsed v2 frame addressed to this
-	 * anchor, including a root-change or first-CCP re-init below that
-	 * would otherwise silently swallow it. */
-	if (f.version == CCP_VERSION_V2 && f.tau_meas_anchor == own_short_addr) {
-		twr_consume(f.tau_meas_dtu, f.twr_quality, twr_tau_mode_active);
-	}
+	/* An accepted CCP of the adopted root is what keeps the clock fresh. */
+	last_ccp_ms = k_uptime_get_32();
+	have_last_ccp = true;
 
 	if (!have_prev || f.root_id != cur_root) {
 		/* A different root is a different time base, and the baseline
@@ -546,11 +446,6 @@ void ccp_slave_set_tau(int32_t tau_dtu)
 	sync_model_set_tau(&model, tau_dtu);
 	k_sched_unlock();
 
-	/* A console-driven write (mode entry or `sync tau set`) always means
-	 * the live value is NOT the TWR filter's output anymore, even if it
-	 * numerically happens to match -- until the filter itself applies
-	 * something again via apply_twr_tau(). */
-	twr_is_source = false;
 }
 
 int32_t ccp_slave_get_tau(void)
@@ -558,40 +453,20 @@ int32_t ccp_slave_get_tau(void)
 	return configured_tau_dtu;
 }
 
-bool ccp_slave_twr_is_source(void)
+bool ccp_slave_clock_fresh(void)
 {
-	return twr_is_source;
+	if (!have_last_ccp) {
+		return false;
+	}
+	/* Unsigned subtraction of two k_uptime_get_32() reads: correct across the
+	 * ~49-day wrap by construction. */
+	return sync_clock_age_ok(k_uptime_get_32() - last_ccp_ms);
 }
 
-void ccp_slave_twr_tau(bool *have, int32_t *tau_dtu)
+uint32_t ccp_slave_clock_age_ms(void)
 {
-	bool h = twr_filter.have_estimate;
-
-	if (have) {
-		*have = h;
-	}
-	if (tau_dtu) {
-		*tau_dtu = h ? twr_filter.value_dtu : 0;
-	}
-}
-
-uint32_t ccp_slave_twr_age_ms(void)
-{
-	if (!twr_have_last_ms) {
+	if (!have_last_ccp) {
 		return UINT32_MAX;
 	}
-	/* Unsigned subtraction of two k_uptime_get_32() reads: correct
-	 * across the ~49-day wrap by construction (modular arithmetic),
-	 * same convention this project uses for every other uptime delta. */
-	return k_uptime_get_32() - twr_last_ms;
-}
-
-uint8_t ccp_slave_twr_last_quality(void)
-{
-	return twr_last_quality;
-}
-
-uint32_t ccp_slave_twr_jump_count(void)
-{
-	return twr_filter.n_jumps;
+	return k_uptime_get_32() - last_ccp_ms;
 }
