@@ -85,6 +85,36 @@ config ANCLA_DEBUG_DUMMY_SEATS
 	  headroom for a small bench fleet while still landing the first real
 	  tag near the true seat_id ceiling of 127.
 
+config ANCLA_DW_IRQ_POLL
+	bool "Poll the DW3000 for RX events instead of using its IRQ line"
+	default n
+	help
+	  For boards whose DW3000 IRQ line does not reach the ESP32 (the older
+	  PA+LNA anchor batch). The GPIO interrupt is never registered; instead
+	  every place that waits for an RX callback (uwb_slave.c, cal_run.c,
+	  uwb_gateway.c, via uwb_irq_wait()) reads SYS_STATUS.IRQS over SPI
+	  (dwt_checkirq()) and, when set, calls dwt_isr() itself from the
+	  waiting thread. Callbacks, rx_pending and CIADONE semantics are
+	  unchanged: dwt_isr() still clears RX_GOOD before calling cbRxOk.
+
+	  Costs: up to one poll period of extra latency between an RX event
+	  and the thread seeing it (the SLAVE's beacon->RX re-arm must stay
+	  under ~1.2 ms for the CCP behind it -- read `cia stats` on a debug
+	  build), and up to ~10k SPI status reads per second while idle.
+
+	  Build with poll.conf. irq-gpios stays in the devicetree (the binding
+	  requires it); uwb_radio.c pulls that pin down instead of arming it.
+
+config ANCLA_DW_IRQ_POLL_PERIOD_US
+	int "Sleep between DW3000 status polls (us)"
+	default 100
+	range 50 2000
+	depends on ANCLA_DW_IRQ_POLL
+	help
+	  k_usleep() between dwt_checkirq() reads. CONFIG_SYS_CLOCK_TICKS_PER_SEC
+	  is 10000 on this build, so 100 us is one tick. A sleep, not a
+	  busy-wait, so WiFi/MQTT and the shell keep running.
+
 endmenu
 
 source "Kconfig.zephyr"

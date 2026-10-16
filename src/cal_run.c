@@ -15,6 +15,7 @@
 #include "cal_math.h"
 #include "cal_solve.h"
 #include "uwb_dwtime.h"
+#include "uwb_irq_wait.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -288,7 +289,19 @@ void cal_run(const uwb_config_t *cfg)
 	rx_arm();
 
 	while (1) {
+#ifdef CONFIG_ANCLA_DW_IRQ_POLL
+		/* No IRQ line: service the radio from here, then wait for either
+		 * semaphore for at most one poll period. A callback dwt_isr()
+		 * runs inside uwb_irq_pump() gives rx_sem synchronously, so the
+		 * k_poll() right after it returns at once. */
+		(void)uwb_irq_pump();
+		if (k_poll(events, 2,
+			   K_USEC(CONFIG_ANCLA_DW_IRQ_POLL_PERIOD_US)) != 0) {
+			continue;
+		}
+#else
 		k_poll(events, 2, K_FOREVER);
+#endif
 
 		if (events[1].state == K_POLL_STATE_SEM_AVAILABLE) {
 			k_sem_take(&req_sem, K_NO_WAIT);

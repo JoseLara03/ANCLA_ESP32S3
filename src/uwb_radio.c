@@ -13,6 +13,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
 
 #include <deca_device_api.h>
 #include <deca_probe_interface.h>
@@ -110,11 +111,33 @@ int uwb_radio_init(const uwb_config_t *cfg)
 	dwt_setfinegraintxseq(0);
 	dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
 
+#ifdef CONFIG_ANCLA_DW_IRQ_POLL
+	/* No IRQ line on this board: uwb_irq_wait() runs dwt_isr() from the
+	 * waiting thread instead, so the GPIO callback is never registered --
+	 * a floating pin would otherwise run a second dwt_isr() on the system
+	 * workqueue, concurrently with the polled one. irq-gpios stays in the
+	 * devicetree only because the decawave,dw3000 binding requires it, and
+	 * the vendored decamutexoff() (every dwt_forcetrxoff()) still re-arms
+	 * an edge interrupt on it with no callback attached. Pull it down so a
+	 * dead or unconnected line cannot storm that empty interrupt. */
+	{
+		static const struct gpio_dt_spec irq =
+			GPIO_DT_SPEC_GET(DT_NODELABEL(dw3000), irq_gpios);
+
+		ret = gpio_pin_configure_dt(&irq, GPIO_INPUT | GPIO_PULL_DOWN);
+		if (ret) {
+			LOG_WRN("irq pin pull-down failed (%d)", ret);
+		}
+	}
+	LOG_INF("DW3000 IRQ line unused: polling SYS_STATUS every %d us",
+		CONFIG_ANCLA_DW_IRQ_POLL_PERIOD_US);
+#else
 	ret = dw3000_hw_init_interrupt();
 	if (ret) {
 		LOG_ERR("dw3000_hw_init_interrupt failed (%d)", ret);
 		return ret;
 	}
+#endif
 
 	LOG_INF("radio ready (ant_tx=%u ant_rx=%u)", cfg->ant_delay_tx,
 		cfg->ant_delay_rx);

@@ -788,6 +788,33 @@ debug board is an ordinary peer on air and mixes with production boards — but 
 is not a deployment image (per-frame console traffic plus one extra SPI read per
 second on the SLAVE loop). See `docs/discovery-silent-anchor-debug.md`.
 
+There is also a **polled-RX image** (branch `feat/dw-irq-poll`, 2026-10-16) for
+the older PA+LNA anchor batch, whose DW3000 IRQ line does not reach the ESP32:
+
+```powershell
+west build -b ancla_esp32s3/esp32s3/procpu --pristine -d build_poll -- "-DEXTRA_CONF_FILE=poll.conf"
+west build -b ancla_esp32s3/esp32s3/procpu --pristine -d build_cal_poll -- "-DEXTRA_CONF_FILE=cal.conf;poll.conf"
+```
+
+`CONFIG_ANCLA_DW_IRQ_POLL` never registers the GPIO interrupt; every RX wait
+(`uwb_slave.c`, `cal_run.c`, `uwb_gateway.c`) goes through `uwb_irq_wait()` /
+`uwb_irq_pump()` (`src/uwb_irq_wait.{c,h}`), which reads SYS_STATUS.IRQS
+(`dwt_checkirq()`) and calls `dwt_isr()` from the waiting thread, sleeping
+`CONFIG_ANCLA_DW_IRQ_POLL_PERIOD_US` (100, one tick) between reads. Callbacks,
+`rx_pending` and the CIADONE rule are unchanged; on the IRQ build
+`uwb_irq_wait()` is plain `k_sem_take()`. `irq-gpios` stays in the devicetree
+because the vendored binding requires it; `uwb_radio.c` pulls the pin down
+instead of arming it (the vendored `decamutexoff()` re-arms an edge interrupt
+on it, with no callback, on every `dwt_forcetrxoff()`). TX-completion and
+`ss_initiator` waits were already polled and needed no change. **Built
+(production, poll, cal+poll), NOT run on hardware.** What to measure first, on
+a debug build with `poll.conf` added: the beacon->RX re-arm in `cia stats` must
+stay well under the 1.2 ms CCP delay (it was 665-870 us with the IRQ, polling
+adds up to ~100-200 us), and CCP reception near 100 %. Unchecked as well: whether
+the old boards' pinout matches this board's DTS, and their LNA (already
+enabled by `dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE)`, cosmetic on the
+current batch).
+
 ## Console
 
 Native USB-JTAG (not UART0), prompt `uwb:~$ `.

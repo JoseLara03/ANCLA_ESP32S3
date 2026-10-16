@@ -22,6 +22,7 @@
 #include "ccp_slave.h"
 #include "uwb_debug.h"
 #include "uwb_dwtime.h"
+#include "uwb_irq_wait.h"
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_mac.h"
 
@@ -556,7 +557,7 @@ void uwb_slave_run(const uwb_config_t *cfg)
 		/* No periodic work on this loop, in any image: see the note on the
 		 * receive instrumentation above for why a 1 Hz heartbeat cost the
 		 * CCP behind every fifth beacon. */
-		k_sem_take(&rx_sem, K_FOREVER);
+		(void)uwb_irq_wait(&rx_sem, K_FOREVER);
 
 		uint32_t status = rx_status;
 		uint16_t flen = rx_len;

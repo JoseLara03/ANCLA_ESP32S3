@@ -57,6 +57,7 @@ target_sources(app PRIVATE
 	src/tdoa_solve.c
 	src/uwb_config.c
 	src/uwb_dwtime.c
+	src/uwb_irq_wait.c
 	src/uwb_frame_802_15_4z.c
 	src/uwb_gateway.c
 	src/uwb_radio.c

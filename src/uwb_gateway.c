@@ -32,6 +32,7 @@
 #include "tdoa_gw.h"
 #include "uwb_debug.h"
 #include "uwb_dwtime.h"
+#include "uwb_irq_wait.h"
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_mac.h"
 
@@ -772,7 +773,7 @@ void uwb_gateway_run(const uwb_config_t *cfg)
 			 * takes the whole network down, not one range. One
 			 * superframe of slack past the window is ample. */
 			CRUMB(GW_CRUMB_RX_WAIT);
-			if (k_sem_take(&rx_sem, K_MSEC(400)) != 0) {
+			if (uwb_irq_wait(&rx_sem, K_MSEC(400)) != 0) {
 				LOG_WRN("no RX event within the window — re-arming");
 				dwt_forcetrxoff();
 				continue;
