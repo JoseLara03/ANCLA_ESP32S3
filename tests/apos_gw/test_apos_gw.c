@@ -24,6 +24,7 @@
 
 #include "apos_gw.h"
 
+#include "apos_addrmap.h"
 #include "apos_frame.h"
 #include "apos_links.h"
 #include "apos_store.h"
@@ -166,6 +167,24 @@ int apos_store_clear_pending(void)
 	return 0;
 }
 
+static struct apos_addrmap store_map;
+static bool map_rejected;
+static bool fail_map_write;
+static int map_saves;
+
+const struct apos_addrmap *apos_store_addrmap(void) { return &store_map; }
+bool apos_store_addrmap_rejected(void) { return map_rejected; }
+int apos_store_save_addrmap(const struct apos_addrmap *m)
+{
+	if (fail_map_write) {
+		return -EIO;
+	}
+	store_map = *m;
+	map_rejected = false;
+	map_saves++;
+	return 0;
+}
+
 /* ---- fake anchors -------------------------------------------------------- */
 
 #define NA 8
@@ -186,6 +205,14 @@ struct fake_anchor {
 	uint32_t gen;
 	int      n_settau_rx;
 	int      n_setpos_rx;
+	/* address assignment */
+	bool     old_fw;            /* predates SETADDR: drops it silently */
+	int      drop_setaddr_acks; /* swallow this many ACKs (and do NOT reboot) */
+	bool     fail_persist_id;   /* NVS write of the new id fails */
+	int64_t  reboot_ms;         /* how long a reboot keeps it off the air */
+	int64_t  offline_until;     /* deaf (rebooting) until this time */
+	int      n_setaddr_rx;
+	int      n_reboots;
 };
 static struct fake_anchor A[NA];
 static float GW[3];
@@ -198,6 +225,8 @@ static int  setpos_frames, settau_frames, to_gateway_frames, range_cmds_at_gatew
 static bool hold_during_setpos, hold_during_settau;
 static bool pending_before_first_setpos;
 static bool saw_setpos;
+static int  setaddr_frames;
+static bool inject_foreign_setaddr_ack;
 
 static uint32_t noise_ctr = 99;
 static int32_t noise_mm(void)
@@ -265,7 +294,7 @@ static void handle_frame(const uint8_t *f, uint16_t len)
 
 		apos_frame_parse_survey_begin(f, len, &sess, &win);
 		for (int i = 0; i < NA; i++) {
-			if (!A[i].present) {
+			if (!A[i].present || now_ms < A[i].offline_until) {
 				continue;
 			}
 			int n = apos_frame_enum_rsp_build(buf, sizeof(buf), A[i].addr, 0,
@@ -371,6 +400,70 @@ static void handle_frame(const uint8_t *f, uint16_t len)
 		}
 		break;
 	}
+	case APOS_SUB_SETADDR: {
+		uint16_t sess, addr;
+		uint8_t target[8];
+
+		CHECK(apos_frame_dest(f) == APOS_ADDR_BCAST);
+		apos_frame_parse_setaddr(f, len, &sess, target, &addr);
+		setaddr_frames++;
+		if (inject_foreign_setaddr_ack) {
+			/* An ACK carrying the right address and status but ANOTHER
+			 * board's EUI, delivered first: it must not count. */
+			uint8_t other[8];
+
+			memset(other, 0x77, sizeof(other));
+			int m = apos_frame_setaddr_ack_build(buf, sizeof(buf), 0x00FF, 0,
+							     sess, other, addr,
+							     APOS_SETADDR_OK);
+			deliver(buf, m);
+		}
+		for (int i = 0; i < NA; i++) {
+			struct fake_anchor *a = &A[i];
+
+			if (!a->present || now_ms < a->offline_until || a->old_fw) {
+				continue;
+			}
+			/* The SAME decision function the real anchor calls. */
+			enum apos_setaddr_verdict v = apos_setaddr_check(
+				a->eui, a->addr, target, addr, UWB_ANCHOR_ADDR_BASE,
+				UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS);
+
+			if (v == APOS_SETADDR_IGNORE) {
+				continue;
+			}
+			a->n_setaddr_rx++;
+
+			uint8_t st = APOS_SETADDR_OK;
+			uint16_t held = a->addr;
+			bool reboot = false;
+
+			if (v == APOS_SETADDR_V_BAD) {
+				st = APOS_SETADDR_BAD_ADDR;
+			} else if (v == APOS_SETADDR_V_CHANGE) {
+				if (a->fail_persist_id) {
+					st = APOS_SETADDR_PERSIST_ERR;
+				} else {
+					held = addr;
+					reboot = true;
+				}
+			}
+			if (a->drop_setaddr_acks > 0) {
+				/* ACK lost on air: the real anchor does not reboot. */
+				a->drop_setaddr_acks--;
+				continue;
+			}
+			int n = apos_frame_setaddr_ack_build(buf, sizeof(buf), a->addr, 0,
+							     sess, a->eui, held, st);
+			deliver(buf, n);
+			if (reboot) {
+				a->addr = held;
+				a->offline_until = now_ms + a->reboot_ms;
+				a->n_reboots++;
+			}
+		}
+		break;
+	}
 	default:
 		break;
 	}
@@ -390,13 +483,18 @@ static void drain_tx(void)
 
 static uint8_t gw_seq;
 
-static void pump(int max_steps)
+static void pump_avail(int max_steps, uint32_t avail)
 {
 	for (int i = 0; i < max_steps && apos_gw_busy(); i++) {
 		now_ms += 60;
-		apos_gw_step(195000u, &gw_seq);
+		apos_gw_step(avail, &gw_seq);
 		drain_tx();
 	}
+}
+
+static void pump(int max_steps)
+{
+	pump_avail(max_steps, 195000u);
 }
 
 /* ---- world setup --------------------------------------------------------- */
@@ -443,6 +541,15 @@ static void world(int n_anchors, bool coplanar)
 	pending_gen = 0;
 	survey_saves = links_saves = 0;
 	fail_pending_write = fail_survey_write = fail_links_write = false;
+
+	memset(&store_map, 0, sizeof(store_map));
+	map_rejected = fail_map_write = false;
+	map_saves = 0;
+	setaddr_frames = 0;
+	inject_foreign_setaddr_ack = false;
+	for (int i = 0; i < NA; i++) {
+		A[i].reboot_ms = 5000;   /* the operator's "good" boot */
+	}
 }
 
 static void start(bool three_d)
@@ -858,6 +965,250 @@ static void test_enumeration_order_does_not_change_identities(void)
 	CHECK(store_survey.node[0].short_addr == 1);
 }
 
+/* ---- `apos assign` (spec 2026-10-21) ------------------------------------ */
+
+static void make_unassigned(int n)
+{
+	for (int i = 0; i < n; i++) {
+		A[i].addr = UWB_ANCHOR_ADDR_UNASSIGNED;
+	}
+}
+
+static void run_assign(void)
+{
+	CHECK(apos_gw_start_assign() == 0);
+	pump(20000);
+	CHECK(!apos_gw_busy());
+}
+
+static bool map_has(int i, uint16_t addr)
+{
+	int k = apos_addrmap_find_eui(&store_map, A[i].eui);
+
+	return k >= 0 && store_map.e[k].addr == addr;
+}
+
+static bool addresses_distinct_and_valid(int n)
+{
+	for (int i = 0; i < n; i++) {
+		if (A[i].addr < UWB_ANCHOR_ADDR_BASE ||
+		    A[i].addr >= UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS) {
+			return false;
+		}
+		for (int j = 0; j < i; j++) {
+			if (A[i].addr == A[j].addr) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/* H1 in host form. */
+static void test_assign_gives_factory_fresh_boards_distinct_addresses(void)
+{
+	world(4, false);
+	make_unassigned(4);
+	apos_gw_init();
+	run_assign();
+
+	CHECK(addresses_distinct_and_valid(4));
+	CHECK(map_saves == 1);
+	CHECK(store_map.n == 4);
+	for (int i = 0; i < 4; i++) {
+		CHECK(map_has(i, A[i].addr));
+		CHECK(A[i].n_reboots == 1);
+	}
+	/* EUI order: A[0] has the lowest EUI and gets the lowest address. */
+	CHECK(A[0].addr == 1 && A[3].addr == 4);
+	CHECK(setaddr_frames == 4);
+	CHECK(log_count[3] == 0);
+
+	/* A second assign over the converged array changes nothing. */
+	setaddr_frames = 0;
+	run_assign();
+	CHECK(setaddr_frames == 0 && map_saves == 1);
+	CHECK(log_count[3] == 0);
+}
+
+/* H3 in host form: zero frames, zero reboots, the map simply learns them. */
+static void test_assign_adopts_a_hand_numbered_fleet_without_frames(void)
+{
+	world(4, false);
+	apos_gw_init();
+	run_assign();
+
+	CHECK(setaddr_frames == 0);
+	CHECK(map_saves == 1 && store_map.n == 4);
+	for (int i = 0; i < 4; i++) {
+		CHECK(A[i].n_reboots == 0);
+		CHECK(map_has(i, (uint16_t)(UWB_ANCHOR_ADDR_BASE + i)));
+	}
+	CHECK(log_count[3] == 0);
+}
+
+static void test_assign_resolves_a_duplicate_lowest_eui_keeps_it(void)
+{
+	world(4, false);
+	A[1].addr = 1;   /* same `anchor id` as A[0], which has the lower EUI */
+	apos_gw_init();
+	run_assign();
+
+	CHECK(A[0].addr == 1 && A[0].n_reboots == 0);
+	CHECK(A[1].addr == 2 && A[1].n_reboots == 1);   /* the only free one */
+	CHECK(addresses_distinct_and_valid(4));
+	CHECK(setaddr_frames == 1);
+	CHECK(log_count[3] == 0);
+}
+
+static void test_assign_lost_ack_is_retried(void)
+{
+	world(4, false);
+	make_unassigned(4);
+	A[2].drop_setaddr_acks = 1;
+	apos_gw_init();
+	run_assign();
+
+	CHECK(A[2].n_setaddr_rx == 2);   /* asked twice, rebooted once */
+	CHECK(A[2].n_reboots == 1);
+	CHECK(addresses_distinct_and_valid(4));
+	CHECK(map_has(2, A[2].addr));
+	CHECK(log_count[3] == 0);
+}
+
+/* H7 in host form. */
+static void test_assign_old_firmware_is_reported_and_not_reserved(void)
+{
+	world(4, false);
+	make_unassigned(4);
+	A[3].old_fw = true;
+	apos_gw_init();
+	run_assign();
+
+	CHECK(log_count[3] > 0);                         /* reported */
+	CHECK(apos_addrmap_find_eui(&store_map, A[3].eui) < 0);   /* not reserved */
+	CHECK(A[3].addr == UWB_ANCHOR_ADDR_UNASSIGNED);
+	/* The others took theirs and are in the map. */
+	for (int i = 0; i < 3; i++) {
+		CHECK(map_has(i, A[i].addr));
+	}
+	/* Asked exactly 1 + retries times: no second SEND cycle. */
+	CHECK(setaddr_frames == 3 + 1 + (int)APOS_GW_APPLY_RETRIES);
+}
+
+static void test_assign_foreign_ack_is_not_counted(void)
+{
+	world(4, false);
+	make_unassigned(1);
+	A[0].old_fw = true;
+	inject_foreign_setaddr_ack = true;
+	apos_gw_init();
+	run_assign();
+
+	CHECK(log_count[3] > 0);
+	CHECK(apos_addrmap_find_eui(&store_map, A[0].eui) < 0);
+}
+
+static void test_assign_map_write_failure_aborts(void)
+{
+	world(4, false);
+	make_unassigned(2);
+	fail_map_write = true;
+	apos_gw_init();
+	run_assign();
+
+	CHECK(map_saves == 0);
+	CHECK(log_count[3] > 0);
+}
+
+/* The map write is a flash write on the beacon-owning loop: it must wait for a
+ * step with the whole solve budget in hand, however long that takes. */
+static void test_assign_map_write_waits_for_budget(void)
+{
+	world(4, false);
+	make_unassigned(2);
+	apos_gw_init();
+	CHECK(apos_gw_start_assign() == 0);
+	pump_avail(2000, APOS_GW_STEP_BUDGET_UUS);       /* enough to transmit */
+	CHECK(apos_gw_busy());
+	CHECK(map_saves == 0);
+	pump(20000);
+	CHECK(!apos_gw_busy());
+	CHECK(map_saves == 1);
+}
+
+static void test_assign_slow_boot_inside_window_converges(void)
+{
+	world(4, false);
+	make_unassigned(4);
+	for (int i = 0; i < 4; i++) {
+		A[i].reboot_ms = 22000;   /* the hung-WiFi-driver boot */
+	}
+	apos_gw_init();
+	run_assign();
+
+	CHECK(addresses_distinct_and_valid(4));
+	CHECK(log_count[3] == 0);
+}
+
+static void test_assign_board_that_never_returns_fails_after_deadline(void)
+{
+	world(4, false);
+	make_unassigned(4);
+	A[1].reboot_ms = 10 * 60 * 1000;
+	apos_gw_init();
+
+	int64_t t0 = now_ms;
+
+	run_assign();
+	CHECK(now_ms - t0 >= (int64_t)APOS_GW_ASSIGN_CONVERGE_MS);
+	CHECK(log_count[3] > 0);
+	/* Persisted anyway: it ACKed and holds the address, it just did not
+	 * come back in time to prove it. */
+	CHECK(map_has(1, A[1].addr));
+}
+
+static void test_assign_clears_the_gauge_when_addresses_move(void)
+{
+	world(4, false);
+	A[1].addr = 1;
+	apos_gw_init();
+	CHECK(apos_gw_set_gauge(1, 3, 4, -1) == 0);
+	run_assign();
+	CHECK(!apos_gw_gauge_set());
+
+	/* No address moves: the gauge survives. */
+	CHECK(apos_gw_set_gauge(1, 3, 4, -1) == 0);
+	run_assign();
+	CHECK(apos_gw_gauge_set());
+}
+
+static void test_run_refuses_with_unassigned_boards(void)
+{
+	world(4, false);
+	A[2].addr = UWB_ANCHOR_ADDR_UNASSIGNED;
+	start(false);
+	CHECK(apos_gw_start_run() == 0);
+	pump(20000);
+	CHECK(!apos_gw_busy());
+	CHECK(!status().have_result);
+	CHECK(status().meas_total == 0);   /* stopped before ranging anything */
+	CHECK(log_count[3] > 0);
+	CHECK(setaddr_frames == 0);   /* a run never re-addresses by itself */
+}
+
+static void test_assign_refuses_over_an_unreadable_map(void)
+{
+	world(4, false);
+	map_rejected = true;
+	apos_gw_init();
+	CHECK(apos_gw_start_assign() == -EIO);
+	CHECK(apos_gw_forget(NULL) == 0);   /* the explicit clear */
+	CHECK(!map_rejected);
+	CHECK(apos_gw_start_assign() == 0);
+	pump(20000);
+}
+
 int main(void)
 {
 	verbose = getenv("APOS_GW_TEST_VERBOSE") != NULL;
@@ -881,6 +1232,19 @@ int main(void)
 	test_2d_flow_is_the_historical_anchors_only_flow();
 	test_gateway_cannot_be_a_gauge_reference();
 	test_enumeration_order_does_not_change_identities();
+	test_assign_gives_factory_fresh_boards_distinct_addresses();
+	test_assign_adopts_a_hand_numbered_fleet_without_frames();
+	test_assign_resolves_a_duplicate_lowest_eui_keeps_it();
+	test_assign_lost_ack_is_retried();
+	test_assign_old_firmware_is_reported_and_not_reserved();
+	test_assign_foreign_ack_is_not_counted();
+	test_assign_map_write_failure_aborts();
+	test_assign_map_write_waits_for_budget();
+	test_assign_slow_boot_inside_window_converges();
+	test_assign_board_that_never_returns_fails_after_deadline();
+	test_assign_clears_the_gauge_when_addresses_move();
+	test_run_refuses_with_unassigned_boards();
+	test_assign_refuses_over_an_unreadable_map();
 
 	if (g_fail) {
 		printf("%d CHECK(s) FAILED\n", g_fail);

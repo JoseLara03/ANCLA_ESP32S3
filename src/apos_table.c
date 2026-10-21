@@ -8,6 +8,8 @@
 
 #include "apos_table.h"
 
+#include "uwb_config.h"   /* UWB_ANCHOR_ADDR_UNASSIGNED */
+
 #include <errno.h>
 #include <math.h>
 #include <string.h>
@@ -56,17 +58,6 @@ int apos_table_add_peer(struct apos_table *t, const uint8_t eui[APOS_EUI_LEN],
 	}
 
 	int existing = apos_table_find_eui(t, eui);
-
-	/* A different board already claims this address. Checked before the
-	 * insert so the table is never left holding two rows for one address --
-	 * every later step addresses peers by short address. */
-	for (uint8_t k = 0; k < t->n_peers; k++) {
-		if (t->peer[k].short_addr == short_addr &&
-		    (existing < 0 || (int)k != existing)) {
-			return -EADDRINUSE;
-		}
-	}
-
 	uint8_t slot;
 
 	if (existing >= 0) {
@@ -85,7 +76,33 @@ int apos_table_add_peer(struct apos_table *t, const uint8_t eui[APOS_EUI_LEN],
 	t->peer[slot].y = y;
 	t->peer[slot].z = z;
 
+	/* Recompute every flag: a board that moved address may have cleared a
+	 * conflict as well as created one. */
+	for (uint8_t k = 0; k < t->n_peers; k++) {
+		bool c = (t->peer[k].short_addr == UWB_ANCHOR_ADDR_UNASSIGNED);
+
+		for (uint8_t j = 0; j < t->n_peers && !c; j++) {
+			if (j != k && t->peer[j].short_addr == t->peer[k].short_addr) {
+				c = true;
+			}
+		}
+		t->peer[k].addr_conflict = c;
+	}
+
 	return slot;
+}
+
+bool apos_table_needs_assign(const struct apos_table *t)
+{
+	if (!t) {
+		return false;
+	}
+	for (uint8_t k = 0; k < t->n_peers; k++) {
+		if (t->peer[k].addr_conflict) {
+			return true;
+		}
+	}
+	return false;
 }
 
 int apos_table_add_meas(struct apos_table *t, uint8_t from, uint8_t to,

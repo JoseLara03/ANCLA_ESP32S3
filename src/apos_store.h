@@ -150,6 +150,22 @@ uint32_t apos_store_pending_generation(void);
 int apos_store_set_pending(uint32_t generation);
 int apos_store_clear_pending(void);
 
+/* ---- Address map (`apos assign`, spec 2026-10-21 D4) -------------------- */
+
+struct apos_addrmap;
+
+/* The EUI -> short address reservations. Never NULL; ->n == 0 means none. */
+const struct apos_addrmap *apos_store_addrmap(void);
+
+/* A map was found on flash but could not be read. It is NOT erased and reads
+ * as empty; `apos assign` refuses rather than overwrite it, until the operator
+ * clears it explicitly. */
+bool apos_store_addrmap_rejected(void);
+
+/* Persist the map. Cache updated only after the write succeeds. A flash write:
+ * from the gateway loop it must be budget-gated (APOS_GW_SOLVE_BUDGET_UUS). */
+int apos_store_save_addrmap(const struct apos_addrmap *m);
+
 /* Invalidate and erase. `apos_store_get()->valid` becomes false, so the anchors
  * payload falls back to the stub. Returns 0 or a negative errno. */
 int apos_store_clear(void);

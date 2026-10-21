@@ -55,15 +55,38 @@ static void test_readding_the_same_eui_is_idempotent(void)
 }
 
 /* The duplicate-anchor-id fault. Two distinct boards claiming one short address
- * must be reported, because everything downstream addresses by short address. */
+ * are both kept (keyed by EUI) and both flagged, because everything downstream
+ * of `apos run` addresses by short address and `apos assign` needs to see both
+ * to re-address one of them. */
 static void test_same_addr_from_a_different_eui_is_reported(void)
 {
     struct apos_table t;
 
     apos_table_init(&t);
     CHECK(add(&t, 1, 0x0002) == 0);
-    CHECK(add(&t, 9, 0x0002) == -EADDRINUSE);
-    CHECK(t.n_peers == 1);
+    CHECK(!apos_table_needs_assign(&t));
+    CHECK(add(&t, 9, 0x0002) == 1);
+    CHECK(t.n_peers == 2);
+    CHECK(t.peer[0].addr_conflict && t.peer[1].addr_conflict);
+    CHECK(apos_table_needs_assign(&t));
+
+    /* The second board moves away (re-enumerated at its new address): both
+     * flags clear, because they are recomputed over the whole table. */
+    CHECK(add(&t, 9, 0x0003) == 1);
+    CHECK(!t.peer[0].addr_conflict && !t.peer[1].addr_conflict);
+    CHECK(!apos_table_needs_assign(&t));
+}
+
+/* An UNASSIGNED board is flagged even when it is the only one: 0x00FF is shared
+ * by every board no gateway has addressed. */
+static void test_unassigned_address_is_always_a_conflict(void)
+{
+    struct apos_table t;
+
+    apos_table_init(&t);
+    CHECK(add(&t, 3, 0x00FF) == 0);
+    CHECK(t.peer[0].addr_conflict);
+    CHECK(apos_table_needs_assign(&t));
 }
 
 /* An anchor that had its id changed between surveys keeps its identity: same
@@ -389,6 +412,7 @@ int main(void)
     test_peers_get_sequential_indices();
     test_readding_the_same_eui_is_idempotent();
     test_same_addr_from_a_different_eui_is_reported();
+    test_unassigned_address_is_always_a_conflict();
     test_same_eui_with_a_new_addr_updates_in_place();
     test_lookup_by_addr_and_eui();
     test_table_full_is_enospc();

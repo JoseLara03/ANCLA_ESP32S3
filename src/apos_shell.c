@@ -13,8 +13,10 @@
  * would corrupt both -- the same rule cal_shell.c follows.
  */
 
+#include "apos_addrmap.h"
 #include "apos_gw.h"
 #include "apos_store.h"
+#include "node_eui.h"
 #include "uwb_config.h"
 
 #include <zephyr/shell/shell.h>
@@ -310,6 +312,121 @@ static int cmd_show(const struct shell *sh, size_t argc, char **argv)
 		shell_print(sh, "  {\"ref\":\"unset — run `apos ref <lat> <lon>` "
 				"or the platform cannot place the map\"}");
 	}
+	return 0;
+}
+
+static int cmd_assign(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	int rc = require_gateway(sh);
+
+	if (rc) {
+		return rc;
+	}
+
+	rc = apos_gw_start_assign();
+	if (rc == -EBUSY) {
+		shell_error(sh, "error: a survey is already running");
+		return rc;
+	}
+	if (rc == -EIO) {
+		shell_error(sh, "error: the stored address map cannot be read "
+				"(unknown version or corrupt) and was NOT erased. "
+				"`apos addr clear` drops it -- every anchor is then "
+				"re-planned from what it answers with");
+		return rc;
+	}
+	if (rc) {
+		shell_error(sh, "error: assign refused (errno %d)", rc);
+		return rc;
+	}
+
+	shell_print(sh, "assigning — boards that need a new address reboot into "
+			"it; the result is logged as JSON (apos_assign_done). "
+			"Set the gauge afterwards: `apos addr` lists who is who.");
+	return 0;
+}
+
+static int cmd_addr(const struct shell *sh, size_t argc, char **argv)
+{
+	int rc = require_gateway(sh);
+
+	if (rc) {
+		return rc;
+	}
+
+	if (argc > 1) {
+		if (strcmp(argv[1], "clear") != 0) {
+			shell_error(sh, "error: the only argument is `clear`");
+			return -EINVAL;
+		}
+		rc = apos_gw_forget(NULL);
+		if (rc == -EBUSY) {
+			shell_error(sh, "error: a survey is running");
+			return rc;
+		}
+		if (rc) {
+			shell_error(sh, "error: map NOT cleared (errno %d)", rc);
+			return rc;
+		}
+		shell_print(sh, "ok: address map cleared — the next `apos assign` "
+				"adopts working addresses and re-plans the rest");
+		return 0;
+	}
+
+	const struct apos_addrmap *m = apos_store_addrmap();
+	const struct apos_table *t = apos_gw_table();
+
+	shell_print(sh, "{\"addrmap\":{\"n\":%u,\"max\":%u,\"readable\":%u}}",
+		    m->n, (unsigned int)APOS_ADDRMAP_MAX,
+		    apos_store_addrmap_rejected() ? 0u : 1u);
+	for (uint8_t k = 0; k < m->n; k++) {
+		char hex[NODE_EUI_HEX_LEN + 1u];
+
+		node_eui_fmt(m->e[k].eui, hex);
+		/* `seen` is the last enumeration this gateway ran -- an absent
+		 * board keeps its reservation, which is the point of the map. */
+		shell_print(sh, "{\"eui\":\"%s\",\"addr\":\"0x%04X\",\"id\":%d,"
+				"\"seen\":%u}", hex, m->e[k].addr,
+			    (int)(m->e[k].addr - UWB_ANCHOR_ADDR_BASE),
+			    apos_table_find_eui(t, m->e[k].eui) >= 0 ? 1u : 0u);
+	}
+	return 0;
+}
+
+static int cmd_forget(const struct shell *sh, size_t argc, char **argv)
+{
+	uint8_t eui[APOS_EUI_LEN];
+
+	ARG_UNUSED(argc);
+
+	int rc = require_gateway(sh);
+
+	if (rc) {
+		return rc;
+	}
+	if (!node_eui_parse(argv[1], eui)) {
+		shell_error(sh, "error: give the EUI as 16 hex digits, as "
+				"`apos addr` prints it");
+		return -EINVAL;
+	}
+	rc = apos_gw_forget(eui);
+	if (rc == -ENOENT) {
+		shell_error(sh, "error: %s is not in the address map", argv[1]);
+		return rc;
+	}
+	if (rc == -EBUSY) {
+		shell_error(sh, "error: a survey is running");
+		return rc;
+	}
+	if (rc) {
+		shell_error(sh, "error: NOT forgotten (errno %d)", rc);
+		return rc;
+	}
+	shell_print(sh, "ok: %s forgotten — its address is free for the next "
+			"`apos assign`", argv[1]);
 	return 0;
 }
 
@@ -633,6 +750,19 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_apos,
 		      "space `anchor id` uses. Omit up= (or pass up=-1) for "
 		      "a 2D (3-anchor) survey.",
 		      cmd_gauge, 4, 1),
+	SHELL_CMD_ARG(assign, NULL,
+		      "assign — give every anchor a unique address (by EUI), "
+		      "rebooting the boards that need one. Run before `apos "
+		      "gauge`",
+		      cmd_assign, 1, 0),
+	SHELL_CMD_ARG(addr,  NULL,
+		      "addr [clear] — the EUI -> address reservations as JSON, "
+		      "or drop them all",
+		      cmd_addr, 1, 1),
+	SHELL_CMD_ARG(forget, NULL,
+		      "forget <eui> — free one board's reservation (a replaced "
+		      "or removed anchor)",
+		      cmd_forget, 2, 0),
 	SHELL_CMD_ARG(run,   NULL,
 		      "run — range every anchor pair, solve, and REPORT ONLY "
 		      "(persists nothing)",

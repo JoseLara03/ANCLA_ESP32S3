@@ -32,10 +32,11 @@
 #include <stdint.h>
 
 enum apos_gw_phase {
-	APOS_GW_IDLE  = 0,
-	APOS_GW_ENUM  = 1,
-	APOS_GW_RANGE = 2,
-	APOS_GW_APPLY = 3,
+	APOS_GW_IDLE   = 0,
+	APOS_GW_ENUM   = 1,
+	APOS_GW_RANGE  = 2,
+	APOS_GW_APPLY  = 3,
+	APOS_GW_ASSIGN = 4, /* `apos assign`: give every anchor a unique address */
 };
 
 /* How long a survey window anchors are told to hold open. Generously longer
@@ -199,6 +200,22 @@ enum apos_gw_phase {
  * and then reports the anchor by address. */
 #define APOS_GW_APPLY_RETRIES 3u
 
+/* How long `apos assign` waits, after the SETADDRs, for every re-addressed
+ * anchor to answer enumeration from its NEW address. There is no fixed reboot
+ * wait: the gateway re-broadcasts SURVEY_BEGIN every APOS_GW_ENUM_SETTLE_MS
+ * (which also reopens the window the reboot closed) and counts a board as
+ * converged the moment it answers from the new address.
+ *
+ * Sized from the operator's report (2026-10-21) of how long an anchor takes to
+ * boot: ~5 s when the ESP32 WiFi driver comes up first time, 10-20 s more when
+ * it hangs and has to be detected, shut down and retried. 30 s is that worst
+ * case plus margin. The UWB loop does not wait for WiFi in code
+ * (net_uplink_start() only creates the thread, main.c enters uwb_slave_run()
+ * right after), so convergence should usually be far faster -- whether a hung
+ * driver can delay the UWB loop too is UNMEASURED; gate H8 of the spec. Must
+ * stay inside APOS_GW_WINDOW_S, checked in apos_gw.c. */
+#define APOS_GW_ASSIGN_CONVERGE_MS 30000u
+
 /* Acceptance thresholds. Anchored on the antenna-delay cross-check, which
  * accepts |error| < 30 mm per pair: a fit over many such edges should land
  * inside 50 mm RMS, and anything much worse means a bad edge or a wrong gauge
@@ -323,8 +340,28 @@ enum apos_geom_dim apos_gw_gauge_dim(void);
 
 /* Begin a full run: re-enumerate, range every ordered pair, solve, report.
  * Persists NOTHING. Returns 0, -EBUSY if a survey runs, or -EINVAL if the gauge
- * has not been set. */
+ * has not been set. The run aborts after enumeration if any anchor answered
+ * UNASSIGNED or shares an address with another (apos_table_needs_assign()):
+ * it never re-addresses boards itself, because the gauge was set as addresses
+ * and would silently point at a different board afterwards. */
 int apos_gw_start_run(void);
+
+/* `apos assign` (spec 2026-10-21 D7): enumerate, plan every board's address
+ * with apos_addr_plan(), send SETADDR to each board that needs one, persist the
+ * map (budget-gated), then re-enumerate until each re-addressed board answers
+ * from its new address or APOS_GW_ASSIGN_CONVERGE_MS passes. Logs the plan and
+ * the outcome as JSON. If any address changed, the stored gauge is CLEARED:
+ * it was a set of addresses and may now name different boards.
+ *
+ * Returns 0, -EBUSY if a survey runs, or -EIO if the stored map is unreadable
+ * (apos_store_addrmap_rejected(); clear it explicitly first). */
+int apos_gw_start_assign(void);
+
+/* Free one reservation, or every reservation (eui == NULL), and persist. A
+ * flash write from the caller's thread (the shell). Returns 0, -EBUSY while a
+ * survey runs, -ENOENT for an EUI that is not in the map, or a settings
+ * errno. Clearing all also clears an unreadable map. */
+int apos_gw_forget(const uint8_t eui[APOS_EUI_LEN]);
 
 /* The last solved result. Never NULL; check apos_gw_get_status()->have_result. */
 const struct apos_result *apos_gw_result(void);

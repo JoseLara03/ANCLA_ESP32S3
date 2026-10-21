@@ -8,6 +8,7 @@
 
 #include "apos_gw.h"
 
+#include "apos_addrmap.h"
 #include "apos_frame.h"
 #include "apos_node.h"    /* APOS_MIN_N_OK, APOS_ENUM_* for the gap derivation */
 #include "apos_stats.h"
@@ -136,6 +137,27 @@ static const char *hold_reason = "none";
 
 static uint8_t tx_buf[APOS_LEN_MAX];
 
+/* ---- `apos assign` (spec 2026-10-21 D7) ---------------------------------- */
+
+_Static_assert(APOS_GW_ASSIGN_CONVERGE_MS < APOS_GW_WINDOW_S * 1000u,
+	       "assign convergence must finish inside the survey window");
+
+enum assign_stage {
+	AS_ENUM     = 0, /* APOS_GW_ENUM_ROUNDS of SURVEY_BEGIN, then plan */
+	AS_SEND     = 1, /* one SETADDR per ASSIGN, each acknowledged */
+	AS_PERSIST  = 2, /* one budget-gated write of the updated map */
+	AS_CONVERGE = 3, /* re-enumerate until every board shows its new address */
+};
+static uint8_t assign_stage;
+static uint8_t plan_n;
+static struct apos_plan_peer plan_peer[APOS_MAX_NODES];
+static struct apos_plan_out plan_out[APOS_MAX_NODES];
+static bool plan_acked[APOS_MAX_NODES];
+static uint8_t assign_idx;
+static uint8_t assign_failed;
+static uint8_t assign_acked;
+static int64_t converge_deadline_ms;
+
 void apos_gw_init(void)
 {
 	apos_table_init(&tbl);
@@ -177,6 +199,8 @@ void apos_gw_init(void)
 	apply_generation = 0;
 	tau_ok = 0;
 	applied_generation = apos_store_links()->generation;
+	assign_stage = AS_ENUM;
+	plan_n = 0;
 
 	/* This board's own identity, from the same source apos_node.c hashes
 	 * for its stagger (node_eui owns the read and the zero padding). */
@@ -454,10 +478,15 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 	 * stays frozen at the old N -- pair_of() then decomposes with the new
 	 * per_row against the old total, revisiting some ordered pairs, never
 	 * commanding others, and dropping the new node into the solve with no
-	 * edges at all. It would also let the -EADDRINUSE branch below abort a
-	 * run in progress with a message about enumeration, which by then is not
-	 * even true. Late enumeration replies belong to ENUM or to nothing. */
-	if (phase != APOS_GW_ENUM) {
+	 * edges at all. Late enumeration replies belong to ENUM, or to the
+	 * enumerating stages of ASSIGN (its first rounds and the convergence
+	 * re-enumeration, which is how a re-addressed board is seen to come
+	 * back at its new address), or to nothing. */
+	bool assign_listening = (phase == APOS_GW_ASSIGN &&
+				 (assign_stage == AS_ENUM ||
+				  assign_stage == AS_CONVERGE));
+
+	if (phase != APOS_GW_ENUM && !assign_listening) {
 		return;
 	}
 
@@ -474,20 +503,11 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 		return;
 	}
 
+	/* Two boards on one address (the same `anchor id`, or both UNASSIGNED)
+	 * are both kept, keyed by EUI, and flagged addr_conflict. A run refuses
+	 * on that when enumeration closes; `apos assign` re-addresses them. */
 	int idx = apos_table_add_peer(&tbl, eui, addr, pv, x, y, z);
 
-	if (idx == -EADDRINUSE) {
-		/* Two distinct boards claiming one short address: both are
-		 * configured with the same `anchor id`. Everything downstream
-		 * addresses peers by short address, so continuing would range
-		 * whichever board answered first and then push coordinates to
-		 * whichever answered second. Abort loudly. */
-		LOG_ERR("{\"apos_error\":\"duplicate short address 0x%04X — two "
-			"boards share an `anchor id`. Fix with `anchor id` on "
-			"one of them and re-run.\"}", addr);
-		phase = APOS_GW_IDLE;
-		return;
-	}
 	if (idx == -ENOSPC) {
 		LOG_WRN("more than %u anchors answered — ignoring 0x%04X",
 			APOS_MAX_NODES, addr);
@@ -497,11 +517,15 @@ static void on_enum_rsp(const uint8_t *buf, uint16_t plen)
 		return;
 	}
 
+	char hex[NODE_EUI_HEX_LEN + 1u];
+
+	node_eui_fmt(eui, hex);
 	LOG_INF("{\"apos_peer\":{\"idx\":%d,\"id\":%d,\"addr\":\"0x%04X\","
-		"\"eui\":\"%02X%02X%02X%02X%02X%02X%02X%02X\",\"pos_valid\":%u,"
+		"\"eui\":\"%s\",\"conflict\":%u,\"pos_valid\":%u,"
 		"\"x\":%.3f,\"y\":%.3f,\"z\":%.3f}}",
-		idx, (int)(addr - UWB_ANCHOR_ADDR_BASE), addr, eui[0], eui[1],
-		eui[2], eui[3], eui[4], eui[5], eui[6], eui[7],
+		idx, (addr == UWB_ANCHOR_ADDR_UNASSIGNED)
+		     ? -1 : (int)(addr - UWB_ANCHOR_ADDR_BASE),
+		addr, hex, tbl.peer[idx].addr_conflict ? 1u : 0u,
 		pv ? 1u : 0u, (double)x, (double)y, (double)z);
 }
 
@@ -1569,8 +1593,8 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 	 *
 	 * One frame per step is respected: this arm transmits and returns. The
 	 * staggered ENUM_RSPs it provokes are discarded by on_enum_rsp()'s
-	 * `phase != APOS_GW_ENUM` guard -- phase is APOS_GW_APPLY throughout --
-	 * so they cannot append peers or trip the -EADDRINUSE abort. */
+	 * phase guard -- phase is APOS_GW_APPLY throughout -- so they cannot
+	 * append peers to the table the apply is walking. */
 	if (apply_stage == AP_REOPEN) {
 		apply_stage = AP_SETPOS;
 		apply_idx = 0;
@@ -1837,6 +1861,389 @@ static void step_apply(uint32_t avail_uus, uint8_t *seq)
 	apply_stage = AP_END;
 }
 
+/* ---- `apos assign` ---- */
+
+int apos_gw_start_assign(void)
+{
+	if (apos_gw_busy()) {
+		return -EBUSY;
+	}
+	if (apos_store_addrmap_rejected()) {
+		/* Writing a new map would overwrite a record this firmware cannot
+		 * read -- possibly one a newer build wrote. That is the operator's
+		 * call (`apos addr clear`), not a side effect of assign. */
+		return -EIO;
+	}
+
+	apos_table_init(&tbl);
+	have_result = false;
+	session = new_session();
+	enum_round = 0;
+	next_action_ms = 0;
+	is_run = false;
+	pair_idx = 0;
+	pair_total = 0;
+	awaiting_rsp = false;
+	reset_static_state();
+
+	assign_stage = AS_ENUM;
+	plan_n = 0;
+	assign_idx = 0;
+	assign_failed = 0;
+	assign_acked = 0;
+	memset(plan_acked, 0, sizeof(plan_acked));
+	phase = APOS_GW_ASSIGN;
+
+	LOG_INF("{\"apos\":\"assigning\",\"session\":%u}", session);
+	return 0;
+}
+
+int apos_gw_forget(const uint8_t eui[APOS_EUI_LEN])
+{
+	struct apos_addrmap m;
+
+	if (apos_gw_busy()) {
+		return -EBUSY;
+	}
+	if (eui == NULL) {
+		memset(&m, 0, sizeof(m));
+	} else {
+		m = *apos_store_addrmap();
+		if (apos_addrmap_forget(&m, eui) != 0) {
+			return -ENOENT;
+		}
+	}
+	return apos_store_save_addrmap(&m);
+}
+
+static void log_plan_entry(uint8_t i)
+{
+	static const char *const what[] = {"keep", "adopt", "assign", "nospace"};
+	char hex[NODE_EUI_HEX_LEN + 1u];
+
+	node_eui_fmt(plan_peer[i].eui, hex);
+	LOG_INF("{\"apos_assign_plan\":{\"eui\":\"%s\",\"from\":\"0x%04X\","
+		"\"to\":\"0x%04X\",\"action\":\"%s\"}}", hex, plan_peer[i].addr,
+		plan_out[i].addr,
+		(plan_out[i].action < 4u) ? what[plan_out[i].action] : "?");
+}
+
+/* Build the plan from the freshly enumerated table. Returns the number of
+ * SETADDRs it needs, or a negative errno (already logged). */
+static int make_plan(void)
+{
+	uint8_t n_assign = 0;
+
+	plan_n = 0;
+	for (uint8_t k = 0; k < tbl.n_peers; k++) {
+		if (tbl.peer[k].short_addr == UWB_ADDR_GATEWAY_RESERVED) {
+			continue;   /* never in an assign table, but never planned */
+		}
+		memcpy(plan_peer[plan_n].eui, tbl.peer[k].eui, APOS_EUI_LEN);
+		plan_peer[plan_n].addr = tbl.peer[k].short_addr;
+		plan_n++;
+	}
+
+	int rc = apos_addr_plan(apos_store_addrmap(), plan_peer, plan_n,
+				UWB_ANCHOR_ADDR_BASE,
+				UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS,
+				plan_out, &n_assign);
+
+	if (rc == -EINVAL) {
+		LOG_ERR("{\"apos_error\":\"assign plan refused its input (two "
+			"boards with one EUI, or an all-zero EUI)\"}");
+		return rc;
+	}
+	for (uint8_t i = 0; i < plan_n; i++) {
+		log_plan_entry(i);
+	}
+	if (rc == -ENOSPC) {
+		LOG_ERR("{\"apos_error\":\"not every anchor fits: %u address(es) "
+			"and %u map slot(s). Nothing was changed. Free a stale "
+			"reservation with `apos forget <eui>`.\"}",
+			(unsigned int)UWB_MAX_ANCHORS,
+			(unsigned int)APOS_ADDRMAP_MAX);
+		return rc;
+	}
+	return n_assign;
+}
+
+/* Close the assign: re-plan from what the table shows NOW. An empty plan (all
+ * KEEP) means every board answers from the address the map gives it. */
+static void finish_assign(void)
+{
+	uint8_t pending = 0;
+	bool replanned;
+	struct apos_plan_out now_out[APOS_MAX_NODES];
+
+	for (uint8_t i = 0; i < plan_n; i++) {
+		int k = apos_table_find_eui(&tbl, plan_peer[i].eui);
+
+		if (k >= 0) {
+			plan_peer[i].addr = tbl.peer[k].short_addr;
+		}
+	}
+	replanned = apos_addr_plan(apos_store_addrmap(), plan_peer, plan_n,
+				   UWB_ANCHOR_ADDR_BASE,
+				   UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS,
+				   now_out, &pending) == 0;
+	for (uint8_t i = 0; i < plan_n && replanned; i++) {
+		if (now_out[i].action != APOS_PLAN_KEEP) {
+			char hex[NODE_EUI_HEX_LEN + 1u];
+
+			node_eui_fmt(plan_peer[i].eui, hex);
+			LOG_ERR("{\"apos_assign_unconverged\":{\"eui\":\"%s\","
+				"\"at\":\"0x%04X\",\"want\":\"0x%04X\"}}", hex,
+				plan_peer[i].addr, now_out[i].addr);
+			pending++;
+		}
+	}
+
+	bool ok = replanned && pending == 0u && assign_failed == 0u;
+
+	LOG_INF("{\"apos_assign_done\":{\"anchors\":%u,\"acked\":%u,"
+		"\"failed\":%u,\"converged\":%u}}", plan_n, assign_acked,
+		assign_failed, ok ? 1u : 0u);
+	if (!ok) {
+		LOG_ERR("{\"apos_error\":\"`apos assign` did NOT converge — see "
+			"the lines above. Re-run it once the listed boards answer.\"}");
+	}
+	phase = APOS_GW_IDLE;
+}
+
+static void on_setaddr_ack(const uint8_t *buf, uint16_t plen)
+{
+	uint16_t sess = 0, addr = 0;
+	uint8_t eui[APOS_EUI_LEN];
+	uint8_t status = 0xFFu;
+
+	if (apos_frame_parse_setaddr_ack(buf, plen, &sess, eui, &addr, &status)
+	    != 0) {
+		return;
+	}
+	if (sess != session || !awaiting_rsp || phase != APOS_GW_ASSIGN ||
+	    assign_stage != AS_SEND || assign_idx >= plan_n) {
+		return;
+	}
+	/* Paired by EUI, never by source address: the ACK leaves from the
+	 * board's OLD address, which may be shared or UNASSIGNED. */
+	if (memcmp(eui, plan_peer[assign_idx].eui, APOS_EUI_LEN) != 0) {
+		return;
+	}
+
+	char hex[NODE_EUI_HEX_LEN + 1u];
+
+	node_eui_fmt(eui, hex);
+	if (status == APOS_SETADDR_OK && addr == plan_out[assign_idx].addr) {
+		plan_acked[assign_idx] = true;
+		assign_acked++;
+		LOG_INF("{\"apos_setaddr_ok\":{\"eui\":\"%s\",\"addr\":\"0x%04X\"}}",
+			hex, addr);
+	} else {
+		assign_failed++;
+		LOG_ERR("{\"apos_error\":\"%s answered SETADDR with status %u, "
+			"address 0x%04X (sent 0x%04X) — it did NOT take it\"}", hex,
+			status, addr, plan_out[assign_idx].addr);
+	}
+	awaiting_rsp = false;
+	apply_retries = 0;
+	tx_fails = 0;
+	assign_idx++;
+	next_action_ms = 0;
+}
+
+static void step_assign(uint32_t avail_uus, uint8_t *seq)
+{
+	int64_t now = k_uptime_get();
+
+	if (assign_stage == AS_ENUM) {
+		if (now < next_action_ms) {
+			return;
+		}
+		if (enum_round < APOS_GW_ENUM_ROUNDS) {
+			send_survey_begin(seq);
+			enum_round++;
+			next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
+			return;
+		}
+		LOG_INF("{\"apos_enum_done\":{\"peers\":%u,\"needs_assign\":%u}}",
+			tbl.n_peers, apos_table_needs_assign(&tbl) ? 1u : 0u);
+
+		int n_assign = make_plan();
+
+		if (n_assign < 0) {
+			phase = APOS_GW_IDLE;
+			return;
+		}
+		assign_idx = 0;
+		apply_retries = 0;
+		tx_fails = 0;
+		awaiting_rsp = false;
+		next_action_ms = 0;
+		assign_stage = (n_assign > 0) ? AS_SEND : AS_PERSIST;
+		return;
+	}
+
+	if (assign_stage == AS_SEND) {
+		if (awaiting_rsp) {
+			if (now < next_action_ms) {
+				return;
+			}
+			if (apply_retries < APOS_GW_APPLY_RETRIES) {
+				apply_retries++;
+				awaiting_rsp = false;
+			} else {
+				char hex[NODE_EUI_HEX_LEN + 1u];
+
+				node_eui_fmt(plan_peer[assign_idx].eui, hex);
+				assign_failed++;
+				LOG_ERR("{\"apos_error\":\"%s never acknowledged "
+					"SETADDR after %u attempts — firmware older "
+					"than address assignment, or out of range\"}",
+					hex, APOS_GW_APPLY_RETRIES + 1u);
+				awaiting_rsp = false;
+				apply_retries = 0;
+				tx_fails = 0;
+				assign_idx++;
+			}
+			return;
+		}
+		while (assign_idx < plan_n &&
+		       plan_out[assign_idx].action != APOS_PLAN_ASSIGN) {
+			assign_idx++;
+		}
+		if (assign_idx >= plan_n) {
+			assign_stage = AS_PERSIST;
+			return;
+		}
+
+		int n = apos_frame_setaddr_build(tx_buf, sizeof(tx_buf),
+						 UWB_ADDR_GATEWAY_RESERVED,
+						 APOS_ADDR_BCAST, session,
+						 plan_peer[assign_idx].eui,
+						 plan_out[assign_idx].addr);
+
+		if (n < 0) {
+			LOG_ERR("SETADDR build failed (%d)", n);
+			phase = APOS_GW_IDLE;
+			return;
+		}
+		if (!tx_now((uint16_t)n, seq)) {
+			/* Bounded like SETPOS: a TX that never starts is not the
+			 * board's fault, but a wedged radio must not park the
+			 * assign forever. */
+			if (++tx_fails >= APOS_GW_TX_FAIL_LIMIT) {
+				assign_failed++;
+				tx_fails = 0;
+				apply_retries = 0;
+				assign_idx++;
+			}
+			return;
+		}
+		tx_fails = 0;
+		awaiting_rsp = true;
+		next_action_ms = now + APOS_GW_APPLY_TIMEOUT_MS;
+		return;
+	}
+
+	if (assign_stage == AS_PERSIST) {
+		struct apos_addrmap m = *apos_store_addrmap();
+		bool changed = false;
+		bool moved = false;
+
+		/* Only what is settled goes in: ADOPTs (no frame needed) and the
+		 * ASSIGNs the board acknowledged. A board that never answered is
+		 * re-planned on the next run, not reserved on a guess. */
+		for (uint8_t i = 0; i < plan_n; i++) {
+			bool take = plan_out[i].action == APOS_PLAN_ADOPT ||
+				    (plan_out[i].action == APOS_PLAN_ASSIGN &&
+				     plan_acked[i]);
+
+			if (plan_acked[i]) {
+				moved = true;
+			}
+			if (!take) {
+				continue;
+			}
+			int k = apos_addrmap_find_eui(&m, plan_peer[i].eui);
+
+			if (k >= 0 && m.e[k].addr == plan_out[i].addr) {
+				continue;
+			}
+			if (apos_addrmap_put(&m, plan_peer[i].eui,
+					     plan_out[i].addr) != 0) {
+				/* The plan was built against this same map, so
+				 * this cannot fail; if it does, persist nothing. */
+				LOG_ERR("{\"apos_error\":\"address map update "
+					"refused — nothing persisted\"}");
+				phase = APOS_GW_IDLE;
+				return;
+			}
+			changed = true;
+		}
+
+		if (changed) {
+			/* A flash write on the beacon-owning loop: gated like
+			 * every other one (see AP_COMMIT in step_apply()). */
+			if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
+				return;
+			}
+			int rc = apos_store_save_addrmap(&m);
+
+			if (rc) {
+				LOG_ERR("{\"apos_error\":\"address map NOT persisted "
+					"(errno %d) — the anchors that took a new "
+					"address will be re-planned next time\"}", rc);
+				phase = APOS_GW_IDLE;
+				return;
+			}
+		}
+
+		if (moved) {
+			/* The gauge is a set of ADDRESSES; boards just changed
+			 * theirs, so it may now name different boxes. */
+			if (apos_gw_gauge_set()) {
+				memset(gauge_addr, 0, sizeof(gauge_addr));
+				gauge_addr[3] = -1;
+				LOG_WRN("{\"apos_warn\":\"addresses changed — the gauge "
+					"was cleared; set it again with `apos gauge`\"}");
+			}
+			converge_deadline_ms = now + APOS_GW_ASSIGN_CONVERGE_MS;
+			next_action_ms = 0;
+			assign_stage = AS_CONVERGE;
+			return;
+		}
+		finish_assign();
+		return;
+	}
+
+	/* AS_CONVERGE: done once every acknowledged board answers enumeration
+	 * from its new address. The reboot closed its survey window; each
+	 * SURVEY_BEGIN below reopens it on the same session. */
+	bool all = true;
+
+	for (uint8_t i = 0; i < plan_n; i++) {
+		if (!plan_acked[i]) {
+			continue;
+		}
+		int k = apos_table_find_eui(&tbl, plan_peer[i].eui);
+
+		if (k < 0 || tbl.peer[k].short_addr != plan_out[i].addr) {
+			all = false;
+			break;
+		}
+	}
+	if (all || now >= converge_deadline_ms) {
+		finish_assign();
+		return;
+	}
+	if (now < next_action_ms) {
+		return;
+	}
+	send_survey_begin(seq);
+	next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
+}
+
 void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
 {
 	if (!apos_frame_is_apos(buf, plen)) {
@@ -1862,6 +2269,9 @@ void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
 	case APOS_SUB_SETTAU_ACK:
 		on_settau_ack(buf, plen);
 		break;
+	case APOS_SUB_SETADDR_ACK:
+		on_setaddr_ack(buf, plen);
+		break;
 	default:
 		/* The remaining subtypes are gateway-to-anchor commands; a
 		 * board echoing one back is not this module's business. */
@@ -1880,7 +2290,33 @@ static void step_enum(uint8_t *seq)
 	}
 
 	if (enum_round >= APOS_GW_ENUM_ROUNDS) {
-		LOG_INF("{\"apos_enum_done\":{\"peers\":%u}}", tbl.n_peers);
+		LOG_INF("{\"apos_enum_done\":{\"peers\":%u,\"needs_assign\":%u}}",
+			tbl.n_peers, apos_table_needs_assign(&tbl) ? 1u : 0u);
+
+		/* Unassigned or duplicate addresses: nothing below can address
+		 * those boards. A run never re-addresses them itself (the gauge
+		 * is a set of addresses and would silently follow the wrong
+		 * board), so it stops and says which command fixes it. */
+		if (apos_table_needs_assign(&tbl)) {
+			for (uint8_t k = 0; k < tbl.n_peers; k++) {
+				if (tbl.peer[k].addr_conflict) {
+					char hex[NODE_EUI_HEX_LEN + 1u];
+
+					node_eui_fmt(tbl.peer[k].eui, hex);
+					LOG_WRN("{\"apos_needs_assign\":{\"eui\":"
+						"\"%s\",\"addr\":\"0x%04X\"}}", hex,
+						tbl.peer[k].short_addr);
+				}
+			}
+			if (is_run) {
+				LOG_ERR("{\"apos_error\":\"some anchors are "
+					"unassigned or share an address — run "
+					"`apos assign` first, then set the gauge "
+					"again\"}");
+			}
+			phase = APOS_GW_IDLE;
+			return;
+		}
 
 		/* An explicit flag, NOT apos_gw_gauge_set(). The gauge is
 		 * sticky module state: an operator who sets the gauge and then
@@ -1979,6 +2415,9 @@ void apos_gw_step(uint32_t avail_uus, uint8_t *seq)
 		break;
 	case APOS_GW_APPLY:
 		step_apply(avail_uus, seq);
+		break;
+	case APOS_GW_ASSIGN:
+		step_assign(avail_uus, seq);
 		break;
 	default:
 		/* Every value of enum apos_gw_phase now has a handler, so this

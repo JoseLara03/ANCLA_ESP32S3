@@ -16,6 +16,7 @@
 
 #include "apos_store.h"
 
+#include "apos_addrmap.h"
 #include "apos_links.h"
 
 #include <zephyr/logging/log.h>
@@ -31,6 +32,7 @@ LOG_MODULE_REGISTER(apos_store, LOG_LEVEL_INF);
 #define KEY_TAGZ   "apos/tagz"
 #define KEY_LINKS   "apos/links"
 #define KEY_PENDING "apos/pending"
+#define KEY_ADDRMAP "apos/addrmap"
 
 /* Only the geometry, so adding a field to struct apos_survey does not silently
  * change the stored layout: this record is what is written, and the size check
@@ -66,6 +68,12 @@ static struct apos_links g_links;
 static struct apos_pending g_pending;
 static bool g_links_rejected;   /* a record was stored but could not be read */
 static bool g_pending_rejected;
+
+/* The EUI -> address map `apos assign` keeps (apos_addrmap.h). Same discipline
+ * as the links: versioned codec, an unreadable record is kept on flash and
+ * reported, never reinterpreted. */
+static struct apos_addrmap g_addrmap;
+static bool g_addrmap_rejected;
 
 static int read_val(settings_read_cb read_cb, void *cb_arg, void *dst,
 		    size_t len)
@@ -171,6 +179,34 @@ static int apos_settings_set(const char *key, size_t len,
 		}
 		g_links = tmp;
 		g_links_rejected = false;
+		return 0;
+	}
+
+	if (strcmp(key, "addrmap") == 0) {
+		uint8_t buf[APOS_ADDRMAP_MAX_LEN + 1];
+		struct apos_addrmap tmp;
+
+		if (len > sizeof(buf)) {
+			g_addrmap_rejected = true;
+			LOG_ERR("{\"apos_store\":\"stored address map is %u bytes, "
+				"larger than any this firmware writes — ignored, "
+				"NOT erased\"}", (unsigned int)len);
+			return 0;
+		}
+		if (read_val(read_cb, cb_arg, buf, len)) {
+			return -EINVAL;
+		}
+		int rc = apos_addrmap_decode(buf, len, &tmp);
+
+		if (rc) {
+			g_addrmap_rejected = true;
+			LOG_ERR("{\"apos_store\":\"stored address map unreadable "
+				"(%d) — `apos assign` refuses until `apos addr clear`, "
+				"the record is left on flash\"}", rc);
+			return 0;
+		}
+		g_addrmap = tmp;
+		g_addrmap_rejected = false;
 		return 0;
 	}
 
@@ -395,5 +431,35 @@ int apos_store_clear_pending(void)
 	}
 	g_pending = p;
 	g_pending_rejected = false;
+	return 0;
+}
+
+const struct apos_addrmap *apos_store_addrmap(void)
+{
+	return &g_addrmap;
+}
+
+bool apos_store_addrmap_rejected(void)
+{
+	return g_addrmap_rejected;
+}
+
+int apos_store_save_addrmap(const struct apos_addrmap *m)
+{
+	uint8_t buf[APOS_ADDRMAP_MAX_LEN];
+	int n = apos_addrmap_encode(m, buf, sizeof(buf));
+
+	if (n < 0) {
+		return n;
+	}
+
+	int ret = settings_save_one(KEY_ADDRMAP, buf, (size_t)n);
+
+	if (ret) {
+		LOG_ERR("failed to persist %s (%d)", KEY_ADDRMAP, ret);
+		return ret;
+	}
+	g_addrmap = *m;
+	g_addrmap_rejected = false;
 	return 0;
 }

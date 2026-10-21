@@ -46,6 +46,11 @@ struct apos_peer {
 	uint16_t short_addr;
 	bool     pos_valid; /* what the anchor reported at enumeration */
 	float    x, y, z;   /* its position BEFORE this survey */
+	/* Another enumerated EUI answered from the same short address, or this
+	 * board answered from UWB_ANCHOR_ADDR_UNASSIGNED. Such a peer cannot be
+	 * addressed by short address, so `apos run` refuses and `apos assign`
+	 * re-addresses it. Recomputed over the whole table on every add. */
+	bool     addr_conflict;
 };
 
 /* One anchor's report of ranging one peer: `from` polled `to`. */
@@ -71,15 +76,24 @@ void apos_table_init(struct apos_table *t);
  * Idempotent on EUI: re-registering the same EUI updates its fields and returns
  * the same index, so repeated SURVEY_BEGIN broadcasts are harmless.
  *
- * Returns -EADDRINUSE if short_addr is already claimed by a DIFFERENT EUI --
- * two boards configured with the same `anchor id`. That is a fault which today
- * produces silently wrong ranging with no indication anywhere, so it is
- * reported rather than tolerated. Returns -ENOSPC when the table is full. */
+ * Two boards claiming one short address (the same `anchor id`, or both
+ * UNASSIGNED) are BOTH registered, keyed by EUI, and both marked
+ * addr_conflict: identity is the EUI, so the table can hold them apart even
+ * though the radio cannot. This used to return -EADDRINUSE and abort the
+ * survey; `apos assign` now needs the full picture to re-address them, and
+ * `apos run` refuses on apos_table_needs_assign() instead. Returns -ENOSPC
+ * when the table is full. */
 int apos_table_add_peer(struct apos_table *t, const uint8_t eui[APOS_EUI_LEN],
 			uint16_t short_addr, bool pos_valid,
 			float x, float y, float z);
 
-/* Node index, or -ENOENT. */
+/* True when any peer has addr_conflict set: the table cannot be ranged or
+ * applied by short address until `apos assign` has run. */
+bool apos_table_needs_assign(const struct apos_table *t);
+
+/* Node index, or -ENOENT. With a duplicate address this returns the FIRST
+ * match, which is ambiguous by definition -- only meaningful when
+ * !apos_table_needs_assign(), which `apos run` guarantees. */
 int apos_table_find_addr(const struct apos_table *t, uint16_t short_addr);
 int apos_table_find_eui(const struct apos_table *t,
 			const uint8_t eui[APOS_EUI_LEN]);

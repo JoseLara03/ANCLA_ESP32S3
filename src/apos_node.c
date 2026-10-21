@@ -19,6 +19,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/reboot.h>
 
 #include <deca_device_api.h>
 
@@ -80,11 +81,27 @@ static bool eui_ready;
 
 static uint8_t tx_buf[APOS_LEN_MAX];
 
+/* How long after a confirmed SETADDR_ACK this board reboots into its new
+ * address. Long enough for the deferred log thread to drain the "rebooting"
+ * line; the ACK itself is already on air (TXFRS confirmed) before this starts. */
+#define SETADDR_REBOOT_DELAY_MS 500
+
+static struct k_work_delayable reboot_work;
+
+static void reboot_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	/* The same reset the remote `reboot` command uses (net_uplink.c), so
+	 * the WiFi driver sees one kind of restart, not a third. */
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
 void apos_node_init(void)
 {
 	window_deadline_ms = 0;
 	window_session = 0;
 	begin_seen = 0;
+	k_work_init_delayable(&reboot_work, reboot_fn);
 
 	/* node_eui owns the read, the zero padding and the all-zero check; a
 	 * board without a valid identity cannot take part in a survey. */
@@ -344,6 +361,13 @@ static void handle_setpos(const uint8_t *buf, uint16_t plen,
 			session, window_session);
 		return;
 	}
+	/* Every unassigned board answers from 0x00FF, so a SETPOS reaching one
+	 * would move ALL of them. The gateway never sends one (apos run refuses
+	 * with an unassigned board present); this is the anchor's half. */
+	if (!uwb_config_is_assigned(cfg)) {
+		LOG_WRN("SETPOS refused — this board has no assigned address");
+		return;
+	}
 	window_refresh();
 
 	/* Applied to the loop's snapshot AND to the shared singleton, then
@@ -416,6 +440,10 @@ static void handle_settau(const uint8_t *buf, uint16_t plen,
 			window_session);
 		return;
 	}
+	if (!uwb_config_is_assigned(cfg)) {
+		LOG_WRN("SETTAU refused — this board has no assigned address");
+		return;
+	}
 	window_refresh();
 
 	uint8_t status = APOS_SETTAU_OK;
@@ -468,6 +496,116 @@ static void handle_settau(const uint8_t *buf, uint16_t plen,
 	}
 	apos_frame_set_seq(tx_buf, (*seq)++);
 	tx_now(tx_buf, (uint16_t)n, bg);
+}
+
+/* Address assignment (docs/superpowers/specs/2026-10-21-anchor-eui-identity-
+ * design.md D5). Addressed by EUI inside a BROADCAST frame, because the target
+ * may have no address of its own yet, or share one.
+ *
+ * Gated like RANGE_CMD -- open window, matching session, src 0x0000 (checked by
+ * the caller) -- because it ends in a reboot: nothing but the gateway that
+ * opened this survey may make a deployed board restart.
+ *
+ * The comparison is against `cfg`, the loop's snapshot, i.e. the address this
+ * board is RUNNING with, not the persisted one. That is what makes a retry
+ * after a lost ACK work: the board persisted the new id but did not reboot (it
+ * reboots only once its ACK is confirmed on air), so it still runs the old
+ * address, sees CHANGE again, re-persists the same value and ACKs. Comparing
+ * against the persisted id would answer SAME without ever rebooting, and the
+ * gateway would wait in vain for the new address to show up. */
+static void handle_setaddr(const uint8_t *buf, uint16_t plen,
+			   const uwb_config_t *cfg, uint8_t *seq,
+			   struct beacon_guard *bg)
+{
+	uint16_t session = 0, addr = 0;
+	uint8_t target[APOS_EUI_LEN];
+
+	if (apos_frame_parse_setaddr(buf, plen, &session, target, &addr) != 0) {
+		LOG_WRN("SETADDR parse failed: plen=%u expected=%u — check the "
+			"caller is passing flen - FCS_LEN",
+			plen, APOS_LEN_SETADDR);
+		return;
+	}
+	if (!eui_ready) {
+		return;
+	}
+
+	enum apos_setaddr_verdict v = apos_setaddr_check(
+		eui, uwb_config_short_addr(cfg), target, addr,
+		UWB_ANCHOR_ADDR_BASE, UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS);
+
+	if (v == APOS_SETADDR_IGNORE) {
+		return;   /* another board's: no reply, no log */
+	}
+	if (!apos_node_window_open() || session != window_session) {
+		LOG_WRN("SETADDR refused — window closed or session mismatch");
+		return;
+	}
+	window_refresh();
+
+	uint8_t status = APOS_SETADDR_OK;
+	uint16_t held = uwb_config_short_addr(cfg);
+	bool reboot = false;
+
+	if (v == APOS_SETADDR_V_BAD) {
+		status = APOS_SETADDR_BAD_ADDR;
+		LOG_ERR("SETADDR 0x%04X refused — outside 0x%04X..0x%04X", addr,
+			UWB_ANCHOR_ADDR_BASE,
+			UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS - 1u);
+	} else if (v == APOS_SETADDR_V_CHANGE) {
+		uwb_config_t *live = uwb_config_get();
+		uint8_t prev = live->anchor_id;
+
+		(void)uwb_config_set_id(live, (uint8_t)(addr - UWB_ANCHOR_ADDR_BASE));
+
+		int rc = uwb_store_save_id();
+
+		if (rc != 0) {
+			(void)uwb_config_set_id(live, prev);
+			status = APOS_SETADDR_PERSIST_ERR;
+			LOG_ERR("SETADDR 0x%04X NOT persisted (%d) — keeping 0x%04X",
+				addr, rc, held);
+		} else {
+			held = addr;
+			reboot = true;
+			LOG_INF("{\"apos_setaddr\":{\"from\":\"0x%04X\","
+				"\"to\":\"0x%04X\"}}", uwb_config_short_addr(cfg),
+				addr);
+		}
+	}
+
+	/* Sent from the address this board is still running with; the gateway
+	 * pairs the ACK by EUI, never by source. `held` is what is persisted. */
+	int n = apos_frame_setaddr_ack_build(tx_buf, sizeof(tx_buf),
+					     uwb_config_short_addr(cfg),
+					     UWB_ADDR_GATEWAY_RESERVED, session,
+					     eui, held, status);
+
+	if (n < 0) {
+		LOG_ERR("SETADDR_ACK build failed (%d)", n);
+		return;
+	}
+
+	bool sent;
+
+	apos_frame_set_seq(tx_buf, (*seq)++);
+	sent = tx_now(tx_buf, (uint16_t)n, bg);
+	if (!sent) {
+		k_sleep(K_MSEC(5));
+		apos_frame_set_seq(tx_buf, (*seq)++);
+		sent = tx_now(tx_buf, (uint16_t)n, bg);
+	}
+
+	if (reboot && sent) {
+		LOG_WRN("rebooting in %d ms to take address 0x%04X",
+			SETADDR_REBOOT_DELAY_MS, held);
+		k_work_reschedule(&reboot_work, K_MSEC(SETADDR_REBOOT_DELAY_MS));
+	} else if (reboot) {
+		/* Persisted, but the gateway never heard so: stay on the old
+		 * address so its retry finds CHANGE again and can complete. */
+		LOG_WRN("SETADDR_ACK lost — staying on 0x%04X until the gateway "
+			"retries", uwb_config_short_addr(cfg));
+	}
 }
 
 static void handle_survey_end(const uint8_t *buf, uint16_t plen)
@@ -527,6 +665,14 @@ static void handle_range_cmd(const uint8_t *buf, uint16_t plen,
 	 * from 0x0000 defeats the window's self-closing property. See
 	 * window_refresh()'s own comment. */
 	window_refresh();
+
+	/* An unassigned board shares 0x00FF with every other one: its polls and
+	 * its RANGE_RSP could not be told apart. apos run refuses to start with
+	 * one present; this is the anchor's half of that rule. */
+	if (!uwb_config_is_assigned(cfg)) {
+		LOG_WRN("RANGE_CMD refused — this board has no assigned address");
+		return;
+	}
 
 	if (peer_addr == UWB_ADDR_GATEWAY_RESERVED ||
 	    peer_addr == uwb_config_short_addr(cfg) ||
@@ -655,6 +801,9 @@ bool apos_node_on_rx(const uint8_t *buf, uint16_t plen, uwb_config_t *cfg,
 		break;
 	case APOS_SUB_SURVEY_END:
 		handle_survey_end(buf, plen);
+		break;
+	case APOS_SUB_SETADDR:
+		handle_setaddr(buf, plen, cfg, seq, bg);
 		break;
 	case APOS_SUB_RANGE_CMD:
 		/* window_refresh() happens inside handle_range_cmd(), after
