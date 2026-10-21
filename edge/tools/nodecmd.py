@@ -1,12 +1,16 @@
 """Send a signed command to a node over MQTT and print its answer.
 
     python -I edge/tools/nodecmd.py genkey                       # make a per-site secret
-    python -I edge/tools/nodecmd.py 1 status                     # anchor 1
-    python -I edge/tools/nodecmd.py 1 tau_set 312
-    python -I edge/tools/nodecmd.py 1 tau_mode 1                 # 0 legacy, 1 survey
-    python -I edge/tools/nodecmd.py 1 ant_set 16453 16385        # applies on the next boot
-    python -I edge/tools/nodecmd.py 1 sync_reset
+    python -I edge/tools/nodecmd.py 7CDFA1B2C3D40000 status      # an anchor, by EUI
+    python -I edge/tools/nodecmd.py 7CDFA1B2C3D40000 tau_set 312
+    python -I edge/tools/nodecmd.py 7CDFA1B2C3D40000 tau_mode 1  # 0 legacy, 1 survey
+    python -I edge/tools/nodecmd.py 7CDFA1B2C3D40000 ant_set 16453 16385   # next boot
+    python -I edge/tools/nodecmd.py 7CDFA1B2C3D40000 sync_reset
     python -I edge/tools/nodecmd.py gw reboot
+
+Since 2026-10-21 an anchor is addressed by its EUI (16 hex digits: the MAC on its label followed by
+0000, as `apos addr` or `anchor show` prints it), not by its anchor id -- two boards can share an id,
+never an EUI. Its topics and the signature both use that name.
 
 The key comes from NODE_CMD_KEY (hex) or --key-file. The broker is the one in edge/.env
 (LOCAL_HOST/PORT/USER/PASS, run from the edge directory) or --host/--port/--user/--password.
@@ -22,6 +26,7 @@ second on a LAN.
 """
 import argparse
 import os
+import re
 import secrets
 import ssl
 import sys
@@ -55,7 +60,7 @@ def mk_client(cid):
 def main():
     env = load_env()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("node", help="anchor id (0..3), 'gw', or 'genkey'")
+    ap.add_argument("node", help="anchor EUI (16 hex digits), 'gw', or 'genkey'")
     ap.add_argument("cmd", nargs="?")
     ap.add_argument("args", nargs="*", type=int)
     ap.add_argument("--zone", default=env.get("ZONE", "852541"))
@@ -85,7 +90,10 @@ def main():
     key = bytes.fromhex(key_hex)
     print("using key with fingerprint %s" % nodecmd.fingerprint(key), file=sys.stderr)
 
-    node = a.node
+    node = a.node if a.node == "gw" else a.node.upper()
+    if node != "gw" and not re.match(r"^[0-9A-F]{16}$", node):
+        ap.error("node must be an anchor EUI (16 hex digits, as `apos addr` prints it) or 'gw' -- "
+                 "anchors are no longer addressed by id")
     status_topic = "uwb/anchor/status/%s/%s" % (a.zone, node)
     cmd_topic = "uwb/anchor/cmd/%s/%s" % (a.zone, node)
     ack_topic = "uwb/anchor/ack/%s/%s" % (a.zone, node)

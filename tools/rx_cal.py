@@ -114,7 +114,16 @@ def group(obs, min_anchors):
     rejecting a group whose internal spread is implausible (see fit_spot).
     """
     groups = defaultdict(dict)
+    eui_of = {}
     for o in obs:
+        # Grouped by id: an id two boards share (an unassigned or duplicated anchor) would merge
+        # their timestamps into one "anchor". Since 2026-10-21 each observation carries its EUI
+        # as "u", so that is detectable -- refuse the capture rather than fit garbage.
+        if "u" in o:
+            a, u = int(o["a"]), str(o["u"]).upper()
+            if eui_of.setdefault(a, u) != u:
+                raise SystemExit("anchor id %d is used by two boards (%s and %s) in this capture"
+                                 " -- run `apos assign` on the gateway first" % (a, eui_of[a], u))
         # A duplicate report from the same anchor for the same blink is an
         # MQTT redelivery; keep the first, exactly as tdoa_collect rejects
         # the second rather than folding it in twice.

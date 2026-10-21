@@ -9,7 +9,8 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tdoa_server import nodecmd, tdoa                          # noqa: E402
-from tdoa_server.service import parse_obs, parse_setup, parse_tid_map, status_events  # noqa: E402
+from tdoa_server.service import (UnknownEui, eui_id_from_status, parse_obs, parse_setup,  # noqa: E402
+                                 parse_tid_map, resolve_keys, status_events)
 
 ANCHORS = {0: (0.0, 0.0, 0.0), 1: (3.2, 0.0, 0.0), 2: (3.34, 1.83, 0.0), 3: (-0.01, 2.42, 0.0)}
 TAG_Z = -0.9                       # tag 0.9 m below the anchor plane
@@ -314,6 +315,33 @@ class Parsing(unittest.TestCase):
         o = parse_obs(b'{"a":2,"t":256,"s":46,"ts":"379107328198","q":223,"b":36,"f":1,"e":42}')
         self.assertEqual((o.anchor, o.tag, o.seq, o.t_dtu, o.flags), (2, 256, 46, 379107328198, 1))
 
+    def test_parse_obs_resolves_by_eui(self):
+        p = b'{"a":2,"t":256,"s":46,"ts":"379107328198","q":223,"b":36,"u":"7cdfa1b2c3d40000"}'
+        # Through the map, the EUI wins over "a" (which an assign may have moved).
+        self.assertEqual(parse_obs(p, {"7CDFA1B2C3D40000": 3}).anchor, 3)
+        # Unmapped EUI: refused, never silently attributed to "a".
+        with self.assertRaises(UnknownEui):
+            parse_obs(p, {})
+        # No map (offline tools): "a" as before.
+        self.assertEqual(parse_obs(p).anchor, 2)
+        # Older firmware without "u": "a", with or without a map.
+        self.assertEqual(parse_obs(b'{"a":1,"t":256,"s":1,"ts":"5","q":0,"b":0}', {}).anchor, 1)
+        with self.assertRaises(ValueError):
+            parse_obs(b'{"a":1,"t":256,"s":1,"ts":"5","q":0,"b":0,"u":"7CDF"}', {})
+
+    def test_eui_id_from_status(self):
+        self.assertEqual(eui_id_from_status({"online": 1, "role": "an", "eui": "7cdfa1b2c3d40000",
+                                             "assigned": 1, "id": 2}), ("7CDFA1B2C3D40000", 2))
+        self.assertIsNone(eui_id_from_status({"online": 1, "role": "an",
+                                              "eui": "7CDFA1B2C3D40000", "assigned": 0}))
+        self.assertIsNone(eui_id_from_status({"online": 1, "role": "gw", "eui": "7CDFA1B2C3D40000"}))
+        self.assertIsNone(eui_id_from_status({"online": 1, "role": "an", "id": 1}))
+
+    def test_resolve_keys_accepts_id_or_eui(self):
+        m = {"7CDFA1B2C3D40000": 3}
+        self.assertEqual(resolve_keys({"1": 10, "7cdfa1b2c3d40000": 30, "AABBCCDDEEFF0011": 9}, m),
+                         {1: 10, 3: 30})
+
     def test_parse_setup_maps_name_to_anchor_id(self):
         doc = {"name": "852541", "anchors": [
             {"name": "ANC-LOBBY-001", "x": 0.0, "y": 0.0, "z": 0.0},
@@ -341,6 +369,12 @@ class StatusEvents(unittest.TestCase):
     def test_brownout_reset_is_called_out(self):
         cur = dict(self.BASE, reset="brownout")
         self.assertTrue(any("BROWNOUT" in e for e in status_events(None, cur)))
+
+    def test_names_carry_the_eui(self):
+        cur = dict(self.BASE, eui="7CDFA1B2C3D40000")
+        self.assertIn("anchor 1 (7CDFA1B2C3D40000) is ONLINE", status_events(None, cur)[0])
+        un = {"online": 1, "role": "an", "eui": "7CDFA1B2C3D40000", "assigned": 0, "up_s": 1}
+        self.assertIn("unassigned", status_events(None, un)[0])
 
     def test_last_will_means_offline(self):
         self.assertEqual(status_events(self.BASE, {"online": 0, "role": "an", "id": 1}),

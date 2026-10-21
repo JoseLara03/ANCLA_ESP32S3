@@ -37,6 +37,7 @@ def sdelta(a, b):
 def load_groups(path):
     groups, open_ = [], {}
     sig = {}
+    eui_of = {}
     with open(path, newline="") as f:
         rd = csv.reader(f)
         next(rd)
@@ -47,6 +48,12 @@ def load_groups(path):
             t = float(r[0])
             t0 = t if t0 is None else t0
             j = json.loads(r[2])
+            # Grouped by id, so an id two boards share would merge them: refuse that capture.
+            if "u" in j:
+                if eui_of.setdefault(j["a"], j["u"].upper()) != j["u"].upper():
+                    raise SystemExit("anchor id %s is used by two boards (%s and %s) in this "
+                                     "capture -- run `apos assign` on the gateway first"
+                                     % (j["a"], eui_of[j["a"]], j["u"].upper()))
             sig.setdefault(j["a"], []).append(j.get("e", 0))
             g = open_.get(j["s"])
             if g is None or t - g["ta"] > 600 or j["a"] in g["v"]:

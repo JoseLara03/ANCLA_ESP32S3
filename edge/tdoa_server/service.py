@@ -76,10 +76,59 @@ def parse_setup(payload: bytes) -> Dict[int, Tuple[float, float, float]]:
     return out
 
 
-def parse_obs(payload: bytes) -> Obs:
+_EUI_RE = re.compile(r"^[0-9A-Fa-f]{16}$")
+
+
+class UnknownEui(Exception):
+    """An observation names its anchor by an EUI no status report has mapped to an id yet."""
+
+
+def norm_eui(v) -> Optional[str]:
+    """The canonical text form of an EUI (16 upper-case hex digits), or None if `v` is not one."""
+    return v.upper() if isinstance(v, str) and _EUI_RE.match(v) else None
+
+
+def eui_id_from_status(doc: dict) -> Optional[Tuple[str, int]]:
+    """(EUI, anchor id) from one node status report, or None when it carries no EUI or no id
+    (a gateway, an unassigned anchor, or firmware older than 2026-10-21)."""
+    eui = norm_eui(doc.get("eui"))
+    if eui is None or doc.get("role") != "an" or "id" not in doc:
+        return None
+    return eui, int(doc["id"])
+
+
+def parse_obs(payload: bytes, eui_to_id: Optional[Dict[str, int]] = None) -> Obs:
+    """One observation. Since 2026-10-21 an anchor names itself by EUI ("u"); the id ("a") is
+    only a radio handle `apos assign` may move. With `eui_to_id` (built from the status topic)
+    an observation carrying "u" is resolved through it and raises UnknownEui if the EUI is not
+    mapped yet -- never falls back to "a", which could name another board. Without "u" (older
+    firmware), or with no map given, "a" is used as before."""
     j = json.loads(payload)
-    return Obs(tag=int(j["t"]), seq=int(j["s"]), anchor=int(j["a"]),
+    anchor = int(j["a"])
+    if "u" in j:
+        eui = norm_eui(j["u"])
+        if eui is None:
+            raise ValueError("malformed EUI %r" % (j["u"],))
+        if eui_to_id is not None:
+            if eui not in eui_to_id:
+                raise UnknownEui(eui)
+            anchor = eui_to_id[eui]
+    return Obs(tag=int(j["t"]), seq=int(j["s"]), anchor=anchor,
                t_dtu=int(j["ts"]), flags=int(j.get("f", 0)), sigma=int(j.get("e", 0)))
+
+
+def resolve_keys(d: Dict[str, object], eui_to_id: Dict[str, int]) -> Dict[int, object]:
+    """ANCHORS_JSON / OFFSETS_DTU keyed by anchor id ("2") or by EUI ("7CDFA1B2C3D40000").
+    EUI keys whose id is not known yet are left out until a status report maps them."""
+    out: Dict[int, object] = {}
+    for k, v in d.items():
+        eui = norm_eui(k)
+        if eui is not None:
+            if eui in eui_to_id:
+                out[eui_to_id[eui]] = v
+        else:
+            out[int(k, 0) if isinstance(k, str) else int(k)] = v
+    return out
 
 
 def status_events(prev: Optional[dict], cur: dict) -> list:
@@ -87,7 +136,12 @@ def status_events(prev: Optional[dict], cur: dict) -> list:
 
     Anchors cannot be reached once mounted, so this is the only place a reset, a brownout
     or a corrupted sync model is noticed. Pure so it is unit-tested."""
-    name = "gateway" if cur.get("role") == "gw" else "anchor %s" % cur.get("id")
+    if cur.get("role") == "gw":
+        name = "gateway"
+    elif "id" in cur:
+        name = "anchor %s" % cur.get("id") + (" (%s)" % cur["eui"] if cur.get("eui") else "")
+    else:
+        name = "anchor %s (unassigned)" % cur.get("eui", "?")
     out = []
     if cur.get("online") == 0:
         return ["%s went OFFLINE (last will)" % name]
@@ -127,15 +181,19 @@ class Service:
         self.t_status = f"uwb/anchor/status/{self.zone}/#"
         self.node_status: Dict[str, dict] = {}
 
+        # EUI -> anchor id, learned from the retained status reports. Observations that name
+        # their anchor by EUI ("u") are resolved through it; see parse_obs().
+        self.eui_to_id: Dict[str, int] = {}
+        self.n_unknown_eui = 0
         override = _env("ANCHORS_JSON")
-        anchors = ({int(k): tuple(v) for k, v in json.loads(override).items()}
-                   if override else {})
+        self.override_raw = {k: tuple(v) for k, v in json.loads(override).items()} if override else {}
         self.have_override = bool(override)
         offsets = _env("OFFSETS_DTU")
+        self.offsets_raw = {k: int(v) for k, v in json.loads(offsets).items()} if offsets else {}
         self.pipe = Pipeline(
-            anchors, self.tag_z,
+            resolve_keys(self.override_raw, self.eui_to_id), self.tag_z,
             sigma_max=int(_env("SIGMA_MAX_DTU", "1000")),
-            offsets_dtu={int(k): int(v) for k, v in json.loads(offsets).items()} if offsets else None,
+            offsets_dtu=resolve_keys(self.offsets_raw, self.eui_to_id) or None,
             hull_margin_m=float(_env("HULL_MARGIN_M", "0.5")))
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -178,7 +236,14 @@ class Service:
         now_ms = time.monotonic() * 1000.0
         try:
             if msg.topic == self.t_blink:
-                o = parse_obs(msg.payload)
+                try:
+                    o = parse_obs(msg.payload, self.eui_to_id)
+                except UnknownEui as e:
+                    self.n_unknown_eui += 1
+                    if self.n_unknown_eui == 1:
+                        log.warning("observation from EUI %s, which no status report maps to an "
+                                    "anchor id yet -- dropped (counted as unknown_eui)", e)
+                    return
                 with self.lock:
                     self.pipe.ingest(o, now_ms)
             elif msg.topic == self.t_setup:
@@ -193,6 +258,19 @@ class Service:
         for ev in status_events(self.node_status.get(node), cur):
             log.warning("node %s: %s", node, ev)
         self.node_status[node] = cur
+        pair = eui_id_from_status(cur)
+        if pair is not None and self.eui_to_id.get(pair[0]) != pair[1]:
+            eui, aid = pair
+            # One id, one board: an id another EUI held is released (the gateway re-assigned it).
+            for other in [k for k, v in self.eui_to_id.items() if v == aid and k != eui]:
+                del self.eui_to_id[other]
+            self.eui_to_id[eui] = aid
+            log.info("anchor %s is id %d", eui, aid)
+            with self.lock:
+                if self.override_raw:
+                    self.pipe.set_anchors(resolve_keys(self.override_raw, self.eui_to_id))
+                if self.offsets_raw:
+                    self.pipe.offsets_dtu = resolve_keys(self.offsets_raw, self.eui_to_id)
 
     def _on_setup(self, payload: bytes) -> None:
         self.last_setup = payload
@@ -246,6 +324,7 @@ class Service:
                     st = dict(self.pipe.stats)
                     anchors = len(self.pipe.anchors)
                 st.update(published=self.n_pub, pub_fail=self.n_pub_fail, anchors=anchors,
+                          unknown_eui=self.n_unknown_eui,
                           cloud=bool(self.cloud and self.cloud.is_connected()))
                 log.info("stats %s", json.dumps(st))
 
