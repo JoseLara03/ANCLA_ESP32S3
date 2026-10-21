@@ -111,6 +111,20 @@ static void print_failure(const struct shell *sh, const struct cal_result *r,
  * is what lets this project the DS-TWR exchange rate WITHOUT implementing
  * DS-TWR: any TWR variant's exchange rate is p_oneway^(frames), so 2 frames
  * for SS-TWR and 3 for DS-TWR. See docs/range-test.md 2. */
+/* The calibration image has no gateway, so `apos assign` cannot reach it: a
+ * board here holds an id only if a human set one. Initiating from an
+ * unassigned board would poll from the shared 0x00FF address. */
+static bool self_assigned(const struct shell *sh)
+{
+	if (uwb_config_is_assigned(uwb_config_get())) {
+		return true;
+	}
+	shell_error(sh, "error: this board has no anchor id. The calibration "
+		    "image has no gateway to assign one -- set it with "
+		    "`anchor id <n>` and reboot");
+	return false;
+}
+
 static int cmd_link(const struct shell *sh, size_t argc, char **argv)
 {
 	struct cal_request req = {0};
@@ -120,6 +134,9 @@ static int cmd_link(const struct shell *sh, size_t argc, char **argv)
 
 	if (!parse_l(argv[1], &id) || id < 0 || id >= UWB_MAX_ANCHORS) {
 		shell_error(sh, "error: id must be 0..%u", UWB_MAX_ANCHORS - 1);
+		return -EINVAL;
+	}
+	if (!self_assigned(sh)) {
 		return -EINVAL;
 	}
 	/* Polling your own id is a self-poll: the responder that would answer
@@ -216,6 +233,9 @@ static int cmd_peer(const struct shell *sh, size_t argc, char **argv)
 
 	if (!parse_l(argv[1], &id) || id < 0 || id >= UWB_MAX_ANCHORS) {
 		shell_error(sh, "error: id must be 0..%u", UWB_MAX_ANCHORS - 1);
+		return -EINVAL;
+	}
+	if (!self_assigned(sh)) {
 		return -EINVAL;
 	}
 	/* Polling your own id is a self-poll: the responder that would answer

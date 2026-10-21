@@ -10,7 +10,8 @@ static void test_defaults(void)
     uwb_config_t c;
     uwb_config_set_defaults(&c);
     CHECK(c.mode == UWB_MODE_SLAVE);
-    CHECK(c.anchor_id == 0);
+    CHECK(c.anchor_id == UWB_ANCHOR_ID_UNASSIGNED);
+    CHECK(!uwb_config_is_assigned(&c));
     CHECK(c.ant_delay_tx == UWB_ANT_DELAY_DEFAULT);
     CHECK(c.ant_delay_rx == UWB_ANT_DELAY_DEFAULT);
     CHECK(c.x == 0.0f && c.y == 0.0f && c.z == 0.0f);
@@ -27,12 +28,20 @@ static void test_set_id(void)
         CHECK(c.anchor_id == id);
     }
 
-    /* Out of range is rejected and leaves the previous value intact. */
+    /* Out of range is rejected and leaves the previous value intact --
+     * everything from UWB_MAX_ANCHORS up to, but not including, the
+     * UNASSIGNED sentinel. */
     CHECK(uwb_config_set_id(&c, 2));
-    CHECK(!uwb_config_set_id(&c, UWB_MAX_ANCHORS));
+    for (unsigned int id = UWB_MAX_ANCHORS; id < UWB_ANCHOR_ID_UNASSIGNED; id++) {
+        CHECK(!uwb_config_set_id(&c, (uint8_t)id));
+    }
     CHECK(c.anchor_id == 2);
-    CHECK(!uwb_config_set_id(&c, 255));
-    CHECK(c.anchor_id == 2);
+    CHECK(uwb_config_is_assigned(&c));
+
+    /* The sentinel is accepted: `anchor id auto` and a persisted 0xFF. */
+    CHECK(uwb_config_set_id(&c, UWB_ANCHOR_ID_UNASSIGNED));
+    CHECK(c.anchor_id == UWB_ANCHOR_ID_UNASSIGNED);
+    CHECK(!uwb_config_is_assigned(&c));
 }
 
 static void test_set_mode(void)
@@ -233,7 +242,7 @@ static void test_singleton_starts_at_defaults(void)
     uwb_config_t *c = uwb_config_get();
     CHECK(c != NULL);
     CHECK(c->mode == UWB_MODE_SLAVE);
-    CHECK(c->anchor_id == 0);
+    CHECK(c->anchor_id == UWB_ANCHOR_ID_UNASSIGNED);
     CHECK(c->ant_delay_tx == UWB_ANT_DELAY_DEFAULT);
     CHECK(uwb_config_get() == c);   /* same instance every call */
 }
@@ -243,8 +252,15 @@ static void test_short_addr(void)
     uwb_config_t c;
     uwb_config_set_defaults(&c);
 
-    /* Default id 0 must not map to the gateway's reserved 0x0000. */
-    CHECK(c.anchor_id == 0);
+    /* An unassigned board gets its own reserved address -- and NOT
+     * BASE + 0xFF, which is 0x0100, the first tag address. */
+    CHECK(c.anchor_id == UWB_ANCHOR_ID_UNASSIGNED);
+    CHECK(uwb_config_short_addr(&c) == UWB_ANCHOR_ADDR_UNASSIGNED);
+    CHECK(uwb_config_short_addr(&c) == 0x00FF);
+    CHECK(uwb_config_short_addr(&c) != 0x0100);
+
+    /* Id 0 must not map to the gateway's reserved 0x0000. */
+    CHECK(uwb_config_set_id(&c, 0));
     CHECK(uwb_config_short_addr(&c) == 0x0001);
 
     /* The mapping is base + id across the whole valid range. */
@@ -258,6 +274,7 @@ static void test_short_addr(void)
         CHECK(uwb_config_set_id(&c, id));
         uint16_t a = uwb_config_short_addr(&c);
         CHECK(a != UWB_ADDR_GATEWAY_RESERVED);
+        CHECK(a != UWB_ANCHOR_ADDR_UNASSIGNED);
         CHECK(a != 0xFFFE);
         CHECK(a != 0xFFFF);
     }
@@ -275,6 +292,9 @@ static void test_short_addr(void)
         CHECK(uwb_config_set_mode(&c, UWB_MODE_GATEWAY));
         CHECK(uwb_config_short_addr(&c) == UWB_ADDR_GATEWAY_RESERVED);
     }
+    /* ...including an unassigned gateway, which is the factory default. */
+    CHECK(uwb_config_set_id(&c, UWB_ANCHOR_ID_UNASSIGNED));
+    CHECK(uwb_config_short_addr(&c) == UWB_ADDR_GATEWAY_RESERVED);
 }
 
 int main(void)

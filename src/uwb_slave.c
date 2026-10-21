@@ -529,8 +529,9 @@ void uwb_slave_run(const uwb_config_t *cfg)
 	dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
 
 	LOG_INF("{\"status\":\"listening\",\"mode\":\"slave\",\"id\":%u,"
-		"\"short_addr\":\"0x%04X\"}",
-		cfg->anchor_id, uwb_config_short_addr(cfg));
+		"\"assigned\":%u,\"short_addr\":\"0x%04X\"}",
+		cfg->anchor_id, uwb_config_is_assigned(cfg) ? 1u : 0u,
+		uwb_config_short_addr(cfg));
 
 	apos_node_init();
 	blink_rx_init(cfg);

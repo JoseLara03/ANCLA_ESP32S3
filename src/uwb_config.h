@@ -32,6 +32,18 @@
  * id ever collides with it. */
 #define UWB_ADDR_GATEWAY_RESERVED 0x0000u
 
+/* A SLAVE that no gateway has given an address yet -- the factory default since
+ * docs/superpowers/specs/2026-10-21-anchor-eui-identity-design.md. Identity is
+ * the EUI (node_eui.h); the id is only a radio handle `apos assign` hands out.
+ *
+ * The address is a SEPARATE constant, not UWB_ANCHOR_ADDR_BASE + the id:
+ * 0x0001 + 0xFF is 0x0100, the FIRST TAG ADDRESS (GW_TAG_ADDR_BASE). Every
+ * unassigned board shares 0x00FF on air, which is why one answers only the
+ * survey's enumeration and SETADDR (both carry its EUI in the payload) and
+ * refuses everything addressed by short address alone. */
+#define UWB_ANCHOR_ID_UNASSIGNED   0xFFu
+#define UWB_ANCHOR_ADDR_UNASSIGNED 0x00FFu
+
 enum uwb_mode {
 	UWB_MODE_SLAVE   = 0, /* SS-TWR responder; observes the gateway beacon */
 	UWB_MODE_GATEWAY = 1, /* emits the TDMA beacon and grants CFP seats    */
@@ -87,7 +99,7 @@ enum sync_tau_mode {
 
 typedef struct {
 	uint8_t  mode;           /* enum uwb_mode */
-	uint8_t  anchor_id;      /* 0..UWB_MAX_ANCHORS-1 */
+	uint8_t  anchor_id;      /* 0..UWB_MAX_ANCHORS-1, or UWB_ANCHOR_ID_UNASSIGNED */
 	uint8_t  cell_mode;      /* enum uwb_cell_mode; GATEWAY only */
 	uint16_t ant_delay_tx;
 	uint16_t ant_delay_rx;
@@ -106,8 +118,8 @@ typedef struct {
 	uint8_t  sync_parent_eui[8]; /* CCP root (the gateway) it was derived for */
 } uwb_config_t;
 
-/* Overwrite *c with the documented defaults: SLAVE, id 0, 16385/16385,
- * origin, position invalid. */
+/* Overwrite *c with the documented defaults: SLAVE, id UNASSIGNED,
+ * 16385/16385, origin, position invalid. */
 void uwb_config_set_defaults(uwb_config_t *c);
 
 /* The single active instance, at defaults until uwb_store_load() runs. */
@@ -116,7 +128,11 @@ uwb_config_t *uwb_config_get(void);
 /* Validating setters. Each returns true and mutates on success, or returns
  * false and leaves *c completely untouched on a rejected value. */
 bool uwb_config_set_mode(uwb_config_t *c, uint8_t mode);
+/* Accepts 0..UWB_MAX_ANCHORS-1 and UWB_ANCHOR_ID_UNASSIGNED. */
 bool uwb_config_set_id(uwb_config_t *c, uint8_t id);
+
+/* True when this board holds a real anchor id. Meaningless on a GATEWAY. */
+bool uwb_config_is_assigned(const uwb_config_t *c);
 bool uwb_config_set_cell_mode(uwb_config_t *c, uint8_t cell_mode);
 bool uwb_config_set_ant(uwb_config_t *c, uint32_t tx, uint32_t rx);
 
@@ -175,10 +191,11 @@ const char *uwb_config_cell_mode_name(uint8_t cell_mode);
 
 /* This board's 16-bit short address. In SLAVE mode: UWB_ANCHOR_ADDR_BASE +
  * anchor_id, the single place the console id maps to the on-air address (its
- * low byte is also the id the tag echoes in the legacy WAVE poll). In GATEWAY
- * mode: always UWB_ADDR_GATEWAY_RESERVED, regardless of anchor_id -- that
- * field is meaningless on a gateway and defaults to 0, which used to alias
- * onto anchor id 0's real address. */
+ * low byte is also the id the tag echoes in the legacy WAVE poll), or
+ * UWB_ANCHOR_ADDR_UNASSIGNED for an unassigned board -- never the sum, which
+ * would be a tag address. In GATEWAY mode: always UWB_ADDR_GATEWAY_RESERVED,
+ * regardless of anchor_id -- that field is meaningless on a gateway and used to
+ * alias onto anchor id 0's real address. */
 uint16_t uwb_config_short_addr(const uwb_config_t *c);
 
 #endif /* UWB_CONFIG_H */

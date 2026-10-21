@@ -51,6 +51,28 @@ LOG_MODULE_REGISTER(anchor_respond, ANCLA_LOG_LEVEL);
  * occasional; 10 s keeps it visible without letting it own the log pool. */
 #define UNPOSITIONED_LOG_GAP_MS 10000
 
+/* An UNASSIGNED board (uwb_config.h) shares 0x00FF with every other one and
+ * its DISCOVERY stagger would be derived from the 0xFF sentinel, so it answers
+ * no TWR traffic at all. Refusing is diagnosable; a reply from a shared address
+ * is not. Rate-limited for the same reason as the unpositioned refusal: a tag
+ * polls at superframe rate, so this fires continuously, not occasionally. */
+static void log_unassigned_refusal(const char *what)
+{
+	static int64_t last_ms;
+	static uint32_t suppressed;
+	int64_t now = k_uptime_get();
+
+	if (last_ms == 0 || now - last_ms >= UNPOSITIONED_LOG_GAP_MS) {
+		LOG_WRN("%s refused — this board has no assigned address (%u more "
+			"since the last line). Run `apos assign` on the gateway.",
+			what, suppressed);
+		last_ms = now;
+		suppressed = 0;
+	} else {
+		suppressed++;
+	}
+}
+
 /* Legacy responder turnaround. Was 2000, carried over unchanged from the
  * nRF5 anchor and the working (non-Zephyr) ESP32S3UWB responder; measured
  * ~1700 uus short on this ANCLA_ESP32S3/Zephyr port for the DISCOVERY path
@@ -204,6 +226,11 @@ void anchor_respond_wave_poll(const uint8_t *buf, uint16_t len,
 	 * this function is offered every received frame regardless of type,
 	 * so gating this early would LOG_WRN on every beacon/DISCOVERY/APOS
 	 * frame too, not just on an actual WAVE poll addressed to us. */
+	if (!uwb_config_is_assigned(cfg)) {
+		log_unassigned_refusal("WAVE poll");
+		return;
+	}
+
 	if (!cfg->position_valid && !allow_unpositioned) {
 		/* Rate-limited, because this is not a rare condition: it fires
 		 * on EVERY addressed poll during exactly the situation it was
@@ -281,6 +308,13 @@ void anchor_respond_discovery(const uint8_t *buf, uint16_t len, uint64_t disc_rx
 			      struct beacon_guard *bg)
 {
 	if (!uwb_frame_is_discovery(buf, len)) {
+		return;
+	}
+
+	/* Before anything is built or a sequence number consumed: the stagger
+	 * below is derived from anchor_id, which is the 0xFF sentinel here. */
+	if (!uwb_config_is_assigned(cfg)) {
+		log_unassigned_refusal("DISCOVERY");
 		return;
 	}
 

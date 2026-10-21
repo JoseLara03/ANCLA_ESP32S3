@@ -31,7 +31,10 @@ void uwb_config_set_defaults(uwb_config_t *c)
 {
 	memset(c, 0, sizeof(*c));
 	c->mode         = UWB_MODE_SLAVE;
-	c->anchor_id    = 0;
+	/* No id until a gateway assigns one (`apos assign`) or the console sets
+	 * one: a factory-fresh board must not claim id 0, which a second
+	 * factory-fresh board would claim too. */
+	c->anchor_id    = UWB_ANCHOR_ID_UNASSIGNED;
 	c->cell_mode    = UWB_CELL_TWR;
 	c->ant_delay_tx = UWB_ANT_DELAY_DEFAULT;
 	c->ant_delay_rx = UWB_ANT_DELAY_DEFAULT;
@@ -70,11 +73,16 @@ bool uwb_config_set_mode(uwb_config_t *c, uint8_t mode)
 
 bool uwb_config_set_id(uwb_config_t *c, uint8_t id)
 {
-	if (id >= UWB_MAX_ANCHORS) {
+	if (id >= UWB_MAX_ANCHORS && id != UWB_ANCHOR_ID_UNASSIGNED) {
 		return false;
 	}
 	c->anchor_id = id;
 	return true;
+}
+
+bool uwb_config_is_assigned(const uwb_config_t *c)
+{
+	return c->anchor_id < UWB_MAX_ANCHORS;
 }
 
 bool uwb_config_set_cell_mode(uwb_config_t *c, uint8_t cell_mode)
@@ -205,6 +213,11 @@ uint16_t uwb_config_short_addr(const uwb_config_t *c)
 	 * than being duplicated at each call site. */
 	if (c->mode == UWB_MODE_GATEWAY) {
 		return UWB_ADDR_GATEWAY_RESERVED;
+	}
+	/* Explicitly, never through the sum: BASE + 0xFF is the first tag
+	 * address. */
+	if (!uwb_config_is_assigned(c)) {
+		return UWB_ANCHOR_ADDR_UNASSIGNED;
 	}
 	return (uint16_t)(UWB_ANCHOR_ADDR_BASE + c->anchor_id);
 }

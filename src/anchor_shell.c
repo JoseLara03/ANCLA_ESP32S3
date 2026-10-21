@@ -11,13 +11,16 @@
  * is what lets the UWB thread treat the config as read-only and skip locking.
  */
 
+#include "node_eui.h"
 #include "uwb_config.h"
 #include "uwb_store.h"
 
 #include <zephyr/shell/shell.h>
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* strtoul()/strtof() return 0 on non-numeric input without reporting the
  * failure, and 0 is a legal value for every field this file parses — so a
@@ -54,13 +57,24 @@ static bool parse_flt(const char *arg, float *out)
 static void print_config(const struct shell *sh)
 {
 	const uwb_config_t *cfg = uwb_config_get();
+	char id[8];
+
+	/* JSON null rather than 255: an unassigned board has no id, and a
+	 * number would read as one. */
+	if (uwb_config_is_assigned(cfg)) {
+		snprintf(id, sizeof(id), "%u", (unsigned int)cfg->anchor_id);
+	} else {
+		snprintf(id, sizeof(id), "null");
+	}
 
 	shell_print(sh,
-		    "{\"mode\":\"%s\",\"id\":%u,\"short_addr\":\"0x%04X\","
+		    "{\"mode\":\"%s\",\"eui\":\"%s\",\"id\":%s,\"assigned\":%u,"
+		    "\"short_addr\":\"0x%04X\","
 		    "\"cell_mode\":\"%s\","
 		    "\"ant_tx\":%u,\"ant_rx\":%u,"
 		    "\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"pos_valid\":%u}",
-		    uwb_config_mode_name(cfg->mode), cfg->anchor_id,
+		    uwb_config_mode_name(cfg->mode), node_eui_hex(), id,
+		    uwb_config_is_assigned(cfg) ? 1u : 0u,
 		    uwb_config_short_addr(cfg),
 		    uwb_config_cell_mode_name(cfg->cell_mode),
 		    cfg->ant_delay_tx, cfg->ant_delay_rx,
@@ -85,10 +99,16 @@ static int cmd_id(const struct shell *sh, size_t argc, char **argv)
 
 	ARG_UNUSED(argc);
 
-	if (!parse_ul(argv[1], &v) || v > UINT8_MAX || !uwb_config_set_id(cfg, (uint8_t)v)) {
-		shell_error(sh, "error: id must be 0..%u", UWB_MAX_ANCHORS - 1);
+	/* `auto` hands the choice back to the gateway (`apos assign`). The
+	 * sentinel is not accepted as a number, so a typo cannot unassign a
+	 * board. */
+	if (strcmp(argv[1], "auto") == 0) {
+		v = UWB_ANCHOR_ID_UNASSIGNED;
+	} else if (!parse_ul(argv[1], &v) || v >= UWB_MAX_ANCHORS) {
+		shell_error(sh, "error: id must be 0..%u or auto", UWB_MAX_ANCHORS - 1);
 		return -EINVAL;
 	}
+	(void)uwb_config_set_id(cfg, (uint8_t)v);
 
 	ret = uwb_store_save_id();
 	if (ret) {
@@ -99,7 +119,14 @@ static int cmd_id(const struct shell *sh, size_t argc, char **argv)
 		return ret;
 	}
 
-	shell_print(sh, "ok: anchor_id=%u (saved) — reboot to apply", cfg->anchor_id);
+	if (!uwb_config_is_assigned(cfg)) {
+		shell_print(sh, "ok: id unassigned (saved) — reboot to apply; run "
+			    "`apos assign` on the gateway to give this board an id");
+		return 0;
+	}
+	shell_print(sh, "ok: anchor_id=%u (saved) — reboot to apply. A gateway "
+		    "keeps it on `apos assign` only if no other board holds it",
+		    cfg->anchor_id);
 	return 0;
 }
 
@@ -268,7 +295,8 @@ static int cmd_reset(const struct shell *sh, size_t argc, char **argv)
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_anchor,
 	SHELL_CMD_ARG(show,  NULL, "Print the active configuration as JSON",
 		      cmd_show,  1, 0),
-	SHELL_CMD_ARG(id,    NULL, "id <0..3> — set the ranging id",
+	SHELL_CMD_ARG(id,    NULL, "id <0..3|auto> — set the ranging id, or "
+		      "leave it to the gateway's `apos assign`",
 		      cmd_id,    2, 0),
 	SHELL_CMD_ARG(mode,  NULL, "mode <slave|gateway> — set the boot mode",
 		      cmd_mode,  2, 0),

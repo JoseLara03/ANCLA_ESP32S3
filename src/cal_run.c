@@ -273,9 +273,17 @@ void cal_run(const uwb_config_t *cfg)
 	dwt_setinterrupt(DWT_INT_RX, 0, DWT_ENABLE_INT);
 
 	LOG_INF("{\"status\":\"listening\",\"mode\":\"cal\",\"id\":%u,"
-		"\"short_addr\":\"0x%04X\",\"ant_tx\":%u,\"ant_rx\":%u}",
-		cfg_live.anchor_id, uwb_config_short_addr(&cfg_live),
+		"\"assigned\":%u,\"short_addr\":\"0x%04X\",\"ant_tx\":%u,"
+		"\"ant_rx\":%u}",
+		cfg_live.anchor_id, uwb_config_is_assigned(&cfg_live) ? 1u : 0u,
+		uwb_config_short_addr(&cfg_live),
 		cfg_live.ant_delay_tx, cfg_live.ant_delay_rx);
+	if (!uwb_config_is_assigned(&cfg_live)) {
+		/* The calibration image has no gateway, so nothing can assign
+		 * this board: it answers nothing until a human does. */
+		LOG_WRN("no anchor id — the calibration image has no gateway to "
+			"assign one; set it with `anchor id <n>` and reboot");
+	}
 
 	struct k_poll_event events[2] = {
 		K_POLL_EVENT_STATIC_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,

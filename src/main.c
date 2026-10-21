@@ -37,16 +37,22 @@ static void log_config(const uwb_config_t *cfg)
 	 * Three consoles side by side must show three different values here; two
 	 * boards sharing one answer the tag's DISCOVERY broadcast in the same
 	 * slot, and neither board can detect that locally. */
-	LOG_INF("{\"mode\":\"%s\",\"id\":%u,\"short_addr\":\"0x%04X\","
+	/* An unassigned board has no stagger at all (it answers no DISCOVERY),
+	 * so print -1 rather than the delay the 0xFF sentinel would compute. */
+	int32_t disc = uwb_config_is_assigned(cfg)
+		       ? (int32_t)disc_resp_delay_uus(cfg->anchor_id) : -1;
+
+	LOG_INF("{\"mode\":\"%s\",\"eui\":\"%s\",\"id\":%u,\"assigned\":%u,"
+		"\"short_addr\":\"0x%04X\","
 		"\"ant_tx\":%u,\"ant_rx\":%u,"
 		"\"x\":%.2f,\"y\":%.2f,\"z\":%.2f,\"pos_valid\":%u,"
-		"\"disc_delay_uus\":%u}",
-		uwb_config_mode_name(cfg->mode), cfg->anchor_id,
+		"\"disc_delay_uus\":%d}",
+		uwb_config_mode_name(cfg->mode), node_eui_hex(), cfg->anchor_id,
+		uwb_config_is_assigned(cfg) ? 1u : 0u,
 		uwb_config_short_addr(cfg),
 		cfg->ant_delay_tx, cfg->ant_delay_rx,
 		(double)cfg->x, (double)cfg->y, (double)cfg->z,
-		cfg->position_valid ? 1u : 0u,
-		disc_resp_delay_uus(cfg->anchor_id));
+		cfg->position_valid ? 1u : 0u, (int)disc);
 }
 
 int main(void)
