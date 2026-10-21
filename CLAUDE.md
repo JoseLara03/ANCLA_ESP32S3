@@ -18,6 +18,43 @@ before any position is worth reading. Both are now written, built and
 code-reviewed; **neither has been run on hardware**, and until they have, the
 residuals recorded below are still the current measurement.
 
+## 2026-10-21: anchors are identified by EUI; the gateway assigns addresses
+
+**Implemented on `feat/anchor-eui-identity` (cut from `codex/b14-static-survey`
+fast-forwarded to `2c2f574`); host-tested and build-verified (production, cal,
+poll). NOT run on hardware -- gates H1-H8 of the spec are `NO EJECUTADO`.**
+Spec: `docs/superpowers/specs/2026-10-21-anchor-eui-identity-design.md`; plan:
+`docs/superpowers/plans/2026-10-21-anchor-eui-identity.md`; operator procedure:
+`docs/anchor-commissioning.md`.
+
+- **Identity is the EUI-64** (`src/node_eui.{c,h}`; on this part it is the
+  6-byte eFuse MAC zero-padded, so its hex is the module label's MAC + `0000`).
+  It names the node in the survey, the static links, the MQTT topics
+  (`uwb/anchor/{status,cmd,ack}/<zone>/<EUI16>`), the command signature, the
+  MQTT client id (`anc-<EUI16>` / `gw-<EUI16>`) and every BLINK observation
+  (`"u"`). The anchor id / short address is a radio handle only.
+- **Factory default is UNASSIGNED** (id `0xFF`, address `0x00FF`, set
+  explicitly -- never `BASE + id`, see the hard-won fact). Such a board refuses
+  DISCOVERY/WAVE, RANGE_CMD, SETPOS and SETTAU, still answers enumeration and
+  publishes observations (`"a":255`). `anchor id auto` returns a board to it.
+- **`apos assign`** (gateway): enumerate, plan (`src/apos_addrmap.c`: the map
+  rules, a working address is adopted, lowest EUI wins an unmapped duplicate,
+  the rest get the lowest free address, no room refuses everything), one
+  `SETADDR` (APOS `0x0A`, broadcast, target EUI in the payload) per board, the
+  board persists, ACKs and reboots cold; one budget-gated write of the
+  EUI->address map (`apos/addrmap`), then re-enumeration until every
+  re-addressed board answers from its new address or 30 s pass
+  (`APOS_GW_ASSIGN_CONVERGE_MS`, sized from the operator's 10-20 s hung-WiFi
+  boot). Clears the gauge if any address moved. `apos run` refuses while any
+  enumerated board is unassigned or shares an address.
+- **Migration:** a board that never persisted `anchor id` boots UNASSIGNED
+  after this flash and is mute to TWR until `apos assign`. A hand-numbered
+  fleet is adopted by `apos assign` with zero frames.
+- Still limited to `UWB_MAX_ANCHORS` (4); raising it is the separate
+  `2026-09-02-blink-anchor-scale-design.md` work. Local `master` carries 32
+  unpushed "network-scaling-v3" commits touching the same modules -- unresolved,
+  decide before merging this branch.
+
 ## 2026-10-13: PHY moved to PLEN_256/PAC16 (read before trusting any number below)
 
 The PHY is now **channel 5, PLEN_256, PAC16, code 9, 850 kbps** (SFD timeout
@@ -821,7 +858,10 @@ Native USB-JTAG (not UART0), prompt `uwb:~$ `.
 
 ```
 anchor show                    active config as JSON
-anchor id <0..3>               ranging id (default 0)
+anchor id <0..3|auto>          ranging id. Default since 2026-10-21 is
+                               UNASSIGNED (`auto`): the gateway's `apos assign`
+                               gives one. A hand-set id is kept by the gateway
+                               only if no other board holds it
 anchor mode <slave|gateway>    boot mode (default slave). GATEWAY refuses to
                                beacon unless `anchor pos` has been set.
 anchor pos <x> <y> <z>         coordinates in metres; sets pos_valid
@@ -873,6 +913,13 @@ apos tagz <metres>             the TAG plane's z in the survey frame, NEGATIVE
                                on every site so far** — see below
 apos show                      phase, enumerated anchors and the stored survey
                                as JSON — the one subcommand a SLAVE accepts
+apos assign                    give every enumerated anchor a unique address by
+                               EUI; boards that need one reboot into it. Clears
+                               the gauge if an address moved. Run before
+                               `apos gauge` (`docs/anchor-commissioning.md`)
+apos addr [clear]              the EUI -> address reservations as JSON (with
+                               `seen` in the last enumeration), or drop them all
+apos forget <EUI16>            free one board's reservation (replaced/removed)
 ```
 
 See `docs/anchor-auto-positioning.md` for the full procedure, and read its §0
@@ -2077,6 +2124,16 @@ sync tau auto [off]            RETIRED 2026-10-12: the automatic TWR
   RANGE_CMD, RANGE_RSP, SETPOS, SETPOS_ACK, SURVEY_END). Deliberately *not*
   added to `uwb_frame_802_15_4z.c`, which must stay byte-identical to the tag's
   copy. Pure C, host-tested in `tests/apos_frame/`.
+- `src/node_eui.{c,h}` — this board's EUI-64, read once (`node_eui_init()`
+  first in `main()`, or lazily, which is what lets host tests link it against a
+  fake hwinfo), zero-padded to 8 bytes, plus the canonical 16-hex text form
+  (`node_eui_fmt()`/`node_eui_parse()`, header-only and pure). The one owner of
+  the identity apos_node, apos_gw, ccp_master, net_uplink and blink_rx use. An
+  all-zero id counts as no identity. Host-tested in `tests/node_eui/`.
+- `src/apos_addrmap.{c,h}` — the gateway's EUI -> short address reservations
+  (`apos/addrmap`, versioned fixed-offset codec, rejected-not-erased like
+  `apos_links`) and `apos_addr_plan()`, the deterministic `apos assign` policy.
+  Pure C, host-tested and mutation-checked in `tests/apos_addrmap/`.
 - `src/apos_links.{c,h}` — the persisted static sync links (`apos/links`) and the
   apply-in-progress marker (`apos/pending`), as an explicit **versioned,
   fixed-offset, little-endian codec**, not a struct memcpy: an unknown version, a
@@ -2181,6 +2238,25 @@ sync tau auto [off]            RETIRED 2026-10-12: the automatic TWR
   stale number. No build-time or test-time check ties the two together.
 
 ## Hard-won facts (do not re-derive)
+
+- **`UWB_ANCHOR_ADDR_BASE + 0xFF` is `0x0100`, the FIRST TAG ADDRESS
+  (`GW_TAG_ADDR_BASE`).** The UNASSIGNED sentinel id `0xFF` therefore has its
+  own address, `0x00FF`, returned by an explicit branch in
+  `uwb_config_short_addr()` before the sum. Never compute an anchor address as
+  `BASE + id` without `uwb_config_is_assigned()` first (2026-10-21).
+- **A duplicate MQTT client id makes the broker drop the older session (MQTT
+  3.1.1 §3.1.4), so two boards sharing one makes them knock each other off in a
+  loop, silently.** Until 2026-10-21 the client id was `uwb-gw-%04X` of the
+  short address: two anchors with the same `anchor id` flapped, and every
+  gateway was `uwb-gw-0000`. It is now derived from the EUI. Same root cause
+  made two such anchors share one retained status topic and accept the same
+  signed command; both now use the EUI too.
+- **On the ESP32-S3 `hwinfo_get_device_id()` returns the 6-byte eFuse MAC, not
+  an EUI-64** (`zephyr/drivers/hwinfo/hwinfo_esp32.c`). `node_eui.c` zero-pads
+  it; the 16-hex form is the label MAC + `0000`, readable by an installer
+  without a cable. The first three bytes are Espressif's OUI, so any scheme that
+  hashes or folds "high and low bits" into a short id gets no entropy from them
+  -- one reason ids are assigned by the gateway rather than derived.
 
 - **Shortening the preamble removes the slack the back-to-back beacon->CCP
   exchange silently relied on (PLEN_1024 -> PLEN_256, 2026-10-13).** At
@@ -3266,8 +3342,23 @@ gcc -Wall -Wextra -Isrc -o tests/apos_stats/t.exe tests/apos_stats/test_apos_sta
 
 # The real apos_gw.c against a fake radio, fake anchors, fake NVS (injectable write
 # failures) and a fake clock -- shims in tests/apos_gw/shim/.
-gcc -Wall -Wextra -Itests/apos_gw/shim -Itests/mac_budget/shim -Itests/ccp_frame/shim -Isrc -o tests/apos_gw/t.exe tests/apos_gw/test_apos_gw.c src/apos_gw.c src/apos_frame.c src/apos_geom.c src/apos_table.c src/apos_stats.c src/apos_links.c src/sync_link.c src/uwb_config.c -lm
+gcc -Wall -Wextra -Itests/apos_gw/shim -Itests/mac_budget/shim -Itests/ccp_frame/shim -Isrc -o tests/apos_gw/t.exe tests/apos_gw/test_apos_gw.c src/apos_gw.c src/apos_frame.c src/apos_geom.c src/apos_table.c src/apos_stats.c src/apos_links.c src/sync_link.c src/uwb_config.c src/node_eui.c src/apos_addrmap.c -lm
 ./tests/apos_gw/t.exe                           # apos_gw: ALL TESTS PASSED
+
+# 2026-10-21 EUI identity.
+gcc -Wall -Wextra -Isrc -o tests/node_eui/t.exe tests/node_eui/test_node_eui.c
+./tests/node_eui/t.exe                          # node_eui: ALL TESTS PASSED
+
+gcc -Wall -Wextra -Isrc -Itests/ccp_frame/shim -o tests/apos_addrmap/t.exe tests/apos_addrmap/test_apos_addrmap.c src/apos_addrmap.c
+./tests/apos_addrmap/t.exe                      # apos_addrmap: ALL TESTS PASSED
+
+# These three existed before 2026-10-21 but were missing from this list.
+gcc -Wall -Wextra -D__USE_MINGW_ANSI_STDIO=1 -Isrc -o tests/cmd_proto/t.exe tests/cmd_proto/test_cmd_proto.c src/cmd_proto.c src/hmac_sha256.c
+gcc -Wall -Wextra -D__USE_MINGW_ANSI_STDIO=1 -Isrc -o tests/node_status/t.exe tests/node_status/test_node_status.c src/node_status.c
+gcc -Wall -Wextra -D__USE_MINGW_ANSI_STDIO=1 -Isrc -o tests/hmac_sha256/t.exe tests/hmac_sha256/test_hmac_sha256.c src/hmac_sha256.c
+
+# Edge server (Python 3.12, paho-mqtt), from edge/:
+python -m unittest discover -s tests
 ```
 
 `tests/pos_ekf/` was removed with the EKF on 2026-09-06 (the tag's own copy

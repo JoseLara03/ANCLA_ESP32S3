@@ -1,7 +1,10 @@
 # Identidad de ancla por EUI y dirección corta asignada por el gateway — diseño
 
-**Estado: DISEÑO. Nada de esto está implementado, compilado ni corrido en
-hardware.**
+**Estado (2026-10-21): IMPLEMENTADO en `feat/anchor-eui-identity`, probado con
+pruebas host y compilado (producción, cal, poll). NO corrido en hardware: los
+gates H1-H8 de §4.2 siguen `NO EJECUTADO`.** Registro de lo construido en el
+plan (`docs/superpowers/plans/2026-10-21-anchor-eui-identity.md`, §"Estado de
+implementación").
 
 **Contexto:** producción en masa. Hoy cada ancla necesita que alguien la
 conecte al shell y le teclee `anchor id <0..3>`, y dos anclas con el mismo id
