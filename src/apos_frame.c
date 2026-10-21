@@ -103,7 +103,7 @@ static int write_hdr(uint8_t *buf, size_t buf_len, size_t need, uint16_t dest,
 
 static bool known_subtype(uint8_t s)
 {
-	return s >= APOS_SUB_SURVEY_BEGIN && s <= APOS_SUB_SETTAU_ACK;
+	return s >= APOS_SUB_SURVEY_BEGIN && s <= APOS_SUB_SETADDR_ACK;
 }
 
 bool apos_frame_is_apos(const uint8_t *buf, size_t len)
@@ -477,4 +477,102 @@ int apos_frame_parse_settau_ack(const uint8_t *buf, size_t len,
 	*tau_dtu = (int32_t)get_u32(&buf[OFF_PAYLOAD + 6]);
 	*status = buf[OFF_PAYLOAD + 10];
 	return 0;
+}
+
+/* ---- SETADDR ---- */
+int apos_frame_setaddr_build(uint8_t *buf, size_t buf_len, uint16_t src,
+			     uint16_t dest, uint16_t session,
+			     const uint8_t eui[APOS_EUI_LEN], uint16_t addr)
+{
+	if (!eui) {
+		return -EINVAL;
+	}
+
+	int rc = write_hdr(buf, buf_len, APOS_LEN_SETADDR, dest, src,
+			   APOS_SUB_SETADDR);
+
+	if (rc) {
+		return rc;
+	}
+	put_u16(&buf[OFF_PAYLOAD], session);
+	memcpy(&buf[OFF_PAYLOAD + 2], eui, APOS_EUI_LEN);
+	put_u16(&buf[OFF_PAYLOAD + 10], addr);
+	return (int)APOS_LEN_SETADDR;
+}
+
+int apos_frame_parse_setaddr(const uint8_t *buf, size_t len, uint16_t *session,
+			     uint8_t eui[APOS_EUI_LEN], uint16_t *addr)
+{
+	int rc = parse_check(buf, len, APOS_SUB_SETADDR, APOS_LEN_SETADDR);
+
+	if (rc) {
+		return rc;
+	}
+	if (!session || !eui || !addr) {
+		return -EINVAL;
+	}
+	*session = get_u16(&buf[OFF_PAYLOAD]);
+	memcpy(eui, &buf[OFF_PAYLOAD + 2], APOS_EUI_LEN);
+	*addr = get_u16(&buf[OFF_PAYLOAD + 10]);
+	return 0;
+}
+
+/* ---- SETADDR_ACK ---- */
+int apos_frame_setaddr_ack_build(uint8_t *buf, size_t buf_len, uint16_t src,
+				 uint16_t dest, uint16_t session,
+				 const uint8_t eui[APOS_EUI_LEN], uint16_t addr,
+				 uint8_t status)
+{
+	if (!eui) {
+		return -EINVAL;
+	}
+
+	int rc = write_hdr(buf, buf_len, APOS_LEN_SETADDR_ACK, dest, src,
+			   APOS_SUB_SETADDR_ACK);
+
+	if (rc) {
+		return rc;
+	}
+	put_u16(&buf[OFF_PAYLOAD], session);
+	memcpy(&buf[OFF_PAYLOAD + 2], eui, APOS_EUI_LEN);
+	put_u16(&buf[OFF_PAYLOAD + 10], addr);
+	buf[OFF_PAYLOAD + 12] = status;
+	return (int)APOS_LEN_SETADDR_ACK;
+}
+
+int apos_frame_parse_setaddr_ack(const uint8_t *buf, size_t len,
+				 uint16_t *session, uint8_t eui[APOS_EUI_LEN],
+				 uint16_t *addr, uint8_t *status)
+{
+	int rc = parse_check(buf, len, APOS_SUB_SETADDR_ACK,
+			     APOS_LEN_SETADDR_ACK);
+
+	if (rc) {
+		return rc;
+	}
+	if (!session || !eui || !addr || !status) {
+		return -EINVAL;
+	}
+	*session = get_u16(&buf[OFF_PAYLOAD]);
+	memcpy(eui, &buf[OFF_PAYLOAD + 2], APOS_EUI_LEN);
+	*addr = get_u16(&buf[OFF_PAYLOAD + 10]);
+	*status = buf[OFF_PAYLOAD + 12];
+	return 0;
+}
+
+enum apos_setaddr_verdict apos_setaddr_check(const uint8_t my_eui[APOS_EUI_LEN],
+					     uint16_t my_addr,
+					     const uint8_t msg_eui[APOS_EUI_LEN],
+					     uint16_t msg_addr,
+					     uint16_t addr_lo, uint16_t addr_hi)
+{
+	if (!my_eui || !msg_eui ||
+	    memcmp(my_eui, msg_eui, APOS_EUI_LEN) != 0) {
+		return APOS_SETADDR_IGNORE;
+	}
+	if (msg_addr < addr_lo || msg_addr >= addr_hi) {
+		return APOS_SETADDR_V_BAD;
+	}
+	return (msg_addr == my_addr) ? APOS_SETADDR_V_SAME
+				     : APOS_SETADDR_V_CHANGE;
 }

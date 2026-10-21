@@ -400,8 +400,90 @@ static void test_subtype_range_edges(void)
     apos_frame_survey_begin_build(buf, sizeof(buf), 0x0000, 1, 1);
     buf[10] = APOS_SUB_SETTAU_ACK;
     CHECK(apos_frame_is_apos(buf, APOS_LEN_SETTAU_ACK));
-    buf[10] = (uint8_t)(APOS_SUB_SETTAU_ACK + 1u);
-    CHECK(!apos_frame_is_apos(buf, APOS_LEN_SETTAU_ACK));
+    buf[10] = APOS_SUB_SETADDR_ACK;
+    CHECK(apos_frame_is_apos(buf, APOS_LEN_SETADDR_ACK));
+    buf[10] = (uint8_t)(APOS_SUB_SETADDR_ACK + 1u);
+    CHECK(!apos_frame_is_apos(buf, APOS_LEN_SETADDR_ACK));
+}
+
+static void test_setaddr_round_trip_and_raw_bytes(void)
+{
+    uint8_t out_eui[APOS_EUI_LEN] = {0};
+    uint16_t session = 0, addr = 0;
+    int n = apos_frame_setaddr_build(buf, sizeof(buf), 0x0000, APOS_ADDR_BCAST,
+                                     0xBEEF, eui_ref, 0x0003);
+
+    CHECK(n == (int)APOS_LEN_SETADDR);
+    CHECK(n == 23);
+    CHECK(n <= (int)APOS_LEN_MAX);
+    CHECK(buf[9] == APOS_FRAME_TYPE && buf[10] == APOS_SUB_SETADDR);
+    CHECK(apos_frame_dest(buf) == APOS_ADDR_BCAST);
+    CHECK(apos_frame_src(buf) == 0x0000);
+    CHECK(apos_frame_is_apos(buf, (size_t)n));
+    /* Wire layout: session LE, target EUI, new address LE. */
+    CHECK(buf[11] == 0xEF && buf[12] == 0xBE);
+    CHECK(memcmp(&buf[13], eui_ref, APOS_EUI_LEN) == 0);
+    CHECK(buf[21] == 0x03 && buf[22] == 0x00);
+
+    CHECK(apos_frame_parse_setaddr(buf, (size_t)n, &session, out_eui, &addr) == 0);
+    CHECK(session == 0xBEEF && addr == 0x0003);
+    CHECK(memcmp(out_eui, eui_ref, APOS_EUI_LEN) == 0);
+
+    /* Exact length only. */
+    CHECK(apos_frame_parse_setaddr(buf, (size_t)n - 1u, &session, out_eui, &addr) == -EINVAL);
+    CHECK(apos_frame_parse_setaddr(buf, (size_t)n + 1u, &session, out_eui, &addr) == -EINVAL);
+    CHECK(apos_frame_setaddr_build(buf, 22, 0, APOS_ADDR_BCAST, 1, eui_ref, 1) == -EMSGSIZE);
+    CHECK(apos_frame_setaddr_build(buf, sizeof(buf), 0, APOS_ADDR_BCAST, 1, NULL, 1) == -EINVAL);
+}
+
+static void test_setaddr_ack_round_trip(void)
+{
+    uint8_t out_eui[APOS_EUI_LEN] = {0};
+    uint16_t session = 0, addr = 0;
+    uint8_t status = 0xFF;
+    /* Sent from the OLD (here: unassigned) address; the gateway pairs it by
+     * EUI, never by source. */
+    int n = apos_frame_setaddr_ack_build(buf, sizeof(buf), 0x00FF, 0x0000,
+                                         0x1234, eui_ref, 0x0002,
+                                         APOS_SETADDR_PERSIST_ERR);
+
+    CHECK(n == (int)APOS_LEN_SETADDR_ACK);
+    CHECK(n == 24);
+    CHECK(apos_frame_src(buf) == 0x00FF);
+    CHECK(buf[23] == APOS_SETADDR_PERSIST_ERR);
+    CHECK(apos_frame_parse_setaddr_ack(buf, (size_t)n, &session, out_eui, &addr,
+                                       &status) == 0);
+    CHECK(session == 0x1234 && addr == 0x0002);
+    CHECK(status == APOS_SETADDR_PERSIST_ERR);
+    CHECK(memcmp(out_eui, eui_ref, APOS_EUI_LEN) == 0);
+    /* An ACK is not a SETADDR and vice versa. */
+    CHECK(apos_frame_parse_setaddr(buf, (size_t)n, &session, out_eui, &addr) == -EINVAL);
+    CHECK(apos_frame_setaddr_ack_build(buf, 23, 0, 0, 1, eui_ref, 1, 0) == -EMSGSIZE);
+}
+
+static void test_setaddr_check_verdicts(void)
+{
+    const uint8_t other[APOS_EUI_LEN] = {
+        0xDE, 0xCA, 0x01, 0x02, 0x03, 0x04, 0x05, 0x78   /* last byte differs */
+    };
+    const uint16_t lo = 0x0001, hi = 0x0005;   /* BASE .. BASE + 4 */
+
+    /* Another board's EUI: no reply at all, whatever the address. */
+    CHECK(apos_setaddr_check(eui_ref, 0x00FF, other, 0x0002, lo, hi) == APOS_SETADDR_IGNORE);
+    CHECK(apos_setaddr_check(eui_ref, 0x00FF, other, 0x00FF, lo, hi) == APOS_SETADDR_IGNORE);
+    CHECK(apos_setaddr_check(NULL, 0x00FF, eui_ref, 0x0002, lo, hi) == APOS_SETADDR_IGNORE);
+
+    /* Range edges: [lo, hi). */
+    CHECK(apos_setaddr_check(eui_ref, 0x00FF, eui_ref, lo - 1u, lo, hi) == APOS_SETADDR_V_BAD);
+    CHECK(apos_setaddr_check(eui_ref, 0x00FF, eui_ref, lo, lo, hi) == APOS_SETADDR_V_CHANGE);
+    CHECK(apos_setaddr_check(eui_ref, 0x00FF, eui_ref, hi - 1u, lo, hi) == APOS_SETADDR_V_CHANGE);
+    CHECK(apos_setaddr_check(eui_ref, 0x00FF, eui_ref, hi, lo, hi) == APOS_SETADDR_V_BAD);
+    /* The UNASSIGNED address is never assignable. */
+    CHECK(apos_setaddr_check(eui_ref, 0x0002, eui_ref, 0x00FF, lo, hi) == APOS_SETADDR_V_BAD);
+
+    /* Already ours: idempotent, no reboot. */
+    CHECK(apos_setaddr_check(eui_ref, 0x0003, eui_ref, 0x0003, lo, hi) == APOS_SETADDR_V_SAME);
+    CHECK(apos_setaddr_check(eui_ref, 0x0003, eui_ref, 0x0002, lo, hi) == APOS_SETADDR_V_CHANGE);
 }
 
 int main(void)
@@ -428,6 +510,9 @@ int main(void)
     test_settau_round_trip_and_raw_bytes();
     test_settau_ack_round_trip();
     test_subtype_range_edges();
+    test_setaddr_round_trip_and_raw_bytes();
+    test_setaddr_ack_round_trip();
+    test_setaddr_check_verdicts();
 
     if (g_fail) {
         printf("%d CHECK(s) FAILED\n", g_fail);

@@ -44,6 +44,13 @@
  * incompatible instead of the survey silently half-applying. */
 #define APOS_SUB_SETTAU       0x08u
 #define APOS_SUB_SETTAU_ACK   0x09u
+/* Address assignment (2026-10-21, docs/superpowers/specs/
+ * 2026-10-21-anchor-eui-identity-design.md D5). SETADDR goes to BROADCAST and
+ * names its target by EUI in the payload: the target may have no address of its
+ * own yet (UNASSIGNED, 0x00FF) or share one with another board. Older firmware
+ * drops the subtype and never ACKs, exactly as for SETTAU. */
+#define APOS_SUB_SETADDR      0x0Au
+#define APOS_SUB_SETADDR_ACK  0x0Bu
 
 /* 10 common header bytes plus the subtype. */
 #define APOS_HDR_LEN 11u
@@ -62,6 +69,14 @@
 #define APOS_LEN_SETTAU       (APOS_HDR_LEN + 19u) /* session, ver, gen, tau,
 						    * parent eui            */
 #define APOS_LEN_SETTAU_ACK   (APOS_HDR_LEN + 11u) /* session, gen, tau, status */
+#define APOS_LEN_SETADDR      (APOS_HDR_LEN + 12u) /* session, eui, addr    */
+#define APOS_LEN_SETADDR_ACK  (APOS_HDR_LEN + 13u) /* session, eui, addr,
+						    * status               */
+
+/* SETADDR_ACK status. Anything non-zero means the address was NOT stored. */
+#define APOS_SETADDR_OK          0u
+#define APOS_SETADDR_PERSIST_ERR 1u /* NVS write failed; old address kept */
+#define APOS_SETADDR_BAD_ADDR    2u /* outside the range this board accepts */
 
 /* SETTAU_ACK status. Anything non-zero means the link was NOT stored. */
 #define APOS_SETTAU_OK          0u
@@ -69,7 +84,11 @@
 #define APOS_SETTAU_BAD_VERSION 2u
 
 /* Largest of the above, for RX buffer sizing. */
-#define APOS_LEN_MAX APOS_LEN_ENUM_RSP /* 34, still the largest (SETTAU is 30) */
+#define APOS_LEN_MAX APOS_LEN_ENUM_RSP /* 34, still the largest (SETTAU is 30,
+					* SETADDR_ACK 24) */
+_Static_assert(APOS_LEN_SETADDR <= APOS_LEN_MAX &&
+	       APOS_LEN_SETADDR_ACK <= APOS_LEN_MAX,
+	       "SETADDR frames must fit the RX buffer sized by APOS_LEN_MAX");
 
 /* Broadcast destination, matching UWB_FRAME_ADDR_BCAST. Redeclared rather than
  * included so this module stays free of the shared codec's header. */
@@ -115,6 +134,15 @@ int apos_frame_settau_ack_build(uint8_t *buf, size_t buf_len, uint16_t src,
 				uint16_t dest, uint16_t session,
 				uint32_t generation, int32_t tau_dtu,
 				uint8_t status);
+/* The gateway always sends SETADDR to APOS_ADDR_BCAST; dest is a parameter only
+ * so the codec stays symmetric with the others. */
+int apos_frame_setaddr_build(uint8_t *buf, size_t buf_len, uint16_t src,
+			     uint16_t dest, uint16_t session,
+			     const uint8_t eui[APOS_EUI_LEN], uint16_t addr);
+int apos_frame_setaddr_ack_build(uint8_t *buf, size_t buf_len, uint16_t src,
+				 uint16_t dest, uint16_t session,
+				 const uint8_t eui[APOS_EUI_LEN], uint16_t addr,
+				 uint8_t status);
 
 /* Parsers return 0, or -EINVAL on a NULL pointer, a length that does not match
  * the subtype exactly, or a subtype mismatch. Out parameters are untouched on
@@ -145,5 +173,32 @@ int apos_frame_parse_settau(const uint8_t *buf, size_t len, uint16_t *session,
 int apos_frame_parse_settau_ack(const uint8_t *buf, size_t len,
 				uint16_t *session, uint32_t *generation,
 				int32_t *tau_dtu, uint8_t *status);
+int apos_frame_parse_setaddr(const uint8_t *buf, size_t len, uint16_t *session,
+			     uint8_t eui[APOS_EUI_LEN], uint16_t *addr);
+int apos_frame_parse_setaddr_ack(const uint8_t *buf, size_t len,
+				 uint16_t *session, uint8_t eui[APOS_EUI_LEN],
+				 uint16_t *addr, uint8_t *status);
+
+/* What an anchor does with a SETADDR, minus the session/window/source gates
+ * apos_node.c already applies to RANGE_CMD. Pure, so the decision is
+ * host-testable even though apos_node.c has no suite, and so the fake anchor in
+ * tests/apos_gw/ calls the SAME function as the real one.
+ *
+ *   IGNORE    -- addressed to another board (EUI mismatch): no reply at all.
+ *   BAD_ADDR  -- ours, but outside [addr_lo, addr_hi): ACK with that status.
+ *   SAME      -- ours, already our address: ACK OK, nothing changes.
+ *   CHANGE    -- ours, a new valid address: persist, ACK, then reboot. */
+enum apos_setaddr_verdict {
+	APOS_SETADDR_IGNORE   = 0,
+	APOS_SETADDR_V_BAD    = 1,
+	APOS_SETADDR_V_SAME   = 2,
+	APOS_SETADDR_V_CHANGE = 3,
+};
+
+enum apos_setaddr_verdict apos_setaddr_check(const uint8_t my_eui[APOS_EUI_LEN],
+					     uint16_t my_addr,
+					     const uint8_t msg_eui[APOS_EUI_LEN],
+					     uint16_t msg_addr,
+					     uint16_t addr_lo, uint16_t addr_hi);
 
 #endif /* APOS_FRAME_H */
