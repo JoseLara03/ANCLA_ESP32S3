@@ -24,6 +24,7 @@
 #include "cmd_key.h"
 #include "cmd_proto.h"
 #include "node_cmd.h"
+#include "node_eui.h"
 #include "node_status.h"
 #include "pos_json.h"
 #include "sync_model.h"
@@ -101,7 +102,7 @@ static struct mqtt_client client;
 static struct sockaddr_storage broker_addr;
 static uint8_t mqtt_rx_buf[MQTT_RX_BUF_SIZE];
 static uint8_t mqtt_tx_buf[MQTT_TX_BUF_SIZE];
-static char    client_id[16];
+static char    client_id[24];   /* "anc-" / "gw-" + node_name */
 static char    payload_buf[POS_JSON_MAX_LEN];
 static uint16_t next_msg_id = 1u;
 static bool    mqtt_connected;
@@ -135,7 +136,18 @@ static uint32_t n_wifi_up;
 static uint32_t n_mqtt_up;
 static const char *reset_name = "?";
 static char status_topic[48];
-static char will_msg[48];
+static char will_msg[80];
+
+/* This node's name on every topic, in its client id and in its command
+ * signatures: the EUI's 16 hex digits, or "a%04X" (short address) on a board
+ * without a valid EUI, which may collide and is logged. Never the anchor id:
+ * two boards sharing an id used to share a retained status topic, accept the
+ * same signed command and kick each other off the broker through a shared
+ * client id. "gw" on the gateway, as before. */
+static char node_name[NODE_EUI_HEX_LEN + 1u];
+
+BUILD_ASSERT(sizeof(status_topic) >= sizeof(POS_JSON_TOPIC_STATUS) + NODE_EUI_HEX_LEN,
+	     "status topic buffer would truncate an EUI-named topic");
 
 /* Remote commands. handle_publish() runs inside mqtt_input(), so it only COPIES the payload and sets
  * a flag; the uplink loop does the work (HMAC, flash writes, a reboot) outside the callback. One
@@ -143,6 +155,10 @@ static char will_msg[48];
  * missing ack says so. */
 static char cmd_topic[56];
 static char ack_topic[56];
+
+BUILD_ASSERT(sizeof(cmd_topic) >= sizeof(POS_JSON_TOPIC_CMD) + NODE_EUI_HEX_LEN &&
+	     sizeof(ack_topic) >= sizeof(POS_JSON_TOPIC_ACK) + NODE_EUI_HEX_LEN,
+	     "cmd/ack topic buffers would truncate an EUI-named topic");
 static uint8_t cmd_payload[CMD_MAX_LEN];
 static size_t cmd_len;
 static volatile bool cmd_pending;
@@ -652,20 +668,21 @@ static void status_identity_init(void)
 	uint32_t cause = 0u;
 
 	if (is_gateway) {
-		snprintf(status_topic, sizeof(status_topic), POS_JSON_TOPIC_STATUS "gw");
+		snprintf(node_name, sizeof(node_name), "gw");
+	} else if (node_eui_valid()) {
+		snprintf(node_name, sizeof(node_name), "%s", node_eui_hex());
 	} else {
-		snprintf(status_topic, sizeof(status_topic), POS_JSON_TOPIC_STATUS "%u",
-			 (unsigned int)u->anchor_id);
+		snprintf(node_name, sizeof(node_name), "a%04X", uwb_config_short_addr(u));
+		LOG_ERR("no valid EUI — publishing as %s, which another such board "
+			"may share", node_name);
 	}
-	(void)node_status_offline_json(will_msg, sizeof(will_msg), is_gateway, u->anchor_id);
-	if (is_gateway) {
-		snprintf(cmd_topic, sizeof(cmd_topic), POS_JSON_TOPIC_CMD "gw");
-		snprintf(ack_topic, sizeof(ack_topic), POS_JSON_TOPIC_ACK "gw");
-	} else {
-		snprintf(cmd_topic, sizeof(cmd_topic), POS_JSON_TOPIC_CMD "%u", (unsigned int)u->anchor_id);
-		snprintf(ack_topic, sizeof(ack_topic), POS_JSON_TOPIC_ACK "%u", (unsigned int)u->anchor_id);
-	}
-	node_cmd_init(is_gateway, u->anchor_id);
+	snprintf(status_topic, sizeof(status_topic), POS_JSON_TOPIC_STATUS "%s", node_name);
+	snprintf(cmd_topic, sizeof(cmd_topic), POS_JSON_TOPIC_CMD "%s", node_name);
+	snprintf(ack_topic, sizeof(ack_topic), POS_JSON_TOPIC_ACK "%s", node_name);
+	(void)node_status_offline_json(will_msg, sizeof(will_msg), is_gateway,
+				       node_eui_valid() ? node_eui_hex() : NULL,
+				       uwb_config_is_assigned(u), u->anchor_id);
+	node_cmd_init(is_gateway, node_name);
 
 	if (hwinfo_get_reset_cause(&cause) == 0) {
 		reset_name = reset_cause_name(cause);
@@ -682,6 +699,8 @@ static void status_collect(struct node_status *s)
 
 	memset(s, 0, sizeof(*s));
 	s->is_gateway = is_gateway;
+	s->eui        = node_eui_valid() ? node_eui_hex() : NULL;
+	s->assigned   = uwb_config_is_assigned(u);
 	s->anchor_id  = u->anchor_id;
 	s->short_addr = uwb_config_short_addr(u);
 	s->uptime_s   = (uint32_t)(k_uptime_get() / 1000);
@@ -903,7 +922,6 @@ static bool process_command(void)
 static bool mqtt_bring_up(const net_config_t *cfg)
 {
 	static struct mqtt_utf8 user, pass;
-	const uwb_config_t *ucfg = uwb_config_get();
 	int64_t deadline;
 	int ret;
 
@@ -915,8 +933,12 @@ static bool mqtt_bring_up(const net_config_t *cfg)
 	connack_seen = false;
 	mqtt_connected = false;
 
-	snprintf(client_id, sizeof(client_id), "uwb-gw-%04X",
-		 uwb_config_short_addr(ucfg));
+	/* From the node name, never the short address: MQTT 3.1.1 3.1.4 makes the
+	 * broker drop the older session on a duplicate client id, so two boards
+	 * sharing an address (or two gateways, which all used to be
+	 * "uwb-gw-0000") knocked each other off in a loop, silently. */
+	snprintf(client_id, sizeof(client_id), "%s-%s", is_gateway ? "gw" : "anc",
+		 node_eui_valid() ? node_eui_hex() : node_name);
 
 	mqtt_client_init(&client);
 

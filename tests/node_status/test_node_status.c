@@ -51,7 +51,8 @@ static struct node_status slave(void)
 {
 	struct node_status s = {0};
 
-	s.is_gateway = false; s.anchor_id = 1; s.short_addr = 0x0002; s.uptime_s = 12498;
+	s.is_gateway = false; s.eui = "7CDFA1B2C3D40000"; s.assigned = true;
+	s.anchor_id = 1; s.short_addr = 0x0002; s.uptime_s = 12498;
 	s.reset = "brownout"; s.fw = "Oct 15 2026 12:00:00";
 	s.has_rssi = true; s.rssi_dbm = -58;
 	s.wifi_up = 2; s.mqtt_up = 3; s.obs_pub = 55000; s.obs_drop = 4;
@@ -71,7 +72,7 @@ static void test_slave_report(void)
 
 	CHECK(n > 0 && (size_t)n == strlen(b));
 	CHECK(looks_like_json_object(b));
-	CHECK(strstr(b, "\"role\":\"an\",\"id\":1"));
+	CHECK(strstr(b, "\"role\":\"an\",\"eui\":\"7CDFA1B2C3D40000\",\"assigned\":1,\"id\":1"));
 	CHECK(strstr(b, "\"addr\":\"0x0002\""));
 	CHECK(strstr(b, "\"reset\":\"brownout\""));
 	CHECK(strstr(b, "\"rssi\":-58"));
@@ -100,6 +101,22 @@ static void test_gateway_report(void)
 	CHECK(!strstr(b, "\"sync\":"));                      /* nor a slave sync model */
 	CHECK(strstr(b, "\"ccp\":{\"sent\":4808,\"dropped\":0}"));
 	CHECK(!strstr(b, "\"rssi\""));                       /* absent, not zero, when unknown */
+}
+
+/* An unassigned anchor reports no id at all -- a 255 would read as one. */
+static void test_unassigned_anchor_has_no_id(void)
+{
+	char b[1024];
+	struct node_status s = slave();
+
+	s.assigned = false;
+	s.anchor_id = 0xFF;
+	s.short_addr = 0x00FF;
+	CHECK(node_status_json(b, sizeof(b), &s) > 0);
+	CHECK(looks_like_json_object(b));
+	CHECK(strstr(b, "\"assigned\":0"));
+	CHECK(!strstr(b, "\"id\":"));
+	CHECK(strstr(b, "\"addr\":\"0x00FF\""));
 }
 
 static void test_challenge_is_published_only_when_commands_are_enabled(void)
@@ -178,14 +195,19 @@ static void test_null_strings_do_not_crash(void)
 
 static void test_offline_will(void)
 {
-	char b[64];
+	char b[80];   /* net_uplink.c's will_msg */
 
-	CHECK(node_status_offline_json(b, sizeof(b), false, 3) > 0);
-	CHECK(strcmp(b, "{\"online\":0,\"role\":\"an\",\"id\":3}") == 0);
+	CHECK(node_status_offline_json(b, sizeof(b), false, "7CDFA1B2C3D40000", true, 3) > 0);
+	CHECK(strcmp(b, "{\"online\":0,\"role\":\"an\",\"eui\":\"7CDFA1B2C3D40000\","
+		     "\"id\":3}") == 0);
 	CHECK(looks_like_json_object(b));
-	CHECK(node_status_offline_json(b, sizeof(b), true, 9) > 0);
+	CHECK(node_status_offline_json(b, sizeof(b), false, "7CDFA1B2C3D40000", false, 0xFF) > 0);
+	CHECK(strcmp(b, "{\"online\":0,\"role\":\"an\",\"eui\":\"7CDFA1B2C3D40000\"}") == 0);
+	CHECK(node_status_offline_json(b, sizeof(b), true, "AABBCCDDEEFF0000", false, 9) > 0);
+	CHECK(strcmp(b, "{\"online\":0,\"role\":\"gw\",\"eui\":\"AABBCCDDEEFF0000\"}") == 0);
+	CHECK(node_status_offline_json(b, sizeof(b), true, NULL, false, 0) > 0);
 	CHECK(strcmp(b, "{\"online\":0,\"role\":\"gw\"}") == 0);
-	CHECK(node_status_offline_json(b, 5, false, 3) == -1);
+	CHECK(node_status_offline_json(b, 5, false, NULL, true, 3) == -1);
 }
 
 int main(void)
@@ -198,6 +220,7 @@ int main(void)
 	test_null_and_zero_length();
 	test_null_strings_do_not_crash();
 	test_offline_will();
+	test_unassigned_anchor_has_no_id();
 
 	if (failures) {
 		printf("\n%d CHECK(s) FAILED\n", failures);

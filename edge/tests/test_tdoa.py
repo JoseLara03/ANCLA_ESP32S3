@@ -374,6 +374,12 @@ class NodeCmd(unittest.TestCase):
         for cmd, a, b, want in vec:
             self.assertEqual(nodecmd.sign(self.KEY, "852541", "1", "a1b2c3d4e5f60718", cmd, a, b), want)
 
+    def test_matches_the_firmware_eui_vector(self):
+        # Since 2026-10-21 an anchor signs and is addressed as its EUI's 16 hex digits.
+        self.assertEqual(
+            nodecmd.sign(self.KEY, "852541", "7CDFA1B2C3D40000", "a1b2c3d4e5f60718", "tau_set", 312),
+            "d42ad06a0e8edbe43a984088e6b47fd28cf9b3955cc6051eb20fb2b17225797a")
+
     def test_fingerprint_matches_the_firmware_vector(self):
         # tests/hmac_sha256/test_hmac_sha256.c checks the same value in C for key 00..1f
         self.assertEqual(nodecmd.fingerprint(self.KEY), hashlib.sha256(bytes(range(32))).hexdigest()[:8])

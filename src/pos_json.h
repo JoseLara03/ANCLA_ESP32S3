@@ -48,13 +48,15 @@
 #define POS_JSON_TOPIC_BLINK "uwb/anchor/blink/" POS_JSON_ZONE_NAME
 
 /* Periodic node status (src/node_status.c): one RETAINED topic per node,
- * POS_JSON_TOPIC_STATUS "<anchor id>" or "gw". Anchors cannot be reached once mounted,
+ * POS_JSON_TOPIC_STATUS "<EUI16>" (an anchor's EUI, node_eui.h) or "gw" -- never the anchor
+ * id, which two boards can share. Anchors cannot be reached once mounted,
  * so this is how `sync stats`, tau and the reset cause are read in the field. */
 #define POS_JSON_TOPIC_STATUS "uwb/anchor/status/" POS_JSON_ZONE_NAME "/"
 
 /* Remote commands (src/node_cmd.c, wire format in cmd_proto.h): each node subscribes to
- * POS_JSON_TOPIC_CMD "<anchor id>|gw" and answers on POS_JSON_TOPIC_ACK "<same>". Commands are
- * HMAC-signed against the challenge the node publishes in its status report. */
+ * POS_JSON_TOPIC_CMD "<EUI16>|gw" and answers on POS_JSON_TOPIC_ACK "<same>". Commands are
+ * HMAC-signed against the challenge the node publishes in its status report, with that same
+ * name as the signed node. */
 #define POS_JSON_TOPIC_CMD "uwb/anchor/cmd/" POS_JSON_ZONE_NAME "/"
 #define POS_JSON_TOPIC_ACK "uwb/anchor/ack/" POS_JSON_ZONE_NAME "/"
 

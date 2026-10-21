@@ -40,8 +40,15 @@ int node_status_json(char *buf, size_t len, const struct node_status *s)
 	}
 
 	ok = ok && put(buf, len, &o, "{\"online\":1,\"role\":\"%s\"", s->is_gateway ? "gw" : "an");
+	if (s->eui != NULL) {
+		ok = ok && put(buf, len, &o, ",\"eui\":\"%s\"", s->eui);
+	}
 	if (!s->is_gateway) {
-		ok = ok && put(buf, len, &o, ",\"id\":%u", (unsigned int)s->anchor_id);
+		/* No id at all for an unassigned board: a 255 would read as one. */
+		ok = ok && put(buf, len, &o, ",\"assigned\":%u", s->assigned ? 1u : 0u);
+		if (s->assigned) {
+			ok = ok && put(buf, len, &o, ",\"id\":%u", (unsigned int)s->anchor_id);
+		}
 	}
 	ok = ok && put(buf, len, &o, ",\"addr\":\"0x%04X\",\"up_s\":%u,\"reset\":\"%s\",\"fw\":\"%s\"",
 		       (unsigned int)s->short_addr, (unsigned int)s->uptime_s,
@@ -90,17 +97,22 @@ int node_status_json(char *buf, size_t len, const struct node_status *s)
 	return ok ? (int)o : -1;
 }
 
-int node_status_offline_json(char *buf, size_t len, bool is_gateway, uint8_t id)
+int node_status_offline_json(char *buf, size_t len, bool is_gateway,
+			     const char *eui, bool assigned, uint8_t id)
 {
-	int n;
+	size_t o = 0;
+	bool ok = true;
 
 	if (buf == NULL || len == 0u) {
 		return -1;
 	}
-	if (is_gateway) {
-		n = snprintf(buf, len, "{\"online\":0,\"role\":\"gw\"}");
-	} else {
-		n = snprintf(buf, len, "{\"online\":0,\"role\":\"an\",\"id\":%u}", (unsigned int)id);
+	ok = ok && put(buf, len, &o, "{\"online\":0,\"role\":\"%s\"", is_gateway ? "gw" : "an");
+	if (eui != NULL) {
+		ok = ok && put(buf, len, &o, ",\"eui\":\"%s\"", eui);
 	}
-	return (n < 0 || (size_t)n >= len) ? -1 : n;
+	if (!is_gateway && assigned) {
+		ok = ok && put(buf, len, &o, ",\"id\":%u", (unsigned int)id);
+	}
+	ok = ok && put(buf, len, &o, "}");
+	return ok ? (int)o : -1;
 }

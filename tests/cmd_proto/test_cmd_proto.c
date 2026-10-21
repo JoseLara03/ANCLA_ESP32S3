@@ -36,6 +36,9 @@ static const char *SIG_TAU = "3dbf20d755345f70100590e7e59556893055348e6f01c93004
 static const char *SIG_ANT = "a1462f949d1b0d9d4dda1231503367d98a036f7bd6481ef3d2a91e04fb33933f";
 static const char *SIG_REB = "a385df6ea492394f078ba6e9eebec7185976f2409536391b6e5bb5785e24ab09";
 static const char *SIG_NEG = "2be60c67357e747a90f83b675a851f5d59db70f48bcc73321d54c675de229ffc";
+/* Since 2026-10-21 an anchor's node name is its EUI's 16 hex digits, not its id. */
+#define EUI_NODE "7CDFA1B2C3D40000"
+static const char *SIG_EUI = "d42ad06a0e8edbe43a984088e6b47fd28cf9b3955cc6051eb20fb2b17225797a";
 
 static void mk(char *buf, size_t n, const char *c, const char *args, const char *sig)
 {
@@ -66,6 +69,13 @@ static void test_cross_language_vectors(void)
 	mk(s, sizeof(s), "tau_set", ",\"a\":-45", SIG_NEG);
 	CHECK(parse(s, &m) == CMD_OK && m.a == -45);
 	CHECK(cmd_verify(&m, KEY, sizeof(KEY), ZONE, "1"));
+
+	mk(s, sizeof(s), "tau_set", ",\"a\":312", SIG_EUI);
+	CHECK(parse(s, &m) == CMD_OK);
+	CHECK(cmd_canonical(canon, sizeof(canon), ZONE, EUI_NODE, &m) > 0);
+	CHECK(strcmp(canon, "852541|" EUI_NODE "|a1b2c3d4e5f60718|tau_set|312|") == 0);
+	CHECK(cmd_verify(&m, KEY, sizeof(KEY), ZONE, EUI_NODE));
+	CHECK(!cmd_verify(&m, KEY, sizeof(KEY), ZONE, "1"));   /* the id is not the name */
 }
 
 static void test_every_signed_part_matters(void)

@@ -29,7 +29,9 @@ struct node_cmd_result {
 	bool reboot;         /* cold reboot AFTER the ack has been sent */
 };
 
-void node_cmd_init(bool is_gateway, uint8_t anchor_id);
+/* `node` is the name commands are signed against and that names this node's
+ * topics: the EUI's 16 hex digits on an anchor, "gw" on the gateway (copied). */
+void node_cmd_init(bool is_gateway, const char *node);
 
 /* The challenge a command must be signed against; 16 hex characters. Rotated by
  * node_cmd_rotate() with every status report. */

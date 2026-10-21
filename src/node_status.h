@@ -16,7 +16,7 @@
  * Why it exists: anchors are unreachable once mounted -- no USB, no console -- so
  * everything `sync stats`, `sync tau show` and `net show` print had to be read
  * on a bench, which is exactly where the field failures do not happen. Each node
- * now publishes the same numbers on uwb/anchor/status/<zone>/<id> (retained, so a
+ * now publishes the same numbers on uwb/anchor/status/<zone>/<EUI16> (retained, so a
  * late subscriber sees the last report) every NODE_STATUS_PERIOD_S, with an MQTT
  * last-will that flips `online` to 0 when the node drops off.
  *
@@ -33,7 +33,11 @@
  * the JSON rather than sent as zero, because a zero reads as a measurement. */
 struct node_status {
 	bool        is_gateway;
-	uint8_t     anchor_id;       /* slave only; the gateway has none */
+	/* The node's identity on every topic (node_eui_hex(), or the short-address
+	 * fallback when the board has no EUI). NULL is omitted. */
+	const char *eui;
+	bool        assigned;        /* slave only: holds a gateway-given id */
+	uint8_t     anchor_id;       /* slave only, and only when assigned */
 	uint16_t    short_addr;
 	uint32_t    uptime_s;
 	const char *reset;           /* "power", "brownout", ... never NULL */
@@ -87,8 +91,9 @@ struct node_status {
  * -- never a truncated document, which would poison the retained topic. */
 int node_status_json(char *buf, size_t len, const struct node_status *s);
 
-/* The last-will payload: the node is gone. `id` is the anchor id, ignored for the
- * gateway. */
-int node_status_offline_json(char *buf, size_t len, bool is_gateway, uint8_t id);
+/* The last-will payload: the node is gone. `eui` may be NULL (omitted); `id` is
+ * printed only for an assigned anchor. */
+int node_status_offline_json(char *buf, size_t len, bool is_gateway,
+			     const char *eui, bool assigned, uint8_t id);
 
 #endif /* NODE_STATUS_H */

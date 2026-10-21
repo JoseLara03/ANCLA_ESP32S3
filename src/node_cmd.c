@@ -31,7 +31,7 @@ LOG_MODULE_REGISTER(node_cmd, LOG_LEVEL_INF);
 
 static struct cmd_challenge chal;
 static bool    is_gw;
-static uint8_t my_id;
+static char    my_node[17];   /* EUI16 or "gw", see node_cmd_init() */
 static int64_t last_ms = INT64_MIN / 2;
 
 static void rotate_with_fresh_random(void)
@@ -39,10 +39,10 @@ static void rotate_with_fresh_random(void)
 	cmd_challenge_rotate(&chal, sys_rand32_get(), sys_rand32_get());
 }
 
-void node_cmd_init(bool is_gateway, uint8_t anchor_id)
+void node_cmd_init(bool is_gateway, const char *node)
 {
 	is_gw = is_gateway;
-	my_id = anchor_id;
+	snprintf(my_node, sizeof(my_node), "%s", (node != NULL) ? node : "");
 	cmd_challenge_init(&chal);
 	rotate_with_fresh_random();
 }
@@ -130,7 +130,6 @@ static const char *do_ant_set(const struct cmd_msg *m, int32_t *value)
 struct node_cmd_result node_cmd_handle(const char *payload, size_t len, char *ack, size_t ack_cap)
 {
 	struct cmd_msg m;
-	char node[8];
 	int64_t now = k_uptime_get();
 	struct node_cmd_result none = { .ack_len = -1 };
 
@@ -151,19 +150,15 @@ struct node_cmd_result node_cmd_handle(const char *payload, size_t len, char *ac
 	if (!cmd_key_is_set()) {
 		return reply(ack, ack_cap, m.name, false, "disabled", false, 0);   /* fail closed */
 	}
-	if (is_gw) {
-		snprintf(node, sizeof(node), "gw");
-	} else {
-		snprintf(node, sizeof(node), "%u", (unsigned int)my_id);
-	}
-
 	size_t klen = 0;
 	const uint8_t *key = cmd_key_get(&klen);
 
 	if (!cmd_challenge_accepts(&chal, m.ch)) {
 		return reply(ack, ack_cap, m.name, false, "stale_challenge", false, 0);
 	}
-	if (!cmd_verify(&m, key, klen, POS_JSON_ZONE_NAME, node)) {
+	/* Signed against the EUI, not the anchor id: two boards sharing an id
+	 * must not both accept one signed command. */
+	if (!cmd_verify(&m, key, klen, POS_JSON_ZONE_NAME, my_node)) {
 		return reply(ack, ack_cap, m.name, false, "bad_sig", false, 0);
 	}
 
