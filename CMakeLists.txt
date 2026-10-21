@@ -13,6 +13,7 @@ target_sources(app PRIVATE
 	src/apos_frame.c
 	src/apos_geom.c
 	src/apos_gw.c
+	src/apos_addrmap.c
 	src/apos_links.c
 	src/apos_node.c
 	src/apos_shell.c
