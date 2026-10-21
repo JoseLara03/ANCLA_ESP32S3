@@ -117,6 +117,11 @@ const struct apos_survey *apos_store_get(void);
  * errno from the settings layer. */
 int apos_store_save(const struct apos_survey *s);
 
+/* A counter bumped every time the saved survey changes. net_uplink compares it
+ * against the value it last published to republish the retained anchors topic
+ * after `apos apply` or `apos assign`, not only on reconnect. */
+uint32_t apos_store_survey_changes(void);
+
 /* Set and persist the geographic reference. Independent of the survey so it can
  * be entered once for a site and then left alone. */
 int apos_store_set_ref(double lat, double lon);

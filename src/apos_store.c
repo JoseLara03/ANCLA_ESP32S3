@@ -60,6 +60,10 @@ struct stored_tagz {
 
 static struct apos_survey g_survey;
 
+/* Bumped on every change to what pos_json_anchors() publishes (survey, ref), so
+ * the uplink can republish the retained anchors topic without being told. */
+static volatile uint32_t g_survey_changes;
+
 /* The static sync links and the apply-in-progress marker. Separate keys and a
  * separate, versioned codec (apos_links.c): the survey blob above is validated
  * by sizeof alone and is deliberately left byte-for-byte as it was, so a board
@@ -291,8 +295,14 @@ int apos_store_save(const struct apos_survey *s)
 	g_survey.n_nodes = s->n_nodes;
 	g_survey.valid = s->valid;
 	g_survey.dim = s->dim;
+	g_survey_changes++;
 
 	return 0;
+}
+
+uint32_t apos_store_survey_changes(void)
+{
+	return g_survey_changes;
 }
 
 int apos_store_set_ref(double lat, double lon)
@@ -309,6 +319,7 @@ int apos_store_set_ref(double lat, double lon)
 	g_survey.ref_lat = lat;
 	g_survey.ref_lon = lon;
 	g_survey.ref_valid = true;
+	g_survey_changes++;
 	return 0;
 }
 
@@ -346,6 +357,7 @@ int apos_store_clear(void)
 	memset(g_survey.node, 0, sizeof(g_survey.node));
 	g_survey.n_nodes = 0;
 	g_survey.valid = false;
+	g_survey_changes++;
 	return 0;
 }
 

@@ -144,15 +144,17 @@ _Static_assert(APOS_GW_ASSIGN_CONVERGE_MS < APOS_GW_WINDOW_S * 1000u,
 
 enum assign_stage {
 	AS_ENUM     = 0, /* APOS_GW_ENUM_ROUNDS of SURVEY_BEGIN, then plan */
-	AS_SEND     = 1, /* one SETADDR per ASSIGN, each acknowledged */
-	AS_PERSIST  = 2, /* one budget-gated write of the updated map */
-	AS_CONVERGE = 3, /* re-enumerate until every board shows its new address */
+	AS_SEND     = 1, /* one SETADDR per ASSIGN, retried on a missing ACK */
+	AS_CONVERGE = 2, /* re-enumerate until every board shows its new address */
+	AS_PERSIST  = 3, /* budget-gated write of the map (+ survey addresses) */
 };
 static uint8_t assign_stage;
 static uint8_t plan_n;
 static struct apos_plan_peer plan_peer[APOS_MAX_NODES];
 static struct apos_plan_out plan_out[APOS_MAX_NODES];
 static bool plan_acked[APOS_MAX_NODES];
+static bool plan_nacked[APOS_MAX_NODES];  /* refused, or never transmitted */
+static struct apos_addrmap forget_map;     /* queued by apos_gw_forget() */
 static uint8_t assign_idx;
 static uint8_t assign_failed;
 static uint8_t assign_acked;
@@ -1892,28 +1894,47 @@ int apos_gw_start_assign(void)
 	assign_failed = 0;
 	assign_acked = 0;
 	memset(plan_acked, 0, sizeof(plan_acked));
+	memset(plan_nacked, 0, sizeof(plan_nacked));
 	phase = APOS_GW_ASSIGN;
 
 	LOG_INF("{\"apos\":\"assigning\",\"session\":%u}", session);
 	return 0;
 }
 
+/* Queued, not written here: a settings write stalls ALL execution for an NVS
+ * sector erase (XIP), so it runs from the gateway loop under the same budget
+ * gate as every other apos flash write -- see step_forget(). */
 int apos_gw_forget(const uint8_t eui[APOS_EUI_LEN])
 {
-	struct apos_addrmap m;
-
 	if (apos_gw_busy()) {
 		return -EBUSY;
 	}
 	if (eui == NULL) {
-		memset(&m, 0, sizeof(m));
+		memset(&forget_map, 0, sizeof(forget_map));
 	} else {
-		m = *apos_store_addrmap();
-		if (apos_addrmap_forget(&m, eui) != 0) {
+		forget_map = *apos_store_addrmap();
+		if (apos_addrmap_forget(&forget_map, eui) != 0) {
 			return -ENOENT;
 		}
 	}
-	return apos_store_save_addrmap(&m);
+	phase = APOS_GW_FORGET;
+	return 0;
+}
+
+static void step_forget(uint32_t avail_uus)
+{
+	if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
+		return;
+	}
+
+	int rc = apos_store_save_addrmap(&forget_map);
+
+	if (rc) {
+		LOG_ERR("{\"apos_error\":\"address map NOT updated (errno %d)\"}", rc);
+	} else {
+		LOG_INF("{\"apos_addrmap\":{\"n\":%u,\"saved\":1}}", forget_map.n);
+	}
+	phase = APOS_GW_IDLE;
 }
 
 static void log_plan_entry(uint8_t i)
@@ -1943,6 +1964,11 @@ static int make_plan(void)
 		plan_peer[plan_n].addr = tbl.peer[k].short_addr;
 		plan_n++;
 	}
+	if (plan_n == 0u) {
+		LOG_ERR("{\"apos_error\":\"no anchor answered enumeration — nothing "
+			"was assigned\"}");
+		return -ENODEV;
+	}
 
 	int rc = apos_addr_plan(apos_store_addrmap(), plan_peer, plan_n,
 				UWB_ANCHOR_ADDR_BASE,
@@ -1968,6 +1994,23 @@ static int make_plan(void)
 	return n_assign;
 }
 
+/* Whether planned board `i` now answers enumeration from its target address. */
+static bool seen_at_target(uint8_t i)
+{
+	int k = apos_table_find_eui(&tbl, plan_peer[i].eui);
+
+	return k >= 0 && tbl.peer[k].short_addr == plan_out[i].addr;
+}
+
+/* An ASSIGN still worth waiting for: not refused by the board. A missing ACK is
+ * NOT a refusal -- the board reboots 500 ms after its ACK leaves, so an ACK lost
+ * on air is followed by retries that hit a rebooting board with its survey
+ * window closed. Whether it moved is settled by re-enumeration instead. */
+static bool assign_pending(uint8_t i)
+{
+	return plan_out[i].action == APOS_PLAN_ASSIGN && !plan_nacked[i];
+}
+
 /* Close the assign: re-plan from what the table shows NOW. An empty plan (all
  * KEEP) means every board answers from the address the map gives it. */
 static void finish_assign(void)
@@ -1987,6 +2030,7 @@ static void finish_assign(void)
 				   UWB_ANCHOR_ADDR_BASE,
 				   UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS,
 				   now_out, &pending) == 0;
+	pending = 0;
 	for (uint8_t i = 0; i < plan_n && replanned; i++) {
 		if (now_out[i].action != APOS_PLAN_KEEP) {
 			char hex[NODE_EUI_HEX_LEN + 1u];
@@ -2040,6 +2084,8 @@ static void on_setaddr_ack(const uint8_t *buf, uint16_t plen)
 		LOG_INF("{\"apos_setaddr_ok\":{\"eui\":\"%s\",\"addr\":\"0x%04X\"}}",
 			hex, addr);
 	} else {
+		/* An explicit refusal: the board answered and did not move. */
+		plan_nacked[assign_idx] = true;
 		assign_failed++;
 		LOG_ERR("{\"apos_error\":\"%s answered SETADDR with status %u, "
 			"address 0x%04X (sent 0x%04X) — it did NOT take it\"}", hex,
@@ -2050,6 +2096,48 @@ static void on_setaddr_ack(const uint8_t *buf, uint16_t plen)
 	tx_fails = 0;
 	assign_idx++;
 	next_action_ms = 0;
+}
+
+/* Rewrite the stored survey's short addresses for boards that just moved, so
+ * the retained anchors payload (named by address, schema frozen with the
+ * platform) and every address-keyed consumer follow the boards. Matched by EUI.
+ * Returns false (logged) when the result would name two nodes by one address
+ * -- a surveyed board that was absent today and holds no reservation -- in
+ * which case nothing is changed and a re-survey is the fix. */
+static bool survey_follow_moves(struct apos_survey *sv, bool *changed)
+{
+	*changed = false;
+	*sv = *apos_store_get();
+	if (!sv->valid) {
+		return true;
+	}
+	for (uint8_t i = 0; i < plan_n; i++) {
+		if (plan_out[i].action != APOS_PLAN_ASSIGN ||
+		    !(plan_acked[i] || seen_at_target(i))) {
+			continue;
+		}
+		for (uint8_t n = 0; n < sv->n_nodes; n++) {
+			if (memcmp(sv->node[n].eui, plan_peer[i].eui,
+				   APOS_EUI_LEN) == 0 &&
+			    sv->node[n].short_addr != plan_out[i].addr) {
+				sv->node[n].short_addr = plan_out[i].addr;
+				*changed = true;
+			}
+		}
+	}
+	for (uint8_t a = 0; a < sv->n_nodes; a++) {
+		for (uint8_t b = (uint8_t)(a + 1u); b < sv->n_nodes; b++) {
+			if (sv->node[a].short_addr == sv->node[b].short_addr) {
+				LOG_ERR("{\"apos_error\":\"after the assign the stored "
+					"survey would hold two nodes at 0x%04X — left "
+					"unchanged; re-run `apos run` + `apos apply`\"}",
+					sv->node[a].short_addr);
+				*changed = false;
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 static void step_assign(uint32_t avail_uus, uint8_t *seq)
@@ -2093,14 +2181,15 @@ static void step_assign(uint32_t avail_uus, uint8_t *seq)
 				apply_retries++;
 				awaiting_rsp = false;
 			} else {
+				/* No ACK at all. Not a failure yet: see
+				 * assign_pending(). Convergence decides. */
 				char hex[NODE_EUI_HEX_LEN + 1u];
 
 				node_eui_fmt(plan_peer[assign_idx].eui, hex);
-				assign_failed++;
-				LOG_ERR("{\"apos_error\":\"%s never acknowledged "
-					"SETADDR after %u attempts — firmware older "
-					"than address assignment, or out of range\"}",
-					hex, APOS_GW_APPLY_RETRIES + 1u);
+				LOG_WRN("{\"apos_warn\":\"%s never acknowledged SETADDR "
+					"after %u attempts — waiting to see whether it "
+					"moved anyway\"}", hex,
+					APOS_GW_APPLY_RETRIES + 1u);
 				awaiting_rsp = false;
 				apply_retries = 0;
 				tx_fails = 0;
@@ -2113,7 +2202,14 @@ static void step_assign(uint32_t avail_uus, uint8_t *seq)
 			assign_idx++;
 		}
 		if (assign_idx >= plan_n) {
-			assign_stage = AS_PERSIST;
+			bool wait = false;
+
+			for (uint8_t i = 0; i < plan_n; i++) {
+				wait = wait || assign_pending(i);
+			}
+			converge_deadline_ms = now + APOS_GW_ASSIGN_CONVERGE_MS;
+			next_action_ms = 0;
+			assign_stage = wait ? AS_CONVERGE : AS_PERSIST;
 			return;
 		}
 
@@ -2131,8 +2227,10 @@ static void step_assign(uint32_t avail_uus, uint8_t *seq)
 		if (!tx_now((uint16_t)n, seq)) {
 			/* Bounded like SETPOS: a TX that never starts is not the
 			 * board's fault, but a wedged radio must not park the
-			 * assign forever. */
+			 * assign forever. Nothing reached it, so it cannot have
+			 * moved: a failure, not a pending. */
 			if (++tx_fails >= APOS_GW_TX_FAIL_LIMIT) {
+				plan_nacked[assign_idx] = true;
 				assign_failed++;
 				tx_fails = 0;
 				apply_retries = 0;
@@ -2146,48 +2244,87 @@ static void step_assign(uint32_t avail_uus, uint8_t *seq)
 		return;
 	}
 
-	if (assign_stage == AS_PERSIST) {
-		struct apos_addrmap m = *apos_store_addrmap();
-		bool changed = false;
-		bool moved = false;
+	if (assign_stage == AS_CONVERGE) {
+		/* Done once every board that did not refuse answers enumeration
+		 * from its new address. The reboot closed its survey window;
+		 * each SURVEY_BEGIN below reopens it on the same session. */
+		bool all = true;
 
-		/* Only what is settled goes in: ADOPTs (no frame needed) and the
-		 * ASSIGNs the board acknowledged. A board that never answered is
-		 * re-planned on the next run, not reserved on a guess. */
-		for (uint8_t i = 0; i < plan_n; i++) {
-			bool take = plan_out[i].action == APOS_PLAN_ADOPT ||
-				    (plan_out[i].action == APOS_PLAN_ASSIGN &&
-				     plan_acked[i]);
-
-			if (plan_acked[i]) {
-				moved = true;
+		for (uint8_t i = 0; i < plan_n && all; i++) {
+			if (assign_pending(i) && !seen_at_target(i)) {
+				all = false;
 			}
-			if (!take) {
-				continue;
-			}
-			int k = apos_addrmap_find_eui(&m, plan_peer[i].eui);
-
-			if (k >= 0 && m.e[k].addr == plan_out[i].addr) {
-				continue;
-			}
-			if (apos_addrmap_put(&m, plan_peer[i].eui,
-					     plan_out[i].addr) != 0) {
-				/* The plan was built against this same map, so
-				 * this cannot fail; if it does, persist nothing. */
-				LOG_ERR("{\"apos_error\":\"address map update "
-					"refused — nothing persisted\"}");
-				phase = APOS_GW_IDLE;
-				return;
-			}
-			changed = true;
 		}
+		if (all || now >= converge_deadline_ms) {
+			assign_stage = AS_PERSIST;
+			return;
+		}
+		if (now < next_action_ms) {
+			return;
+		}
+		send_survey_begin(seq);
+		next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
+		return;
+	}
 
-		if (changed) {
-			/* A flash write on the beacon-owning loop: gated like
-			 * every other one (see AP_COMMIT in step_apply()). */
-			if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
-				return;
+	/* AS_PERSIST. Only what is settled goes in: ADOPTs (no frame needed),
+	 * and ASSIGNs the board either acknowledged or was SEEN at afterwards.
+	 * A board with neither is reported and re-planned next time, not
+	 * reserved on a guess. */
+	struct apos_addrmap m = *apos_store_addrmap();
+	bool map_changed = false;
+	bool moved = false;
+	uint8_t newly_failed = 0;
+
+	for (uint8_t i = 0; i < plan_n; i++) {
+		bool take = plan_out[i].action == APOS_PLAN_ADOPT;
+
+		if (assign_pending(i)) {
+			if (plan_acked[i] || seen_at_target(i)) {
+				take = true;
+				moved = true;
+			} else {
+				char hex[NODE_EUI_HEX_LEN + 1u];
+
+				node_eui_fmt(plan_peer[i].eui, hex);
+				LOG_ERR("{\"apos_error\":\"%s neither acknowledged "
+					"SETADDR nor appeared at 0x%04X — firmware older "
+					"than address assignment, or out of range\"}",
+					hex, plan_out[i].addr);
+				newly_failed++;
 			}
+		}
+		if (!take) {
+			continue;
+		}
+		int k = apos_addrmap_find_eui(&m, plan_peer[i].eui);
+
+		if (k >= 0 && m.e[k].addr == plan_out[i].addr) {
+			continue;
+		}
+		if (apos_addrmap_put(&m, plan_peer[i].eui, plan_out[i].addr) != 0) {
+			/* The plan was built against this same map, so this cannot
+			 * fail; if it does, persist nothing. */
+			LOG_ERR("{\"apos_error\":\"address map update refused — "
+				"nothing persisted\"}");
+			phase = APOS_GW_IDLE;
+			return;
+		}
+		map_changed = true;
+	}
+
+	struct apos_survey sv;
+	bool survey_changed = false;
+
+	(void)survey_follow_moves(&sv, &survey_changed);
+
+	if (map_changed || survey_changed) {
+		/* Flash writes on the beacon-owning loop: gated like every other
+		 * one (see AP_COMMIT in step_apply()). Up to two in this step. */
+		if (avail_uus < APOS_GW_SOLVE_BUDGET_UUS) {
+			return;
+		}
+		if (map_changed) {
 			int rc = apos_store_save_addrmap(&m);
 
 			if (rc) {
@@ -2198,50 +2335,27 @@ static void step_assign(uint32_t avail_uus, uint8_t *seq)
 				return;
 			}
 		}
+		if (survey_changed) {
+			int rc = apos_store_save(&sv);
 
-		if (moved) {
-			/* The gauge is a set of ADDRESSES; boards just changed
-			 * theirs, so it may now name different boxes. */
-			if (apos_gw_gauge_set()) {
-				memset(gauge_addr, 0, sizeof(gauge_addr));
-				gauge_addr[3] = -1;
-				LOG_WRN("{\"apos_warn\":\"addresses changed — the gauge "
-					"was cleared; set it again with `apos gauge`\"}");
+			if (rc) {
+				LOG_ERR("{\"apos_error\":\"survey addresses NOT updated "
+					"(errno %d) — re-run `apos run` + `apos apply`\"}",
+					rc);
 			}
-			converge_deadline_ms = now + APOS_GW_ASSIGN_CONVERGE_MS;
-			next_action_ms = 0;
-			assign_stage = AS_CONVERGE;
-			return;
-		}
-		finish_assign();
-		return;
-	}
-
-	/* AS_CONVERGE: done once every acknowledged board answers enumeration
-	 * from its new address. The reboot closed its survey window; each
-	 * SURVEY_BEGIN below reopens it on the same session. */
-	bool all = true;
-
-	for (uint8_t i = 0; i < plan_n; i++) {
-		if (!plan_acked[i]) {
-			continue;
-		}
-		int k = apos_table_find_eui(&tbl, plan_peer[i].eui);
-
-		if (k < 0 || tbl.peer[k].short_addr != plan_out[i].addr) {
-			all = false;
-			break;
 		}
 	}
-	if (all || now >= converge_deadline_ms) {
-		finish_assign();
-		return;
+	assign_failed += newly_failed;
+
+	if (moved && apos_gw_gauge_set()) {
+		/* The gauge is a set of ADDRESSES; boards just changed theirs, so
+		 * it may now name different boxes. */
+		memset(gauge_addr, 0, sizeof(gauge_addr));
+		gauge_addr[3] = -1;
+		LOG_WRN("{\"apos_warn\":\"addresses changed — the gauge was "
+			"cleared; set it again with `apos gauge`\"}");
 	}
-	if (now < next_action_ms) {
-		return;
-	}
-	send_survey_begin(seq);
-	next_action_ms = now + APOS_GW_ENUM_SETTLE_MS;
+	finish_assign();
 }
 
 void apos_gw_on_rx(const uint8_t *buf, uint16_t plen)
@@ -2418,6 +2532,9 @@ void apos_gw_step(uint32_t avail_uus, uint8_t *seq)
 		break;
 	case APOS_GW_ASSIGN:
 		step_assign(avail_uus, seq);
+		break;
+	case APOS_GW_FORGET:
+		step_forget(avail_uus);
 		break;
 	default:
 		/* Every value of enum apos_gw_phase now has a handler, so this

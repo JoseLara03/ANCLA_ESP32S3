@@ -507,12 +507,14 @@ static void handle_settau(const uint8_t *buf, uint16_t plen,
  * opened this survey may make a deployed board restart.
  *
  * The comparison is against `cfg`, the loop's snapshot, i.e. the address this
- * board is RUNNING with, not the persisted one. That is what makes a retry
- * after a lost ACK work: the board persisted the new id but did not reboot (it
- * reboots only once its ACK is confirmed on air), so it still runs the old
- * address, sees CHANGE again, re-persists the same value and ACKs. Comparing
- * against the persisted id would answer SAME without ever rebooting, and the
- * gateway would wait in vain for the new address to show up. */
+ * board is RUNNING with, not the persisted one, so a gateway retry after an ACK
+ * this board never got onto the air finds CHANGE again and can complete.
+ *
+ * The reboot is armed once the ACK has LEFT this radio (TXFRS), which says
+ * nothing about whether the gateway received it. An ACK lost on air is followed
+ * by retries that reach a rebooting board with its window closed; the gateway
+ * does not count that as a failure but settles it by re-enumeration, seeing the
+ * board at its new address (apos_gw.c, assign_pending()). */
 static void handle_setaddr(const uint8_t *buf, uint16_t plen,
 			   const uwb_config_t *cfg, uint8_t *seq,
 			   struct beacon_guard *bg)
@@ -601,10 +603,19 @@ static void handle_setaddr(const uint8_t *buf, uint16_t plen,
 			SETADDR_REBOOT_DELAY_MS, held);
 		k_work_reschedule(&reboot_work, K_MSEC(SETADDR_REBOOT_DELAY_MS));
 	} else if (reboot) {
-		/* Persisted, but the gateway never heard so: stay on the old
-		 * address so its retry finds CHANGE again and can complete. */
-		LOG_WRN("SETADDR_ACK lost — staying on 0x%04X until the gateway "
-			"retries", uwb_config_short_addr(cfg));
+		/* The ACK never left: undo the persist, so the live config, the
+		 * status report and NVS all keep saying what the radio runs. A
+		 * later power cut must not move this board to an address the
+		 * gateway never recorded; the gateway's retry redoes it. */
+		uwb_config_t *live = uwb_config_get();
+
+		(void)uwb_config_set_id(live, cfg->anchor_id);
+		if (uwb_store_save_id() != 0) {
+			LOG_ERR("SETADDR rollback NOT persisted — this board moves to "
+				"0x%04X on its next reboot", held);
+		}
+		LOG_WRN("SETADDR_ACK could not be sent — staying on 0x%04X",
+			uwb_config_short_addr(cfg));
 	}
 }
 

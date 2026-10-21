@@ -213,6 +213,8 @@ struct fake_anchor {
 	int64_t  offline_until;     /* deaf (rebooting) until this time */
 	int      n_setaddr_rx;
 	int      n_reboots;
+	bool     win_closed;        /* rebooted: deaf to SETADDR until SURVEY_BEGIN */
+	bool     ack_lost_on_air;   /* ACK leaves (so it reboots) but never arrives */
 };
 static struct fake_anchor A[NA];
 static float GW[3];
@@ -297,6 +299,7 @@ static void handle_frame(const uint8_t *f, uint16_t len)
 			if (!A[i].present || now_ms < A[i].offline_until) {
 				continue;
 			}
+			A[i].win_closed = false;
 			int n = apos_frame_enum_rsp_build(buf, sizeof(buf), A[i].addr, 0,
 							  sess, A[i].eui, false, 0, 0, 0);
 			deliver(buf, n);
@@ -421,7 +424,8 @@ static void handle_frame(const uint8_t *f, uint16_t len)
 		for (int i = 0; i < NA; i++) {
 			struct fake_anchor *a = &A[i];
 
-			if (!a->present || now_ms < a->offline_until || a->old_fw) {
+			if (!a->present || now_ms < a->offline_until || a->old_fw ||
+			    a->win_closed) {
 				continue;
 			}
 			/* The SAME decision function the real anchor calls. */
@@ -455,10 +459,15 @@ static void handle_frame(const uint8_t *f, uint16_t len)
 			}
 			int n = apos_frame_setaddr_ack_build(buf, sizeof(buf), a->addr, 0,
 							     sess, a->eui, held, st);
-			deliver(buf, n);
+			if (!a->ack_lost_on_air) {
+				deliver(buf, n);
+			}
 			if (reboot) {
+				/* Like the real anchor: reboots once the ACK has left,
+				 * comes back with its survey window closed. */
 				a->addr = held;
 				a->offline_until = now_ms + a->reboot_ms;
+				a->win_closed = true;
 				a->n_reboots++;
 			}
 		}
@@ -967,6 +976,11 @@ static void test_enumeration_order_does_not_change_identities(void)
 
 /* ---- `apos assign` (spec 2026-10-21) ------------------------------------ */
 
+static void map_put_eui(const uint8_t eui[8], uint16_t addr)
+{
+	CHECK(apos_addrmap_put(&store_map, eui, addr) == 0);
+}
+
 static void make_unassigned(int n)
 {
 	for (int i = 0; i < n; i++) {
@@ -1183,6 +1197,63 @@ static void test_assign_clears_the_gauge_when_addresses_move(void)
 	CHECK(apos_gw_gauge_set());
 }
 
+/* The review's case: the board took the address and rebooted, but its ACK was
+ * lost on air. Every retry then meets a rebooting board with its window closed.
+ * It must still be recorded -- it is SEEN at its new address. */
+static void test_assign_ack_lost_after_reboot_is_settled_by_enumeration(void)
+{
+	world(4, false);
+	make_unassigned(4);
+	A[1].ack_lost_on_air = true;
+	apos_gw_init();
+	run_assign();
+
+	CHECK(A[1].n_reboots == 1);
+	CHECK(A[1].n_setaddr_rx == 1);   /* retries hit a closed window */
+	CHECK(addresses_distinct_and_valid(4));
+	CHECK(map_has(1, A[1].addr));
+	CHECK(log_count[3] == 0);
+}
+
+static void test_assign_with_nobody_answering_is_an_error(void)
+{
+	world(4, false);
+	for (int i = 0; i < 4; i++) {
+		A[i].present = false;
+	}
+	apos_gw_init();
+	run_assign();
+	CHECK(log_count[3] > 0);
+	CHECK(map_saves == 0);
+}
+
+/* Boards that move take their survey node with them (by EUI), so the retained
+ * anchors payload -- named by address -- and the edge keep the right
+ * coordinates on the right board. */
+static void test_assign_moves_the_survey_addresses_with_the_boards(void)
+{
+	world(4, false);
+	store_survey.valid = true;
+	store_survey.n_nodes = 4;
+	for (int i = 0; i < 4; i++) {
+		memcpy(store_survey.node[i].eui, A[i].eui, 8);
+		store_survey.node[i].short_addr = A[i].addr;
+		store_survey.node[i].x = (float)i;
+	}
+	/* The map says A[1] and A[2] swapped. */
+	map_put_eui(A[1].eui, 3);
+	map_put_eui(A[2].eui, 2);
+	apos_gw_init();
+	run_assign();
+
+	CHECK(A[1].addr == 3 && A[2].addr == 2);
+	CHECK(survey_saves == 1);
+	CHECK(store_survey.node[1].short_addr == 3 && store_survey.node[1].x == 1.0f);
+	CHECK(store_survey.node[2].short_addr == 2 && store_survey.node[2].x == 2.0f);
+	CHECK(store_survey.node[0].short_addr == 1);
+	CHECK(log_count[3] == 0);
+}
+
 static void test_run_refuses_with_unassigned_boards(void)
 {
 	world(4, false);
@@ -1203,7 +1274,12 @@ static void test_assign_refuses_over_an_unreadable_map(void)
 	map_rejected = true;
 	apos_gw_init();
 	CHECK(apos_gw_start_assign() == -EIO);
-	CHECK(apos_gw_forget(NULL) == 0);   /* the explicit clear */
+	CHECK(apos_gw_forget(NULL) == 0);   /* the explicit clear -- queued */
+	CHECK(map_rejected);                /* not written from the caller */
+	pump_avail(200, APOS_GW_STEP_BUDGET_UUS);
+	CHECK(map_rejected && apos_gw_busy());   /* waits for the solve budget */
+	pump(200);
+	CHECK(!apos_gw_busy());
 	CHECK(!map_rejected);
 	CHECK(apos_gw_start_assign() == 0);
 	pump(20000);
@@ -1245,6 +1321,9 @@ int main(void)
 	test_assign_clears_the_gauge_when_addresses_move();
 	test_run_refuses_with_unassigned_boards();
 	test_assign_refuses_over_an_unreadable_map();
+	test_assign_ack_lost_after_reboot_is_settled_by_enumeration();
+	test_assign_with_nobody_answering_is_an_error();
+	test_assign_moves_the_survey_addresses_with_the_boards();
 
 	if (g_fail) {
 		printf("%d CHECK(s) FAILED\n", g_fail);

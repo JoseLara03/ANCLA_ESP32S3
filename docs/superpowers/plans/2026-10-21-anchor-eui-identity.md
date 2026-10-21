@@ -1,8 +1,9 @@
 # Identidad de ancla por EUI y asignación de dirección desde el gateway — plan
 
 Fecha: 2026-10-21.
-Estado: **plan, sin implementar.** No hay código escrito, ni compilado, ni
-corrido en hardware.
+Estado: **T0-T10 implementadas en `feat/anchor-eui-identity`, con pruebas host
+y compilación de las tres imágenes. T11 (hardware) NO EJECUTADO.** Ver
+"Estado de implementación" al final.
 Spec: `docs/superpowers/specs/2026-10-21-anchor-eui-identity-design.md`. Las
 referencias D1–D9 y H1–H8 son de ese documento. Este plan no re-decide nada de
 lo que el spec decide; si una tarea descubre que una decisión del spec es
@@ -515,3 +516,62 @@ T1..T9 ─ T10 ─ T11
 T1, T2, T3 y T4 no comparten archivos y pueden ir en paralelo. T5 y T6 tocan
 `apos_*` y van en serie. T7 y T8 comparten `pos_json.h` sólo en comentarios;
 si corren en paralelo, se coordinan ese archivo.
+
+---
+
+## Estado de implementación (2026-10-21)
+
+Commits (sobre el spec/plan `ab5ca42`): T1 `37f5251`, T2 `e4a3169`, T3
+`0187837`, T4 `f9edaf1`, T5+T6 `65f850b`, T7 `76b3f07`, T8 `28be4b8`, T9
+`be98ffb`, T10 `7cff005`, más un commit de correcciones de la revisión
+independiente (el siguiente a este texto).
+
+Verificación: 38 suites host, `edge` 52/52 (`python -m unittest discover -s
+tests`). Producción, cal y poll compilan sin warnings nuevos. Producción
+`dram0_0_seg` pasó de 274 320 a 275 824 B: unos 1 KB son las dos colas de
+observaciones, que ahora llevan el EUI. Mutaciones deliberadas, todas
+detectadas: `apos_addrmap` 4/4 y la lógica de assign en `apos_gw` 11/11.
+
+**Desviaciones respecto al texto de arriba, todas deliberadas:**
+
+1. **El assign converge ANTES de persistir**, no después (T6 decía SEND →
+   PERSIST → CONVERGE). Un ancla se reinicia 500 ms después de que su ACK SALE
+   de su radio, sin saber si llegó. Con un ACK perdido en el aire, los
+   reintentos encuentran un ancla reiniciando y con la ventana cerrada. El
+   orden original la contaba como fallida y no la registraba, aunque ya estaba
+   en su dirección nueva. Ahora un ACK ausente no es un fallo: el ancla queda
+   "pendiente" y la re-enumeración lo decide. Se persiste lo ADOPTADO más lo
+   ASIGNADO que se confirmó con ACK **o se vio** en su dirección nueva. Sigue
+   siendo fallo una negativa explícita del ancla, o un TX que nunca salió.
+   Lo encontró la revisión independiente.
+2. **El assign también reescribe las direcciones del survey guardado** (por
+   EUI) para las anclas que se movieron. Además, net_uplink ahora republica el
+   topic retained `setup/<zone>` cada vez que cambia el survey; antes solo lo
+   publicaba al reconectar, también después de `apos apply`. Sin esto, el edge
+   (que ubica por id el payload de setup, cuyo schema congelado no lleva EUI)
+   le pondría a un ancla movida las coordenadas de otra. Si el resultado
+   dejaría dos nodos con una misma dirección, el survey no se toca y se pide
+   re-survey. Lo encontró la revisión.
+3. **`apos forget` y `apos addr clear` quedan en cola** (fase
+   `APOS_GW_FORGET`): el gateway escribe el mapa desde su lazo con el
+   presupuesto de solve, no desde el hilo del shell. Lo encontró la revisión.
+4. **Ancla: si el ACK no pudo salir, se deshace el id guardado**, para que
+   config viva, status y NVS sigan diciendo lo que corre el radio. Lo encontró
+   la revisión.
+5. **Agregados que no estaban en el plan:**
+   - `apos addr clear`, para un mapa ilegible que el operador decide descartar.
+   - Un ancla sin asignar también rechaza SETPOS y SETTAU.
+   - Un assign sin ninguna ancla que conteste es error.
+   - El edge borra el EUI → id de un ancla que reporta sin id, y las llaves
+     numéricas se leen en base 10 como antes.
+6. Las líneas de prueba nuevas de `CLAUDE.md` se agregaron juntas en T10, no en
+   cada tarea.
+
+**Hallazgo de la revisión NO corregido:** `AS_PERSIST`, igual que `AP_MARK` y
+`AP_COMMIT` de apply, espera sin plazo un paso con `APOS_GW_SOLVE_BUDGET_UUS`
+disponible. Por diseño ese paso llega una vez por superframe (el primero
+después del beacon), así que se dejó igual que el código existente en vez de
+inventar un plazo solo para assign.
+
+**Abierto:** T11 completo (H1-H8), y decidir qué pasa con los 32 commits sin
+subir de `master` ("network-scaling-v3") antes de mergear esta rama.

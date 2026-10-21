@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tdoa_server import nodecmd, tdoa                          # noqa: E402
 from tdoa_server.service import (UnknownEui, eui_id_from_status, parse_obs, parse_setup,  # noqa: E402
-                                 parse_tid_map, resolve_keys, status_events)
+                                 parse_tid_map, resolve_keys, status_events, update_eui_map)
 
 ANCHORS = {0: (0.0, 0.0, 0.0), 1: (3.2, 0.0, 0.0), 2: (3.34, 1.83, 0.0), 3: (-0.01, 2.42, 0.0)}
 TAG_Z = -0.9                       # tag 0.9 m below the anchor plane
@@ -341,6 +341,23 @@ class Parsing(unittest.TestCase):
         m = {"7CDFA1B2C3D40000": 3}
         self.assertEqual(resolve_keys({"1": 10, "7cdfa1b2c3d40000": 30, "AABBCCDDEEFF0011": 9}, m),
                          {1: 10, 3: 30})
+        self.assertEqual(resolve_keys({"08": 1}, {}), {8: 1})   # base 10, as it always was
+
+    def test_update_eui_map(self):
+        m = {}
+        A, B = "7CDFA1B2C3D40000", "7CDFA1B2C3D50000"
+        self.assertTrue(update_eui_map(m, {"online": 1, "role": "an", "eui": A, "id": 2}))
+        self.assertFalse(update_eui_map(m, {"online": 1, "role": "an", "eui": A, "id": 2}))
+        # B takes id 2 (re-assigned): A's stale claim is released.
+        self.assertTrue(update_eui_map(m, {"online": 1, "role": "an", "eui": B, "id": 2}))
+        self.assertEqual(m, {B: 2})
+        # B unassigned again: its entry goes, its observations become UnknownEui.
+        self.assertTrue(update_eui_map(m, {"online": 1, "role": "an", "eui": B, "assigned": 0}))
+        self.assertEqual(m, {})
+        # A last will changes nothing.
+        update_eui_map(m, {"online": 1, "role": "an", "eui": A, "id": 1})
+        self.assertFalse(update_eui_map(m, {"online": 0, "role": "an", "eui": A}))
+        self.assertEqual(m, {A: 1})
 
     def test_parse_setup_maps_name_to_anchor_id(self):
         doc = {"name": "852541", "anchors": [

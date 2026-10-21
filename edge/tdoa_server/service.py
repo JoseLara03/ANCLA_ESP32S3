@@ -127,8 +127,31 @@ def resolve_keys(d: Dict[str, object], eui_to_id: Dict[str, int]) -> Dict[int, o
             if eui in eui_to_id:
                 out[eui_to_id[eui]] = v
         else:
-            out[int(k, 0) if isinstance(k, str) else int(k)] = v
+            out[int(k)] = v      # base 10, as before: "08" must keep working
     return out
+
+
+def update_eui_map(eui_to_id: Dict[str, int], doc: dict) -> bool:
+    """Fold one status report into the EUI -> id map. Returns True if the map changed.
+
+    An anchor that reports an id claims it (and an id another EUI held is released: the gateway
+    re-assigned it). An anchor that reports its EUI but NO id (unassigned again, e.g. `anchor id
+    auto`) drops its entry, so its observations stop resolving to a position it no longer has. A
+    last will or a gateway report changes nothing."""
+    if doc.get("role") != "an" or doc.get("online") == 0:
+        return False
+    eui = norm_eui(doc.get("eui"))
+    if eui is None:
+        return False
+    if "id" not in doc:
+        return eui_to_id.pop(eui, None) is not None
+    aid = int(doc["id"])
+    if eui_to_id.get(eui) == aid:
+        return False
+    for other in [k for k, v in eui_to_id.items() if v == aid and k != eui]:
+        del eui_to_id[other]
+    eui_to_id[eui] = aid
+    return True
 
 
 def status_events(prev: Optional[dict], cur: dict) -> list:
@@ -258,14 +281,8 @@ class Service:
         for ev in status_events(self.node_status.get(node), cur):
             log.warning("node %s: %s", node, ev)
         self.node_status[node] = cur
-        pair = eui_id_from_status(cur)
-        if pair is not None and self.eui_to_id.get(pair[0]) != pair[1]:
-            eui, aid = pair
-            # One id, one board: an id another EUI held is released (the gateway re-assigned it).
-            for other in [k for k, v in self.eui_to_id.items() if v == aid and k != eui]:
-                del self.eui_to_id[other]
-            self.eui_to_id[eui] = aid
-            log.info("anchor %s is id %d", eui, aid)
+        if update_eui_map(self.eui_to_id, cur):
+            log.info("anchor ids by EUI: %s", self.eui_to_id)
             with self.lock:
                 if self.override_raw:
                     self.pipe.set_anchors(resolve_keys(self.override_raw, self.eui_to_id))

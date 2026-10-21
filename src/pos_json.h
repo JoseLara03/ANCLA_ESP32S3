@@ -140,7 +140,11 @@ struct pos_blink_obs {
  * which still fit under the old 95-byte limit but left only 11 bytes of
  * headroom -- enough to make the NEXT field an emergency rather than an
  * edit. tests/pos_json_blink/ prints the measured figure on every run
- * precisely so this is never estimated again. */
+ * precisely so this is never estimated again.
+ *
+ * 2026-10-21: "u" (the anchor's EUI, 22 bytes) took the measured worst case
+ * to 107 bytes, still under 127. The margin for the NEXT field is now ~20
+ * bytes -- measure before adding one. */
 #define POS_JSON_BLINK_MAX_LEN 128
 
 /* Upper bound on t_dtu: the DW3220's system counter is 40 bits, so anything

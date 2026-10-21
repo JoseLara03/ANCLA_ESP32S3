@@ -371,8 +371,10 @@ static int cmd_addr(const struct shell *sh, size_t argc, char **argv)
 			shell_error(sh, "error: map NOT cleared (errno %d)", rc);
 			return rc;
 		}
-		shell_print(sh, "ok: address map cleared — the next `apos assign` "
-				"adopts working addresses and re-plans the rest");
+		shell_print(sh, "queued: the gateway clears the address map on its "
+				"next free slot and logs {\"apos_addrmap\":...}; the "
+				"next `apos assign` adopts working addresses and "
+				"re-plans the rest");
 		return 0;
 	}
 
@@ -425,8 +427,9 @@ static int cmd_forget(const struct shell *sh, size_t argc, char **argv)
 		shell_error(sh, "error: NOT forgotten (errno %d)", rc);
 		return rc;
 	}
-	shell_print(sh, "ok: %s forgotten — its address is free for the next "
-			"`apos assign`", argv[1]);
+	shell_print(sh, "queued: %s will be forgotten on the gateway's next free "
+			"slot (logged as {\"apos_addrmap\":...}); its address is then "
+			"free for the next `apos assign`", argv[1]);
 	return 0;
 }
 

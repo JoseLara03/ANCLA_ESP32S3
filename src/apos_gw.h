@@ -37,6 +37,7 @@ enum apos_gw_phase {
 	APOS_GW_RANGE  = 2,
 	APOS_GW_APPLY  = 3,
 	APOS_GW_ASSIGN = 4, /* `apos assign`: give every anchor a unique address */
+	APOS_GW_FORGET = 5, /* a queued address-map write (`apos forget`/`addr clear`) */
 };
 
 /* How long a survey window anchors are told to hold open. Generously longer
@@ -347,20 +348,24 @@ enum apos_geom_dim apos_gw_gauge_dim(void);
 int apos_gw_start_run(void);
 
 /* `apos assign` (spec 2026-10-21 D7): enumerate, plan every board's address
- * with apos_addr_plan(), send SETADDR to each board that needs one, persist the
- * map (budget-gated), then re-enumerate until each re-addressed board answers
- * from its new address or APOS_GW_ASSIGN_CONVERGE_MS passes. Logs the plan and
- * the outcome as JSON. If any address changed, the stored gauge is CLEARED:
- * it was a set of addresses and may now name different boards.
+ * with apos_addr_plan(), send SETADDR to each board that needs one, re-enumerate
+ * until each re-addressed board answers from its new address or
+ * APOS_GW_ASSIGN_CONVERGE_MS passes, then persist (budget-gated) the map and the
+ * stored survey's addresses for the boards that moved. A missing ACK is not a
+ * failure on its own: the board may have moved and rebooted with the ACK lost on
+ * air, and re-enumeration is what settles it. Logs the plan and the outcome as
+ * JSON. If any address changed, the stored gauge is CLEARED: it was a set of
+ * addresses and may now name different boards.
  *
  * Returns 0, -EBUSY if a survey runs, or -EIO if the stored map is unreadable
  * (apos_store_addrmap_rejected(); clear it explicitly first). */
 int apos_gw_start_assign(void);
 
-/* Free one reservation, or every reservation (eui == NULL), and persist. A
- * flash write from the caller's thread (the shell). Returns 0, -EBUSY while a
- * survey runs, -ENOENT for an EUI that is not in the map, or a settings
- * errno. Clearing all also clears an unreadable map. */
+/* Free one reservation, or every reservation (eui == NULL). QUEUED: the write
+ * happens from the gateway loop under APOS_GW_SOLVE_BUDGET_UUS, like every
+ * other apos flash write, and its outcome is logged as JSON. Returns 0 (queued),
+ * -EBUSY while a survey runs, or -ENOENT for an EUI not in the map. Clearing all
+ * also clears an unreadable map. */
 int apos_gw_forget(const uint8_t eui[APOS_EUI_LEN]);
 
 /* The last solved result. Never NULL; check apos_gw_get_status()->have_result. */
