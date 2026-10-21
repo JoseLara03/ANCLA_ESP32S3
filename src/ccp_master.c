@@ -8,13 +8,13 @@
 
 #include "ccp_frame.h"
 #include "ccp_sched.h"
+#include "node_eui.h"
 #include "sync_model.h"
 #include "tag_id.h"
 #include "uwb_config.h"
 #include "uwb_debug.h"
 #include "uwb_dwtime.h"
 
-#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -138,25 +138,17 @@ static uint8_t txtest_buf[CCP_FRAME_LEN];
 
 void ccp_master_init(void)
 {
-	/* Zero-pad FIRST, mirroring apos_node.c's apos_node_init(): hwinfo may
-	 * return fewer than 8 bytes on this part (the ESP32-S3 eFuse MAC read
-	 * is 6, not 8), and an uninitialised tail would make root_id change
-	 * between boots. The two derivations must agree -- the anchor survey
-	 * already keys peers by EUI-64 the same way. */
-	uint8_t eui[8];
+	/* The same zero-padded 8 bytes the anchor survey keys peers by
+	 * (node_eui.h): the two derivations must agree. */
+	const uint8_t *eui = node_eui();
 
-	memset(eui, 0, sizeof(eui));
-
-	ssize_t n = hwinfo_get_device_id(eui, sizeof(eui));
-
-	if (n <= 0) {
+	if (!node_eui_valid()) {
 		/* Not fatal for the measurement: root_id only has to be stable
 		 * for this board's lifetime and distinct from other roots on
 		 * the same air, and a single site has one root. Say so instead
 		 * of pretending, because a receiver keys its baseline on it. */
-		LOG_WRN("hwinfo_get_device_id failed (%d) — root_id falls "
-			"back to a constant, which is only safe with ONE "
-			"gateway on this air", (int)n);
+		LOG_WRN("no valid EUI — root_id falls back to a constant, "
+			"which is only safe with ONE gateway on this air");
 		root_id = 0xC0FFEE01u;
 	} else {
 		/* FNV-1a over the whole 8-byte (zero-padded) buffer, reusing
@@ -164,7 +156,7 @@ void ccp_master_init(void)
 		 * than two. Its 31-bit mask is irrelevant here -- root_id has
 		 * no int32 consumer -- but harmless, and sharing the function
 		 * is worth more than shaving a bit. */
-		root_id = tag_id_from_eui(eui, sizeof(eui));
+		root_id = tag_id_from_eui(eui, NODE_EUI_LEN);
 	}
 
 	ccp_seq = 0;

@@ -19,7 +19,7 @@
  *       -Itests/ccp_frame/shim -Isrc -o tests/apos_gw/test_apos_gw.exe \
  *       tests/apos_gw/test_apos_gw.c src/apos_gw.c src/apos_frame.c \
  *       src/apos_geom.c src/apos_table.c src/apos_stats.c src/apos_links.c \
- *       src/sync_link.c src/uwb_config.c -lm
+ *       src/sync_link.c src/uwb_config.c src/node_eui.c -lm
  */
 
 #include "apos_gw.h"

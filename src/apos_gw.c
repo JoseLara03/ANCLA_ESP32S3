@@ -13,11 +13,11 @@
 #include "apos_stats.h"
 #include "apos_store.h"
 #include "gw_selftau.h"   /* GW_SELFTAU_STEP_BUDGET_UUS */
+#include "node_eui.h"
 #include "ss_initiator.h"
 #include "uwb_config.h"
 #include "uwb_dwtime.h"
 
-#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
@@ -178,15 +178,13 @@ void apos_gw_init(void)
 	tau_ok = 0;
 	applied_generation = apos_store_links()->generation;
 
-	/* This board's own identity, the same source apos_node.c hashes for its
-	 * stagger. Zero-padded for the same reason: the tail is compared for
-	 * identity, so uninitialised bytes would change it between boots. */
-	memset(gw_eui, 0, sizeof(gw_eui));
-	gw_eui_ready = hwinfo_get_device_id(gw_eui, sizeof(gw_eui)) > 0;
+	/* This board's own identity, from the same source apos_node.c hashes
+	 * for its stagger (node_eui owns the read and the zero padding). */
+	memcpy(gw_eui, node_eui(), sizeof(gw_eui));
+	gw_eui_ready = node_eui_valid();
 	if (!gw_eui_ready) {
-		LOG_ERR("{\"apos_error\":\"hwinfo_get_device_id failed — this "
-			"gateway has no unique id and cannot be a node of its own "
-			"survey\"}");
+		LOG_ERR("{\"apos_error\":\"no valid EUI — this gateway cannot be "
+			"a node of its own survey\"}");
 	}
 
 	/* An apply that was started and never finished leaves the anchors holding

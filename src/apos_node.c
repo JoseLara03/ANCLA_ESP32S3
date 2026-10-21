@@ -12,11 +12,11 @@
 #include "apos_stats.h"
 #include "ccp_sched.h"
 #include "ccp_slave.h"
+#include "node_eui.h"
 #include "ss_initiator.h"
 #include "uwb_dwtime.h"
 #include "uwb_store.h"
 
-#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
@@ -86,24 +86,15 @@ void apos_node_init(void)
 	window_session = 0;
 	begin_seen = 0;
 
-	/* hwinfo may return fewer than 8 bytes. Zero-pad rather than leaving
-	 * the tail uninitialised: the tail is hashed for the stagger and
-	 * compared for identity, so uninitialised bytes would make this board's
-	 * identity change between boots. */
-	memset(eui, 0, sizeof(eui));
-
-	ssize_t n = hwinfo_get_device_id(eui, sizeof(eui));
-
-	if (n <= 0) {
-		LOG_ERR("hwinfo_get_device_id failed (%d) — this board has no "
-			"unique id and cannot take part in a survey",
-			(int)n);
-		eui_ready = false;
+	/* node_eui owns the read, the zero padding and the all-zero check; a
+	 * board without a valid identity cannot take part in a survey. */
+	memcpy(eui, node_eui(), sizeof(eui));
+	eui_ready = node_eui_valid();
+	if (!eui_ready) {
+		LOG_ERR("no valid EUI — this board cannot take part in a survey");
 		return;
 	}
-	eui_ready = true;
-	LOG_INF("{\"apos\":\"ready\",\"eui\":\"%02X%02X%02X%02X%02X%02X%02X%02X\"}",
-		eui[0], eui[1], eui[2], eui[3], eui[4], eui[5], eui[6], eui[7]);
+	LOG_INF("{\"apos\":\"ready\",\"eui\":\"%s\"}", node_eui_hex());
 }
 
 const uint8_t *apos_node_eui(void)

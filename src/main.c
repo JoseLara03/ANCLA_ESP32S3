@@ -18,6 +18,7 @@
 #include "disc_schedule.h"
 #include "net_config.h"
 #include "net_uplink.h"
+#include "node_eui.h"
 #include "uwb_config.h"
 #include "uwb_modes.h"
 #include "uwb_radio.h"
@@ -52,6 +53,10 @@ int main(void)
 {
 	const uwb_config_t *cfg = uwb_config_get();
 	int ret;
+
+	/* First: every module that names this board -- the survey, the MQTT
+	 * client id and topics, the BLINK observation -- reads the one copy. */
+	node_eui_init();
 
 	/* Before uwb_store_init(): its settings_load() runs the "net" handler,
 	 * which writes into this singleton. Explicit rather than lazy because

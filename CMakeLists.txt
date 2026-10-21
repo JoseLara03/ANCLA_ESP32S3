@@ -40,6 +40,7 @@ target_sources(app PRIVATE
 	src/net_store.c
 	src/net_uplink.c
 	src/node_cmd.c
+	src/node_eui.c
 	src/node_status.c
 	src/pos_abg.c
 	src/pos_json.c
