@@ -75,6 +75,8 @@ static void test_worst_case_fits_and_short_buffer_refuses(void)
         .anchor_id = 255, .blink_seq = 255, .batt_soc = 255,
         .tag_addr = 0xFFFF, .quality = 0xFFFF, .flags = 0xFF,
         .sigma_dtu = 0xFFFF, .t_dtu = 1099511627775LL,
+        .has_eui = true,
+        .eui = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
     };
     int n = pos_json_blink(buf, sizeof(buf), &in);
 
@@ -205,8 +207,68 @@ static void test_flags_field_is_optional(void)
     CHECK(o.flags == 0x02u);
 }
 
+/* "u" (2026-10-21): the anchor's EUI, the identity the gateway resolves by. */
+static void test_eui_field(void)
+{
+    struct pos_blink_obs o;
+    char buf[POS_JSON_BLINK_MAX_LEN];
+    struct pos_blink_obs src = {
+        .anchor_id = 255, .blink_seq = 5, .batt_soc = 55, .tag_addr = 0x0101,
+        .quality = 7, .t_dtu = 999, .has_eui = true,
+        .eui = {0x7C, 0xDF, 0xA1, 0xB2, 0xC3, 0xD4, 0x00, 0x00},
+    };
+
+    /* Builder emits it upper case and the document stays one object. */
+    int n = pos_json_blink(buf, sizeof(buf), &src);
+
+    CHECK(n > 0 && (size_t)n == strlen(buf));
+    CHECK(strstr(buf, ",\"u\":\"7CDFA1B2C3D40000\"}") != NULL);
+    CHECK(buf[n - 1] == '}');
+    CHECK(pos_json_blink_parse(buf, strlen(buf), &o) == 0);
+    CHECK(o.has_eui && memcmp(o.eui, src.eui, 8) == 0);
+    CHECK(o.anchor_id == 255u);   /* an unassigned anchor still publishes */
+
+    /* Absent: an older anchor, resolved by "a". */
+    src.has_eui = false;
+    CHECK(pos_json_blink(buf, sizeof(buf), &src) > 0);
+    CHECK(strstr(buf, "\"u\"") == NULL);
+    memset(&o, 0xAA, sizeof(o));
+    CHECK(pos_json_blink_parse(buf, strlen(buf), &o) == 0);
+    CHECK(!o.has_eui);
+
+    /* Lower case is accepted. */
+    const char *lower =
+        "{\"a\":1,\"t\":256,\"s\":9,\"ts\":\"123456\",\"q\":100,\"b\":80,"
+        "\"u\":\"7cdfa1b2c3d40000\"}";
+
+    CHECK(pos_json_blink_parse(lower, strlen(lower), &o) == 0);
+    CHECK(o.has_eui && o.eui[0] == 0x7C && o.eui[5] == 0xD4);
+
+    /* Present but malformed: the whole observation is rejected. */
+    static const char *const bad[] = {
+        "\"u\":\"7CDFA1B2C3D4000\"}",     /* 15 digits */
+        "\"u\":\"7CDFA1B2C3D400000\"}",   /* 17 digits */
+        "\"u\":\"7CDFA1B2C3D4000G\"}",    /* non-hex */
+        "\"u\":\"\"}",                    /* empty */
+        "\"u\":\"7CDFA1B2",               /* unterminated */
+    };
+    for (unsigned int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char doc[POS_JSON_BLINK_MAX_LEN];
+
+        snprintf(doc, sizeof(doc),
+                 "{\"a\":1,\"t\":256,\"s\":9,\"ts\":\"123456\",\"q\":100,"
+                 "\"b\":80,%s", bad[i]);
+        CHECK(pos_json_blink_parse(doc, strlen(doc), &o) == -1);
+    }
+
+    /* A builder buffer that fits the base document but not "u" refuses. */
+    src.has_eui = true;
+    CHECK(pos_json_blink(buf, 70, &src) == -1);
+}
+
 int main(void)
 {
+    test_eui_field();
     test_flags_field_is_optional();
     test_topic_is_zone_scoped();
     test_roundtrip();

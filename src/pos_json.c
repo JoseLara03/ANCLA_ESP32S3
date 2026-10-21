@@ -6,6 +6,7 @@
 
 #include "pos_json.h"
 
+#include "node_eui.h"              /* node_eui_fmt()/_parse(), header-only */
 #include "uwb_frame_802_15_4z.h"   /* UWB_FRAME_POS_SOC_CONNECTED */
 
 #include <errno.h>
@@ -308,7 +309,52 @@ int pos_json_blink(char *buf, size_t len, const struct pos_blink_obs *o)
 	if (n < 0 || (size_t)n >= len) {
 		return -1;
 	}
+
+	/* "u" (2026-10-21), appended last like "f" and "e" were. Rewrites the
+	 * closing brace so the document stays one object. */
+	if (o->has_eui) {
+		char hex[NODE_EUI_HEX_LEN + 1u];
+		int m;
+
+		node_eui_fmt(o->eui, hex);
+		m = snprintf(buf + n - 1, len - (size_t)(n - 1), ",\"u\":\"%s\"}", hex);
+		if (m < 0 || (size_t)m >= len - (size_t)(n - 1)) {
+			return -1;
+		}
+		n += m - 1;
+	}
 	return n;
+}
+
+/* "key":"<16 hex>" -> 8 bytes. Absent returns 0, well-formed returns 1, present
+ * but malformed returns -1: an identity that cannot be read is worse than none,
+ * so the caller rejects the whole observation rather than ignoring the field. */
+static int scan_eui(const char *json, const char *key, uint8_t out[8])
+{
+	char pat[16];
+	char hex[NODE_EUI_HEX_LEN + 1u];
+	const char *p;
+	int n = snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+
+	if (n < 0 || (size_t)n >= sizeof(pat)) {
+		return -1;
+	}
+	p = strstr(json, pat);
+	if (p == NULL) {
+		return 0;
+	}
+	p += (size_t)n;
+	for (unsigned int i = 0; i < NODE_EUI_HEX_LEN; i++) {
+		if (p[i] == '\0') {
+			return -1;
+		}
+		hex[i] = p[i];
+	}
+	hex[NODE_EUI_HEX_LEN] = '\0';
+	if (p[NODE_EUI_HEX_LEN] != '"' || !node_eui_parse(hex, out)) {
+		return -1;
+	}
+	return 1;
 }
 
 int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
@@ -321,6 +367,8 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 	uint32_t f = 0u;
 	uint32_t e = 0u;
 	int64_t ts;
+	uint8_t eui[8];
+	int has_u;
 
 	if (buf == NULL || out == NULL) {
 		return -1;
@@ -356,6 +404,12 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 		return -1;
 	}
 
+	/* "u" (2026-10-21), optional: an older anchor resolves by "a". */
+	has_u = scan_eui(scratch, "u", eui);
+	if (has_u < 0) {
+		return -1;
+	}
+
 	if (a > 0xFFu || t > 0xFFFFu || s > 0xFFu || q > 0xFFFFu || b > 0xFFu) {
 		return -1;
 	}
@@ -378,6 +432,12 @@ int pos_json_blink_parse(const char *buf, size_t len, struct pos_blink_obs *out)
 	out->quality   = (uint16_t)q;
 	out->flags     = (uint8_t)f;
 	out->sigma_dtu = (uint16_t)e;
+	out->has_eui   = (has_u == 1);
+	if (out->has_eui) {
+		memcpy(out->eui, eui, sizeof(out->eui));
+	} else {
+		memset(out->eui, 0, sizeof(out->eui));
+	}
 	out->t_dtu     = ts;
 	return 0;
 }

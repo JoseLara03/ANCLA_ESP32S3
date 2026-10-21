@@ -189,32 +189,51 @@ void tdoa_gw_init(void)
 	warned_dt_reseed    = false;
 }
 
-/* Where anchor `anchor_id` is, from the applied survey.
+/* Where the anchor that published `o` is, from the applied survey, and the
+ * collector key `*aid` to file its observation under.
  *
- * The survey is keyed by short address, and an anchor's short address is
- * UWB_ANCHOR_ADDR_BASE + anchor_id (the MAC contract reserves 0x0000 for the
- * gateway, which is why the console's 0-based id cannot go on the wire). An
- * unsurveyed gateway returns false for every anchor and therefore publishes no
- * fixes at all -- which is correct and is the same refusal
+ * By EUI when the observation carries one (2026-10-21): the survey nodes are
+ * stored with their EUI, and an anchor's short address is only a radio handle
+ * `apos assign` may move. An older anchor without "u" falls back to the
+ * historical lookup, short address = UWB_ANCHOR_ADDR_BASE + anchor_id.
+ *
+ * *aid is the matched survey node's short address minus the base either way, so
+ * it is unique per surveyed node even if an assign has since moved the board:
+ * the survey's addresses are unique among themselves, which is all
+ * tdoa_collect's duplicate check needs. The gateway's own node (0x0000) never
+ * publishes an observation and is never matched.
+ *
+ * An unsurveyed gateway returns false for every anchor and therefore publishes
+ * no fixes at all -- which is correct and is the same refusal
  * anchor_respond_wave_poll() makes: coordinates that were never measured
  * produce a confidently meaningless position. */
-static bool anchor_xyz(uint8_t anchor_id, float *x, float *y, float *z)
+static bool anchor_resolve(const struct pos_blink_obs *o, float *x, float *y,
+			   float *z, uint8_t *aid)
 {
 	const struct apos_survey *s = apos_store_get();
-	uint16_t want;
 	uint8_t i;
 
-	if (s == NULL || !s->valid || anchor_id >= UWB_MAX_ANCHORS) {
+	if (s == NULL || !s->valid) {
 		return false;
 	}
 
-	want = (uint16_t)(UWB_ANCHOR_ADDR_BASE + anchor_id);
-
 	for (i = 0u; i < s->n_nodes; i++) {
-		if (s->node[i].short_addr == want) {
+		uint16_t a = s->node[i].short_addr;
+		bool hit;
+
+		if (a == UWB_ADDR_GATEWAY_RESERVED ||
+		    a >= UWB_ANCHOR_ADDR_BASE + UWB_MAX_ANCHORS) {
+			continue;
+		}
+		hit = o->has_eui
+		      ? memcmp(s->node[i].eui, o->eui, sizeof(o->eui)) == 0
+		      : (o->anchor_id < UWB_MAX_ANCHORS &&
+			 a == (uint16_t)(UWB_ANCHOR_ADDR_BASE + o->anchor_id));
+		if (hit) {
 			*x = s->node[i].x;
 			*y = s->node[i].y;
 			*z = s->node[i].z;
+			*aid = (uint8_t)(a - UWB_ANCHOR_ADDR_BASE);
 			return true;
 		}
 	}
@@ -335,7 +354,9 @@ static bool ingest_one(struct gw_core_ctx *ctx, uint32_t now_ms)
 		return true;
 	}
 
-	if (!anchor_xyz(obs.anchor_id, &t.meas.x, &t.meas.y, &z)) {
+	uint8_t aid = 0u;
+
+	if (!anchor_resolve(&obs, &t.meas.x, &t.meas.y, &z, &aid)) {
 		n_no_anchor++;
 		if (!warned_no_anchor) {
 			warned_no_anchor = true;
@@ -376,7 +397,7 @@ static bool ingest_one(struct gw_core_ctx *ctx, uint32_t now_ms)
 	t.meas.t_dtu = obs.t_dtu;
 	t.tag_addr   = obs.tag_addr;
 	t.blink_seq  = obs.blink_seq;
-	t.anchor_id  = obs.anchor_id;
+	t.anchor_id  = aid;
 
 	/* The battery reading rides on the observation, not on the group: the
 	 * collector carries only struct tdoa_meas, so it is remembered here
@@ -774,7 +795,7 @@ void tdoa_gw_step(struct gw_core_ctx *ctx, uint32_t now_ms)
 	 * while the gateway is running (anchor count changed, no reboot) takes
 	 * effect on the very next step instead of needing one. Skipped while
 	 * unsurveyed, matching ingest_one(), which already drops every
-	 * observation in that state via anchor_xyz() -- there is no anchor
+	 * observation in that state via anchor_resolve() -- there is no anchor
 	 * count to set expectations from yet. */
 	if (s != NULL && s->valid) {
 		/* RECEIVERS, not survey nodes: the gateway is a node of the survey

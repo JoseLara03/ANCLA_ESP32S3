@@ -9,11 +9,14 @@
 #include "blink_frame.h"
 #include "ccp_slave.h"
 #include "net_uplink.h"
+#include "node_eui.h"
 #include "pos_json.h"
 #include "sync_model.h"
 #include "uwb_debug.h"
 
 #include <zephyr/logging/log.h>
+
+#include <string.h>
 
 /* ANCLA_LOG_LEVEL, not LOG_LEVEL_INF: the per-BLINK verdict line below is the
  * only way to see WHY observations are not reaching the gateway, and an INF cap
@@ -105,6 +108,9 @@ bool blink_rx_on_rx(const uint8_t *buf, uint16_t plen, uint64_t rx_ts,
 	 * out of it; blink_frame_parse() has already rejected any reserved
 	 * bit, so whatever survives to here is a flag this build knows. */
 	obs.flags     = bf.flags;
+	/* The identity the gateway and the edge resolve this anchor by. */
+	obs.has_eui   = node_eui_valid();
+	memcpy(obs.eui, node_eui(), sizeof(obs.eui));
 
 	/*
 	 * This anchor's own MEASURED timestamp jitter, so the gateway can

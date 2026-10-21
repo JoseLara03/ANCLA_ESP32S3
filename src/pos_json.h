@@ -64,7 +64,10 @@
  * master's time base. Produced by blink_rx.c on the anchor and consumed by the
  * gateway (Task 6). */
 struct pos_blink_obs {
-	uint8_t  anchor_id;   /* 0..UWB_MAX_ANCHORS-1, the anchor that heard it */
+	/* The anchor's id as it was when it published: 0..UWB_MAX_ANCHORS-1, or
+	 * 255 for an anchor no gateway has assigned (UWB_ANCHOR_ID_UNASSIGNED).
+	 * Only a fallback since 2026-10-21 -- `eui` below is the identity. */
+	uint8_t  anchor_id;
 	uint8_t  blink_seq;   /* from the frame; with tag_addr it is the group key */
 	uint8_t  batt_soc;    /* 0-100, or UWB_FRAME_POS_SOC_CONNECTED */
 	uint16_t tag_addr;    /* short address of the emitting tag */
@@ -109,6 +112,13 @@ struct pos_blink_obs {
 	 * `quality` stays diagnostic and nothing weights by it. */
 	uint16_t sigma_dtu;
 	int64_t  t_dtu;       /* RX in the master's base, sync_model_to_master() */
+	/* The publishing anchor's EUI-64, on the wire as "u" (16 hex digits).
+	 * This is what the gateway and the edge resolve the anchor by; the id is
+	 * a radio handle `apos assign` may move. has_eui is false for an anchor
+	 * older than this field, which is then resolved by `anchor_id` as
+	 * before. */
+	bool     has_eui;
+	uint8_t  eui[8];
 };
 
 /* Buffer big enough for pos_json_blink()'s worst case plus its NUL, and ALSO
@@ -140,7 +150,8 @@ struct pos_blink_obs {
 #define POS_JSON_BLINK_TS_MAX 0xFFFFFFFFFFLL
 
 /* Format one observation:
- *   {"a":2,"t":257,"s":90,"ts":"123456789012","q":1234,"b":77}
+ *   {"a":2,"t":257,"s":90,"ts":"123456789012","q":1234,"b":77,"f":0,"e":22,
+ *    "u":"7CDFA1B2C3D40000"}
  *
  * `ts` goes out as a QUOTED decimal string, not as a JSON number, and that is
  * deliberate: it is a 40-bit value (up to 1099511627775) and the Tid lesson (the
