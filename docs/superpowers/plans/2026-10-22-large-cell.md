@@ -14,8 +14,14 @@ tamaño de celda antes de cerrar las tareas de survey (T7–T11).
 
 - **Rama:** `feat/large-cell`, cortada de `feat/anchor-eui-identity` (el paso 1
   todavía no está mergeado). Si el paso 1 se mergea antes, cortar de esa base.
-  **Antes de T1** hay que decidir qué pasa con los 32 commits sin publicar de
-  `master` (spec §10). Este plan no los usa como base.
+- **Línea "network-scaling-v3" de `master`:** resuelto el 2026-10-22. Sus 32
+  commits quedaron archivados en `archive/network-scaling-v3` (`535d015`, en
+  `origin`) y el `master` local volvió a `origin/master` (`c2a1fb0`). De esa
+  línea **no se hace cherry-pick**: lo útil se reimplementa en T0, T5 y T8,
+  como se indica en cada tarea, porque la base divergió el 2026-08-24 y los
+  commits chocan. Lo diferido (reusar la dirección del tag por EUI `36bf9b0`,
+  `gw seed` `4cb4d61`/`25a326f`, POS que renueva el lease `a5a48c6`) es de otro
+  frente y queda en el archivo.
 - **Cada tarea de firmware cierra con:**
   - las tres imágenes compilando (producción, `cal.conf`, `poll.conf`);
   - el delta de `dram0_0_seg` anotado en el commit;
@@ -39,6 +45,24 @@ tamaño de celda antes de cerrar las tareas de survey (T7–T11).
 ---
 
 ## Fase A — firmware base (sin cambios de protocolo)
+
+### T0. Diagnósticos rescatados del archivo (opcional, independiente)
+
+Reimplementación de dos commits de `archive/network-scaling-v3`, chicos y
+útiles ya, antes de que el paso 2 cargue más el lazo del gateway:
+
+- **`45a6449`:** `LOG_WRN` cuando un JOIN de tipo y longitud correctos no
+  parsea; un catch-all en `LOG_DBG` (tipo, longitud y origen) para los frames
+  que `dispatch()` no reclama; y `uwb_gateway.c` registrado con
+  `ANCLA_LOG_LEVEL` en lugar de `LOG_LEVEL_INF`, para que la imagen de debug
+  pueda verlos.
+- **`e9b06aa`, parte del solve:** medir `do_solve()` con `k_uptime_get()` y
+  agregar `solve_ms` a la línea `apos_solve`, más un aviso **antes** de
+  resolver por encima de `APOS_GW_SOLVE_TIMED_NODES` (8). La parte de
+  `SURVEY_BEGIN` va en T5.
+
+**Cierre:** compilan las tres imágenes; en banco, `apos run` muestra
+`solve_ms`.
 
 ### T1. Ids hasta 254 y modo TWR limitado a 4 (spec §2.2)
 
@@ -214,9 +238,26 @@ nueva `tests/neigh_json/`), `tests/apos_gw/`.
   `"n":0` y la razón.
 - **El survey chico no cambia:** `apos run` sigue usando su tabla y su solve. La
   cola de trabajos es otro modo (`APOS_GW_JOBS`) que no persiste geometría.
+- **Refresco de ventanas durante la cola** (rescatado de `896cac3`,
+  reimplementado): mientras haya trabajos, el gateway re-emite `SURVEY_BEGIN`
+  con la misma sesión cada `APOS_GW_WINDOW_REFRESH_MS` (30 s), un frame por step
+  y respetando el margen de asentamiento. Sin esto, un ancla que pasa más de
+  `APOS_NODE_REFRESH_S` (60 s) sin recibir un `RANGE_CMD` cierra su ventana, y
+  sus pares posteriores salen como huecos con el radio aparentemente sano. Con
+  una cola de ~17 min eso es el caso normal, no un borde. La cola nunca se
+  "salta" pares de a uno por step: si no hay frame que mandar, avanza dentro del
+  mismo step.
+- **`SURVEY_BEGIN` que no sale** (rescatado de `e9b06aa`): `send_survey_begin()`
+  deja de descartar el resultado de `tx_now()`. Un fallo se avisa y nombra la
+  consecuencia (ventanas que vencen a mitad de la cola); el refresco se registra
+  con su posición en la cola. Sin reintento propio: cada llamador re-emite en su
+  propio calendario.
 
 **Pruebas:**
 - vector HMAC de trabajo compartido C y Python;
+- una cola de más de 60 s simulados re-emite `SURVEY_BEGIN` antes de que venza
+  la ventana de cualquier ancla falsa (las anclas falsas modelan el cierre de
+  ventana, como en las pruebas de assign);
 - replay rechazado y fuera de orden rechazado;
 - cola llena;
 - en `tests/apos_gw/`, un lote de 24 pares ejecutado contra las anclas falsas
@@ -281,6 +322,28 @@ coherentes con `apos run` en las mismas anclas.
     las ya ubicadas;
   - siempre lo suficiente para la rigidez por ancla;
   - genera los lotes de trabajos de ≤ 24 pares.
+  - **Reglas rescatadas de `b87a767`** (reimplementadas sobre las tablas de
+    sondeo en lugar del bitmap de 32 bits):
+    - la evidencia de un solo sentido basta para que un par sea candidato (la
+      ronda no garantiza que cada ancla oiga a todas las que la oyen);
+    - un ancla con tabla **vacía** reportó no oír a nadie, lo cual es falta de
+      evidencia y no aislamiento, así que conserva como candidatos todos sus
+      pares con las anclas que sí la oyeron;
+    - los huecos se cuentan solo sobre pares candidatos, para que "se pidió y
+      falló" no quede enterrado bajo "nunca se pidió".
+- **Rigidez global del sitio, rescatada de `7563263`** (portada a Python, como
+  reporte y no como bloqueo; el bloqueo es la rigidez por ancla):
+  - conexión por union-find, grado mínimo d y conteo de aristas contra
+    2N−3 / 3N−6, sobre la lista de aristas;
+  - pares repetidos contados **una sola vez**, porque una arista duplicada haría
+    pasar por redundante una malla isostática;
+  - el reporte dice cuál de las tres condiciones falla, porque el remedio es
+    distinto en cada caso;
+  - la advertencia del original se conserva literal: las tres condiciones son
+    **necesarias, no suficientes**. Dos grupos densos unidos por una sola ancla
+    pasan las tres y aun así giran alrededor de ella. La prueba rigurosa (rango
+    de la matriz de rigidez) queda fuera, igual que en el original, hasta tener
+    una malla real medida.
 - **Solver:**
   - forma cerrada del gauge (port de `apos_geom_seed()`);
   - crecimiento con Gauss-Newton de 3 incógnitas y las ubicadas fijas;
@@ -299,6 +362,9 @@ coherentes con `apos run` en las mismas anclas.
 - las ubicadas no se mueven en un segundo incremento;
 - `xcheck_survey.py`: el gauge del port coincide con `apos_geom.c` en 1000 casos
   aleatorios.
+- rigidez global: dos grupos unidos por una sola ancla pasan el chequeo (se
+  prueba que la limitación documentada existe); una arista duplicada no cuenta
+  dos veces; un ancla de tabla vacía conserva sus pares candidatos.
 
 ### T9. TDoA con las mejores K y hull local (D8)
 
@@ -367,6 +433,7 @@ con su número, en el spec.
 ## Dependencias
 
 ```
+T0 (independiente, en cualquier momento antes de T5)
 T1 ─┬─ T2 ─ T3 ─ T4 ─ T5 ─┐
     └─ T6 ─────────────────┤
 T7 ─ T8 ──────────────────┼─ T11 ─ T12 ─ T13
